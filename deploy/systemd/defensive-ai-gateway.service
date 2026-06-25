@@ -1,0 +1,21 @@
+[Unit]
+Description=Defensive AI Gateway
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/defensive-ai-gateway
+ExecStart=/usr/bin/python3 -m defensive_ai_gateway --config /etc/defensive-ai-gateway/prod.yaml
+Restart=always
+RestartSec=3
+User=defensive-ai
+Group=defensive-ai
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/defensive-ai-gateway
+
+[Install]
+WantedBy=multi-user.target
+

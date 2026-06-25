@@ -1,0 +1,93 @@
+{
+  "alert_id": "rasp-20260624104513-8588",
+  "source": "direct",
+  "product": "rasp",
+  "event_type": "runtime_sql_guard_and_sensitive_query_exception",
+  "severity": "high",
+  "timestamp": "2026-06-24T10:30:59+08:00",
+  "payload": {
+    "rule_id": "RASP-SQL-GUARD-221",
+    "rule_name": "Runtime SQL injection guard",
+    "trace_id": "rasp-trace-6898",
+    "app": "mobile-payment-api",
+    "host": "pay-api-prod-04",
+    "method": "GET",
+    "route": "GET /openbanking/v2/payments/search",
+    "user": "retail-user-1290",
+    "src_ip": "10.24.8.16",
+    "release_version": "2026.06.24-r1",
+    "deployment_window": false,
+    "attack_data": [
+      {
+        "rule_info": "SQL 注入风险：用户可控参数进入动态 SQL 查询构造",
+        "context": {
+          "hook_data": {
+            "source": "request_parameter:beneficiaryName",
+            "sink": "JdbcTemplate.query",
+            "payload_marker": "SQL boolean expression markers; raw payload withheld",
+            "sql": "withheld; normalized query shape only"
+          },
+          "stacktrace": [
+            "PaymentSearchController.search",
+            "BeneficiaryRepository.findByFilter",
+            "JdbcTemplate.query"
+          ]
+        }
+      }
+    ],
+    "stack_trace": [
+      "PaymentSearchController.search",
+      "BeneficiaryRepository.findByFilter",
+      "JdbcTemplate.query"
+    ],
+    "taint_source": "request_parameter:beneficiaryName",
+    "sink": "sql_query_builder",
+    "hook_data": {
+      "source": "request_parameter:beneficiaryName",
+      "sink": "JdbcTemplate.query",
+      "payload_marker": "SQL boolean expression markers; raw payload withheld",
+      "sql": "withheld; normalized query shape only"
+    },
+    "rasp_action": "blocked_query_execution",
+    "exception": "RASP prevented dynamic SQL query assembled from tainted request parameter; raw query withheld",
+    "business_context": {
+      "api_sensitivity": "customer-payment-search",
+      "customer_data_access": "possible_if_query_executed",
+      "same_trace_waf_request_id": "req-11fdcb3"
+    },
+    "evidence_assessment": {
+      "expected_verdict": "【真实攻击】- SQL 注入触达动态查询 sink",
+      "analysis_dimensions": [
+        {
+          "title": "参数特征",
+          "status": "risk",
+          "evidence": "taint_source=request_parameter:beneficiaryName，参数摘要包含 SQL boolean expression markers。"
+        },
+        {
+          "title": "危险调用",
+          "status": "risk",
+          "evidence": "调用栈经过 BeneficiaryRepository.findByFilter -> JdbcTemplate.query。"
+        },
+        {
+          "title": "规则匹配",
+          "status": "risk",
+          "evidence": "RASP-SQL-GUARD-221 与动态 SQL 查询构造风险一致。"
+        },
+        {
+          "title": "上下文",
+          "status": "blocked",
+          "evidence": "hook_data 显示用户可控输入触达 JdbcTemplate.query，RASP 动作为 blocked_query_execution。"
+        }
+      ],
+      "success_assessment": "RASP 阻断查询执行；目前没有证据显示 SQL 已成功执行。",
+      "business_impact": "若绕过可能影响客户支付搜索和收款人数据读取，应关联 WAF request_id 与应用审计日志确认影响面。",
+      "missing_evidence": [
+        "WAF request_id",
+        "数据库审计日志",
+        "应用访问日志",
+        "同 trace 后续异常"
+      ]
+    },
+    "whitelist_candidate": {}
+  }
+}

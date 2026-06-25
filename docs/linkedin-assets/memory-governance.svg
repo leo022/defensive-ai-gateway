@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="860" viewBox="0 0 1600 860" role="img" aria-labelledby="title desc">
+  <title id="title">Governed memory model for defensive AI agents</title>
+  <desc id="desc">The memory model separates short-term case memory, product long-term memory, asset profiles, organizational knowledge, and immutable evidence references, with five gates before promotion.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f7f9fc; }
+      .layer { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; rx: 18; }
+      .evidence { fill: #eef2ff; stroke: #4f46e5; stroke-width: 2; rx: 18; }
+      .gate { fill: #ecfdf5; stroke: #16a34a; stroke-width: 2; rx: 14; }
+      .warn { fill: #fff7ed; stroke: #f97316; stroke-width: 2; rx: 18; }
+      .title { font: 700 40px Arial, sans-serif; fill: #0f172a; }
+      .h { font: 700 24px Arial, sans-serif; fill: #0f172a; }
+      .b { font: 400 18px Arial, sans-serif; fill: #334155; }
+      .small { font: 400 15px Arial, sans-serif; fill: #64748b; }
+      .arrow { stroke: #64748b; stroke-width: 3; fill: none; marker-end: url(#arrowhead); }
+      .arrow-green { stroke: #16a34a; stroke-width: 3; fill: none; marker-end: url(#arrowhead-green); }
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <path d="M0,0 L10,4 L0,8 z" fill="#64748b"/>
+    </marker>
+    <marker id="arrowhead-green" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <path d="M0,0 L10,4 L0,8 z" fill="#16a34a"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" width="1600" height="860"/>
+  <text class="title" x="80" y="78">Multi-layer memory with governance</text>
+
+  <rect class="layer" x="80" y="135" width="300" height="140"/>
+  <text class="h" x="115" y="185">Case short-term</text>
+  <text class="b" x="115" y="225">Scoped to one case</text>
+  <text class="small" x="115" y="252">24-hour TTL, archived on close</text>
+
+  <rect class="layer" x="80" y="315" width="300" height="140"/>
+  <text class="h" x="115" y="365">Asset profile</text>
+  <text class="b" x="115" y="405">Host, app, owner context</text>
+  <text class="small" x="115" y="432">Sensitive fields minimized</text>
+
+  <rect class="layer" x="80" y="495" width="300" height="140"/>
+  <text class="h" x="115" y="545">Org knowledge</text>
+  <text class="b" x="115" y="585">Policy and playbooks</text>
+  <text class="small" x="115" y="612">Governance team maintained</text>
+
+  <rect class="evidence" x="80" y="675" width="300" height="120"/>
+  <text class="h" x="115" y="725">Evidence refs</text>
+  <text class="b" x="115" y="765">Read-only, desensitized</text>
+
+  <rect class="warn" x="540" y="155" width="320" height="170"/>
+  <text class="h" x="575" y="205">Pending candidate</text>
+  <text class="b" x="575" y="245">Proposed product memory</text>
+  <text class="small" x="575" y="275">Created after analysis, not trusted yet</text>
+
+  <rect class="gate" x="1010" y="105" width="430" height="300"/>
+  <text class="h" x="1045" y="155">Five promotion gates</text>
+  <text class="b" x="1045" y="205">1. Evidence is traceable</text>
+  <text class="b" x="1045" y="245">2. Analyst approved</text>
+  <text class="b" x="1045" y="285">3. Scope is clear</text>
+  <text class="b" x="1045" y="325">4. Expiry is set</text>
+  <text class="b" x="1045" y="365">5. No sensitive leakage</text>
+
+  <rect class="layer" x="1010" y="500" width="430" height="170"/>
+  <text class="h" x="1045" y="550">Product long-term memory</text>
+  <text class="b" x="1045" y="590">Active only after promotion</text>
+  <text class="small" x="1045" y="620">Quarterly review, expiry sweep, conflict detection</text>
+
+  <rect class="warn" x="540" y="555" width="320" height="150"/>
+  <text class="h" x="575" y="605">Governance actions</text>
+  <text class="b" x="575" y="645">Reject, quarantine, expire</text>
+  <text class="small" x="575" y="675">All actions leave memory events</text>
+
+  <path class="arrow" d="M380 205 C455 205 480 240 540 240"/>
+  <path class="arrow" d="M380 745 C460 745 480 300 540 270"/>
+  <path class="arrow-green" d="M860 240 L1010 240"/>
+  <path class="arrow-green" d="M1225 405 L1225 500"/>
+  <path class="arrow" d="M860 630 C930 630 950 630 1010 630"/>
+  <path class="arrow" d="M1010 585 C930 515 880 650 860 650"/>
+
+  <text class="small" x="555" y="365">Memory is useful only when it is scoped, reviewed, and reversible.</text>
+</svg>

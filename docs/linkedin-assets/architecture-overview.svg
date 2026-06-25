@@ -1,0 +1,99 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">Defensive AI Gateway architecture overview</title>
+  <desc id="desc">Security alerts enter a defensive AI gateway, are normalized and governed by policy, routed to product-specific agents, enriched by memory, analyzed by an LLM adapter, and surfaced through a dashboard and audit trail.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f6f8fb; }
+      .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; rx: 18; }
+      .core { fill: #e8f1ff; stroke: #2563eb; stroke-width: 2; rx: 18; }
+      .safe { fill: #eefaf4; stroke: #16a34a; stroke-width: 2; rx: 18; }
+      .store { fill: #fff7ed; stroke: #f97316; stroke-width: 2; rx: 18; }
+      .audit { fill: #f8f0ff; stroke: #9333ea; stroke-width: 2; rx: 18; }
+      .title { font: 700 42px Arial, sans-serif; fill: #0f172a; }
+      .subtitle { font: 400 22px Arial, sans-serif; fill: #475569; }
+      .h { font: 700 24px Arial, sans-serif; fill: #0f172a; }
+      .b { font: 400 18px Arial, sans-serif; fill: #334155; }
+      .small { font: 400 15px Arial, sans-serif; fill: #64748b; }
+      .arrow { stroke: #64748b; stroke-width: 3; fill: none; marker-end: url(#arrowhead); }
+      .arrow-blue { stroke: #2563eb; stroke-width: 3; fill: none; marker-end: url(#arrowhead-blue); }
+      .label { font: 700 16px Arial, sans-serif; fill: #334155; }
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <path d="M0,0 L10,4 L0,8 z" fill="#64748b"/>
+    </marker>
+    <marker id="arrowhead-blue" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <path d="M0,0 L10,4 L0,8 z" fill="#2563eb"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" width="1600" height="900"/>
+  <text class="title" x="80" y="80">Defensive AI Gateway</text>
+  <text class="subtitle" x="80" y="118">A governed, offline-friendly architecture for AI-assisted SOC alert analysis</text>
+
+  <rect class="panel" x="70" y="180" width="250" height="470"/>
+  <text class="h" x="105" y="225">Security inputs</text>
+  <text class="b" x="105" y="275">HIPS alerts</text>
+  <text class="b" x="105" y="320">RASP findings</text>
+  <text class="b" x="105" y="365">NDR detections</text>
+  <text class="b" x="105" y="410">WAF events</text>
+  <text class="b" x="105" y="455">SIEM cases</text>
+  <text class="small" x="105" y="530">JSON over HTTP today</text>
+  <text class="small" x="105" y="557">Kafka or webhook later</text>
+
+  <rect class="core" x="430" y="160" width="470" height="560"/>
+  <text class="h" x="465" y="210">Gateway core</text>
+  <rect class="panel" x="470" y="245" width="390" height="74"/>
+  <text class="h" x="495" y="278">HTTP API and dashboard</text>
+  <text class="small" x="495" y="303">Receives alerts and serves case views</text>
+  <rect class="panel" x="470" y="345" width="390" height="74"/>
+  <text class="h" x="495" y="378">Policy engine</text>
+  <text class="small" x="495" y="403">Redaction, read-only mode, approval rules</text>
+  <rect class="panel" x="470" y="445" width="390" height="74"/>
+  <text class="h" x="495" y="478">Event normalizer</text>
+  <text class="small" x="495" y="503">Common entities, evidence, sensitivity tags</text>
+  <rect class="panel" x="470" y="545" width="390" height="74"/>
+  <text class="h" x="495" y="578">Orchestrator</text>
+  <text class="small" x="495" y="603">Routes to the right product agent</text>
+
+  <rect class="safe" x="1010" y="160" width="250" height="240"/>
+  <text class="h" x="1045" y="210">Product agents</text>
+  <text class="b" x="1045" y="260">WAF agent</text>
+  <text class="b" x="1045" y="300">HIPS agent</text>
+  <text class="b" x="1045" y="340">RASP, NDR, SIEM</text>
+  <text class="small" x="1045" y="372">Product-specific prompts</text>
+
+  <rect class="safe" x="1010" y="480" width="250" height="170"/>
+  <text class="h" x="1045" y="530">LLM adapter</text>
+  <text class="b" x="1045" y="575">Local heuristic</text>
+  <text class="b" x="1045" y="615">Ollama or gateway</text>
+
+  <rect class="store" x="1350" y="160" width="180" height="220"/>
+  <text class="h" x="1380" y="210">SQLite</text>
+  <text class="b" x="1380" y="255">Cases</text>
+  <text class="b" x="1380" y="295">Alerts</text>
+  <text class="b" x="1380" y="335">Agent runs</text>
+
+  <rect class="audit" x="1350" y="430" width="180" height="220"/>
+  <text class="h" x="1380" y="480">Memory</text>
+  <text class="b" x="1380" y="525">Case</text>
+  <text class="b" x="1380" y="565">Product</text>
+  <text class="b" x="1380" y="605">Asset and org</text>
+
+  <rect class="audit" x="430" y="770" width="470" height="70"/>
+  <text class="h" x="465" y="812">Audit trail</text>
+  <text class="small" x="610" y="812">Alert received, analysis completed, memory governance events</text>
+
+  <path class="arrow" d="M320 415 C365 415 380 415 430 415"/>
+  <path class="arrow-blue" d="M900 420 C950 350 960 275 1010 270"/>
+  <path class="arrow-blue" d="M900 520 C950 565 960 565 1010 565"/>
+  <path class="arrow" d="M1260 280 C1300 280 1310 270 1350 270"/>
+  <path class="arrow" d="M1260 570 C1300 570 1310 540 1350 540"/>
+  <path class="arrow" d="M665 720 L665 770"/>
+  <path class="arrow" d="M1350 270 C1210 730 840 735 690 770"/>
+
+  <text class="label" x="345" y="390">ingest</text>
+  <text class="label" x="930" y="330">analyze</text>
+  <text class="label" x="930" y="548">generate JSON result</text>
+  <text class="label" x="1290" y="252">persist</text>
+  <text class="label" x="1272" y="520">retrieve</text>
+</svg>

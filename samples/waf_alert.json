@@ -1,0 +1,100 @@
+{
+  "alert_id": "waf-20260624114727-3625",
+  "source": "direct",
+  "product": "waf",
+  "event_type": "web_attack_sqli_anomaly",
+  "severity": "high",
+  "timestamp": "2026-06-24T10:25:31+08:00",
+  "payload": {
+    "rule_id": "WAF-942-SQLI",
+    "rule_name": "SQL injection anomaly threshold exceeded",
+    "rule_info": "SQL injection anomaly threshold exceeded on fields beneficiaryName, remarks",
+    "action": "blocked",
+    "confidence": 0.84,
+    "src_ip": "10.24.8.154",
+    "dst_ip": "10.30.2.176",
+    "xff": "203.0.113.208",
+    "geo": "US",
+    "method": "POST",
+    "uri": "/openbanking/v2/payments/search",
+    "query": "batch=true",
+    "status": 403,
+    "request_id": "req-50a7228",
+    "session": "redacted-session-4261",
+    "user": "retail-user-8842",
+    "app": "mobile-payment-api",
+    "business_owner": "Digital Banking",
+    "asset_criticality": "internet-facing",
+    "upstream": "partner-gw-prod-02",
+    "matched_parameters": [
+      "beneficiaryName",
+      "remarks"
+    ],
+    "payload_category": "boolean expression and SQL keyword markers observed; raw payload withheld",
+    "memory_hint": "",
+    "matched_field_samples": {
+      "parameter": "beneficiaryName",
+      "payload_marker": "SQL boolean expression markers",
+      "raw_payload": "[WITHHELD]"
+    },
+    "rate_window": {
+      "same_src_ip_5m": 83,
+      "same_session_5m": 16,
+      "same_uri_5m": 94
+    },
+    "correlation": {
+      "rasp_trace_id": "rasp-trace-4072",
+      "same_user_failed_login_10m": 2,
+      "recent_rule_ids": [
+        "WAF-942-SQLI"
+      ]
+    },
+    "headers": {
+      "user-agent": "curl/8.4 synthetic-probe",
+      "authorization": "Bearer demo-token-1311"
+    },
+    "evidence_assessment": {
+      "expected_verdict": "【真实攻击】- SQL 注入",
+      "analysis_dimensions": [
+        {
+          "title": "请求特征",
+          "status": "risk",
+          "evidence": "POST /openbanking/v2/payments/search 命中互联网侧业务接口，来源短时间请求 83 次。"
+        },
+        {
+          "title": "参数/Header",
+          "status": "risk",
+          "evidence": "命中参数 beneficiaryName, remarks，载荷摘要为 SQL boolean expression markers。"
+        },
+        {
+          "title": "规则匹配",
+          "status": "risk",
+          "evidence": "WAF-942-SQLI / SQL injection anomaly threshold exceeded 与 SQL 注入 特征一致。"
+        },
+        {
+          "title": "响应与处置",
+          "status": "blocked",
+          "evidence": "WAF 动作为 blocked，响应码 403，当前样本显示请求已被边界层拦截。"
+        },
+        {
+          "title": "行为基线",
+          "status": "risk",
+          "evidence": "same_src_ip_5m=83，明显高于普通单用户查询频率。"
+        },
+        {
+          "title": "关联证据",
+          "status": "review",
+          "evidence": "样本预留 RASP/SIEM 关联字段，可用于确认是否到达应用层。"
+        }
+      ],
+      "success_assessment": "WAF 已阻断请求；仍需通过 RASP 或应用日志确认是否存在绕过或后续请求成功。",
+      "business_impact": "可能影响 mobile-payment-api 上的敏感接口，若绕过可能造成数据查询、脚本执行或文件访问风险。",
+      "missing_evidence": [
+        "RASP trace 或应用访问日志",
+        "同源 IP 后续请求结果",
+        "账号/session 的认证上下文"
+      ]
+    },
+    "whitelist_candidate": {}
+  }
+}

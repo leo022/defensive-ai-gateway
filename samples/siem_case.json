@@ -1,0 +1,107 @@
+{
+  "alert_id": "siem-20260624125222-7726",
+  "source": "siem",
+  "product": "siem",
+  "event_type": "multi_product_lateral_movement_and_privilege_case",
+  "severity": "critical",
+  "timestamp": "2026-06-24T11:29:37+08:00",
+  "payload": {
+    "rule_id": "SIEM-CORR-LATERAL-PRIV-009",
+    "rule_name": "High value asset lateral movement with suspicious admin share and PowerShell chain",
+    "case_priority": "P1",
+    "host": "core-db-22",
+    "asset_criticality": "crown-jewel",
+    "src_ip": "10.12.9.156",
+    "dst_ip": "10.14.2.173",
+    "user": "adm.db",
+    "user_risk": "service-account-interactive-login",
+    "business_service": "Payments Clearing",
+    "mitre_tactic": [
+      "credential_access",
+      "lateral_movement",
+      "execution"
+    ],
+    "signals": [
+      {
+        "product": "ndr",
+        "event": "rare_smb_admin_share_access",
+        "details": "ADMIN$ and C$ shares outside baseline"
+      },
+      {
+        "product": "hips",
+        "event": "encoded_powershell_spawned_by_wmi_provider",
+        "process_name": "powershell.exe"
+      },
+      {
+        "product": "iam",
+        "event": "service_account_login_from_new_workstation",
+        "mfa_status": "not_applicable_service_account"
+      }
+    ],
+    "timeline": [
+      "10:57:44 service account interactive login from new workstation",
+      "10:58:31 rare SMB admin share access",
+      "10:59:08 encoded PowerShell child process",
+      "11:02:36 HIPS blocked credential-dump behavior"
+    ],
+    "correlation_logic": {
+      "window_minutes": 15,
+      "entity_join": [
+        "user",
+        "src_ip",
+        "host"
+      ],
+      "threshold": "3 distinct security domains"
+    },
+    "case_summary": "Multiple controls suggest possible service account abuse and lateral movement.",
+    "evidence_assessment": {
+      "expected_verdict": "【真实事件】- 服务账号滥用与横向移动攻击链",
+      "analysis_dimensions": [
+        {
+          "title": "时间线",
+          "status": "risk",
+          "evidence": "服务账号异常登录后出现 SMB 管理共享访问，再出现 WMI 拉起编码 PowerShell。"
+        },
+        {
+          "title": "实体关系",
+          "status": "risk",
+          "evidence": "用户 adm.db 连接 core-db-22 等高价值资产，来源工作站不在历史基线内。"
+        },
+        {
+          "title": "攻击链假设",
+          "status": "risk",
+          "evidence": "可映射到 credential_access、lateral_movement、execution 阶段。"
+        },
+        {
+          "title": "多源一致性",
+          "status": "risk",
+          "evidence": "NDR/HIPS/IAM 三类信号互相支持同一服务账号滥用假设。"
+        },
+        {
+          "title": "影响面",
+          "status": "risk",
+          "evidence": "目标为 crown-jewel 资产，可能影响核心账务或清算业务。"
+        },
+        {
+          "title": "证据缺口",
+          "status": "review",
+          "evidence": "持久化、数据访问和最终外传尚未确认。"
+        },
+        {
+          "title": "响应优先级",
+          "status": "risk",
+          "evidence": "P1 Case，应优先做只读会话复核并按审批流程升级响应。"
+        }
+      ],
+      "success_assessment": "HIPS 阻断一条凭证转储行为，但登录和横向访问已经发生；攻击链部分成功。",
+      "business_impact": "可能影响核心数据库主机、服务账号权限和关键业务数据访问，需要优先确认数据访问范围。",
+      "missing_evidence": [
+        "服务账号完整登录历史",
+        "目标主机安全日志",
+        "数据库审计日志",
+        "网络文件共享访问明细"
+      ]
+    },
+    "whitelist_candidate": {}
+  }
+}

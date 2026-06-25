@@ -1,0 +1,144 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: syslog-collector-vector-config
+  namespace: defensive-ai-gateway
+data:
+  vector.toml: |
+    [api]
+    enabled = false
+
+    [sources.syslog_udp]
+    type = "syslog"
+    address = "0.0.0.0:1514"
+    mode = "udp"
+
+    [sources.syslog_tcp]
+    type = "syslog"
+    address = "0.0.0.0:1514"
+    mode = "tcp"
+
+    [transforms.to_gateway_alert]
+    type = "remap"
+    inputs = ["syslog_udp", "syslog_tcp"]
+    source = '''
+    raw = .
+    structured = parse_json(.message) ?? {}
+    if !is_object(structured) {
+      structured = {}
+    }
+
+    message_text = to_string(.message) ?? ""
+    host_text = to_string(.hostname) ?? ""
+    source_name = to_string(.appname) ?? host_text
+    if source_name == "" {
+      source_name = "syslog"
+    }
+
+    product = downcase(to_string(structured.product) ?? to_string(structured.event.product) ?? "siem")
+    if product != "hips" && product != "rasp" && product != "ndr" && product != "waf" && product != "siem" {
+      product = "siem"
+    }
+
+    event_type = to_string(structured.event_type) ?? to_string(structured.event.type) ?? to_string(structured.type) ?? to_string(.msgid) ?? "syslog_event"
+    severity = downcase(to_string(structured.severity) ?? to_string(structured.level) ?? to_string(.severity) ?? "medium")
+    if severity == "emerg" || severity == "alert" || severity == "crit" || severity == "critical" {
+      severity = "critical"
+    } else if severity == "err" || severity == "error" || severity == "warning" || severity == "warn" {
+      severity = "high"
+    } else if severity == "notice" || severity == "info" || severity == "debug" {
+      severity = "low"
+    } else if severity != "critical" && severity != "high" && severity != "medium" && severity != "low" {
+      severity = "medium"
+    }
+
+    timestamp_text = format_timestamp(.timestamp, format: "%+") ?? to_string(now())
+    alert_id = to_string(structured.alert_id) ?? to_string(structured.id) ?? ""
+    if alert_id == "" {
+      alert_id = source_name + ":" + event_type + ":" + timestamp_text
+    }
+
+    payload = structured
+    payload.syslog = raw
+    payload.syslog_message = message_text
+    payload.syslog_hostname = host_text
+    payload.syslog_appname = source_name
+    payload.syslog_collector = "vector"
+    payload.syslog_received_at = to_string(now())
+
+    . = {
+      "alert_id": alert_id,
+      "source": source_name,
+      "product": product,
+      "event_type": event_type,
+      "severity": severity,
+      "timestamp": timestamp_text,
+      "payload": payload
+    }
+    '''
+
+    [sinks.gateway_http]
+    type = "http"
+    inputs = ["to_gateway_alert"]
+    uri = "http://defensive-ai-gateway:8080/api/alerts"
+    method = "post"
+    request.headers.Content-Type = "application/json"
+    encoding.codec = "json"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: syslog-collector-vector
+  namespace: defensive-ai-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: syslog-collector-vector
+  template:
+    metadata:
+      labels:
+        app: syslog-collector-vector
+    spec:
+      containers:
+        - name: vector
+          image: timberio/vector:0.39.0-alpine
+          imagePullPolicy: IfNotPresent
+          args: ["--config", "/etc/vector/vector.toml"]
+          ports:
+            - name: syslog-udp
+              containerPort: 1514
+              protocol: UDP
+            - name: syslog-tcp
+              containerPort: 1514
+              protocol: TCP
+          volumeMounts:
+            - name: config
+              mountPath: /etc/vector
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+      volumes:
+        - name: config
+          configMap:
+            name: syslog-collector-vector-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: syslog-collector
+  namespace: defensive-ai-gateway
+spec:
+  type: LoadBalancer
+  selector:
+    app: syslog-collector-vector
+  ports:
+    - name: syslog-udp
+      port: 1514
+      targetPort: syslog-udp
+      protocol: UDP
+    - name: syslog-tcp
+      port: 1514
+      targetPort: syslog-tcp
+      protocol: TCP

@@ -1,0 +1,135 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">LinkedIn cover image for Defensive AI Gateway article</title>
+  <desc id="desc">A professional dark cover image showing a defensive AI gateway connecting SOC alert streams, policy controls, product agents, memory, and auditability.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1220"/>
+      <stop offset="0.48" stop-color="#10233d"/>
+      <stop offset="1" stop-color="#142f2e"/>
+    </linearGradient>
+    <radialGradient id="glowBlue" cx="50%" cy="50%" r="50%">
+      <stop offset="0" stop-color="#38bdf8" stop-opacity="0.55"/>
+      <stop offset="0.55" stop-color="#2563eb" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#2563eb" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowGreen" cx="50%" cy="50%" r="50%">
+      <stop offset="0" stop-color="#34d399" stop-opacity="0.48"/>
+      <stop offset="0.55" stop-color="#10b981" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#10b981" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="softShadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#020617" flood-opacity="0.38"/>
+    </filter>
+    <marker id="arrow" markerWidth="12" markerHeight="10" refX="11" refY="5" orient="auto">
+      <path d="M0,0 L12,5 L0,10 z" fill="#7dd3fc"/>
+    </marker>
+    <style>
+      .grid { stroke: #334155; stroke-width: 1; opacity: 0.18; }
+      .title { font: 800 76px Arial, sans-serif; fill: #f8fafc; letter-spacing: 0; }
+      .subtitle { font: 400 30px Arial, sans-serif; fill: #cbd5e1; letter-spacing: 0; }
+      .eyebrow { font: 700 20px Arial, sans-serif; fill: #67e8f9; letter-spacing: 2px; }
+      .node-title { font: 700 22px Arial, sans-serif; fill: #f8fafc; }
+      .node-small { font: 400 15px Arial, sans-serif; fill: #cbd5e1; }
+      .chip { font: 700 16px Arial, sans-serif; fill: #e0f2fe; }
+      .line { stroke: #7dd3fc; stroke-width: 3; opacity: 0.75; fill: none; marker-end: url(#arrow); }
+      .line-soft { stroke: #5eead4; stroke-width: 2; opacity: 0.42; fill: none; }
+      .panel { fill: rgba(15, 23, 42, 0.76); stroke: rgba(148, 163, 184, 0.35); stroke-width: 2; }
+      .panel-blue { fill: rgba(14, 116, 144, 0.24); stroke: rgba(125, 211, 252, 0.6); stroke-width: 2; }
+      .panel-green { fill: rgba(5, 150, 105, 0.22); stroke: rgba(110, 231, 183, 0.55); stroke-width: 2; }
+      .dot-blue { fill: #38bdf8; }
+      .dot-green { fill: #34d399; }
+      .dot-orange { fill: #fb923c; }
+      .muted { fill: #94a3b8; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="900" fill="url(#bg)"/>
+
+  <g opacity="0.8">
+    <path class="grid" d="M0 130 H1600"/>
+    <path class="grid" d="M0 260 H1600"/>
+    <path class="grid" d="M0 390 H1600"/>
+    <path class="grid" d="M0 520 H1600"/>
+    <path class="grid" d="M0 650 H1600"/>
+    <path class="grid" d="M0 780 H1600"/>
+    <path class="grid" d="M160 0 V900"/>
+    <path class="grid" d="M320 0 V900"/>
+    <path class="grid" d="M480 0 V900"/>
+    <path class="grid" d="M640 0 V900"/>
+    <path class="grid" d="M800 0 V900"/>
+    <path class="grid" d="M960 0 V900"/>
+    <path class="grid" d="M1120 0 V900"/>
+    <path class="grid" d="M1280 0 V900"/>
+    <path class="grid" d="M1440 0 V900"/>
+  </g>
+
+  <circle cx="1080" cy="430" r="360" fill="url(#glowBlue)"/>
+  <circle cx="1370" cy="710" r="300" fill="url(#glowGreen)"/>
+
+  <g transform="translate(110 120)">
+    <text class="eyebrow" x="0" y="0">DEFENSIVE AI / SOC ARCHITECTURE</text>
+    <text class="title" x="0" y="100">Defensive AI Gateway</text>
+    <text class="subtitle" x="0" y="154">Governed alert analysis for regulated security operations</text>
+    <rect x="0" y="220" width="560" height="68" rx="34" fill="rgba(14, 165, 233, 0.14)" stroke="rgba(125, 211, 252, 0.45)" stroke-width="2"/>
+    <text class="chip" x="34" y="263">Read-only by default</text>
+    <circle cx="230" cy="254" r="5" fill="#67e8f9"/>
+    <text class="chip" x="250" y="263">Evidence-first</text>
+    <circle cx="390" cy="254" r="5" fill="#67e8f9"/>
+    <text class="chip" x="410" y="263">Auditable</text>
+  </g>
+
+  <g filter="url(#softShadow)">
+    <rect class="panel-blue" x="840" y="220" width="340" height="220" rx="24"/>
+    <text class="node-title" x="900" y="280">AI Gateway Core</text>
+    <text class="node-small" x="900" y="318">Normalize alerts</text>
+    <text class="node-small" x="900" y="348">Apply policy controls</text>
+    <text class="node-small" x="900" y="378">Route product agents</text>
+    <circle class="dot-blue" cx="872" cy="274" r="14"/>
+
+    <rect class="panel" x="760" y="560" width="250" height="140" rx="22"/>
+    <text class="node-title" x="815" y="615">Memory</text>
+    <text class="node-small" x="815" y="650">Case, asset, org</text>
+    <text class="node-small" x="815" y="678">with promotion gates</text>
+    <circle class="dot-green" cx="790" cy="610" r="12"/>
+
+    <rect class="panel" x="1120" y="560" width="250" height="140" rx="22"/>
+    <text class="node-title" x="1175" y="615">Audit Trail</text>
+    <text class="node-small" x="1175" y="650">Cases, runs, events</text>
+    <text class="node-small" x="1175" y="678">for review</text>
+    <circle class="dot-orange" cx="1150" cy="610" r="12"/>
+
+    <rect class="panel-green" x="1230" y="250" width="240" height="160" rx="22"/>
+    <text class="node-title" x="1280" y="306">LLM Adapter</text>
+    <text class="node-small" x="1280" y="342">Local analyzer</text>
+    <text class="node-small" x="1280" y="370">or enterprise gateway</text>
+    <circle class="dot-green" cx="1260" cy="300" r="12"/>
+  </g>
+
+  <g>
+    <rect class="panel" x="115" y="550" width="480" height="170" rx="24"/>
+    <text class="node-title" x="165" y="606">Security Inputs</text>
+    <text class="node-small" x="165" y="642">HIPS / RASP / NDR / WAF / SIEM</text>
+    <text class="node-small" x="165" y="672">Product-specific agents, one governed workflow</text>
+    <circle class="dot-blue" cx="145" cy="600" r="12"/>
+  </g>
+
+  <path class="line" d="M595 635 C720 620 755 390 840 340"/>
+  <path class="line" d="M1180 330 C1205 330 1205 330 1230 330"/>
+  <path class="line-soft" d="M1000 440 C990 510 935 535 890 560"/>
+  <path class="line-soft" d="M1070 440 C1100 510 1190 520 1245 560"/>
+
+  <g opacity="0.95">
+    <circle cx="697" cy="565" r="5" fill="#7dd3fc"/>
+    <circle cx="735" cy="520" r="4" fill="#7dd3fc"/>
+    <circle cx="775" cy="455" r="5" fill="#7dd3fc"/>
+    <circle cx="815" cy="383" r="4" fill="#7dd3fc"/>
+    <circle cx="1204" cy="330" r="4" fill="#a7f3d0"/>
+    <circle cx="960" cy="512" r="4" fill="#a7f3d0"/>
+    <circle cx="1152" cy="512" r="4" fill="#fed7aa"/>
+  </g>
+
+  <g transform="translate(1110 760)">
+    <rect x="0" y="0" width="360" height="58" rx="29" fill="rgba(15, 23, 42, 0.55)" stroke="rgba(148, 163, 184, 0.32)" stroke-width="2"/>
+    <text class="node-small" x="32" y="36">Normalize • Govern • Analyze • Review</text>
+  </g>
+</svg>

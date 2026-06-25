@@ -1,0 +1,81 @@
+{
+  "alert_id": "ndr-20260624103738-6595",
+  "source": "direct",
+  "product": "ndr",
+  "event_type": "possible_data_exfiltration",
+  "severity": "medium",
+  "timestamp": "2026-06-24T11:05:37+08:00",
+  "payload": {
+    "rule_id": "NDR-EXFIL-RATIO-031",
+    "rule_name": "Rare outbound TLS beacon or exfiltration pattern",
+    "src_ip": "10.30.2.206",
+    "host": "pay-api-prod-03",
+    "src_host": "pay-api-prod-03",
+    "dst_ip": "198.51.100.194",
+    "dst_port": 443,
+    "protocol": "tls",
+    "sni": "telemetry-edge.example",
+    "ja3": "771,4865-4866-4867,0-11-10,23-24,0",
+    "bytes_out": 38218249,
+    "bytes_in": 543581,
+    "session_count_30m": 86,
+    "beacon_interval_seconds": 60,
+    "network_segment": "payment-api-prod",
+    "baseline": {
+      "first_seen_dst": true,
+      "usual_outbound_from_segment": false,
+      "same_ja3_seen_assets_24h": 1,
+      "domain_age_days": 5,
+      "reputation": "newly observed low-prevalence destination",
+      "proxy_category": "uncategorized"
+    },
+    "related_events": [
+      "WAF request blocked before first outbound beacon",
+      "RASP trace recorded abnormal SQL exception"
+    ],
+    "evidence_assessment": {
+      "expected_verdict": "【真实攻击】- C2 beacon 或疑似数据外传",
+      "analysis_dimensions": [
+        {
+          "title": "通信主体",
+          "status": "risk",
+          "evidence": "pay-api-prod-03 从生产网段访问新观察目的地 198.51.100.194:443 / telemetry-edge.example。"
+        },
+        {
+          "title": "时序与流量",
+          "status": "risk",
+          "evidence": "session_count_30m=86，beacon_interval_seconds=60，呈固定间隔连接。"
+        },
+        {
+          "title": "协议与指纹",
+          "status": "risk",
+          "evidence": "TLS 元数据存在低普及目的地和少见指纹组合，载荷加密不可见。"
+        },
+        {
+          "title": "目的地信誉",
+          "status": "risk",
+          "evidence": "baseline 标记 first_seen_dst=true，reputation 为 newly observed low-prevalence destination。"
+        },
+        {
+          "title": "关联证据",
+          "status": "risk",
+          "evidence": "related_events 可关联 WAF/RASP 异常，支持入侵后外联假设。"
+        },
+        {
+          "title": "数据风险",
+          "status": "risk",
+          "evidence": "bytes_out=38218249 明显高于 bytes_in=543581，存在低慢外传或分阶段传输风险。"
+        }
+      ],
+      "success_assessment": "NDR 观察到连接成功；由于载荷加密，无法仅凭网络侧确认数据内容是否外传。",
+      "business_impact": "可能影响生产服务器及其可访问数据，应关联主机进程、代理日志和应用层事件确认源进程。",
+      "missing_evidence": [
+        "源主机进程连接日志",
+        "代理/防火墙完整会话",
+        "目的域名信誉情报",
+        "同资产 HIPS 事件"
+      ]
+    },
+    "whitelist_candidate": {}
+  }
+}

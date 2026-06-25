@@ -1,0 +1,82 @@
+{
+  "alert_id": "hips-20260624104479-3356",
+  "source": "direct",
+  "product": "hips",
+  "event_type": "suspicious_powershell_credential_access_chain",
+  "severity": "high",
+  "timestamp": "2026-06-24T09:47:47+08:00",
+  "payload": {
+    "rule_id": "HIPS-WIN-CRED-042",
+    "rule_name": "PowerShell credential access behavior chain",
+    "host": "patch-srv-02",
+    "asset_criticality": "server-admin-zone",
+    "user": "svc-reporting",
+    "src_ip": "10.12.9.133",
+    "process_name": "powershell.exe",
+    "process_path": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+    "process_id": 3040,
+    "parent_process": "psexesvc.exe",
+    "parent_process_id": 1782,
+    "command_line": "encoded command observed; raw command withheld",
+    "file_hash_sha256": "1fb4d4f2d0b7e501f6c64f9fbd-demo",
+    "signature_status": "unsigned",
+    "behavior": [
+      "credential store access attempt",
+      "remote thread creation blocked",
+      "attempted connection to core database segment"
+    ],
+    "hips_action": "blocked_process_tree",
+    "change_window": false,
+    "change_ticket": "",
+    "recent_context": {
+      "same_user_logins_1h": 3,
+      "same_host_admin_sessions_1h": 1,
+      "change_window": false,
+      "known_good_hash": false
+    },
+    "evidence_assessment": {
+      "expected_verdict": "【真实攻击】- 凭证访问与横向移动前置行为",
+      "analysis_dimensions": [
+        {
+          "title": "主机与身份",
+          "status": "risk",
+          "evidence": "patch-srv-02 为特权访问区资产，账号 svc-reporting 来源不在变更窗口。"
+        },
+        {
+          "title": "进程链",
+          "status": "risk",
+          "evidence": "psexesvc.exe 拉起 powershell.exe，属于高风险父子进程组合。"
+        },
+        {
+          "title": "命令行与脚本",
+          "status": "risk",
+          "evidence": "命令行包含编码脚本特征，原始内容已脱敏保留。"
+        },
+        {
+          "title": "主机行为",
+          "status": "risk",
+          "evidence": "出现凭证存储访问、远程线程创建和核心数据库网段连接尝试。"
+        },
+        {
+          "title": "规则与处置",
+          "status": "blocked",
+          "evidence": "HIPS-WIN-CRED-042 命中凭证访问链，HIPS 阻断进程树。"
+        },
+        {
+          "title": "基线与变更",
+          "status": "risk",
+          "evidence": "无变更窗口和变更单支持，签名状态为 unsigned。"
+        }
+      ],
+      "success_assessment": "HIPS 阻断了进程树；仍需确认阻断前是否已有凭证读取或远程连接成功。",
+      "business_impact": "可能影响特权账号和核心数据库访问路径，应优先复核账号会话与同源主机行为。",
+      "missing_evidence": [
+        "进程树完整上下文",
+        "脚本哈希信誉",
+        "同账号登录日志",
+        "目标主机安全日志"
+      ]
+    },
+    "whitelist_candidate": {}
+  }
+}

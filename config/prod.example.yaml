@@ -1,0 +1,16 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+database:
+  path: "/var/lib/defensive-ai-gateway/gateway.db"
+llm:
+  provider: "gateway"
+  endpoint: "https://llm-gateway.internal.example/v1/security/analyze"
+  model: "enterprise-sec-analyst"
+  timeout_seconds: 30
+policy:
+  mode: "read_only"
+  max_prompt_chars: 12000
+  require_approval_for: [block, isolate, change_policy, disable_account]
+  redact_fields: [password, token, cookie, authorization, customer_id, id_card, phone, email, session]
+
