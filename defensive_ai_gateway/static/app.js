@@ -75,6 +75,7 @@ const STRINGS = {
     expandCase: "展开 Case {id}",
     alertCountLong: "{count} 条告警",
     loadingDetail: "加载关联告警与 AI 分析...",
+    detailLoadFailed: "加载详情失败：{message}",
     extractingMemory: "正在抽取特征并写入记忆层...",
     falsePositiveReason: "Dashboard 人工确认：该告警符合业务场景下的误报模式",
     memoryWritten: "已写入产品长期记忆：{id}，后续同类高相似告警会降低置信。",
@@ -187,6 +188,7 @@ const STRINGS = {
     expandCase: "Expand Case {id}",
     alertCountLong: "{count} alerts",
     loadingDetail: "Loading linked alerts and AI analysis...",
+    detailLoadFailed: "Failed to load detail: {message}",
     extractingMemory: "Extracting features and writing to memory...",
     falsePositiveReason: "Dashboard analyst confirmation: this alert matches a business false-positive pattern",
     memoryWritten: "Written to product long-term memory: {id}. Similar future alerts will reduce confidence.",
@@ -640,7 +642,15 @@ async function toggleCase(wrapper, caseId) {
   panel.hidden = false;
   if (!detailCache.has(caseId)) {
     panel.innerHTML = `<div class="loading">${escapeHtml(tr("loadingDetail"))}</div>`;
-    detailCache.set(caseId, await json(`/api/cases/${encodeURIComponent(caseId)}`));
+    try {
+      detailCache.set(caseId, await json(`/api/cases/${encodeURIComponent(caseId)}`));
+    } catch (err) {
+      const message = err.message || String(err);
+      detailCache.delete(caseId);
+      panel.innerHTML = `<div class="empty-state">${escapeHtml(tr("detailLoadFailed", { message }))}</div>`;
+      showToast(tr("detailLoadFailed", { message }), "error");
+      return;
+    }
   }
   panel.innerHTML = renderDetail(detailCache.get(caseId));
   panel.querySelectorAll(".review-button").forEach((button) => {
@@ -727,6 +737,10 @@ function selectedProfile() {
 function mappingFromSelectValue(value) {
   if (!value) return null;
   if (value.startsWith("__literal:")) return { literal: value.slice("__literal:".length) };
+  if (value.startsWith("__transform:")) {
+    const [, transform, path] = value.match(/^__transform:([^:]+):(.+)$/) || [];
+    if (transform && path) return { path, transform };
+  }
   return value;
 }
 
@@ -735,7 +749,16 @@ function selectValueFromMapping(mapping) {
   if (typeof mapping === "object" && Object.prototype.hasOwnProperty.call(mapping, "literal")) {
     return `__literal:${mapping.literal}`;
   }
+  if (typeof mapping === "object" && mapping.transform && mapping.path) {
+    return `__transform:${mapping.transform}:${mapping.path}`;
+  }
   return String(mapping);
+}
+
+function selectValueFromOption(option) {
+  if (!option?.path) return "";
+  if (option.transform) return `__transform:${option.transform}:${option.path}`;
+  return option.path;
 }
 
 function currentLog() {
@@ -850,8 +873,10 @@ function renderFieldMappingTable(result) {
                   <select data-field-index="${idx}">
                     ${options
                       .map((option) => {
-                        const value = option.path || "";
-                        const label = value ? `${value} (${Math.round((option.confidence || 0) * 100)}%)` : tr("noMapping");
+                        const value = selectValueFromOption(option);
+                        const labelPath = option.path || "";
+                        const suffix = option.transform ? ` / ${option.transform}` : "";
+                        const label = labelPath ? `${labelPath}${suffix} (${Math.round((option.confidence || 0) * 100)}%)` : tr("noMapping");
                         return `<option value="${escapeHtml(value)}" ${value === selected ? "selected" : ""}>${escapeHtml(label)}</option>`;
                       })
                       .join("")}

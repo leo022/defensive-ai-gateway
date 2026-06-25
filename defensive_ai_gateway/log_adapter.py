@@ -32,7 +32,7 @@ INFER_FIELD_SPECS = [
         "target": "alert_id",
         "label": "告警 ID",
         "required": True,
-        "candidates": ["alert_id", "id", "event_id", "alert.id", "metadata.id", "event.id", "trace.id"],
+        "candidates": ["alert_id", "id", "event_id", "request_id", "alert.id", "metadata.id", "event.id", "event.request_id", "trace.id"],
     },
     {
         "target": "product",
@@ -44,79 +44,91 @@ INFER_FIELD_SPECS = [
         "target": "event_type",
         "label": "事件类型",
         "required": True,
-        "candidates": ["event_type", "rule.name", "attack.type", "event.type", "vulnerability.type", "type", "name"],
+        "candidates": [
+            "event_type",
+            "rule.name",
+            "rule_name",
+            "attack.type",
+            "attack_type",
+            "items[0].attack_type",
+            "items[0].rule_name",
+            "event.type",
+            "vulnerability.type",
+            "type",
+            "name",
+        ],
     },
     {
         "target": "severity",
         "label": "严重级别",
         "required": True,
-        "candidates": ["severity", "risk.level", "risk.severity", "level", "priority"],
+        "candidates": ["severity", "risk.level", "risk.severity", "level", "attack_level", "items[0].attack_level", "priority"],
     },
     {
         "target": "timestamp",
         "label": "事件时间",
         "required": True,
-        "candidates": ["timestamp", "time", "@timestamp", "event.time", "event_time", "created_at"],
+        "candidates": ["timestamp", "time", "@timestamp", "event.time", "event_time", "attack_time", "event.attack_time", "created_at"],
     },
     {
         "target": "entities.host",
         "label": "主机",
         "optional_key": "host",
-        "candidates": ["host.name", "host.hostname", "hostname", "host", "runtime.host", "server.hostname"],
+        "candidates": ["host.name", "host.hostname", "hostname", "server_hostname", "event.server_hostname", "host", "runtime.host", "server.hostname"],
     },
     {
         "target": "entities.src_ip",
         "label": "源 IP",
         "optional_key": "src_ip",
-        "candidates": ["src_ip", "source_ip", "client_ip", "http.client_ip", "request.client_ip", "client.ip", "source.ip"],
+        "candidates": ["src_ip", "source_ip", "client_ip", "attack_source", "event.attack_source", "http.client_ip", "request.client_ip", "client.ip", "source.ip"],
     },
     {
         "target": "entities.url",
         "label": "URL",
         "optional_key": "url",
-        "candidates": ["url", "uri", "path", "http.uri", "request.uri", "request.url"],
+        "candidates": ["url", "uri", "path", "event.path", "request_message.url", "event.request_message.url", "http.uri", "request.uri", "request.url"],
     },
     {
         "target": "entities.method",
         "label": "HTTP 方法",
         "optional_key": "method",
-        "candidates": ["method", "http.method", "request.method"],
+        "candidates": ["method", "request_message.method", "event.request_message.method", "http.method", "request.method"],
     },
     {
         "target": "entities.rule",
         "label": "规则 ID",
         "optional_key": "rule",
-        "candidates": ["rule_id", "rule.id", "rule.rule_id", "attack.rule_id", "signature"],
+        "candidates": ["rule_id", "items[0].rule_id", "rule.id", "rule.rule_id", "attack.rule_id", "signature"],
     },
     {
         "target": "entities.app",
         "label": "应用",
         "optional_key": "app",
-        "candidates": ["app", "app.name", "application.name", "service.name", "service"],
+        "candidates": ["app", "app_name", "event.app_name", "app.name", "application.name", "service.name", "service"],
     },
     {
         "target": "entities.action",
         "label": "处置动作",
         "optional_key": "action",
-        "candidates": ["action", "rasp.action", "attack.action", "rasp_action"],
+        "candidates": ["action", "intercept_state", "items[0].intercept_state", "rasp.action", "attack.action", "rasp_action"],
     },
     {
         "target": "payload.event_time",
         "label": "Payload 时间",
         "optional_key": "event_time",
-        "candidates": ["timestamp", "time", "@timestamp", "event.time", "event_time"],
+        "candidates": ["timestamp", "time", "@timestamp", "event.time", "event_time", "attack_time", "event.attack_time"],
     },
     {
         "target": "payload.host",
         "label": "Payload 主机",
         "optional_key": "host",
-        "candidates": ["host.name", "host.hostname", "hostname", "host", "runtime.host", "server.hostname"],
+        "candidates": ["host.name", "host.hostname", "hostname", "server_hostname", "event.server_hostname", "host", "runtime.host", "server.hostname"],
     },
     {
         "target": "payload.stack_trace",
         "label": "调用栈",
         "optional_key": "stack_trace",
-        "candidates": ["stacktrace", "stack_trace", "exception.stacktrace", "attack.stacktrace"],
+        "candidates": ["stacktrace", "items[0].stacktrace", "stack_trace", "exception.stacktrace", "attack.stacktrace"],
     },
     {
         "target": "payload.sink",
@@ -128,7 +140,7 @@ INFER_FIELD_SPECS = [
         "target": "payload.hook_data",
         "label": "Hook 数据",
         "optional_key": "hook_data",
-        "candidates": ["hook_data", "attack.hook_data"],
+        "candidates": ["hook_data", "items[0].hook_data", "attack.hook_data"],
     },
     {
         "target": "payload.taint_source",
@@ -146,20 +158,25 @@ INFER_FIELD_SPECS = [
         "target": "payload.request_id",
         "label": "Request ID",
         "optional_key": "request_id",
-        "candidates": ["request_id", "request.id", "http.request_id"],
+        "candidates": ["request_id", "event.request_id", "request.id", "http.request_id"],
     },
 ]
 DEFAULT_SEVERITY_MAP = {
     "critical": "critical",
     "严重": "critical",
     "高危": "critical",
+    "1": "critical",
     "high": "high",
     "高": "high",
+    "2": "high",
     "medium": "medium",
     "中": "medium",
     "中危": "medium",
+    "3": "medium",
     "low": "low",
     "低": "low",
+    "4": "low",
+    "5": "low",
     "info": "low",
     "informational": "low",
 }
@@ -237,35 +254,39 @@ def demo_rasp_profile() -> MappingProfile:
         version="v1",
         description="示例：把常见 RASP JSON 日志映射为内部 RawAlert，并保留 host、time、stacktrace、hook 和 trace 关键上下文。",
         mappings={
-            "alert_id": ["$.metadata.id", "$.alert.id", "$.event.id", "$.id", "$.trace.id"],
-            "source": ["$.device.vendor", "$.agent.name", "$.source", {"literal": "rasp"}],
+            "alert_id": ["$.metadata.id", "$.alert.id", "$.event.id", "$.event.request_id", "$.request_id", "$.id", "$.trace.id"],
+            "source": ["$.device.vendor", "$.event.app_name", "$.event.agent_id", "$.agent.name", "$.source", {"literal": "rasp"}],
             "product": ["$.product", "$.device.type", {"literal": "rasp"}],
-            "event_type": ["$.rule.name", "$.attack.type", "$.event.type", "$.vulnerability.type"],
-            "severity": ["$.risk.level", "$.severity", "$.level", "$.risk.severity"],
-            "timestamp": ["$.time", "$.timestamp", "$.@timestamp", "$.event.time"],
-            "entities.host": ["$.host.name", "$.host.hostname", "$.host", "$.runtime.host", "$.server.hostname"],
-            "entities.src_ip": ["$.http.client_ip", "$.request.client_ip", "$.client.ip", "$.source.ip"],
-            "entities.url": ["$.http.uri", "$.request.uri", "$.request.url", "$.url"],
-            "entities.method": ["$.http.method", "$.request.method"],
-            "entities.rule": ["$.rule.id", "$.rule.rule_id", "$.attack.rule_id"],
-            "entities.app": ["$.app.name", "$.application.name", "$.service.name"],
-            "entities.action": ["$.rasp.action", "$.action", "$.attack.action"],
-            "payload.host": ["$.host.name", "$.host.hostname", "$.host", "$.runtime.host", "$.server.hostname"],
-            "payload.event_time": ["$.time", "$.timestamp", "$.@timestamp", "$.event.time"],
-            "payload.stack_trace": ["$.stacktrace", "$.stack_trace", "$.exception.stacktrace", "$.attack.stacktrace"],
+            "event_type": ["$.rule.name", "$.items[0].rule_name", "$.items[0].attack_type", "$.attack.type", "$.event.type", "$.vulnerability.type"],
+            "severity": ["$.risk.level", "$.severity", "$.items[0].attack_level", "$.level", "$.risk.severity"],
+            "timestamp": ["$.time", "$.timestamp", "$.@timestamp", "$.event.attack_time", "$.event.time", "$.event.created_at"],
+            "entities.host": ["$.host.name", "$.host.hostname", "$.event.server_hostname", "$.host", "$.runtime.host", "$.server.hostname"],
+            "entities.src_ip": ["$.event.attack_source", "$.http.client_ip", "$.request.client_ip", "$.client.ip", "$.source.ip"],
+            "entities.url": ["$.event.request_message.url", "$.event.path", "$.http.uri", "$.request.uri", "$.request.url", "$.url"],
+            "entities.method": ["$.event.request_message.method", "$.http.method", "$.request.method"],
+            "entities.rule": ["$.rule.id", "$.items[0].rule_id", "$.rule.rule_id", "$.attack.rule_id"],
+            "entities.app": ["$.event.app_name", "$.app.name", "$.application.name", "$.service.name"],
+            "entities.action": ["$.rasp.action", "$.items[0].intercept_state", "$.action", "$.attack.action"],
+            "payload.host": ["$.host.name", "$.host.hostname", "$.event.server_hostname", "$.host", "$.runtime.host", "$.server.hostname"],
+            "payload.event_time": ["$.time", "$.timestamp", "$.@timestamp", "$.event.attack_time", "$.event.time"],
+            "payload.stack_trace": ["$.stacktrace", "$.items[0].stacktrace", "$.stack_trace", "$.exception.stacktrace", "$.attack.stacktrace"],
             "payload.trace_id": ["$.trace.id", "$.trace_id", "$.request.trace_id"],
-            "payload.request_id": ["$.http.request_id", "$.request.id", "$.request_id"],
-            "payload.hook_data": ["$.hook_data", "$.attack.hook_data"],
+            "payload.request_id": ["$.event.request_id", "$.http.request_id", "$.request.id", "$.request_id"],
+            "payload.hook_data": ["$.hook_data", "$.items[0].hook_data", "$.attack.hook_data"],
             "payload.taint_source": ["$.taint.source", "$.attack.taint_source"],
-            "payload.sink": ["$.sink", "$.attack.sink"],
+            "payload.sink": ["$.sink", "$.attack.sink", {"path": "$.items[0].stacktrace", "transform": "rasp_sink_from_stacktrace"}],
             "payload.exception": ["$.exception.message", "$.exception", "$.attack.exception"],
         },
         product_map={"runtime_app_protection": "rasp", "runtime_application_self_protection": "rasp", "rasp": "rasp"},
         evidence_fields=[
             {"type": "rule_id", "path": "$.rule.id", "why_it_matters": "RASP 规则 ID 用于关联误报记忆和调优范围。"},
+            {"type": "rule_id", "path": "$.items[0].rule_id", "why_it_matters": "RASP 规则 ID 用于关联误报记忆和调优范围。"},
             {"type": "stack_trace", "path": "$.stacktrace", "why_it_matters": "调用栈用于确认用户输入是否触达危险 sink。"},
+            {"type": "stack_trace", "path": "$.items[0].stacktrace", "why_it_matters": "调用栈用于确认用户输入是否触达危险 sink。"},
             {"type": "sink", "path": "$.sink", "why_it_matters": "危险 sink 是判断 RASP 告警成功性和影响面的核心字段。"},
+            {"type": "sink", "path": {"path": "$.items[0].stacktrace", "transform": "rasp_sink_from_stacktrace"}, "why_it_matters": "真实 RASP 日志常把危险调用放在 stacktrace 顶部，可据此推导 sink。"},
             {"type": "action", "path": "$.rasp.action", "why_it_matters": "RASP 处置动作影响攻击是否已被阻断。"},
+            {"type": "action", "path": "$.items[0].intercept_state", "why_it_matters": "RASP 处置动作影响攻击是否已被阻断。"},
         ],
     )
 
@@ -410,6 +431,18 @@ class LogAdapter:
                 confidence = match["confidence"]
                 sample_value = match["value"]
 
+            if target == "payload.sink" and mapping is None:
+                stack_mapping = mappings.get("payload.stack_trace")
+                stack_path = self._first_mapping_path(stack_mapping)
+                stack_value = self._resolve_mapping(stack_mapping, log) if stack_mapping else None
+                derived_sink = self._derive_rasp_sink(stack_value)
+                if stack_path and derived_sink:
+                    mapping = {"path": stack_path, "transform": "rasp_sink_from_stacktrace"}
+                    status = "needs_review"
+                    confidence = 0.78
+                    sample_value = derived_sink
+                    candidates.insert(0, {"path": stack_path, "value": derived_sink, "confidence": confidence, "transform": "rasp_sink_from_stacktrace"})
+
             if mapping is not None:
                 mappings[target] = mapping
 
@@ -440,7 +473,7 @@ class LogAdapter:
             evidence_fields=[
                 {"type": "rule_id", "path": self._first_mapping_path(mappings.get("entities.rule")), "why_it_matters": "RASP 规则 ID 用于关联误报记忆和调优范围。"},
                 {"type": "stack_trace", "path": self._first_mapping_path(mappings.get("payload.stack_trace")), "why_it_matters": "调用栈用于确认用户输入是否触达危险 sink。"},
-                {"type": "sink", "path": self._first_mapping_path(mappings.get("payload.sink")), "why_it_matters": "危险 sink 是判断 RASP 告警成功性和影响面的核心字段。"},
+                {"type": "sink", "path": mappings.get("payload.sink"), "why_it_matters": "危险 sink 是判断 RASP 告警成功性和影响面的核心字段。"},
                 {"type": "action", "path": self._first_mapping_path(mappings.get("entities.action")), "why_it_matters": "RASP 处置动作影响攻击是否已被阻断。"},
             ],
         )
@@ -476,7 +509,8 @@ class LogAdapter:
             if "literal" in mapping:
                 return mapping["literal"]
             if "path" in mapping:
-                return self._path_get(log, str(mapping["path"]))
+                value = self._path_get(log, str(mapping["path"]))
+                return self._apply_transform(value, str(mapping.get("transform") or ""))
             return None
         if isinstance(mapping, str):
             if mapping.startswith("$.") or mapping == "$":
@@ -487,10 +521,14 @@ class LogAdapter:
     def _flatten_paths(self, value: Any, prefix: str = "$") -> dict[str, Any]:
         out: dict[str, Any] = {}
         if isinstance(value, dict):
+            if prefix != "$" and prefix.lower().split(".")[-1] in {"hook_data", "request_message", "response_message"}:
+                out[prefix] = value
             for key, item in value.items():
                 path = f"{prefix}.{key}" if prefix else str(key)
                 out.update(self._flatten_paths(item, path))
         elif isinstance(value, list):
+            if prefix != "$":
+                out[prefix] = value
             for idx, item in enumerate(value):
                 path = f"{prefix}[{idx}]"
                 out.update(self._flatten_paths(item, path))
@@ -520,7 +558,7 @@ class LogAdapter:
                     score = max(score, 0.9)
                 elif leaf == candidate_leaf and candidate_leaf not in generic_leafs:
                     score = max(score, 0.74)
-                elif candidate_leaf in leaf or leaf in candidate_leaf:
+                elif candidate_leaf not in generic_leafs and (candidate_leaf in leaf or leaf in candidate_leaf):
                     score = max(score, 0.55)
             if score:
                 scored.append({"path": path, "value": value, "confidence": score})
@@ -543,6 +581,8 @@ class LogAdapter:
     def _mapping_label(self, mapping: Any) -> str:
         if isinstance(mapping, dict) and "literal" in mapping:
             return f"literal:{mapping['literal']}"
+        if isinstance(mapping, dict) and mapping.get("transform"):
+            return f"{mapping.get('path')} | {mapping.get('transform')}"
         return str(mapping or "")
 
     def _first_mapping_path(self, mapping: Any) -> str:
@@ -606,6 +646,63 @@ class LogAdapter:
     def _map_value(self, value: Any, mapping: dict[str, str]) -> str:
         text = "" if value is None else str(value).strip()
         return mapping.get(text, mapping.get(text.lower(), text))
+
+    def _apply_transform(self, value: Any, transform: str) -> Any:
+        if transform == "rasp_sink_from_stacktrace":
+            return self._derive_rasp_sink(value)
+        return value
+
+    def _derive_rasp_sink(self, stacktrace: Any) -> str:
+        frames = self._stack_frames(stacktrace)
+        if not frames:
+            return ""
+        sink_needles = [
+            ".lookup",
+            ".connect",
+            ".query",
+            ".execute",
+            ".executequery",
+            ".exec",
+            ".start",
+            ".eval",
+            ".deserialize",
+            ".readobject",
+            ".loadclass",
+            ".openconnection",
+        ]
+        framework_needles = [
+            "controller.",
+            "filterchain.",
+            "dispatcherservlet.",
+            "frameworkservlet.",
+            "threadpoolexecutor.",
+            "taskthread.",
+            "socketprocessor",
+            "reflect.",
+        ]
+        for frame in frames:
+            normalized = frame.lower()
+            if any(needle in normalized for needle in sink_needles):
+                return self._frame_symbol(frame)
+        for frame in frames:
+            normalized = frame.lower()
+            if not any(needle in normalized for needle in framework_needles):
+                return self._frame_symbol(frame)
+        return self._frame_symbol(frames[0])
+
+    def _stack_frames(self, value: Any) -> list[str]:
+        if isinstance(value, list):
+            frames: list[str] = []
+            for item in value:
+                frames.extend(self._stack_frames(item))
+            return frames
+        if isinstance(value, str):
+            return [line.strip() for line in value.splitlines() if line.strip()]
+        return []
+
+    def _frame_symbol(self, frame: str) -> str:
+        symbol = frame.split("(", 1)[0].strip()
+        return symbol or frame.strip()
 
     def _build_adapter_evidence(self, profile: MappingProfile, log: dict[str, Any]) -> list[dict[str, Any]]:
         evidence = []

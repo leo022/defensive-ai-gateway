@@ -792,10 +792,335 @@ def _siem(rng: random.Random, requested: str) -> dict[str, Any]:
     }
 
 
+def _rasp_realistic(rng: random.Random, requested: str) -> dict[str, Any]:
+    scenario = _scenario(rng, requested)
+    fp = scenario == "false_positive"
+    suspicious = scenario == "suspicious"
+    variants = [
+        {
+            "kind": "deserialization_jndi",
+            "label": "反序列化/JNDI",
+            "event_type": "runtime_deserialization_jndi_guard",
+            "rule_id": "cloudrasp_jndi_108",
+            "review_rule_id": "cloudrasp_jndi_review_108",
+            "fp_rule_id": "RASP-CANARY-JNDI-010",
+            "rule_name": "请求触发 JNDI 连接判断",
+            "review_rule_name": "JNDI 连接行为需人工复核",
+            "fp_rule_name": "Expected canary JNDI guard check",
+            "attack_type": "jndi",
+            "method": "POST",
+            "path": "/cloudrasp-vulns/deserialization/fastjson/postBody",
+            "fp_path": "/internal/canary/deserialization-jndi-check",
+            "content_type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "parameter_key": "payload",
+            "payload_marker": "Fastjson autoType and JNDI lookup markers observed; raw object withheld",
+            "suspicious_marker": "deserialization type marker observed without confirmed remote lookup; raw object withheld",
+            "fp_marker": "expected canary deserialization marker",
+            "source": "request_body:payload",
+            "fp_source": "synthetic_canary",
+            "sink": "javax.naming.InitialContext.lookup",
+            "hook_data": {"url": "ldap://127.0.0.1:1389/obj"},
+            "fp_hook_data": {"url": "ldap://127.0.0.1:1389/canary"},
+            "stack_trace": [
+                "com.sun.jndi.toolkit.url.GenericURLContext.lookup(GenericURLContext.java)",
+                "javax.naming.InitialContext.lookup(InitialContext.java:417)",
+                "com.sun.rowset.JdbcRowSetImpl.connect(JdbcRowSetImpl.java:624)",
+                "com.alibaba.fastjson.parser.deserializer.FieldDeserializer.setValue(FieldDeserializer.java:110)",
+                "com.alibaba.fastjson.JSON.parseObject(JSON.java:365)",
+                "cn.rasp.vuln.deserialization.Deserialization.fastJson(Deserialization.java:45)",
+                "cn.rasp.vuln.controller.FastJsonController.execute(DeserializationController.java:28)",
+            ],
+            "fp_stack_trace": [
+                "CanaryDeserializationController.check(CanaryDeserializationController.java:31)",
+                "DeserializationGuardHealthProbe.run(DeserializationGuardHealthProbe.java:44)",
+                "javax.naming.InitialContext.lookup(InitialContext.java:417)",
+            ],
+            "blocked_action": "blocked_jndi_lookup",
+            "logged_action": "logged_jndi_lookup_review",
+            "success": "RASP 识别到反序列化触发的 JNDI lookup；当前样本未提供远程类加载成功证据。",
+            "impact": "若未被限制，可能导致应用出站连接、远程对象加载或后续代码执行风险。",
+            "missing": ["出站网络连接日志", "应用异常日志", "WAF request_id", "同源请求序列"],
+        },
+        {
+            "kind": "sql_injection",
+            "label": "SQL 注入",
+            "event_type": "runtime_sql_guard",
+            "rule_id": "cloudrasp_sql_201",
+            "review_rule_id": "RASP-SQL-REVIEW-118",
+            "fp_rule_id": "RASP-CANARY-SQL-010",
+            "rule_name": "SQL 注入执行前检测",
+            "review_rule_name": "SQL 注入疑似触达查询路径",
+            "fp_rule_name": "Expected canary SQL guard check",
+            "attack_type": "sql_injection",
+            "method": rng.choice(["POST", "GET"]),
+            "path": "/openbanking/v2/payments/search",
+            "fp_path": "/internal/canary/sql-guard-check",
+            "content_type": "application/json;charset=UTF-8",
+            "parameter_key": "beneficiaryName",
+            "payload_marker": "SQL boolean expression and union keyword markers observed; raw payload withheld",
+            "suspicious_marker": "single SQL keyword marker observed in free-text field; raw payload withheld",
+            "fp_marker": "expected canary SQL token",
+            "source": "request_parameter:beneficiaryName",
+            "fp_source": "synthetic_canary",
+            "sink": "org.springframework.jdbc.core.JdbcTemplate.query",
+            "hook_data": {
+                "sql": "withheld; normalized query shape only",
+                "parameter": "beneficiaryName",
+                "sink": "JdbcTemplate.query",
+            },
+            "fp_hook_data": {
+                "sql": "withheld; canary query shape only",
+                "parameter": "syntheticCanary",
+                "sink": "JdbcTemplate.query",
+            },
+            "stack_trace": [
+                "com.mysql.cj.jdbc.StatementImpl.executeQuery(StatementImpl.java:1235)",
+                "org.springframework.jdbc.core.JdbcTemplate.query(JdbcTemplate.java:723)",
+                "com.bank.payment.repository.BeneficiaryRepository.findByFilter(BeneficiaryRepository.java:88)",
+                "com.bank.payment.controller.PaymentSearchController.search(PaymentSearchController.java:51)",
+            ],
+            "fp_stack_trace": [
+                "CanarySqlGuardController.check(CanarySqlGuardController.java:27)",
+                "SqlGuardHealthProbe.run(SqlGuardHealthProbe.java:39)",
+                "org.springframework.jdbc.core.JdbcTemplate.query(JdbcTemplate.java:723)",
+            ],
+            "blocked_action": "blocked_query_execution",
+            "logged_action": "logged_suspicious_query",
+            "success": "RASP 在 SQL 执行前识别到用户可控输入触达查询 sink；当前样本未显示 SQL 已成功执行。",
+            "impact": "若绕过可能影响客户支付搜索和收款人数据读取。",
+            "missing": ["数据库审计日志", "WAF request_id", "应用访问日志", "同 trace 后续异常"],
+        },
+        {
+            "kind": "command_execution",
+            "label": "命令执行",
+            "event_type": "runtime_command_execution_guard",
+            "rule_id": "cloudrasp_cmd_301",
+            "review_rule_id": "RASP-CMD-REVIEW-118",
+            "fp_rule_id": "RASP-CANARY-CMD-010",
+            "rule_name": "危险命令执行行为判断",
+            "review_rule_name": "命令执行疑似行为需人工复核",
+            "fp_rule_name": "Expected canary process guard check",
+            "attack_type": "command_execution",
+            "method": "POST",
+            "path": "/ops/tools/ping",
+            "fp_path": "/internal/canary/process-guard-check",
+            "content_type": "application/json;charset=UTF-8",
+            "parameter_key": "target",
+            "payload_marker": "shell metacharacter and process spawn markers observed; raw command withheld",
+            "suspicious_marker": "network diagnostic argument includes shell-like delimiter marker; raw command withheld",
+            "fp_marker": "expected canary process token",
+            "source": "request_parameter:target",
+            "fp_source": "release_smoke_test",
+            "sink": "java.lang.ProcessBuilder.start",
+            "hook_data": {
+                "command_line": "withheld; shell metacharacter marker observed",
+                "class": "java.lang.ProcessBuilder",
+                "working_directory": "/app",
+            },
+            "fp_hook_data": {
+                "command_line": "withheld; approved health-check command shape",
+                "class": "java.lang.ProcessBuilder",
+                "working_directory": "/app",
+            },
+            "stack_trace": [
+                "java.lang.ProcessBuilder.start(ProcessBuilder.java:1048)",
+                "java.lang.Runtime.exec(Runtime.java:620)",
+                "com.bank.ops.service.NetworkToolService.ping(NetworkToolService.java:64)",
+                "com.bank.ops.controller.NetworkToolController.execute(NetworkToolController.java:42)",
+            ],
+            "fp_stack_trace": [
+                "CanaryProcessGuardController.check(CanaryProcessGuardController.java:29)",
+                "ProcessGuardHealthProbe.run(ProcessGuardHealthProbe.java:45)",
+                "java.lang.ProcessBuilder.start(ProcessBuilder.java:1048)",
+            ],
+            "blocked_action": "blocked_process_execution",
+            "logged_action": "logged_process_execution_review",
+            "success": "RASP 在进程启动前识别到用户可控输入触达命令执行 sink；当前样本未显示命令已执行成功。",
+            "impact": "若绕过可能导致应用容器内命令执行、横向移动或敏感文件访问风险。",
+            "missing": ["主机进程审计", "容器运行时日志", "应用访问日志", "同源 IP 后续行为"],
+        },
+    ]
+    variant = _choice(rng, variants)
+    trace_id = f"rasp-trace-{rng.randrange(1000, 9999)}"
+    request_id = f"{rng.getrandbits(128):032x}"
+    attack_time = _timestamp(rng)
+    created_at = (datetime.fromisoformat(attack_time) + timedelta(minutes=rng.randrange(1, 8), seconds=rng.randrange(0, 59))).isoformat()
+    app = "mobile-payment-api" if variant["kind"] == "sql_injection" else rng.choice(["cloudrasp-vulns", "ops-admin-api", "retail-web"])
+    path = variant["fp_path"] if fp else variant["path"]
+    method = variant["method"]
+    host_ip = f"192.168.15.{rng.randrange(20, 240)}"
+    port = 8080 if app == "cloudrasp-vulns" else 8443
+    url = f"http://{host_ip}:{port}{path}"
+    source = variant["fp_source"] if fp else variant["source"]
+    marker = variant["fp_marker"] if fp else (variant["suspicious_marker"] if suspicious else variant["payload_marker"])
+    hook_data = dict(variant["fp_hook_data"] if fp else variant["hook_data"])
+    stack_trace = list(variant["fp_stack_trace"] if fp else variant["stack_trace"])
+    rule_id = variant["fp_rule_id"] if fp else (variant["review_rule_id"] if suspicious else variant["rule_id"])
+    rule_name = variant["fp_rule_name"] if fp else (variant["review_rule_name"] if suspicious else variant["rule_name"])
+    intercept_state = "log" if fp or suspicious else "block"
+    attack_level = 4 if fp else (2 if suspicious else 1)
+    response_status = 200 if fp or suspicious else rng.choice([200, 403, 500])
+    response_body = (
+        "expected canary guard check logged"
+        if fp
+        else ("request logged for analyst review" if suspicious else f"{variant['label']} guard blocked by RASP")
+    )
+    item = {
+        "sequence": 1,
+        "trigger_time": attack_time,
+        "rule_id": rule_id,
+        "rule_name": rule_name,
+        "attack_type": variant["attack_type"],
+        "attack_level": attack_level,
+        "intercept_state": intercept_state,
+        "hook_data": hook_data,
+        "stacktrace": stack_trace,
+        "advices": [
+            f"确认{variant['label']}告警是否来自外部用户输入触达 {variant['sink']}。",
+            "保留 RASP、应用、WAF 和主机审计日志用于同 trace 关联分析。",
+        ],
+    }
+    event = {
+        "request_id": request_id,
+        "attack_time": attack_time,
+        "created_at": created_at,
+        "app_name": app,
+        "application_id": rng.randrange(100, 999),
+        "agent_id": f"{rng.getrandbits(128):032x}",
+        "path": path,
+        "attack_source": _ip(rng, "10.0.10"),
+        "server_nic": [
+            {"ip": host_ip, "name": ""},
+            {"ip": "172.24.0.1", "name": ""},
+            {"ip": "172.17.0.1", "name": ""},
+        ],
+        "server_hostname": rng.choice(["localhost.localdomain", "pay-api-prod-03", "ops-api-prod-02"]),
+        "server_type": "Tomcat",
+        "server_version": rng.choice(["8.5.77", "9.0.82"]),
+        "web_path": f"/mnt/apache-tomcat/webapps/{app}/",
+        "server_domain": "",
+        "request_message": {
+            "protocol": "HTTP/1.1",
+            "method": method,
+            "url": url,
+            "parameter": f"{variant['parameter_key']}={marker}",
+            "body": None,
+            "header": {
+                "connection": "keep-alive",
+                "content-type": variant["content_type"],
+                "host": f"{host_ip}:{port}",
+                "user-agent": rng.choice(["Apache-HttpClient/4.5.7 (Java/1.8.0_321)", "Mozilla/5.0", "bank-mobile-app/2026.06"]),
+            },
+        },
+        "response_message": {
+            "status_code": response_status,
+            "header": {"content-type": "application/json;charset=UTF-8", "connection": "keep-alive"},
+            "body": response_body,
+        },
+    }
+    raw_rasp_log = {"data_type": "attack_event", "event": event, "items": [item]}
+    if fp:
+        assessment = _assessment(
+            f"【误报】- 合成 canary {variant['label']} 防护巡检触发预期异常",
+            [
+                _dimension("参数特征", f"污染源为 {source}，payload_marker 为预期巡检 token。", "benign"),
+                _dimension("危险调用", f"调用栈经过 {stack_trace[0]}，属于内部健康检查路径。", "benign"),
+                _dimension("规则匹配", f"{rule_id} 命中预期 canary 规则，不代表外部用户攻击。", "benign"),
+                _dimension("上下文", "rasp_action=logged_expected_canary，deployment_window=true。", "normal"),
+            ],
+            "未执行真实攻击动作；该异常由健康检查主动触发并被记录。",
+            "确认误报后可降低 canary 巡检噪声，但必须限定内部路由、来源和固定调用栈。",
+        )
+        whitelist = {
+            "rule_type": "RASP 白名单",
+            "attack_type": variant["label"],
+            "detection_content": f"route={path}; source={source}; stacktrace={stack_trace[0]}",
+            "match_method": "包含",
+            "scope": f"rule_id={rule_id}; app={app}",
+            "reason": f"内部 canary 巡检用于验证 RASP {variant['label']} 防护是否生效。",
+            "review_cycle": "巡检路由或 canary 用户变更时复核",
+        }
+    elif suspicious:
+        assessment = _assessment(
+            f"【需人工复核】- {variant['label']} 疑似触达危险 sink 但证据不足",
+            [
+                _dimension("参数特征", f"taint_source={source}，{marker}。", "review"),
+                _dimension("危险调用", f"调用栈出现 {variant['sink']}，但 hook_data 未确认完整攻击语义。", "review"),
+                _dimension("规则匹配", f"{rule_id} 与{variant['label']}相关，但证据弱于明确攻击样本。", "review"),
+                _dimension("上下文", f"RASP 动作为 {variant['logged_action']}，未阻断，需结合审计日志确认。", "review"),
+            ],
+            variant["success"],
+            f"真实攻击影响：{variant['impact']}；若为业务误伤，直接阻断会影响正常功能。",
+            variant["missing"],
+        )
+        whitelist = {}
+    else:
+        assessment = _assessment(
+            f"【真实攻击】- {variant['label']} 触达危险 sink",
+            [
+                _dimension("参数特征", f"taint_source={source}，参数摘要包含 {marker}。", "risk"),
+                _dimension("危险调用", f"调用栈出现 {variant['sink']}，用户输入触达运行时危险点。", "risk"),
+                _dimension("规则匹配", f"{rule_id} / {rule_name} 与 {variant['label']} 特征一致。", "risk"),
+                _dimension("上下文", f"hook_data 显示用户可控输入触达 {variant['sink']}，RASP 动作为 {variant['blocked_action']}。", "blocked"),
+            ],
+            variant["success"],
+            f"{variant['impact']} 应关联 WAF request_id、应用日志和运行时审计确认影响面。",
+            variant["missing"],
+        )
+        whitelist = {}
+    return {
+        "alert_id": _alert_id("rasp", rng),
+        "source": "direct",
+        "product": "rasp",
+        "event_type": (
+            f"canary_{variant['kind']}_expected_exception"
+            if fp
+            else (f"{variant['event_type']}_needs_review" if suspicious else f"{variant['event_type']}_exception")
+        ),
+        "severity": "low" if fp else ("medium" if suspicious else "high"),
+        "timestamp": attack_time,
+        "payload": {
+            "rule_id": rule_id,
+            "rule_name": rule_name,
+            "trace_id": trace_id,
+            "app": app,
+            "host": event["server_hostname"],
+            "method": method,
+            "route": f"{method} {path}",
+            "user": "synthetic-canary" if fp else rng.choice(["retail-user-8842", "ops-user-1290", "anonymous"]),
+            "src_ip": event["attack_source"],
+            "release_version": rng.choice(["2026.06.21-r3", "2026.06.24-r1"]),
+            "deployment_window": fp,
+            "attack_data": [
+                {
+                    "rule_info": f"{variant['label']}风险：用户可控输入触达 {variant['sink']}",
+                    "context": {"hook_data": hook_data, "stacktrace": stack_trace},
+                }
+            ],
+            "stack_trace": stack_trace,
+            "taint_source": source,
+            "sink": variant["sink"],
+            "hook_data": hook_data,
+            "rasp_action": "logged_expected_canary" if fp else (variant["logged_action"] if suspicious else variant["blocked_action"]),
+            "exception": response_body,
+            "business_context": {
+                "api_sensitivity": "canary-health-check" if fp else variant["label"],
+                "customer_data_access": "none_expected" if fp else "possible_if_sink_executed",
+                "same_trace_waf_request_id": "" if fp else f"req-{rng.randrange(10**7, 10**8):x}",
+            },
+            "raw_rasp_log": raw_rasp_log,
+            "event": event,
+            "items": [item],
+            "evidence_assessment": assessment,
+            "whitelist_candidate": whitelist,
+        },
+    }
+
+
 _BUILDERS = {
     "waf": _waf,
     "hips": _hips,
-    "rasp": _rasp,
+    "rasp": _rasp_realistic,
     "ndr": _ndr,
     "siem": _siem,
 }

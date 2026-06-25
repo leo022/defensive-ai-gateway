@@ -141,6 +141,66 @@ class PipelineTest(unittest.TestCase):
             self.assertFalse(incomplete["ok"])
             self.assertIn("alert_id", incomplete["required_missing"])
 
+    def test_auto_infer_real_rasp_event_items_format_derives_sink(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        config = GatewayConfig()
+        config.database.path = str(Path(tmp.name) / "gateway.db")
+        state = GatewayState(config)
+        raw_log = {
+            "data_type": "attack_event",
+            "event": {
+                "request_id": "3b585cb05d3e4610ab2b2ab68e131eea",
+                "attack_time": "2025-10-16T09:17:20+08:00",
+                "created_at": "2025-10-16T11:19:23.064+08:00",
+                "app_name": "cloudrasp-vulns",
+                "path": "/cloudrasp-vulns/deserialization/fastjson/postBody",
+                "attack_source": "10.0.10.132",
+                "server_hostname": "localhost.localdomain",
+                "request_message": {
+                    "method": "POST",
+                    "url": "http://192.168.15.93:8080/cloudrasp-vulns/deserialization/fastjson/postBody",
+                },
+            },
+            "items": [
+                {
+                    "rule_id": "cloudrasp_jndi_108",
+                    "rule_name": "请求触发 JNDI 连接判断",
+                    "attack_type": "jndi",
+                    "attack_level": 1,
+                    "intercept_state": "log",
+                    "hook_data": {"url": "ldap://127.0.0.1:1389/obj"},
+                    "stacktrace": [
+                        "com.sun.jndi.toolkit.url.GenericURLContext.lookup(GenericURLContext.java)",
+                        "javax.naming.InitialContext.lookup(InitialContext.java:417)",
+                        "com.sun.rowset.JdbcRowSetImpl.connect(JdbcRowSetImpl.java:624)",
+                    ],
+                }
+            ],
+        }
+
+        inferred = state.infer_mapping_profile({"log": raw_log})
+
+        self.assertTrue(inferred["ok"], inferred)
+        self.assertEqual(inferred["profile"]["mappings"]["alert_id"], "$.event.request_id")
+        self.assertEqual(inferred["profile"]["mappings"]["severity"], "$.items[0].attack_level")
+        self.assertEqual(inferred["profile"]["mappings"]["payload.stack_trace"], "$.items[0].stacktrace")
+        self.assertNotIn("sink", inferred["recommended_missing"])
+        self.assertEqual(
+            inferred["profile"]["mappings"]["payload.sink"],
+            {"path": "$.items[0].stacktrace", "transform": "rasp_sink_from_stacktrace"},
+        )
+
+        result = state.dry_run_mapping_profile({"profile": inferred["profile"], "log": raw_log})
+        self.assertTrue(result["ok"], result["errors"])
+        self.assertEqual(result["raw_alert_preview"]["severity"], "critical")
+        self.assertEqual(result["raw_alert_preview"]["payload"]["sink"], "com.sun.jndi.toolkit.url.GenericURLContext.lookup")
+        self.assertEqual(result["mapped_entities"]["src_ip"], "10.0.10.132")
+
+        demo_result = state.dry_run_mapping_profile({"profile": demo_rasp_profile().to_dict(), "log": raw_log})
+        self.assertTrue(demo_result["ok"], demo_result["errors"])
+        self.assertEqual(demo_result["raw_alert_preview"]["payload"]["sink"], "com.sun.jndi.toolkit.url.GenericURLContext.lookup")
+
     def test_waf_alert_creates_case(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = GatewayConfig()
@@ -208,6 +268,20 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual({item["product"] for item in first}, {"waf"})
         self.assertGreater(len({item["alert_id"] for item in first}), 1)
         self.assertGreaterEqual(len({item["payload"]["rule_id"] for item in first}), 1)
+
+    def test_random_rasp_generation_covers_real_attack_event_shapes(self):
+        alerts = [generate_alert(product="rasp", scenario="attack", seed=seed) for seed in range(1, 12)]
+        attack_types = {alert["payload"]["items"][0]["attack_type"] for alert in alerts}
+
+        self.assertGreaterEqual({"jndi", "sql_injection", "command_execution"}, attack_types)
+        for alert in alerts:
+            payload = alert["payload"]
+            raw_log = payload["raw_rasp_log"]
+            self.assertEqual(raw_log["data_type"], "attack_event")
+            self.assertEqual(raw_log["event"]["request_id"], payload["event"]["request_id"])
+            self.assertEqual(raw_log["items"][0]["rule_id"], payload["rule_id"])
+            self.assertIn("hook_data", raw_log["items"][0])
+            self.assertIn("stacktrace", raw_log["items"][0])
 
     def test_suspicious_sample_generation_has_review_verdict(self):
         for product in ["waf", "hips", "rasp", "ndr", "siem"]:

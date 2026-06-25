@@ -6,7 +6,7 @@ import mimetypes
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from .config import GatewayConfig, LLMConfig, load_config
 from .database import Repository
@@ -266,7 +266,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._json(200, {"cases": self.state.repo.list_cases(limit)})
             return
         if parsed.path.startswith("/api/cases/"):
-            case_id = parsed.path.rsplit("/", 1)[-1]
+            case_id = unquote(parsed.path.rsplit("/", 1)[-1])
             case_data = self.state.repo.get_case(case_id)
             if not case_data:
                 self._json(404, {"error": "case not found"})
@@ -347,7 +347,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 self._json(400, {"error": str(exc)})
             return
         if parsed.path.startswith("/api/alerts/") and parsed.path.endswith("/confirm-false-positive"):
-            alert_id = parsed.path.split("/")[-2]
+            alert_id = unquote(parsed.path.split("/")[-2])
             try:
                 self._json(200, self.state.confirm_alert_false_positive(alert_id, self._read_json()))
             except Exception as exc:
