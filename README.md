@@ -1,5 +1,7 @@
 # Defensive AI Gateway
 
+[English](README_EN.md) | 中文
+
 银行业防御 AI 代理网关 MVP。该工程用于先在外网开发与验证，再以离线包形式迁移到企业内网部署。
 
 ## 技术路线

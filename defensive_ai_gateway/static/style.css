@@ -196,6 +196,13 @@ main {
   padding: 0 clamp(16px, 4vw, 40px) 28px;
 }
 
+.footer-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
 .site-footer p {
   font-size: 13px;
 }
@@ -211,6 +218,10 @@ main {
 .theme-switch:hover {
   border-color: var(--brand);
   background: var(--brand-bg);
+}
+
+.language-switch {
+  min-width: 118px;
 }
 
 .view {
@@ -1010,6 +1021,11 @@ h4 {
   }
 
   .site-footer {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .footer-actions {
     align-items: stretch;
     flex-direction: column;
   }

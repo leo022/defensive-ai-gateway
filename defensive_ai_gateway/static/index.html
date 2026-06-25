@@ -27,31 +27,31 @@
   <body>
     <header>
       <div>
-        <h1>AI 安全告警研判与处置中心</h1>
-        <p>面向 HIPS / RASP / NDR / WAF / SIEM 的多源告警关联分析、风险定级与响应编排能力</p>
+        <h1 data-i18n="appTitle">AI 安全告警研判与处置中心</h1>
+        <p data-i18n="appSubtitle">面向 HIPS / RASP / NDR / WAF / SIEM 的多源告警关联分析、风险定级与响应编排能力</p>
       </div>
       <nav class="top-actions">
         <button class="nav-button active" type="button" data-view="dashboard">Dashboard</button>
-        <button class="nav-button" type="button" data-view="adapter">适配</button>
-        <button class="nav-button" type="button" data-view="settings">配置</button>
-        <button id="refresh" type="button">刷新</button>
+        <button class="nav-button" type="button" data-view="adapter" data-i18n="navAdapter">适配</button>
+        <button class="nav-button" type="button" data-view="settings" data-i18n="navSettings">配置</button>
+        <button id="refresh" type="button" data-i18n="refresh">刷新</button>
       </nav>
     </header>
     <main>
       <section id="dashboard-view" class="view active">
         <section class="stats">
-          <div><span id="alerts">0</span><label>告警</label></div>
+          <div><span id="alerts">0</span><label data-i18n="alerts">告警</label></div>
           <div><span id="cases">0</span><label>Case</label></div>
-          <div><span id="high">0</span><label>高危/严重</label></div>
+          <div><span id="high">0</span><label data-i18n="highCritical">高危/严重</label></div>
         </section>
         <section class="panel">
-          <h2>最新 Case</h2>
+          <h2 data-i18n="latestCases">最新 Case</h2>
           <div id="cases-list" class="case-list"></div>
         </section>
       </section>
       <section id="settings-view" class="view">
         <section class="panel settings-panel">
-          <h2>LLM 配置</h2>
+          <h2 data-i18n="llmConfig">LLM 配置</h2>
           <form id="llm-form" class="settings-form">
             <label>
               <span>Provider</span>
@@ -71,19 +71,19 @@
             </label>
             <label>
               <span>API Key</span>
-              <input id="llm-api-key" name="api_key" type="password" autocomplete="off" placeholder="留空则保留现有 Key" />
+              <input id="llm-api-key" name="api_key" type="password" autocomplete="off" placeholder="留空则保留现有 Key" data-i18n-placeholder="apiKeyPlaceholder" />
             </label>
             <label>
-              <span>Key 环境变量</span>
+              <span data-i18n="keyEnv">Key 环境变量</span>
               <input id="llm-api-key-env" name="api_key_env" type="text" placeholder="DEFENSIVE_AI_LLM_API_KEY" />
             </label>
             <label>
-              <span>超时秒数</span>
+              <span data-i18n="timeoutSeconds">超时秒数</span>
               <input id="llm-timeout" name="timeout_seconds" type="number" min="1" max="600" step="1" />
             </label>
             <div class="form-actions">
-              <button type="submit">保存配置</button>
-              <button type="button" id="reload-llm-config">重新加载</button>
+              <button type="submit" data-i18n="saveConfig">保存配置</button>
+              <button type="button" id="reload-llm-config" data-i18n="reload">重新加载</button>
             </div>
             <p id="llm-config-status" class="form-status"></p>
           </form>
@@ -92,49 +92,52 @@
       <section id="adapter-view" class="view">
         <section class="adapter-grid">
           <section class="panel">
-            <h2>日志自动适配</h2>
+            <h2 data-i18n="logAdapter">日志自动适配</h2>
             <form id="infer-form" class="settings-form profile-form">
               <label>
-                <span>RASP JSON 日志</span>
+                <span data-i18n="raspJsonLog">RASP JSON 日志</span>
                 <textarea id="source-log" spellcheck="false"></textarea>
               </label>
               <div class="form-actions">
-                <button type="submit">自动识别字段</button>
-                <button type="button" id="load-sample-log">加载示例</button>
-                <button type="button" id="save-inferred-profile">保存模板</button>
+                <button type="submit" data-i18n="autoDetectFields">自动识别字段</button>
+                <button type="button" id="load-sample-log" data-i18n="loadSample">加载示例</button>
+                <button type="button" id="save-inferred-profile" data-i18n="saveTemplate">保存模板</button>
               </div>
               <p id="profile-status" class="form-status"></p>
             </form>
             <div id="field-mapping-table" class="field-mapping-table"></div>
             <details class="advanced-profile">
-              <summary>高级配置</summary>
+              <summary data-i18n="advancedConfig">高级配置</summary>
               <div id="profile-list" class="profile-list"></div>
               <form id="profile-form" class="settings-form profile-form">
                 <label>
-                  <span>Profile JSON（字段映射）</span>
+                  <span data-i18n="profileJson">Profile JSON（字段映射）</span>
                   <textarea id="profile-json" spellcheck="false"></textarea>
                 </label>
                 <div class="form-actions">
-                  <button type="submit">保存 Profile</button>
-                  <button type="button" id="reload-profiles">重新加载</button>
+                  <button type="submit" data-i18n="saveProfile">保存 Profile</button>
+                  <button type="button" id="reload-profiles" data-i18n="reload">重新加载</button>
                 </div>
               </form>
             </details>
           </section>
           <section class="panel">
-            <h2>Dry-run 预览</h2>
+            <h2 data-i18n="dryRunPreview">Dry-run 预览</h2>
             <form id="dry-run-form" class="settings-form profile-form">
               <div class="form-actions">
-                <button type="submit">运行 Dry-run</button>
+                <button type="submit" data-i18n="runDryRun">运行 Dry-run</button>
               </div>
             </form>
-            <pre id="dry-run-result" class="json-block dry-run-result">粘贴一条脱敏 RASP JSON 日志，自动识别字段后运行 dry-run。</pre>
+            <pre id="dry-run-result" class="json-block dry-run-result" data-i18n="dryRunHint">粘贴一条脱敏 RASP JSON 日志，自动识别字段后运行 dry-run。</pre>
           </section>
         </section>
       </section>
     </main>
     <footer class="site-footer">
-      <button id="theme-switch" class="theme-switch" type="button" aria-label="切换深色或浅色模式"></button>
+      <div class="footer-actions">
+        <button id="theme-switch" class="theme-switch" type="button" aria-label="切换深色或浅色模式" data-i18n-aria-label="themeAria"></button>
+        <button id="language-switch" class="theme-switch language-switch" type="button" aria-label="Switch language"></button>
+      </div>
       <p>Copyright by tc</p>
     </footer>
     <script src="/app.js"></script>

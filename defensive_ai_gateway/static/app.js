@@ -1,9 +1,238 @@
 const detailCache = new Map();
 const THEME_KEY = "dashboard-theme";
+const LANGUAGE_KEY = "dashboard-language";
+const STRINGS = {
+  zh: {
+    appTitle: "AI 安全告警研判与处置中心",
+    appSubtitle: "面向 HIPS / RASP / NDR / WAF / SIEM 的多源告警关联分析、风险定级与响应编排能力",
+    navAdapter: "适配",
+    navSettings: "配置",
+    refresh: "刷新",
+    alerts: "告警",
+    highCritical: "高危/严重",
+    latestCases: "最新 Case",
+    llmConfig: "LLM 配置",
+    apiKeyPlaceholder: "留空则保留现有 Key",
+    keyEnv: "Key 环境变量",
+    timeoutSeconds: "超时秒数",
+    saveConfig: "保存配置",
+    reload: "重新加载",
+    logAdapter: "日志自动适配",
+    raspJsonLog: "RASP JSON 日志",
+    autoDetectFields: "自动识别字段",
+    loadSample: "加载示例",
+    saveTemplate: "保存模板",
+    advancedConfig: "高级配置",
+    profileJson: "Profile JSON（字段映射）",
+    saveProfile: "保存 Profile",
+    dryRunPreview: "Dry-run 预览",
+    runDryRun: "运行 Dry-run",
+    dryRunHint: "粘贴一条脱敏 RASP JSON 日志，自动识别字段后运行 dry-run。",
+    themeAria: "切换深色或浅色模式",
+    switchLight: "切换浅色模式",
+    switchDark: "切换深色模式",
+    languageButton: "English",
+    languageAria: "Switch to English",
+    statusRisk: "风险",
+    statusNormal: "正常",
+    statusReview: "复核",
+    statusInfo: "信息",
+    noWhitelist: "当前结论未建议添加白名单",
+    verdict: "研判结论",
+    noVerdict: "未提取到结构化结论",
+    dimensions: "分维度判断依据",
+    evidenceDimension: "证据维度",
+    noExtraNotes: "无补充说明",
+    noDimensions: "暂无结构化证据维度",
+    tuning: "白名单/调优建议",
+    noActions: "暂无建议动作",
+    noEvidence: "暂无归一化证据",
+    confirmFalsePositive: "确认为业务误报",
+    aiAnalysis: "AI 分析结果",
+    product: "产品",
+    classification: "分类",
+    confidence: "置信度",
+    updatedAt: "更新时间",
+    recommendedActions: "建议动作",
+    missingEvidence: "缺失证据",
+    none: "暂无",
+    linkedRawAlerts: "关联原始告警",
+    alertCount: "{count} 条",
+    source: "来源",
+    event: "事件",
+    severity: "严重性",
+    time: "时间",
+    adapterProfile: "适配 Profile",
+    adapterStatus: "适配状态",
+    normalizedEvidence: "归一化证据",
+    entities: "实体",
+    sensitivityTags: "敏感标签",
+    type: "类型",
+    value: "值",
+    weightSource: "权重/来源",
+    agentRuns: "Agent 运行记录",
+    runCount: "{count} 次",
+    expandCase: "展开 Case {id}",
+    alertCountLong: "{count} 条告警",
+    loadingDetail: "加载关联告警与 AI 分析...",
+    extractingMemory: "正在抽取特征并写入记忆层...",
+    falsePositiveReason: "Dashboard 人工确认：该告警符合业务场景下的误报模式",
+    memoryWritten: "已写入产品长期记忆：{id}，后续同类高相似告警会降低置信。",
+    falsePositiveDone: "已确认业务误报，并写入记忆层：{id}",
+    confirmFailed: "确认失败：{message}",
+    noCases: "暂无 Case，提交样例告警后会在这里展示。",
+    refreshFailed: "刷新失败：{message}",
+    enabled: "启用",
+    disabled: "停用",
+    profilesLoaded: "已加载 {count} 个 profile。",
+    saved: "保存成功：{id}",
+    mappingEmpty: "自动识别后会在这里显示字段确认结果。",
+    requiredMissing: "缺少必填字段：{fields}",
+    recommendedMissing: "必填字段已识别，建议补充：{fields}",
+    mappingPassed: "必填字段与关键 RASP 字段已识别",
+    standardField: "标准字段",
+    detectedPath: "识别路径",
+    sampleValue: "样例值",
+    status: "状态",
+    noMapping: "不映射",
+    required: "必填",
+    enhanced: "增强",
+    inferOk: "自动识别完成，可以运行 dry-run。",
+    inferNeedsRequired: "自动识别完成，但仍有必填字段需要补充。",
+    selectProfileFirst: "请先自动识别字段或选择一个 profile",
+    templateSaved: "模板已保存：{id}",
+    dryRunOk: "Dry-run 通过，可以用于正式接入。",
+    dryRunFailed: "Dry-run 未通过，缺失字段：{fields}",
+    checkResult: "请查看结果",
+    keySetKeep: "已设置，留空则保留",
+    keyUnset: "未设置",
+    configLoadedWithKey: "已加载配置，API Key 当前已设置。",
+    configLoadedNoKey: "已加载配置，API Key 当前未设置。",
+    configSaved: "保存成功：{provider} / {model}",
+    sampleLoaded: "已加载 RASP 示例日志。",
+    dryRunError: "Dry-run 失败：{message}",
+    fieldRequired: "必填",
+    fieldEnhanced: "增强",
+  },
+  en: {
+    appTitle: "AI Security Alert Triage and Response Center",
+    appSubtitle: "Correlation analysis, risk grading, and response orchestration for HIPS / RASP / NDR / WAF / SIEM alerts",
+    navAdapter: "Adapter",
+    navSettings: "Settings",
+    refresh: "Refresh",
+    alerts: "Alerts",
+    highCritical: "High/Critical",
+    latestCases: "Latest Cases",
+    llmConfig: "LLM Configuration",
+    apiKeyPlaceholder: "Leave blank to keep the existing key",
+    keyEnv: "Key environment variable",
+    timeoutSeconds: "Timeout seconds",
+    saveConfig: "Save configuration",
+    reload: "Reload",
+    logAdapter: "Log Auto-Adapter",
+    raspJsonLog: "RASP JSON log",
+    autoDetectFields: "Auto-detect fields",
+    loadSample: "Load sample",
+    saveTemplate: "Save template",
+    advancedConfig: "Advanced configuration",
+    profileJson: "Profile JSON (field mapping)",
+    saveProfile: "Save profile",
+    dryRunPreview: "Dry-run Preview",
+    runDryRun: "Run dry-run",
+    dryRunHint: "Paste a sanitized RASP JSON log, auto-detect fields, then run a dry-run.",
+    themeAria: "Toggle dark or light mode",
+    switchLight: "Switch to light mode",
+    switchDark: "Switch to dark mode",
+    languageButton: "中文",
+    languageAria: "切换到中文",
+    statusRisk: "Risk",
+    statusNormal: "Normal",
+    statusReview: "Review",
+    statusInfo: "Info",
+    noWhitelist: "No whitelist recommendation for the current verdict",
+    verdict: "Verdict",
+    noVerdict: "No structured verdict extracted",
+    dimensions: "Dimension evidence",
+    evidenceDimension: "Evidence dimension",
+    noExtraNotes: "No extra notes",
+    noDimensions: "No structured evidence dimensions",
+    tuning: "Whitelist / Tuning recommendation",
+    noActions: "No recommended actions",
+    noEvidence: "No normalized evidence",
+    confirmFalsePositive: "Confirm business false positive",
+    aiAnalysis: "AI Analysis Result",
+    product: "Product",
+    classification: "Classification",
+    confidence: "Confidence",
+    updatedAt: "Updated at",
+    recommendedActions: "Recommended actions",
+    missingEvidence: "Missing evidence",
+    none: "None",
+    linkedRawAlerts: "Linked Raw Alerts",
+    alertCount: "{count} items",
+    source: "Source",
+    event: "Event",
+    severity: "Severity",
+    time: "Time",
+    adapterProfile: "Adapter profile",
+    adapterStatus: "Adapter status",
+    normalizedEvidence: "Normalized Evidence",
+    entities: "Entities",
+    sensitivityTags: "Sensitivity tags",
+    type: "Type",
+    value: "Value",
+    weightSource: "Weight/Source",
+    agentRuns: "Agent Runs",
+    runCount: "{count} runs",
+    expandCase: "Expand Case {id}",
+    alertCountLong: "{count} alerts",
+    loadingDetail: "Loading linked alerts and AI analysis...",
+    extractingMemory: "Extracting features and writing to memory...",
+    falsePositiveReason: "Dashboard analyst confirmation: this alert matches a business false-positive pattern",
+    memoryWritten: "Written to product long-term memory: {id}. Similar future alerts will reduce confidence.",
+    falsePositiveDone: "Business false positive confirmed and written to memory: {id}",
+    confirmFailed: "Confirmation failed: {message}",
+    noCases: "No cases yet. Submit sample alerts to populate this view.",
+    refreshFailed: "Refresh failed: {message}",
+    enabled: "Enabled",
+    disabled: "Disabled",
+    profilesLoaded: "Loaded {count} profiles.",
+    saved: "Saved: {id}",
+    mappingEmpty: "Field confirmation results will appear here after auto-detection.",
+    requiredMissing: "Missing required fields: {fields}",
+    recommendedMissing: "Required fields are mapped. Recommended additions: {fields}",
+    mappingPassed: "Required fields and key RASP fields are mapped",
+    standardField: "Standard field",
+    detectedPath: "Detected path",
+    sampleValue: "Sample value",
+    status: "Status",
+    noMapping: "Do not map",
+    required: "Required",
+    enhanced: "Enhanced",
+    inferOk: "Auto-detection completed. You can run a dry-run.",
+    inferNeedsRequired: "Auto-detection completed, but required fields still need mapping.",
+    selectProfileFirst: "Auto-detect fields or select a profile first",
+    templateSaved: "Template saved: {id}",
+    dryRunOk: "Dry-run passed. Ready for production ingestion.",
+    dryRunFailed: "Dry-run failed. Missing fields: {fields}",
+    checkResult: "check the result",
+    keySetKeep: "Set. Leave blank to keep it",
+    keyUnset: "Not set",
+    configLoadedWithKey: "Configuration loaded. API Key is currently set.",
+    configLoadedNoKey: "Configuration loaded. API Key is not set.",
+    configSaved: "Saved: {provider} / {model}",
+    sampleLoaded: "Loaded RASP sample log.",
+    dryRunError: "Dry-run failed: {message}",
+    fieldRequired: "Required",
+    fieldEnhanced: "Enhanced",
+  },
+};
 let mappingProfiles = [];
 let selectedProfileId = "";
 let inferredProfile = null;
 let inferredFields = [];
+let currentLanguage = "zh";
+let lastFieldMappingResult = null;
 const SAMPLE_RASP_LOG = {
   metadata: { id: "real-rasp-001" },
   device: { vendor: "bank-rasp", type: "runtime_app_protection" },
@@ -46,6 +275,61 @@ function text(value) {
   return String(value);
 }
 
+function tr(key, params = {}) {
+  const template = STRINGS[currentLanguage]?.[key] || STRINGS.zh[key] || key;
+  return template.replace(/\{(\w+)\}/g, (_, name) => text(params[name]));
+}
+
+function loadLanguagePreference() {
+  try {
+    currentLanguage = localStorage.getItem(LANGUAGE_KEY) === "en" ? "en" : "zh";
+  } catch (err) {
+    currentLanguage = "zh";
+  }
+  applyLanguage();
+}
+
+function saveLanguagePreference(language) {
+  currentLanguage = language === "en" ? "en" : "zh";
+  try {
+    localStorage.setItem(LANGUAGE_KEY, currentLanguage);
+  } catch (err) {
+    // Language still applies for the current session when storage is unavailable.
+  }
+  applyLanguage();
+}
+
+function applyLanguage() {
+  document.documentElement.lang = currentLanguage === "en" ? "en" : "zh-CN";
+  document.title = tr("appTitle");
+  document.querySelectorAll("[data-i18n]").forEach((node) => {
+    if (node.id === "dry-run-result") {
+      const current = node.textContent.trim();
+      const hints = [STRINGS.zh.dryRunHint, STRINGS.en.dryRunHint];
+      if (!hints.includes(current)) return;
+    }
+    node.textContent = tr(node.dataset.i18n);
+  });
+  document.querySelectorAll("[data-i18n-placeholder]").forEach((node) => {
+    node.setAttribute("placeholder", tr(node.dataset.i18nPlaceholder));
+  });
+  document.querySelectorAll("[data-i18n-aria-label]").forEach((node) => {
+    node.setAttribute("aria-label", tr(node.dataset.i18nAriaLabel));
+  });
+  applyTheme(document.documentElement.dataset.theme || "light");
+  const languageButton = document.querySelector("#language-switch");
+  if (languageButton) {
+    const nextLanguage = currentLanguage === "en" ? "zh" : "en";
+    languageButton.dataset.languageValue = nextLanguage;
+    languageButton.textContent = tr("languageButton");
+    languageButton.setAttribute("aria-label", tr("languageAria"));
+  }
+  if (lastFieldMappingResult) {
+    renderFieldMappingTable(lastFieldMappingResult);
+  }
+  renderProfileList();
+}
+
 function escapeHtml(value) {
   return text(value)
     .replaceAll("&", "&amp;")
@@ -63,6 +347,33 @@ function formatSampleValue(value) {
   return typeof value === "string" ? value : JSON.stringify(value, null, 2);
 }
 
+function localizedFieldLabel(label) {
+  if (currentLanguage !== "en") return label;
+  const labels = {
+    "告警 ID": "Alert ID",
+    产品类型: "Product",
+    事件类型: "Event type",
+    严重级别: "Severity",
+    事件时间: "Event time",
+    主机: "Host",
+    "源 IP": "Source IP",
+    URL: "URL",
+    "HTTP 方法": "HTTP method",
+    "规则 ID": "Rule ID",
+    应用: "Application",
+    处置动作: "Action",
+    "Payload 时间": "Payload time",
+    "Payload 主机": "Payload host",
+    调用栈: "Stack trace",
+    "危险 sink": "Dangerous sink",
+    "Hook 数据": "Hook data",
+    污染源: "Taint source",
+    "Trace ID": "Trace ID",
+    "Request ID": "Request ID",
+  };
+  return labels[label] || label;
+}
+
 function applyTheme(theme) {
   const normalized = theme === "dark" ? "dark" : "light";
   document.documentElement.dataset.theme = normalized;
@@ -75,7 +386,8 @@ function applyTheme(theme) {
   if (switchButton) {
     const nextTheme = normalized === "dark" ? "light" : "dark";
     switchButton.dataset.themeValue = nextTheme;
-    switchButton.textContent = normalized === "dark" ? "切换浅色模式" : "切换深色模式";
+    switchButton.textContent = normalized === "dark" ? tr("switchLight") : tr("switchDark");
+    switchButton.setAttribute("aria-label", tr("themeAria"));
     switchButton.setAttribute("aria-pressed", String(normalized === "dark"));
   }
   return normalized;
@@ -121,10 +433,10 @@ function showToast(message, type = "success") {
 
 function statusLabel(status) {
   const value = text(status).toLowerCase();
-  if (["risk", "malicious", "blocked", "high"].includes(value)) return "风险";
-  if (["benign", "normal", "allow", "low"].includes(value)) return "正常";
-  if (["review", "suspicious", "medium"].includes(value)) return "复核";
-  return "信息";
+  if (["risk", "malicious", "blocked", "high"].includes(value)) return tr("statusRisk");
+  if (["benign", "normal", "allow", "low"].includes(value)) return tr("statusNormal");
+  if (["review", "suspicious", "medium"].includes(value)) return tr("statusReview");
+  return tr("statusInfo");
 }
 
 function explanationBlock(explanation) {
@@ -134,14 +446,14 @@ function explanationBlock(explanation) {
   const whitelistHtml =
     whitelist && Object.keys(whitelist).length
       ? `<pre class="mini-json">${pretty(whitelist)}</pre>`
-      : '<p class="empty">当前结论未建议添加白名单</p>';
+      : `<p class="empty">${escapeHtml(tr("noWhitelist"))}</p>`;
 
   return `
     <div class="verdict-box">
-      <span>研判结论</span>
-      <strong>${escapeHtml(data.verdict || "未提取到结构化结论")}</strong>
+      <span>${escapeHtml(tr("verdict"))}</span>
+      <strong>${escapeHtml(data.verdict || tr("noVerdict"))}</strong>
     </div>
-    <h4>分维度判断依据</h4>
+    <h4>${escapeHtml(tr("dimensions"))}</h4>
     ${
       dimensions.length
         ? `<ol class="dimension-list">
@@ -151,23 +463,23 @@ function explanationBlock(explanation) {
                   <li>
                     <span class="status-dot ${escapeHtml(item.status || "info")}">${escapeHtml(statusLabel(item.status))}</span>
                     <div>
-                      <strong>${escapeHtml(item.title || "证据维度")}</strong>
-                      <p>${escapeHtml(item.evidence || "无补充说明")}</p>
+                      <strong>${escapeHtml(item.title || tr("evidenceDimension"))}</strong>
+                      <p>${escapeHtml(item.evidence || tr("noExtraNotes"))}</p>
                     </div>
                   </li>
                 `,
               )
               .join("")}
           </ol>`
-        : '<p class="empty">暂无结构化证据维度</p>'
+        : `<p class="empty">${escapeHtml(tr("noDimensions"))}</p>`
     }
-    <h4>白名单/调优建议</h4>
+    <h4>${escapeHtml(tr("tuning"))}</h4>
     ${whitelistHtml}
   `;
 }
 
 function actionRows(actions) {
-  if (!actions || !actions.length) return '<p class="empty">暂无建议动作</p>';
+  if (!actions || !actions.length) return `<p class="empty">${escapeHtml(tr("noActions"))}</p>`;
   return actions
     .map(
       (item) => `
@@ -183,7 +495,7 @@ function actionRows(actions) {
 
 function evidenceRows(evidence) {
   if (!evidence || !evidence.length) {
-    return '<tr><td colspan="3" class="empty">暂无归一化证据</td></tr>';
+    return `<tr><td colspan="3" class="empty">${escapeHtml(tr("noEvidence"))}</td></tr>`;
   }
   return evidence
     .map(
@@ -204,7 +516,7 @@ function reviewTools(raw) {
   return `
     <div class="review-tools">
       <button class="review-button" type="button" data-alert-id="${escapeHtml(alertId)}">
-        确认为业务误报
+        ${escapeHtml(tr("confirmFalsePositive"))}
       </button>
       <p class="review-status" data-alert-status="${escapeHtml(alertId)}"></p>
     </div>
@@ -224,44 +536,44 @@ function renderDetail(detail) {
     <div class="detail-grid">
       <section class="detail-card analysis-card">
         <div class="section-title">
-          <h3>AI 分析结果</h3>
+          <h3>${escapeHtml(tr("aiAnalysis"))}</h3>
           <span class="badge ${escapeHtml(detail.severity)}">${escapeHtml(detail.severity)}</span>
         </div>
         <dl class="kv">
           <dt>Case ID</dt><dd>${escapeHtml(detail.case_id)}</dd>
-          <dt>产品</dt><dd>${escapeHtml(detail.product).toUpperCase()}</dd>
-          <dt>分类</dt><dd>${escapeHtml(detail.classification)}</dd>
-          <dt>置信度</dt><dd>${Math.round((detail.confidence || 0) * 100)}%</dd>
-          <dt>更新时间</dt><dd>${fmtTime(detail.updated_at_ms)}</dd>
+          <dt>${escapeHtml(tr("product"))}</dt><dd>${escapeHtml(detail.product).toUpperCase()}</dd>
+          <dt>${escapeHtml(tr("classification"))}</dt><dd>${escapeHtml(detail.classification)}</dd>
+          <dt>${escapeHtml(tr("confidence"))}</dt><dd>${Math.round((detail.confidence || 0) * 100)}%</dd>
+          <dt>${escapeHtml(tr("updatedAt"))}</dt><dd>${fmtTime(detail.updated_at_ms)}</dd>
         </dl>
         <p class="summary">${escapeHtml(detail.summary)}</p>
         ${explanationBlock(latestRun.explanation)}
-        <h4>建议动作</h4>
+        <h4>${escapeHtml(tr("recommendedActions"))}</h4>
         <ul class="action-list">${actionRows(latestRun.recommended_actions)}</ul>
-        <h4>缺失证据</h4>
+        <h4>${escapeHtml(tr("missingEvidence"))}</h4>
         <ul class="plain-list">
           ${
             missing.length
               ? missing.map((item) => `<li>${escapeHtml(item)}</li>`).join("")
-              : '<li class="empty">暂无</li>'
+              : `<li class="empty">${escapeHtml(tr("none"))}</li>`
           }
         </ul>
       </section>
 
       <section class="detail-card">
         <div class="section-title">
-          <h3>关联原始告警</h3>
-          <span>${linked.length} 条</span>
+          <h3>${escapeHtml(tr("linkedRawAlerts"))}</h3>
+          <span>${escapeHtml(tr("alertCount", { count: linked.length }))}</span>
         </div>
         <dl class="kv">
           <dt>Alert ID</dt><dd>${escapeHtml(raw.alert_id || firstLink.alert_id)}</dd>
-          <dt>来源</dt><dd>${escapeHtml(raw.source)}</dd>
-          <dt>产品</dt><dd>${escapeHtml(raw.product).toUpperCase()}</dd>
-          <dt>事件</dt><dd>${escapeHtml(raw.event_type)}</dd>
-          <dt>严重性</dt><dd>${escapeHtml(raw.severity)}</dd>
-          <dt>时间</dt><dd>${escapeHtml(raw.timestamp)}</dd>
-          <dt>适配 Profile</dt><dd>${escapeHtml(adapter.profile_id ? `${adapter.profile_id} / ${adapter.profile_version}` : "direct")}</dd>
-          <dt>适配状态</dt><dd>${escapeHtml(adapter.mapping_status || "passed")}</dd>
+          <dt>${escapeHtml(tr("source"))}</dt><dd>${escapeHtml(raw.source)}</dd>
+          <dt>${escapeHtml(tr("product"))}</dt><dd>${escapeHtml(raw.product).toUpperCase()}</dd>
+          <dt>${escapeHtml(tr("event"))}</dt><dd>${escapeHtml(raw.event_type)}</dd>
+          <dt>${escapeHtml(tr("severity"))}</dt><dd>${escapeHtml(raw.severity)}</dd>
+          <dt>${escapeHtml(tr("time"))}</dt><dd>${escapeHtml(raw.timestamp)}</dd>
+          <dt>${escapeHtml(tr("adapterProfile"))}</dt><dd>${escapeHtml(adapter.profile_id ? `${adapter.profile_id} / ${adapter.profile_version}` : "direct")}</dd>
+          <dt>${escapeHtml(tr("adapterStatus"))}</dt><dd>${escapeHtml(adapter.mapping_status || "passed")}</dd>
         </dl>
         ${reviewTools(raw)}
         <pre class="json-block">${pretty(raw.payload)}</pre>
@@ -269,16 +581,16 @@ function renderDetail(detail) {
 
       <section class="detail-card">
         <div class="section-title">
-          <h3>归一化证据</h3>
+          <h3>${escapeHtml(tr("normalizedEvidence"))}</h3>
           <span>${escapeHtml(normalized.event_id || firstLink.event_id)}</span>
         </div>
         <dl class="kv">
-          <dt>实体</dt><dd>${escapeHtml(JSON.stringify(normalized.entities || {}))}</dd>
-          <dt>敏感标签</dt><dd>${escapeHtml((normalized.sensitivity_tags || []).join(", ") || "-")}</dd>
+          <dt>${escapeHtml(tr("entities"))}</dt><dd>${escapeHtml(JSON.stringify(normalized.entities || {}))}</dd>
+          <dt>${escapeHtml(tr("sensitivityTags"))}</dt><dd>${escapeHtml((normalized.sensitivity_tags || []).join(", ") || "-")}</dd>
         </dl>
         <table class="evidence-table">
           <thead>
-            <tr><th>类型</th><th>值</th><th>权重/来源</th></tr>
+            <tr><th>${escapeHtml(tr("type"))}</th><th>${escapeHtml(tr("value"))}</th><th>${escapeHtml(tr("weightSource"))}</th></tr>
           </thead>
           <tbody>${evidenceRows(normalized.evidence)}</tbody>
         </table>
@@ -286,8 +598,8 @@ function renderDetail(detail) {
 
       <section class="detail-card">
         <div class="section-title">
-          <h3>Agent 运行记录</h3>
-          <span>${detail.agent_runs?.length || 0} 次</span>
+          <h3>${escapeHtml(tr("agentRuns"))}</h3>
+          <span>${escapeHtml(tr("runCount", { count: detail.agent_runs?.length || 0 }))}</span>
         </div>
         <pre class="json-block">${pretty(detail.agent_runs || [])}</pre>
       </section>
@@ -300,12 +612,12 @@ function renderCase(item) {
   wrapper.className = "case-item";
   wrapper.dataset.caseId = item.case_id;
   wrapper.innerHTML = `
-    <button class="case-toggle" type="button" aria-expanded="false" aria-label="展开 Case ${escapeHtml(item.case_id)}">
+    <button class="case-toggle" type="button" aria-expanded="false" aria-label="${escapeHtml(tr("expandCase", { id: item.case_id }))}">
       <span class="case-chevron">›</span>
       <strong class="case-product">${escapeHtml(item.product).toUpperCase()}</strong>
       <span class="badge ${escapeHtml(item.severity)}">${escapeHtml(item.severity)}</span>
       <span class="case-summary">${escapeHtml(item.summary)}</span>
-      <span class="linked-count">${item.alert_count || 0} 条告警</span>
+      <span class="linked-count">${escapeHtml(tr("alertCountLong", { count: item.alert_count || 0 }))}</span>
       <small class="case-time">${fmtTime(item.updated_at_ms)}</small>
     </button>
     <div class="case-collapse" hidden></div>
@@ -327,7 +639,7 @@ async function toggleCase(wrapper, caseId) {
   button.setAttribute("aria-expanded", "true");
   panel.hidden = false;
   if (!detailCache.has(caseId)) {
-    panel.innerHTML = '<div class="loading">加载关联告警与 AI 分析...</div>';
+    panel.innerHTML = `<div class="loading">${escapeHtml(tr("loadingDetail"))}</div>`;
     detailCache.set(caseId, await json(`/api/cases/${encodeURIComponent(caseId)}`));
   }
   panel.innerHTML = renderDetail(detailCache.get(caseId));
@@ -340,27 +652,27 @@ async function confirmBusinessFalsePositive(button, caseId) {
   const alertId = button.dataset.alertId;
   const status = document.querySelector(`[data-alert-status="${CSS.escape(alertId)}"]`);
   button.disabled = true;
-  if (status) status.textContent = "正在抽取特征并写入记忆层...";
+  if (status) status.textContent = tr("extractingMemory");
   try {
     const result = await json(`/api/alerts/${encodeURIComponent(alertId)}/confirm-false-positive`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         analyst: "dashboard-analyst",
-        reason: "Dashboard 人工确认：该告警符合业务场景下的误报模式",
+        reason: tr("falsePositiveReason"),
       }),
     });
     detailCache.delete(caseId);
     if (status) {
-      status.textContent = `已写入产品长期记忆：${result.memory_id}，后续同类高相似告警会降低置信。`;
+      status.textContent = tr("memoryWritten", { id: result.memory_id });
     }
     await loadCases();
-    showToast(`已确认业务误报，并写入记忆层：${result.memory_id}`);
+    showToast(tr("falsePositiveDone", { id: result.memory_id }));
   } catch (err) {
     button.disabled = false;
     const message = err.message || String(err);
     if (status) status.textContent = message;
-    showToast(`确认失败：${message}`, "error");
+    showToast(tr("confirmFailed", { message }), "error");
   }
 }
 
@@ -384,7 +696,7 @@ async function loadCases() {
     list.innerHTML = "";
     detailCache.clear();
     if (!data.cases.length) {
-      list.innerHTML = '<div class="empty-state">暂无 Case，提交样例告警后会在这里展示。</div>';
+      list.innerHTML = `<div class="empty-state">${escapeHtml(tr("noCases"))}</div>`;
       return;
     }
     for (const item of data.cases) {
@@ -392,7 +704,7 @@ async function loadCases() {
     }
   } catch (err) {
     list.innerHTML = `<div class="empty-state">${escapeHtml(err.stack || String(err))}</div>`;
-    showToast(`刷新失败：${err.message || String(err)}`, "error");
+    showToast(tr("refreshFailed", { message: err.message || String(err) }), "error");
   }
 }
 
@@ -452,7 +764,7 @@ function renderProfileList() {
         <strong>${escapeHtml(profile.name || profile.profile_id)}</strong>
         <span>${escapeHtml(profile.profile_id)} / ${escapeHtml(profile.version || "v1")}</span>
       </span>
-      <span>${profile.enabled ? "启用" : "停用"}</span>
+      <span>${escapeHtml(profile.enabled ? tr("enabled") : tr("disabled"))}</span>
     `;
     button.addEventListener("click", () => selectProfile(profile.profile_id));
     list.appendChild(button);
@@ -479,7 +791,7 @@ async function loadMappingProfiles() {
   }
   renderProfileList();
   if (selectedProfileId) selectProfile(selectedProfileId);
-  setProfileStatus(`已加载 ${mappingProfiles.length} 个 profile。`);
+  setProfileStatus(tr("profilesLoaded", { count: mappingProfiles.length }));
 }
 
 async function saveMappingProfile(event) {
@@ -492,24 +804,25 @@ async function saveMappingProfile(event) {
   });
   selectedProfileId = result.profile.profile.profile_id;
   await loadMappingProfiles();
-  setProfileStatus(`保存成功：${selectedProfileId}`);
+  setProfileStatus(tr("saved", { id: selectedProfileId }));
 }
 
 function renderFieldMappingTable(result) {
   const container = document.querySelector("#field-mapping-table");
   const fields = result?.fields || [];
+  lastFieldMappingResult = result || null;
   if (!fields.length) {
-    container.innerHTML = '<p class="empty">自动识别后会在这里显示字段确认结果。</p>';
+    container.innerHTML = `<p class="empty">${escapeHtml(tr("mappingEmpty"))}</p>`;
     return;
   }
   const requiredMissing = result.required_missing || [];
   const recommendedMissing = result.recommended_missing || [];
   const summaryClass = requiredMissing.length ? "error" : recommendedMissing.length ? "warn" : "success";
   const summaryText = requiredMissing.length
-    ? `缺少必填字段：${requiredMissing.join(", ")}`
+    ? tr("requiredMissing", { fields: requiredMissing.join(", ") })
     : recommendedMissing.length
-      ? `必填字段已识别，建议补充：${recommendedMissing.join(", ")}`
-      : "必填字段与关键 RASP 字段已识别";
+      ? tr("recommendedMissing", { fields: recommendedMissing.join(", ") })
+      : tr("mappingPassed");
   container.innerHTML = `
     <div class="mapping-summary ${summaryClass}">${escapeHtml(summaryText)}</div>
     <table>
@@ -520,25 +833,25 @@ function renderFieldMappingTable(result) {
         <col class="mapping-status-col" />
       </colgroup>
       <thead>
-        <tr><th>标准字段</th><th>识别路径</th><th>样例值</th><th>状态</th></tr>
+        <tr><th>${escapeHtml(tr("standardField"))}</th><th>${escapeHtml(tr("detectedPath"))}</th><th>${escapeHtml(tr("sampleValue"))}</th><th>${escapeHtml(tr("status"))}</th></tr>
       </thead>
       <tbody>
         ${fields
           .map((field, idx) => {
             const selected = selectValueFromMapping(field.mapping);
-            const options = [{ path: "", value: "不映射", confidence: 0 }, ...(field.candidates || [])];
+            const options = [{ path: "", value: tr("noMapping"), confidence: 0 }, ...(field.candidates || [])];
             return `
               <tr>
                 <td>
-                  <strong>${escapeHtml(field.label)}</strong>
-                  <span>${field.required ? "必填" : "增强"}</span>
+                  <strong>${escapeHtml(localizedFieldLabel(field.label))}</strong>
+                  <span>${escapeHtml(field.required ? tr("required") : tr("enhanced"))}</span>
                 </td>
                 <td>
                   <select data-field-index="${idx}">
                     ${options
                       .map((option) => {
                         const value = option.path || "";
-                        const label = value ? `${value} (${Math.round((option.confidence || 0) * 100)}%)` : "不映射";
+                        const label = value ? `${value} (${Math.round((option.confidence || 0) * 100)}%)` : tr("noMapping");
                         return `<option value="${escapeHtml(value)}" ${value === selected ? "selected" : ""}>${escapeHtml(label)}</option>`;
                       })
                       .join("")}
@@ -589,12 +902,12 @@ async function inferMappingProfile(event) {
   setProfileJson(inferredProfile);
   renderFieldMappingTable(result);
   document.querySelector("#dry-run-result").textContent = JSON.stringify(result.quality || result, null, 2);
-  setProfileStatus(result.ok ? "自动识别完成，可以运行 dry-run。" : "自动识别完成，但仍有必填字段需要补充。", !result.ok);
+  setProfileStatus(result.ok ? tr("inferOk") : tr("inferNeedsRequired"), !result.ok);
 }
 
 async function saveCurrentProfile() {
   const profile = currentProfileForDryRun();
-  if (!profile.profile_id) throw new Error("请先自动识别字段或选择一个 profile");
+  if (!profile.profile_id) throw new Error(tr("selectProfileFirst"));
   const result = await json("/api/mapping-profiles", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -602,7 +915,7 @@ async function saveCurrentProfile() {
   });
   selectedProfileId = result.profile.profile.profile_id;
   await loadMappingProfiles();
-  setProfileStatus(`模板已保存：${selectedProfileId}`);
+  setProfileStatus(tr("templateSaved", { id: selectedProfileId }));
 }
 
 async function runDryRun(event) {
@@ -616,7 +929,7 @@ async function runDryRun(event) {
   });
   document.querySelector("#dry-run-result").textContent = JSON.stringify(result, null, 2);
   const missing = Array.isArray(result.missing_required_fields) ? result.missing_required_fields.join(", ") : "";
-  showToast(result.ok ? "Dry-run 通过，可以用于正式接入。" : `Dry-run 未通过，缺失字段：${missing || "请查看结果"}`, result.ok ? "success" : "error");
+  showToast(result.ok ? tr("dryRunOk") : tr("dryRunFailed", { fields: missing || tr("checkResult") }), result.ok ? "success" : "error");
 }
 
 async function loadLlmConfig() {
@@ -625,10 +938,10 @@ async function loadLlmConfig() {
   document.querySelector("#llm-endpoint").value = cfg.endpoint || "";
   document.querySelector("#llm-model").value = cfg.model || "";
   document.querySelector("#llm-api-key").value = "";
-  document.querySelector("#llm-api-key").placeholder = cfg.api_key_set ? "已设置，留空则保留" : "未设置";
+  document.querySelector("#llm-api-key").placeholder = cfg.api_key_set ? tr("keySetKeep") : tr("keyUnset");
   document.querySelector("#llm-api-key-env").value = cfg.api_key_env || "DEFENSIVE_AI_LLM_API_KEY";
   document.querySelector("#llm-timeout").value = cfg.timeout_seconds || 30;
-  setConfigStatus(cfg.api_key_set ? "已加载配置，API Key 当前已设置。" : "已加载配置，API Key 当前未设置。");
+  setConfigStatus(cfg.api_key_set ? tr("configLoadedWithKey") : tr("configLoadedNoKey"));
 }
 
 async function saveLlmConfig(event) {
@@ -648,10 +961,11 @@ async function saveLlmConfig(event) {
     body: JSON.stringify(payload),
   });
   document.querySelector("#llm-api-key").value = "";
-  document.querySelector("#llm-api-key").placeholder = result.llm.api_key_set ? "已设置，留空则保留" : "未设置";
-  setConfigStatus(`保存成功：${result.llm.provider} / ${result.llm.model}`);
+  document.querySelector("#llm-api-key").placeholder = result.llm.api_key_set ? tr("keySetKeep") : tr("keyUnset");
+  setConfigStatus(tr("configSaved", { provider: result.llm.provider, model: result.llm.model }));
 }
 
+loadLanguagePreference();
 loadThemePreference();
 
 if (window.matchMedia) {
@@ -671,6 +985,10 @@ document.querySelector("#refresh").addEventListener("click", loadCases);
 document.querySelector("#theme-switch").addEventListener("click", (event) => {
   saveThemePreference(event.currentTarget.dataset.themeValue);
 });
+document.querySelector("#language-switch").addEventListener("click", (event) => {
+  saveLanguagePreference(event.currentTarget.dataset.languageValue);
+  loadCases().catch((err) => showToast(err.message || String(err), "error"));
+});
 document.querySelector("#llm-form").addEventListener("submit", (event) => {
   saveLlmConfig(event).catch((err) => setConfigStatus(err.message || String(err), true));
 });
@@ -685,7 +1003,7 @@ document.querySelector("#infer-form").addEventListener("submit", (event) => {
 });
 document.querySelector("#load-sample-log").addEventListener("click", () => {
   document.querySelector("#source-log").value = JSON.stringify(SAMPLE_RASP_LOG, null, 2);
-  setProfileStatus("已加载 RASP 示例日志。");
+  setProfileStatus(tr("sampleLoaded"));
 });
 document.querySelector("#save-inferred-profile").addEventListener("click", () => {
   saveCurrentProfile().catch((err) => setProfileStatus(err.message || String(err), true));
@@ -696,7 +1014,7 @@ document.querySelector("#reload-profiles").addEventListener("click", () => {
 document.querySelector("#dry-run-form").addEventListener("submit", (event) => {
   runDryRun(event).catch((err) => {
     document.querySelector("#dry-run-result").textContent = err.message || String(err);
-    showToast(`Dry-run 失败：${err.message || String(err)}`, "error");
+    showToast(tr("dryRunError", { message: err.message || String(err) }), "error");
   });
 });
 document.querySelectorAll(".nav-button").forEach((btn) => {
