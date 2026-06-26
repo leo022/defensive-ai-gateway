@@ -14,9 +14,18 @@ class LLMClient:
     def analyze(self, prompt: str, context: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError
 
+    @property
+    def is_deterministic(self) -> bool:
+        """True for analyzers whose judgment is already grounded and need no
+        reconciliation against structured sample evidence (e.g. the heuristic
+        analyzer that reads ``evidence_assessment`` and merges memory itself)."""
+        return False
+
 
 class LocalHeuristicLLM(LLMClient):
     """Deterministic local analyzer for offline MVP and tests."""
+
+    is_deterministic = True
 
     HIGH_WORDS = ["rce", "sql", "xss", "c2", "exfil", "lateral", "credential", "webshell", "提权", "横向", "外传"]
     FALSE_POSITIVE_WORDS = [

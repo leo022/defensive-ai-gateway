@@ -615,7 +615,7 @@ def _ndr(rng: random.Random, requested: str) -> dict[str, Any]:
         "source": "direct",
         "product": "ndr",
         "event_type": event_type,
-        "severity": "low" if fp else ("medium" if suspicious else rng.choice(["medium", "high"])),
+        "severity": "low" if fp else ("medium" if suspicious else ("critical" if rule_id == "NDR-EXFIL-RATIO-031" else "high")),
         "timestamp": _timestamp(rng),
         "payload": {
             "rule_id": rule_id,
