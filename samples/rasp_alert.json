@@ -4,7 +4,7 @@
     "request_id": "3b585cb05d3e4610ab2b2ab68e131eea",
     "attack_time": "2025-10-16T09:17:20+08:00",
     "created_at": "2025-10-16T11:19:23.064+08:00",
-    "app_name": "92自动注入新",
+    "app_name": "smartHR",
     "application_id": 569,
     "agent_id": "be84410a00ac48f396274cd8d09174fc",
     "path": "/cloudrasp-vulns/deserialization/fastjson/postBody",
