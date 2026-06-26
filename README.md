@@ -44,6 +44,8 @@ python3 scripts/send_sample.py --random --count 3 --product waf --scenario false
 
 Dashboard 的“适配”页面可配置 Mapping Profile，把内网真实告警日志映射为内部稳定 `RawAlert`，并通过 dry-run 预览 `RawAlert` 与 `NormalizedEvent`。正式接入时可通过 `POST /api/alerts?profile=<profile_id>` 或请求体中的 `profile_id` 提交真实日志；映射失败的日志不会进入 LLM 分析。
 
+不带 `profile` 直接提交厂商原生日志时，网关会按内容指纹识别来源（例如 cloudrasp 的 `data_type=attack_event` 识别为 `rasp`）；若该产品已注册自动 profile（`AUTO_PROFILE`，默认 `rasp → auto-rasp-json`），则自动套用做深度字段映射，否则落到对应 Subagent（浅字段）。既无显式 `product` 字段、又无法识别的日志会被拒绝（400），不再静默降级为 `siem`。
+
 Harness 也支持用 profile 回放脱敏真实日志：
 
 ```bash

@@ -10,13 +10,45 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from .config import GatewayConfig, LLMConfig, load_config
 from .database import Repository
-from .log_adapter import LogAdapter, MappingProfile, default_mapping_profile, demo_rasp_profile, mapping_profile_record
+from .log_adapter import (
+    AUTO_PROFILE,
+    LogAdapter,
+    MappingProfile,
+    default_mapping_profile,
+    demo_rasp_profile,
+    explicit_product,
+    fingerprint_product,
+    mapping_profile_record,
+)
 from .llm import build_llm
 from .memory import MemoryManager
 from .models import RawAlert, new_id
 from .normalizer import EventNormalizer
 from .orchestrator import Orchestrator
 from .policy import PolicyEngine
+
+
+_STANDARD_ALERT_KEYS = ("event_type", "severity", "alert_id", "source", "timestamp")
+
+
+def _looks_like_standard_alert(payload: dict) -> bool:
+    """Heuristic: payload carries standard alert top-level fields but omitted product."""
+    return any(k in payload for k in _STANDARD_ALERT_KEYS)
+
+
+def _build_raw_alert(payload: dict, product: str) -> RawAlert:
+    alert = RawAlert(
+        source=str(payload.get("source", "direct")),
+        product=product,
+        event_type=str(payload.get("event_type", "unknown")),
+        severity=str(payload.get("severity", "medium")),
+        timestamp=str(payload.get("timestamp", "")),
+        payload=dict(payload.get("payload", payload)),
+        alert_id=str(payload.get("alert_id") or payload.get("id") or ""),
+    )
+    if not alert.alert_id:
+        alert.alert_id = new_id("alert")
+    return alert
 
 
 class GatewayState:
@@ -133,18 +165,40 @@ class GatewayState:
             if not result["ok"]:
                 raise ValueError("log mapping failed: " + ", ".join(result["errors"]))
             return result["raw_alert"]
-        alert = RawAlert(
-            source=str(payload.get("source", "direct")),
-            product=str(payload.get("product", "siem")),
-            event_type=str(payload.get("event_type", "unknown")),
-            severity=str(payload.get("severity", "medium")),
-            timestamp=str(payload.get("timestamp", "")),
-            payload=dict(payload.get("payload", payload)),
-            alert_id=str(payload.get("alert_id") or payload.get("id") or ""),
+
+        # 显式带 product 字段的标准告警：走快速路径，按顶层字段构造。
+        product = explicit_product(payload)
+        if product:
+            return _build_raw_alert(payload, product)
+
+        # 无显式 product 的厂商原生日志：按内容指纹识别 product；若该产品已注册
+        # 自动 profile，则套用 profile 做深度字段映射（如 cloudcrasp → auto-rasp-json）。
+        detected = fingerprint_product(payload)
+        if detected:
+            auto_profile_id = AUTO_PROFILE.get(detected)
+            if auto_profile_id:
+                try:
+                    profile = self.get_mapping_profile(auto_profile_id)
+                except ValueError:
+                    profile = None
+                if profile:
+                    result = self.log_adapter.adapt(profile, payload)
+                    if not result["ok"]:
+                        raise ValueError(
+                            f"auto profile {auto_profile_id} mapping failed: " + ", ".join(result["errors"])
+                        )
+                    return result["raw_alert"]
+            # 指纹命中但无已注册 profile：落到正确 Subagent（浅字段），而非静默误判为 siem。
+            return _build_raw_alert(payload, detected)
+
+        # 看起来是标准告警但漏了 product：保留 siem 兜底（向后兼容）。
+        if _looks_like_standard_alert(payload):
+            return _build_raw_alert(payload, "siem")
+
+        raise ValueError(
+            "无法识别日志来源 product。厂商原生日志请用 ?profile=<id> 提交，"
+            "或补全顶层 product 字段（hips/rasp/ndr/waf/siem）。"
         )
-        if not alert.alert_id:
-            alert.alert_id = new_id("alert")
-        return alert
 
     # ---- memory governance (Dashboard 记忆治理 module, architecture §8/§11) ----
 
