@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -42,6 +43,7 @@ class SecurityAgent(ABC):
         classification = self._normalize_classification(llm_result.get("classification", "insufficient_evidence"))
         confidence = self._normalize_confidence(llm_result.get("confidence", 0.3))
         explanation = self._explanation(llm_result)
+        explanation["verdict"] = self._format_verdict(explanation.get("verdict", ""), classification)
         summary = self._summary(event, classification, confidence, llm_result, explanation)
         actions = self._actions(event, classification, llm_result)
         return AgentResult(
@@ -196,6 +198,55 @@ class SecurityAgent(ABC):
             "suspicious": "【需人工复核】- 归一化证据不足以完全确认",
         }.get(classification, "【需人工复核】- 证据不足")
 
+    # 原始三类结论格式：【真实攻击/误报/需人工复核】- 原因
+    _VERDICT_TAGS = ("【真实攻击】", "【误报】", "【需人工复核】")
+
+    # 分维度 status 原始取值（与 prompt 中 analysis_dimensions.status 枚举一致，
+    # 对应 Dashboard 的 风险/正常/复核/信息 四类颜色）。
+    _DIMENSION_STATUSES = ("risk", "benign", "normal", "blocked", "review", "info")
+    _DIMENSION_STATUS_ALIASES = {
+        "malicious": "risk",
+        "high": "risk",
+        "allow": "normal",
+        "low": "normal",
+        "suspicious": "review",
+        "medium": "review",
+    }
+
+    def _normalize_dimension_status(self, status: Any) -> str:
+        """把维度 status 归一到原始枚举，保证 Dashboard 能匹配到颜色。
+        模型有时会输出 "PASSED"/"OK" 之类非约定值，这里映射回原始六类。"""
+        value = str(status or "").strip().lower()
+        if value in self._DIMENSION_STATUSES:
+            return value
+        return self._DIMENSION_STATUS_ALIASES.get(value, "info")
+
+    def _format_verdict(self, verdict: str, classification: str) -> str:
+        """把模型产出的 verdict 规范化为原始三类结论格式
+        【真实攻击/误报/需人工复核】- 原因。
+
+        本地小模型常把 verdict 填成 "high_risk" 之类的自由标签，这里在
+        不改 prompt 的前提下，按 classification 修正类别标签、保留模型的
+        原因描述，使研判结论回到统一的三类格式。
+        """
+        verdict = (verdict or "").strip()
+        for tag in self._VERDICT_TAGS:
+            if verdict.startswith(tag):
+                return verdict
+        if "真实攻击" in verdict or classification == "malicious":
+            tag = "【真实攻击】"
+        elif "误报" in verdict or classification == "benign":
+            tag = "【误报】"
+        else:
+            tag = "【需人工复核】"
+        detail = verdict
+        if detail:
+            detail = re.sub(r"^(真实攻击|误报|需人工复核|恶意|良性)[\s\-:：、，,]*", "", detail).strip()
+            detail = detail.strip("【】[]-—：:、，, ")
+        if not detail:
+            detail = self._verdict_from_classification(classification).split("】- ", 1)[-1].strip()
+        return f"{tag}- {detail}"
+
     def _fallback_confidence(self, classification: str, dimensions: list[dict[str, str]], severity: str) -> float:
         confidence = 0.65 + min(0.18, len(dimensions) * 0.03)
         if classification == "benign":
@@ -220,7 +271,7 @@ class SecurityAgent(ABC):
             normalized_dimensions.append(
                 {
                     "title": title or "未命名维度",
-                    "status": str(item.get("status") or "info"),
+                    "status": self._normalize_dimension_status(item.get("status")),
                     "evidence": evidence,
                 }
             )

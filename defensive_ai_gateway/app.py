@@ -117,6 +117,13 @@ class GatewayState:
             profile_id = str(payload.get("profile_id") or "auto-rasp-json").strip() or "auto-rasp-json"
             return self.log_adapter.infer_mapping_profile(log, profile_id)
 
+    def rasp_sample_log(self) -> dict:
+        """Return the canonical RASP vendor-format sample used by the Dashboard
+        日志自动适配 "加载示例" button. Sourced from samples_syslog/ so the UI
+        example stays in sync with the raw vendor-format samples."""
+        sample_path = Path(__file__).resolve().parent.parent / "samples_syslog" / "rasp" / "rasp_alert.json"
+        return json.loads(sample_path.read_text(encoding="utf-8"))
+
     def alert_from_payload(self, payload: dict, profile_id: str = "") -> RawAlert:
         selected_profile = profile_id or str(payload.get("profile_id") or payload.get("_profile_id") or "")
         if selected_profile:
@@ -251,6 +258,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/mapping-profiles":
             self._json(200, {"profiles": self.state.list_mapping_profiles()})
+            return
+        if parsed.path == "/api/samples/rasp-alert":
+            self._json(200, self.state.rasp_sample_log())
             return
         if parsed.path.startswith("/api/mapping-profiles/"):
             profile_id = parsed.path.rsplit("/", 1)[-1]

@@ -235,32 +235,12 @@ let inferredProfile = null;
 let inferredFields = [];
 let currentLanguage = "zh";
 let lastFieldMappingResult = null;
-const SAMPLE_RASP_LOG = {
-  metadata: { id: "real-rasp-001" },
-  device: { vendor: "bank-rasp", type: "runtime_app_protection" },
-  risk: { level: "高" },
-  time: "2026-06-25T10:00:00+08:00",
-  rule: { id: "RASP-SQL-GUARD-221", name: "SQL Injection Runtime Guard" },
-  host: { name: "pay-api-01" },
-  http: {
-    client_ip: "10.1.2.3",
-    uri: "/openbanking/v2/payments/search",
-    method: "POST",
-    request_id: "req-001",
-  },
-  app: { name: "mobile-payment-api" },
-  rasp: { action: "blocked_query_execution" },
-  sink: "JdbcTemplate.query",
-  taint: { source: "request.parameter.beneficiaryName" },
-  stacktrace:
-    "com.bank.PaymentSearchController.search(PaymentSearchController.java:88)\n" +
-    "com.bank.payment.service.PaymentSearchService.searchBeneficiary(PaymentSearchService.java:143)\n" +
-    "com.bank.payment.repository.BeneficiaryRepository.findByFilter(BeneficiaryRepository.java:211)\n" +
-    "org.springframework.jdbc.core.JdbcTemplate.query(JdbcTemplate.java:752)\n" +
-    "org.springframework.jdbc.core.JdbcTemplate.query(JdbcTemplate.java:779)\n" +
-    "com.bank.security.rasp.sql.SqlGuardHook.beforeQuery(SqlGuardHook.java:57)\n" +
-    "com.bank.security.rasp.taint.TaintTracker.assertUserInputReachedSink(TaintTracker.java:129)",
-};
+let sampleRaspLog = null;
+async function loadSampleRaspLog() {
+  if (sampleRaspLog) return sampleRaspLog;
+  sampleRaspLog = await json("/api/samples/rasp-alert");
+  return sampleRaspLog;
+}
 
 async function json(url, options) {
   const res = await fetch(url, options);
@@ -800,8 +780,8 @@ function selectProfile(profileId) {
   inferredProfile = profile;
   setProfileJson(profile);
   const sourceLog = document.querySelector("#source-log");
-  if (profile?.profile_id === "demo-rasp-json" && !sourceLog.value.trim()) {
-    sourceLog.value = JSON.stringify(SAMPLE_RASP_LOG, null, 2);
+  if (profile?.profile_id === "demo-rasp-json" && !sourceLog.value.trim() && sampleRaspLog) {
+    sourceLog.value = JSON.stringify(sampleRaspLog, null, 2);
   }
   renderProfileList();
 }
@@ -1027,8 +1007,12 @@ document.querySelector("#infer-form").addEventListener("submit", (event) => {
   inferMappingProfile(event).catch((err) => setProfileStatus(err.message || String(err), true));
 });
 document.querySelector("#load-sample-log").addEventListener("click", () => {
-  document.querySelector("#source-log").value = JSON.stringify(SAMPLE_RASP_LOG, null, 2);
-  setProfileStatus(tr("sampleLoaded"));
+  loadSampleRaspLog()
+    .then((sample) => {
+      document.querySelector("#source-log").value = JSON.stringify(sample, null, 2);
+      setProfileStatus(tr("sampleLoaded"));
+    })
+    .catch((err) => setProfileStatus(err.message || String(err), true));
 });
 document.querySelector("#save-inferred-profile").addEventListener("click", () => {
   saveCurrentProfile().catch((err) => setProfileStatus(err.message || String(err), true));
@@ -1054,4 +1038,6 @@ document.querySelectorAll(".nav-button").forEach((btn) => {
   });
 });
 
-Promise.all([loadCases(), loadLlmConfig(), loadMappingProfiles()]).catch((err) => showToast(err.message || String(err), "error"));
+Promise.all([loadSampleRaspLog(), loadCases(), loadLlmConfig(), loadMappingProfiles()]).catch((err) =>
+  showToast(err.message || String(err), "error"),
+);

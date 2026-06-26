@@ -18,7 +18,11 @@ data:
     address = "0.0.0.0:1514"
     mode = "tcp"
 
-    [transforms.to_gateway_alert]
+    # 1) 来源识别 + 按已保存的 mapping profile 分类。
+    #    识别优先级：syslog appname 标签（运维侧给每类设备打的标签）> 日志内容指纹。
+    #    识别到 product 后映射到 Dashboard「日志自动适配」中已保存的 profile_id；
+    #    gateway_profile 为空表示未配置 profile，走下方 standard 路径（collector 侧归一化）。
+    [transforms.classify_source]
     type = "remap"
     inputs = ["syslog_udp", "syslog_tcp"]
     source = '''
@@ -28,6 +32,71 @@ data:
       structured = {}
     }
 
+    appname = downcase(to_string(.appname) ?? "")
+    product = downcase(to_string(structured.product) ?? to_string(structured.event.product) ?? "")
+
+    # cloudrasp 原生 RASP 指纹：data_type=attack_event
+    if product == "" && to_string(structured.data_type) == "attack_event" {
+      product = "rasp"
+    }
+    # appname 标签兜底（运维侧把设备 syslog appname 设为 rasp/waf/hips/ndr/siem）
+    if product == "" && (appname == "rasp" || appname == "waf" || appname == "hips" || appname == "ndr" || appname == "siem") {
+      product = appname
+    }
+
+    # product → 已保存的 profile_id。RASP 默认复用内置 demo-rasp-json（开箱即用）。
+    # 其它产品需先在 Dashboard 保存对应 profile，再取消注释相应分支；
+    # 未取消注释的产品会落入 standard 路径，由 collector 侧归一化，不会被丢弃。
+    gateway_profile = ""
+    if product == "rasp" {
+      gateway_profile = "demo-rasp-json"
+    }
+    # else if product == "waf" { gateway_profile = "waf-syslog-json" }
+    # else if product == "hips" { gateway_profile = "hips-syslog-json" }
+    # else if product == "ndr" { gateway_profile = "ndr-syslog-json" }
+    # else if product == "siem" { gateway_profile = "siem-syslog-json" }
+
+    .structured = structured
+    .raw = raw
+    .appname = appname
+    .product = product
+    .gateway_profile = gateway_profile
+    '''
+
+    # 2) 路由分流：有 profile 的走网关 profile 解析；其余走 collector 侧归一化。
+    [transforms.route_by_profile]
+    type = "route"
+    inputs = ["classify_source"]
+    route.profiled = '.gateway_profile != ""'
+    route.standard = '.gateway_profile == ""'
+
+    # 3a) profiled：透传原始结构化日志 {"log": ...}，URI 用 ?profile=<id> 指定网关侧 profile。
+    #     网关 alert_from_payload 检测到 profile_id 后只读取 body 中的 "log" 字段做语义映射。
+    [transforms.shape_profiled]
+    type = "remap"
+    inputs = ["route_by_profile.profiled"]
+    source = '''
+    . = {
+      "log": .structured,
+      "_gateway_profile": .gateway_profile
+    }
+    '''
+
+    [sinks.gateway_profiled]
+    type = "http"
+    inputs = ["shape_profiled"]
+    uri = "http://defensive-ai-gateway:8080/api/alerts?profile={{ _gateway_profile }}"
+    method = "post"
+    request.headers.Content-Type = "application/json"
+    encoding.codec = "json"
+
+    # 3b) standard：未配置 profile 的来源，由 collector 归一化为标准告警 JSON 后直送网关。
+    [transforms.shape_standard]
+    type = "remap"
+    inputs = ["route_by_profile.standard"]
+    source = '''
+    structured = .structured
+    raw = .raw
     message_text = to_string(.message) ?? ""
     host_text = to_string(.hostname) ?? ""
     source_name = to_string(.appname) ?? host_text
@@ -35,7 +104,7 @@ data:
       source_name = "syslog"
     }
 
-    product = downcase(to_string(structured.product) ?? to_string(structured.event.product) ?? "siem")
+    product = .product
     if product != "hips" && product != "rasp" && product != "ndr" && product != "waf" && product != "siem" {
       product = "siem"
     }
@@ -77,9 +146,9 @@ data:
     }
     '''
 
-    [sinks.gateway_http]
+    [sinks.gateway_standard]
     type = "http"
-    inputs = ["to_gateway_alert"]
+    inputs = ["shape_standard"]
     uri = "http://defensive-ai-gateway:8080/api/alerts"
     method = "post"
     request.headers.Content-Type = "application/json"
