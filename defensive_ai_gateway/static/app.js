@@ -110,6 +110,10 @@ const STRINGS = {
     configLoadedWithKey: "已加载配置，API Key 当前已设置。",
     configLoadedNoKey: "已加载配置，API Key 当前未设置。",
     configSaved: "保存成功：{provider} / {model}",
+    loadModels: "拉取本地模型",
+    modelsLoaded: "已从 {endpoint} 拉取 {count} 个本地模型，可在 Model 下拉中选择。",
+    modelsEmpty: "未在 {endpoint} 发现任何模型，请确认 Ollama 已启动。",
+    modelsLoadFailed: "拉取模型失败：{error}",
     sampleLoaded: "已加载 RASP 示例日志。",
     dryRunError: "Dry-run 失败：{message}",
     fieldRequired: "必填",
@@ -223,6 +227,10 @@ const STRINGS = {
     configLoadedWithKey: "Configuration loaded. API Key is currently set.",
     configLoadedNoKey: "Configuration loaded. API Key is not set.",
     configSaved: "Saved: {provider} / {model}",
+    loadModels: "Fetch local models",
+    modelsLoaded: "Loaded {count} local model(s) from {endpoint}; pick one from the Model dropdown.",
+    modelsEmpty: "No models found at {endpoint}. Is Ollama running?",
+    modelsLoadFailed: "Failed to load models: {error}",
     sampleLoaded: "Loaded RASP sample log.",
     dryRunError: "Dry-run failed: {message}",
     fieldRequired: "Required",
@@ -947,6 +955,30 @@ async function loadLlmConfig() {
   document.querySelector("#llm-api-key-env").value = cfg.api_key_env || "DEFENSIVE_AI_LLM_API_KEY";
   document.querySelector("#llm-timeout").value = cfg.timeout_seconds || 30;
   setConfigStatus(cfg.api_key_set ? tr("configLoadedWithKey") : tr("configLoadedNoKey"));
+  if ((cfg.provider || "local") === "ollama") {
+    loadOllamaModels().catch((err) => setConfigStatus(err.message || String(err), true));
+  }
+}
+
+async function loadOllamaModels() {
+  const datalist = document.querySelector("#ollama-models");
+  const result = await json("/api/config/llm/models");
+  const models = Array.isArray(result.models) ? result.models : [];
+  const current = document.querySelector("#llm-model").value;
+  datalist.innerHTML = models.map((name) => `<option value="${escapeHtml(name)}"></option>`).join("");
+  if (!result.ok) {
+    setConfigStatus(tr("modelsLoadFailed", { error: result.error || "unknown" }), true);
+    return models;
+  }
+  if (models.length === 0) {
+    setConfigStatus(tr("modelsEmpty", { endpoint: result.endpoint || "" }));
+  } else {
+    setConfigStatus(tr("modelsLoaded", { count: models.length, endpoint: result.endpoint || "" }));
+  }
+  if (current && !models.includes(current)) {
+    datalist.innerHTML += `<option value="${escapeHtml(current)}"></option>`;
+  }
+  return models;
 }
 
 async function saveLlmConfig(event) {
@@ -999,6 +1031,17 @@ document.querySelector("#llm-form").addEventListener("submit", (event) => {
 });
 document.querySelector("#reload-llm-config").addEventListener("click", () => {
   loadLlmConfig().catch((err) => setConfigStatus(err.message || String(err), true));
+});
+document.querySelector("#load-llm-models").addEventListener("click", () => {
+  loadOllamaModels().catch((err) => setConfigStatus(err.message || String(err), true));
+});
+document.querySelector("#llm-provider").addEventListener("change", () => {
+  const provider = document.querySelector("#llm-provider").value;
+  if (provider === "ollama") {
+    loadOllamaModels().catch((err) => setConfigStatus(err.message || String(err), true));
+  } else {
+    document.querySelector("#ollama-models").innerHTML = "";
+  }
 });
 document.querySelector("#profile-form").addEventListener("submit", (event) => {
   saveMappingProfile(event).catch((err) => setProfileStatus(err.message || String(err), true));
