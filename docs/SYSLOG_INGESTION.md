@@ -56,27 +56,21 @@ kubectl apply -f deploy/k3s/syslog-collector-vector.yaml
 
 ## 产品原生 JSON 与 Mapping Profile
 
-如果某个安全产品把原生 JSON 放在 syslog message 中，并且你希望复用 Dashboard 里的 Mapping Profile，可以把 Vector sink 改为：
+如果某个安全产品把原生 JSON 放在 syslog message 中，并且你希望复用 Dashboard 里的 Mapping Profile，部署清单 `deploy/k3s/syslog-collector-vector.yaml` 已经内置按来源自动分类：
 
-```toml
-uri = "http://defensive-ai-gateway:8080/api/alerts?profile=demo-rasp-json"
-```
+1. `classify_source` 识别来源 product（优先 syslog `appname` 标签，其次日志内容指纹，例如 cloudrasp 的 `data_type=attack_event` → `rasp`）。
+2. 把 product 映射到 Dashboard 中已保存的 profile_id，写入 `gateway_profile`。
+3. `route_by_profile` 分流：
+   - `profiled`（有 profile）→ 透传 `{"log": structured}`，sink URI `?profile={{ _gateway_profile }}`，由网关侧 profile 做字段语义映射。
+   - `standard`（未配置 profile）→ collector 侧归一化为标准告警 JSON 直送 `/api/alerts`，不会被丢弃。
 
-并把 remap 的最终输出改成：
+默认仅 RASP 路由到内置 `demo-rasp-json`（开箱即用）。为其它产品启用 profile 路由的步骤：
 
-```text
-. = { "log": structured }
-```
+1. 在 Dashboard「日志自动适配」中用脱敏样本 infer + dry-run，确认字段映射后「保存模板」，profile_id 建议命名为 `waf-syslog-json` / `hips-syslog-json` / `ndr-syslog-json` / `siem-syslog-json`。
+2. 编辑 `deploy/k3s/syslog-collector-vector.yaml` 中 `classify_source` 的 product → profile_id 映射，取消注释对应分支（或改为已保存的 profile_id）。
+3. `kubectl apply -f deploy/k3s/syslog-collector-vector.yaml` 滚动更新 collector。
 
-生产环境建议为每类设备保存独立 profile，例如：
-
-- `waf-syslog-json`
-- `rasp-syslog-json`
-- `hips-syslog-json`
-- `ndr-syslog-json`
-- `siem-syslog-json`
-
-这样 collector 负责协议接入，网关的 Mapping Profile 负责字段语义映射。
+注意：profile_id 必须与 Dashboard 已保存的 profile 一致，否则网关返回 400、该来源告警会被 collector 记为失败。未启用 profile 的来源会安全回落到 `standard` 路径。
 
 ## 运维注意事项
 

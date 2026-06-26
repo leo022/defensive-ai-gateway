@@ -6,8 +6,8 @@ database:
 llm:
   provider: "ollama"
   endpoint: "http://127.0.0.1:11434/api/generate"
-  model: "gemma3:4b"
-  timeout_seconds: 120
+  model: "deepseek-r1:7b"
+  timeout_seconds: 300
 policy:
   mode: "read_only"
   max_prompt_chars: 12000

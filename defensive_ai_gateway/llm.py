@@ -382,6 +382,61 @@ class GatewayLLM(LLMClient):
             return json.loads(resp.read().decode("utf-8"))
 
 
+# JSON Schema for Ollama structured outputs. Mirrors the result contract that
+# SecurityAgent._build_prompt asks for, so local models are grammar-constrained
+# into the exact fields instead of free-form (or wrong-schema) JSON.
+OLLAMA_ANALYSIS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "classification": {
+            "type": "string",
+            "enum": ["malicious", "suspicious", "benign", "insufficient_evidence"],
+        },
+        "confidence": {"type": "number"},
+        "verdict": {"type": "string"},
+        "reason": {"type": "string"},
+        "analysis_dimensions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "status": {
+                        "type": "string",
+                        "enum": ["risk", "benign", "normal", "blocked", "review", "info"],
+                    },
+                    "evidence": {"type": "string"},
+                },
+                "required": ["title", "status", "evidence"],
+            },
+        },
+        "whitelist_recommendation": {
+            "type": "object",
+            "properties": {
+                "rule_type": {"type": "string"},
+                "detection_content": {"type": "string"},
+                "match_method": {"type": "string"},
+                "reason": {"type": "string"},
+            },
+        },
+        "recommended_next_steps": {"type": "array", "items": {"type": "string"}},
+        "missing_evidence": {"type": "array", "items": {"type": "string"}},
+        "attack_stage": {"type": "array", "items": {"type": "string"}},
+        "business_impact": {"type": "string"},
+    },
+    "required": [
+        "classification",
+        "confidence",
+        "verdict",
+        "reason",
+        "analysis_dimensions",
+        "business_impact",
+        "missing_evidence",
+        "recommended_next_steps",
+    ],
+}
+
+
 class OllamaLLM(LLMClient):
     """Adapter for local Ollama models such as gemma3:4b."""
 
@@ -406,7 +461,11 @@ class OllamaLLM(LLMClient):
             "model": model,
             "prompt": prompt,
             "stream": False,
-            "format": "json",
+            # 结构化输出：用 JSON Schema 约束模型必须产出 Agent 约定的字段。
+            # 仅靠 format:"json" 时，reasoning 模型（如 deepseek-r1）的 <think> 被
+            # 语法约束抑制，容易原样回吐输入字段或产出错误 schema；显式 schema 可
+            # 强制字段名与枚举值，显著提升本地小模型的字段遵循率。
+            "format": OLLAMA_ANALYSIS_SCHEMA,
             "options": {
                 "temperature": 0.1,
                 "top_p": 0.9,
@@ -430,6 +489,9 @@ class OllamaLLM(LLMClient):
 def _parse_json_object(text: str) -> dict[str, Any]:
     if not text:
         return {"classification": "insufficient_evidence", "confidence": 0.2, "reason": "模型返回为空。"}
+    # Reasoning models (e.g. deepseek-r1) may wrap chain-of-thought in
+    # <think>...</think>; strip it so we parse only the final answer.
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
     try:
         return json.loads(text)
     except json.JSONDecodeError:
