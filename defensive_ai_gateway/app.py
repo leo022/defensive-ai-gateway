@@ -4,6 +4,8 @@ import argparse
 import json
 import mimetypes
 import threading
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
@@ -49,6 +51,19 @@ def _build_raw_alert(payload: dict, product: str) -> RawAlert:
     if not alert.alert_id:
         alert.alert_id = new_id("alert")
     return alert
+
+
+def _ollama_tags_url(endpoint: str) -> str:
+    """Derive the Ollama ``/api/tags`` URL from a configured generate endpoint."""
+    endpoint = (endpoint or "").strip()
+    if not endpoint:
+        return "http://127.0.0.1:11434/api/tags"
+    if endpoint.endswith("/api/generate"):
+        return endpoint[: -len("/api/generate")] + "/api/tags"
+    parsed = urlparse(endpoint)
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}/api/tags"
+    return "http://127.0.0.1:11434/api/tags"
 
 
 class GatewayState:
@@ -100,6 +115,50 @@ class GatewayState:
             self.llm = build_llm(updated)
             self.orchestrator = Orchestrator(self.repo, self.normalizer, self.memory, self.llm, self.policy)
             return self.llm_config_payload()
+
+    def list_ollama_models(self) -> dict:
+        """List models available in the local Ollama instance.
+
+        Derives the Ollama ``/api/tags`` URL from the configured LLM endpoint
+        so the dashboard can offer a model picker instead of a free-text field.
+        """
+        with self.lock:
+            llm = self.config.llm
+            provider = llm.provider
+            endpoint = llm.endpoint
+        tags_url = _ollama_tags_url(endpoint)
+        if provider != "ollama":
+            return {
+                "ok": False,
+                "provider": provider,
+                "endpoint": tags_url,
+                "models": [],
+                "error": "provider is not ollama",
+            }
+        try:
+            req = urllib.request.Request(tags_url, headers={"Accept": "application/json"}, method="GET")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            models: list[str] = []
+            for item in data.get("models", []) or []:
+                name = item.get("name") or item.get("model")
+                if name:
+                    models.append(str(name))
+            return {
+                "ok": True,
+                "provider": provider,
+                "endpoint": tags_url,
+                "models": sorted(models),
+                "error": "",
+            }
+        except Exception as exc:  # noqa: BLE001 - surfaced to the operator via UI
+            return {
+                "ok": False,
+                "provider": provider,
+                "endpoint": tags_url,
+                "models": [],
+                "error": str(exc),
+            }
 
     # ---- log mapping profiles ----------------------------------------------
 
@@ -309,6 +368,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/config/llm":
             self._json(200, self.state.llm_config_payload())
+            return
+        if parsed.path == "/api/config/llm/models":
+            self._json(200, self.state.list_ollama_models())
             return
         if parsed.path == "/api/mapping-profiles":
             self._json(200, {"profiles": self.state.list_mapping_profiles()})

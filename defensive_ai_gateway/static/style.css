@@ -689,6 +689,31 @@ h4 {
   opacity: 1;
 }
 
+.model-picker {
+  display: flex;
+  gap: 8px;
+}
+
+.model-picker input {
+  flex: 1 1 auto;
+}
+
+.model-picker button {
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 10px 14px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.model-picker button:hover {
+  border-color: var(--accent, #3b82f6);
+}
+
 .adapter-grid {
   display: grid;
   grid-template-columns: minmax(360px, 0.92fr) minmax(420px, 1.08fr);

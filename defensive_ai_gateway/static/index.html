@@ -67,7 +67,11 @@
             </label>
             <label>
               <span>Model</span>
-              <input id="llm-model" name="model" type="text" placeholder="gemma3:4b" />
+              <div class="model-picker">
+                <input id="llm-model" name="model" type="text" list="ollama-models" placeholder="gemma3:4b" />
+                <button type="button" id="load-llm-models" data-i18n="loadModels">拉取本地模型</button>
+              </div>
+              <datalist id="ollama-models"></datalist>
             </label>
             <label>
               <span>API Key</span>
