@@ -8,7 +8,7 @@ from pathlib import Path
 from defensive_ai_gateway.app import GatewayState
 from defensive_ai_gateway.config import GatewayConfig
 from defensive_ai_gateway.database import Repository
-from defensive_ai_gateway.log_adapter import LogAdapter, demo_rasp_profile
+from defensive_ai_gateway.log_adapter import LogAdapter, demo_rasp_profile, mapping_profile_record
 from defensive_ai_gateway.llm import GatewayLLM, LocalHeuristicLLM
 from defensive_ai_gateway.memory import MemoryManager
 from defensive_ai_gateway.models import RawAlert
@@ -371,6 +371,67 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(result.classification, "benign")
             self.assertIn("误报", result.explanation["verdict"])
             self.assertTrue(any(item.get("title") == "历史误报" for item in result.explanation.get("dimensions", [])))
+
+
+class AlertProductRoutingTest(unittest.TestCase):
+    """Raw vendor-format logs without ?profile= must not silently default to siem."""
+
+    def _state(self, tmp) -> GatewayState:
+        config = GatewayConfig()
+        config.database.path = str(Path(tmp) / "gateway.db")
+        return GatewayState(config)
+
+    def _cloudrasp_log(self) -> dict:
+        path = Path(__file__).parent.parent / "samples_syslog" / "rasp" / "rasp_alert.json"
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def test_raw_cloudrasp_log_without_profile_detected_as_rasp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._state(tmp)
+            alert = state.alert_from_payload(self._cloudrasp_log())
+            self.assertEqual(alert.product, "rasp")  # not "siem"
+            # no auto-rasp-json registered in temp DB -> shallow build, no adapter
+            self.assertNotIn("adapter", alert.payload)
+
+    def test_raw_vendor_log_auto_applies_registered_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._state(tmp)
+            # register auto-rasp-json profile (reuse demo mappings, which cover cloudcrasp)
+            profile = demo_rasp_profile()
+            profile.profile_id = "auto-rasp-json"
+            state.repo.save_mapping_profile(mapping_profile_record(profile))
+
+            alert = state.alert_from_payload(self._cloudrasp_log())
+            self.assertEqual(alert.product, "rasp")
+            self.assertEqual(alert.payload["adapter"]["profile_id"], "auto-rasp-json")
+            entities = alert.payload["mapped_entities"]
+            self.assertEqual(entities["rule"], "cloudrasp_jndi_108")
+            self.assertEqual(entities["src_ip"], "10.0.10.132")
+
+    def test_unrecognizable_log_without_profile_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._state(tmp)
+            with self.assertRaisesRegex(ValueError, "无法识别"):
+                state.alert_from_payload({"foo": "bar", "nested": {"x": 1}})
+
+    def test_standard_alert_without_product_defaults_to_siem(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._state(tmp)
+            alert = state.alert_from_payload({"event_type": "scan", "severity": "high"})
+            self.assertEqual(alert.product, "siem")
+
+    def test_standard_alert_with_explicit_product_is_not_auto_profiled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._state(tmp)
+            # register an auto profile for rasp to prove it is NOT used for explicit products
+            profile = demo_rasp_profile()
+            profile.profile_id = "auto-rasp-json"
+            state.repo.save_mapping_profile(mapping_profile_record(profile))
+            alert = state.alert_from_payload(
+                {"product": "waf", "event_type": "sqli", "severity": "high", "payload": {"uri": "/x"}}
+            )
+            self.assertEqual(alert.product, "waf")
+            self.assertNotIn("adapter", alert.payload)
 
 
 if __name__ == "__main__":

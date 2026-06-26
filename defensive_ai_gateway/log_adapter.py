@@ -11,6 +11,37 @@ from .normalizer import EventNormalizer
 
 SUPPORTED_PRODUCTS = {"hips", "rasp", "ndr", "waf", "siem"}
 DEFAULT_REQUIRED_FIELDS = ["alert_id", "product", "event_type", "severity", "timestamp"]
+
+# product → 默认自动套用的 mapping profile_id。仅对“无显式 product 字段、靠内容
+# 指纹识别到的厂商原生日志”生效（显式带 product 的标准告警走快速路径，不会触发）。
+# 新增产品接入并保存对应 profile 后，在此注册。与 deploy/k3s/syslog-collector-vector.yaml
+# 中 classify_source 的 product→gateway_profile 映射保持同源。
+AUTO_PROFILE: dict[str, str] = {"rasp": "auto-rasp-json"}
+
+
+def explicit_product(payload: dict[str, Any]) -> str | None:
+    """Return the product if the payload carries an explicit, supported product field."""
+    raw = payload.get("product")
+    if raw is None:
+        event = payload.get("event")
+        if isinstance(event, dict):
+            raw = event.get("product")
+    product = str(raw or "").strip().lower()
+    return product if product in SUPPORTED_PRODUCTS else None
+
+
+def fingerprint_product(payload: dict[str, Any]) -> str | None:
+    """Infer product from content fingerprints when no explicit product field exists.
+
+    Kept in sync with the Vector ``classify_source`` remap in
+    ``deploy/k3s/syslog-collector-vector.yaml`` so the HTTP path and the syslog
+    path agree on vendor-log identification.
+    """
+    # cloudrasp 原生 RASP 指纹：data_type=attack_event + items[] 告警条目
+    if str(payload.get("data_type")) == "attack_event" and isinstance(payload.get("items"), list):
+        return "rasp"
+    return None
+
 DEFAULT_REQUIRED_FIELD_HINTS = {
     "alert_id": "映射到 RASP 日志中的唯一告警 ID，例如 $.metadata.id、$.alert.id 或 $.id。",
     "product": "映射到产品类型，RASP 接入可使用 {\"literal\": \"rasp\"}。",
