@@ -110,6 +110,8 @@ const STRINGS = {
     configLoadedWithKey: "已加载配置，API Key 当前已设置。",
     configLoadedNoKey: "已加载配置，API Key 当前未设置。",
     configSaved: "保存成功：{provider} / {model}",
+    configRestored: "已恢复为配置文件与环境变量的默认 LLM 配置（如启动时的 local）。",
+    restoreDefaults: "恢复默认配置",
     loadModels: "拉取本地模型",
     modelsLoaded: "已从 {endpoint} 拉取 {count} 个本地模型，可在 Model 下拉中选择。",
     modelsEmpty: "未在 {endpoint} 发现任何模型，请确认 Ollama 已启动。",
@@ -227,6 +229,8 @@ const STRINGS = {
     configLoadedWithKey: "Configuration loaded. API Key is currently set.",
     configLoadedNoKey: "Configuration loaded. API Key is not set.",
     configSaved: "Saved: {provider} / {model}",
+    configRestored: "Restored the default LLM config from the config file and environment (e.g. startup local).",
+    restoreDefaults: "Restore defaults",
     loadModels: "Fetch local models",
     modelsLoaded: "Loaded {count} local model(s) from {endpoint}; pick one from the Model dropdown.",
     modelsEmpty: "No models found at {endpoint}. Is Ollama running?",
@@ -947,22 +951,66 @@ async function runDryRun(event) {
 
 async function loadLlmConfig() {
   const cfg = await json("/api/config/llm");
-  document.querySelector("#llm-provider").value = cfg.provider || "local";
-  document.querySelector("#llm-endpoint").value = cfg.endpoint || "";
-  document.querySelector("#llm-model").value = cfg.model || "";
-  document.querySelector("#llm-api-key").value = "";
-  document.querySelector("#llm-api-key").placeholder = cfg.api_key_set ? tr("keySetKeep") : tr("keyUnset");
-  document.querySelector("#llm-api-key-env").value = cfg.api_key_env || "DEFENSIVE_AI_LLM_API_KEY";
-  document.querySelector("#llm-timeout").value = cfg.timeout_seconds || 30;
+  populateLlmForm(cfg);
   setConfigStatus(cfg.api_key_set ? tr("configLoadedWithKey") : tr("configLoadedNoKey"));
   if ((cfg.provider || "local") === "ollama") {
     loadOllamaModels().catch((err) => setConfigStatus(err.message || String(err), true));
   }
 }
 
+function populateLlmForm(cfg) {
+  document.querySelector("#llm-provider").value = cfg.provider || "local";
+  document.querySelector("#llm-endpoint").value = cfg.endpoint || "";
+  // local provider ignores the model field; force the canonical value so the
+  // form always reflects the real "local" configuration instead of stale
+  // model names left over from a previous ollama session.
+  document.querySelector("#llm-model").value =
+    (cfg.provider || "local") === "local" ? "local-rule-analyst" : cfg.model || "";
+  document.querySelector("#llm-api-key").value = "";
+  document.querySelector("#llm-api-key").placeholder = cfg.api_key_set ? tr("keySetKeep") : tr("keyUnset");
+  document.querySelector("#llm-api-key-env").value = cfg.api_key_env || "DEFENSIVE_AI_LLM_API_KEY";
+  document.querySelector("#llm-timeout").value = cfg.timeout_seconds || 30;
+}
+
+function applyProviderDefaults(provider) {
+  const endpoint = document.querySelector("#llm-endpoint");
+  const timeout = document.querySelector("#llm-timeout");
+  if (provider === "local") {
+    document.querySelector("#llm-model").value = "local-rule-analyst";
+    timeout.value = 30;
+    document.querySelector("#ollama-models").innerHTML = "";
+  } else if (provider === "ollama") {
+    if (!endpoint.value.trim()) endpoint.value = "http://127.0.0.1:11434/api/generate";
+    if (!timeout.value || Number(timeout.value) < 60) timeout.value = 300;
+    loadOllamaModels().catch((err) => setConfigStatus(err.message || String(err), true));
+  } else if (provider === "gateway") {
+    if (!timeout.value || Number(timeout.value) < 60) timeout.value = 120;
+    document.querySelector("#ollama-models").innerHTML = "";
+  }
+}
+
+async function restoreLlmDefaults() {
+  const result = await json("/api/config/llm/reload", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+  populateLlmForm(result.llm);
+  document.querySelector("#llm-api-key").placeholder = result.llm.api_key_set ? tr("keySetKeep") : tr("keyUnset");
+  setConfigStatus(tr("configRestored"));
+  if ((result.llm.provider || "local") === "ollama") {
+    loadOllamaModels().catch((err) => setConfigStatus(err.message || String(err), true));
+  }
+}
+
 async function loadOllamaModels() {
   const datalist = document.querySelector("#ollama-models");
-  const result = await json("/api/config/llm/models");
+  // Pass the endpoint currently typed in the form so the picker works before
+  // the configuration is saved (the backend no longer gates on the saved
+  // provider).
+  const endpoint = document.querySelector("#llm-endpoint").value.trim();
+  const qs = endpoint ? `?endpoint=${encodeURIComponent(endpoint)}` : "";
+  const result = await json(`/api/config/llm/models${qs}`);
   const models = Array.isArray(result.models) ? result.models : [];
   const current = document.querySelector("#llm-model").value;
   datalist.innerHTML = models.map((name) => `<option value="${escapeHtml(name)}"></option>`).join("");
@@ -997,7 +1045,7 @@ async function saveLlmConfig(event) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-  document.querySelector("#llm-api-key").value = "";
+  populateLlmForm(result.llm);
   document.querySelector("#llm-api-key").placeholder = result.llm.api_key_set ? tr("keySetKeep") : tr("keyUnset");
   setConfigStatus(tr("configSaved", { provider: result.llm.provider, model: result.llm.model }));
 }
@@ -1032,15 +1080,18 @@ document.querySelector("#llm-form").addEventListener("submit", (event) => {
 document.querySelector("#reload-llm-config").addEventListener("click", () => {
   loadLlmConfig().catch((err) => setConfigStatus(err.message || String(err), true));
 });
+document.querySelector("#restore-llm-defaults").addEventListener("click", () => {
+  restoreLlmDefaults().catch((err) => setConfigStatus(err.message || String(err), true));
+});
 document.querySelector("#load-llm-models").addEventListener("click", () => {
   loadOllamaModels().catch((err) => setConfigStatus(err.message || String(err), true));
 });
 document.querySelector("#llm-provider").addEventListener("change", () => {
-  const provider = document.querySelector("#llm-provider").value;
-  if (provider === "ollama") {
+  applyProviderDefaults(document.querySelector("#llm-provider").value);
+});
+document.querySelector("#llm-endpoint").addEventListener("change", () => {
+  if (document.querySelector("#llm-provider").value === "ollama") {
     loadOllamaModels().catch((err) => setConfigStatus(err.message || String(err), true));
-  } else {
-    document.querySelector("#ollama-models").innerHTML = "";
   }
 });
 document.querySelector("#profile-form").addEventListener("submit", (event) => {

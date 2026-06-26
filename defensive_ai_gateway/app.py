@@ -67,8 +67,9 @@ def _ollama_tags_url(endpoint: str) -> str:
 
 
 class GatewayState:
-    def __init__(self, config: GatewayConfig):
+    def __init__(self, config: GatewayConfig, config_path: str = ""):
         self.config = config
+        self.config_path = config_path
         self.lock = threading.RLock()
         self.repo = Repository(config.database.path)
         self.policy = PolicyEngine(config.policy)
@@ -116,25 +117,20 @@ class GatewayState:
             self.orchestrator = Orchestrator(self.repo, self.normalizer, self.memory, self.llm, self.policy)
             return self.llm_config_payload()
 
-    def list_ollama_models(self) -> dict:
+    def list_ollama_models(self, endpoint_override: str = "") -> dict:
         """List models available in the local Ollama instance.
 
-        Derives the Ollama ``/api/tags`` URL from the configured LLM endpoint
-        so the dashboard can offer a model picker instead of a free-text field.
+        Derives the Ollama ``/api/tags`` URL from ``endpoint_override`` (the
+        value currently typed in the dashboard form) when provided, otherwise
+        from the configured LLM endpoint. Decoupling from the saved provider
+        lets the picker work as soon as the operator selects ``ollama`` and
+        enters an endpoint, before the configuration is saved.
         """
         with self.lock:
             llm = self.config.llm
             provider = llm.provider
-            endpoint = llm.endpoint
+            endpoint = (endpoint_override or llm.endpoint).strip()
         tags_url = _ollama_tags_url(endpoint)
-        if provider != "ollama":
-            return {
-                "ok": False,
-                "provider": provider,
-                "endpoint": tags_url,
-                "models": [],
-                "error": "provider is not ollama",
-            }
         try:
             req = urllib.request.Request(tags_url, headers={"Accept": "application/json"}, method="GET")
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -159,6 +155,22 @@ class GatewayState:
                 "models": [],
                 "error": str(exc),
             }
+
+    def reload_llm_defaults(self) -> dict:
+        """Reload the LLM configuration from the config file + environment.
+
+        This reverts any in-memory runtime overrides applied via
+        ``update_llm_config`` (e.g. an operator switching to ``ollama`` for a
+        live test), restoring the startup defaults such as ``local``.
+        """
+        with self.lock:
+            if not self.config_path:
+                return self.llm_config_payload()
+            config = load_config(self.config_path)
+            self.config = config
+            self.llm = build_llm(config.llm)
+            self.orchestrator = Orchestrator(self.repo, self.normalizer, self.memory, self.llm, self.policy)
+            return self.llm_config_payload()
 
     # ---- log mapping profiles ----------------------------------------------
 
@@ -370,7 +382,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._json(200, self.state.llm_config_payload())
             return
         if parsed.path == "/api/config/llm/models":
-            self._json(200, self.state.list_ollama_models())
+            endpoint = parse_qs(parsed.query).get("endpoint", [""])[0]
+            self._json(200, self.state.list_ollama_models(endpoint))
             return
         if parsed.path == "/api/mapping-profiles":
             self._json(200, {"profiles": self.state.list_mapping_profiles()})
@@ -423,6 +436,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
             try:
                 updated = self.state.update_llm_config(self._read_json())
                 self._json(200, {"ok": True, "llm": updated})
+            except Exception as exc:
+                self._json(400, {"error": str(exc)})
+            return
+        if parsed.path == "/api/config/llm/reload":
+            try:
+                reloaded = self.state.reload_llm_defaults()
+                self._json(200, {"ok": True, "llm": reloaded})
             except Exception as exc:
                 self._json(400, {"error": str(exc)})
             return
@@ -512,8 +532,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         print(f"[gateway] {self.address_string()} {fmt % args}")
 
 
-def build_server(config: GatewayConfig) -> ThreadingHTTPServer:
-    GatewayHandler.state = GatewayState(config)
+def build_server(config: GatewayConfig, config_path: str = "") -> ThreadingHTTPServer:
+    GatewayHandler.state = GatewayState(config, config_path=config_path)
     return ThreadingHTTPServer((config.server.host, config.server.port), GatewayHandler)
 
 
@@ -522,6 +542,6 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--config", default="config/dev.yaml")
     args = parser.parse_args(argv)
     config = load_config(args.config)
-    server = build_server(config)
+    server = build_server(config, config_path=args.config)
     print(f"Defensive AI Gateway listening on http://{config.server.host}:{config.server.port}")
     server.serve_forever()

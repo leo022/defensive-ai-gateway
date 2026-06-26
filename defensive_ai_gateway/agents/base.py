@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from abc import ABC, abstractmethod
 from typing import Any
@@ -106,16 +107,29 @@ class SecurityAgent(ABC):
 
     def _ensure_explainable_result(self, llm_result: dict[str, Any], event: NormalizedEvent) -> dict[str, Any]:
         explanation = self._explanation(llm_result)
-        if explanation.get("verdict") and explanation.get("dimensions"):
+        llm_verdict = explanation.get("verdict", "")
+        llm_dims = explanation.get("dimensions", [])
+        classification = self._normalize_classification(llm_result.get("classification", "insufficient_evidence"))
+
+        # The heuristic analyzer is deterministic and already reconciles sample
+        # evidence + memory itself; only fill missing fields (original behavior).
+        # Model-backed LLMs (ollama/gateway) are reconciled for consistency and
+        # grounded against structured sample evidence where available.
+        if not getattr(self.llm, "is_deterministic", False):
+            return self._reconcile_model_result(
+                llm_result, event, explanation, classification, llm_verdict, llm_dims
+            )
+
+        if llm_verdict and llm_dims:
             return llm_result
         fallback = self._fallback_from_evidence(event)
         if not fallback:
             return llm_result
         merged = dict(llm_result)
         merged.setdefault("reason", fallback["reason"])
-        if not explanation.get("verdict"):
+        if not llm_verdict:
             merged["verdict"] = fallback["verdict"]
-        if not explanation.get("dimensions"):
+        if not llm_dims:
             merged["analysis_dimensions"] = fallback["analysis_dimensions"]
         if not merged.get("whitelist_recommendation") and fallback.get("whitelist_recommendation"):
             merged["whitelist_recommendation"] = fallback["whitelist_recommendation"]
@@ -128,6 +142,173 @@ class SecurityAgent(ABC):
             merged["classification"] = fallback["classification"]
             merged["confidence"] = max(self._normalize_confidence(merged.get("confidence", 0.0)), fallback["confidence"])
         return merged
+
+    def _reconcile_model_result(
+        self,
+        llm_result: dict[str, Any],
+        event: NormalizedEvent,
+        explanation: dict[str, Any],
+        classification: str,
+        llm_verdict: str,
+        llm_dims: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Reconcile unreliable model output into a logically consistent result.
+
+        Priority:
+        1. Structured sample ground truth (``evidence_assessment.expected_verdict``)
+           is authoritative — small local models frequently misclassify samples,
+           so the annotated verdict wins and the model may only enrich reason /
+           next steps.
+        2. Otherwise, trust the model only when its own dimensions carry a status
+           consistent with its classification (e.g. malicious ⇒ a risk/blocked
+           dimension). This catches the common failure of a high-confidence
+           verdict with all-``info`` dimensions.
+        3. Otherwise, synthesize consistent dimensions from the normalized
+           evidence so the dashboard never shows a verdict contradicted by
+           "信息"-only dimensions.
+        """
+        structured = self._fallback_from_evidence(event)
+        if structured and structured.get("verdict"):
+            return self._merge_with_structured(llm_result, structured)
+        if llm_dims and llm_verdict and self._dimensions_support_classification(llm_dims, classification):
+            return llm_result
+        return self._reconcile_ungrounded(llm_result, event, explanation, classification)
+
+    def _merge_with_structured(self, llm_result: dict[str, Any], structured: dict[str, Any]) -> dict[str, Any]:
+        """Override the model's classification/verdict/dimensions with structured
+        sample ground truth, keeping the model's free-text enrichments when they
+        add value."""
+        merged = dict(llm_result)
+        merged["classification"] = structured["classification"]
+        merged["verdict"] = structured["verdict"]
+        merged["analysis_dimensions"] = structured["analysis_dimensions"]
+        merged["confidence"] = structured["confidence"]
+        if not str(merged.get("business_impact", "")).strip():
+            merged["business_impact"] = structured.get("business_impact", "")
+        if not merged.get("missing_evidence"):
+            merged["missing_evidence"] = structured.get("missing_evidence", [])
+        if not merged.get("whitelist_recommendation") and structured.get("whitelist_recommendation"):
+            merged["whitelist_recommendation"] = structured["whitelist_recommendation"]
+        if not str(merged.get("reason", "")).strip():
+            merged["reason"] = structured.get("reason", "")
+        return merged
+
+    def _reconcile_ungrounded(
+        self,
+        llm_result: dict[str, Any],
+        event: NormalizedEvent,
+        explanation: dict[str, Any],
+        classification: str,
+    ) -> dict[str, Any]:
+        """No structured ground truth available (e.g. a real vendor log without
+        ``evidence_assessment``). Keep the model's classification but ensure the
+        dimensions are consistent with it instead of leaving all-``info`` gaps."""
+        merged = dict(llm_result)
+        llm_dims = explanation.get("dimensions", [])
+        if llm_dims and self._dimensions_support_classification(llm_dims, classification):
+            merged["analysis_dimensions"] = llm_dims
+        else:
+            merged["analysis_dimensions"] = self._synthesize_dimensions(event, classification)
+        if not str(merged.get("verdict", "")).strip():
+            merged["verdict"] = self._verdict_from_classification(classification)
+        return merged
+
+    # Dimension status ↔ classification consistency helpers -------------------
+
+    _CLASSIFICATION_STATUS = {
+        "malicious": "risk",
+        "benign": "benign",
+        "suspicious": "review",
+        "insufficient_evidence": "info",
+    }
+    _CLASSIFICATION_LABEL = {
+        "malicious": "真实攻击",
+        "benign": "误报",
+        "suspicious": "需人工复核",
+        "insufficient_evidence": "证据不足",
+    }
+
+    def _status_supports_classification(self, status: Any, classification: str) -> bool:
+        s = self._normalize_dimension_status(status)
+        if classification == "malicious":
+            return s in {"risk", "blocked"}
+        if classification == "benign":
+            return s in {"benign", "normal"}
+        if classification == "suspicious":
+            return s in {"review", "risk", "blocked"}
+        return True
+
+    def _dimensions_support_classification(self, dims: list[dict[str, Any]], classification: str) -> bool:
+        return any(self._status_supports_classification(d.get("status"), classification) for d in dims if isinstance(d, dict))
+
+    def _synthesize_dimensions(self, event: NormalizedEvent, classification: str) -> list[dict[str, str]]:
+        """Build Chinese dimensions with statuses consistent with ``classification``
+        from the normalized evidence, used when the model produced no grounded
+        dimensions and no structured sample assessment exists."""
+        status = self._CLASSIFICATION_STATUS.get(classification, "info")
+        label = self._CLASSIFICATION_LABEL.get(classification, "证据不足")
+        entities = event.entities or {}
+        by_type: dict[str, Any] = {}
+        for item in event.evidence or []:
+            if isinstance(item, dict) and item.get("type") and item.get("type") not in by_type:
+                by_type[item["type"]] = item.get("value")
+
+        dims: list[dict[str, str]] = []
+        rule = entities.get("rule") or by_type.get("rule_id") or by_type.get("rule_name")
+        if rule:
+            dims.append({"title": "检测规则", "status": status, "evidence": f"命中规则 {self._short(rule)}，与「{label}」判断相关。"})
+        indicators = self._collect_attack_indicators(event, by_type, entities)
+        if indicators:
+            dims.append({"title": "攻击特征", "status": status, "evidence": indicators})
+        sink = by_type.get("sink") or by_type.get("stack_trace") or by_type.get("stacktrace")
+        if sink:
+            dims.append({"title": "危险调用", "status": status, "evidence": f"调用栈/危险 sink 涉及 {self._short(sink)}。"})
+        action = entities.get("action") or by_type.get("action")
+        if action:
+            action_status = "blocked" if classification == "malicious" and self._looks_blocked(action) else status
+            dims.append({"title": "处置动作", "status": action_status, "evidence": f"安全产品动作：{self._short(action)}。"})
+        host = entities.get("host") or entities.get("src_ip")
+        if host:
+            dims.append({"title": "受影响实体", "status": status, "evidence": f"关键实体：{host}。"})
+
+        if not dims:
+            dims.append({"title": "综合判断", "status": status, "evidence": f"基于归一化证据的综合判断为「{label}」，缺少结构化分维度标注。"})
+        dims.append(
+            {
+                "title": "证据完整性",
+                "status": "review" if classification in {"malicious", "suspicious"} else "normal",
+                "evidence": f"归一化证据 {len(event.evidence or [])} 条，建议结合产品原始日志与关联事件只读复核。",
+            }
+        )
+        return dims
+
+    def _collect_attack_indicators(self, event: NormalizedEvent, by_type: dict[str, Any], entities: dict[str, Any]) -> str:
+        parts: list[str] = []
+        if by_type.get("hook_data"):
+            parts.append(f"hook_data={self._short(by_type['hook_data'])}")
+        if by_type.get("taint_source"):
+            parts.append(f"污染源={by_type['taint_source']}")
+        if by_type.get("payload_category"):
+            parts.append(f"载荷={self._short(by_type['payload_category'])}")
+        if by_type.get("command_line"):
+            parts.append(f"命令行={self._short(by_type['command_line'])}")
+        if by_type.get("sni"):
+            parts.append(f"SNI={by_type['sni']}")
+        url = entities.get("url")
+        if url and any(m in str(url).lower() for m in ("ldap://", "rmi://", "ftp://", "http://", "gopher://")):
+            parts.append(f"URL={self._short(url)}")
+        return "；".join(parts)
+
+    def _short(self, value: Any) -> str:
+        if isinstance(value, (dict, list)):
+            text = json.dumps(value, ensure_ascii=False)
+        else:
+            text = str(value)
+        text = text.replace("\n", " ").strip()
+        return text[:100] + ("…" if len(text) > 100 else "")
+
+    def _looks_blocked(self, action: Any) -> bool:
+        return any(w in str(action).lower() for w in ("block", "阻断", "intercept", "prevent", "deny"))
 
     def _fallback_from_evidence(self, event: NormalizedEvent) -> dict[str, Any] | None:
         verdict = ""
@@ -360,6 +541,11 @@ class SecurityAgent(ABC):
     def _severity(self, original: str, classification: str, confidence: float) -> str:
         if classification == "benign":
             return "low" if confidence >= 0.7 else "medium"
+        if classification == "malicious":
+            # A confirmed real attack is at least high-urgency regardless of the
+            # product's original rating; preserve critical when the source already
+            # rated it so. Without this, a confirmed attack can sit at "medium".
+            return "critical" if original == "critical" else "high"
         if original in {"critical", "high"}:
             return original
         if classification == "suspicious" and confidence >= 0.75:

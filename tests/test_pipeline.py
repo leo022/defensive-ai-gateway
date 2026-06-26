@@ -9,7 +9,7 @@ from defensive_ai_gateway.app import GatewayState
 from defensive_ai_gateway.config import GatewayConfig
 from defensive_ai_gateway.database import Repository
 from defensive_ai_gateway.log_adapter import LogAdapter, demo_rasp_profile, mapping_profile_record
-from defensive_ai_gateway.llm import GatewayLLM, LocalHeuristicLLM
+from defensive_ai_gateway.llm import GatewayLLM, LLMClient, LocalHeuristicLLM
 from defensive_ai_gateway.memory import MemoryManager
 from defensive_ai_gateway.models import RawAlert
 from defensive_ai_gateway.normalizer import EventNormalizer
@@ -371,6 +371,94 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(result.classification, "benign")
             self.assertIn("误报", result.explanation["verdict"])
             self.assertTrue(any(item.get("title") == "历史误报" for item in result.explanation.get("dimensions", [])))
+
+
+class ModelReconciliationTest(unittest.TestCase):
+    """Model-backed LLMs (ollama/gateway) must produce logically consistent
+    results even when the small local model returns a verdict contradicted by
+    all-``info`` dimensions or misclassifies a sample."""
+
+    class _FakeModelLLM(LLMClient):
+        is_deterministic = False
+
+        def __init__(self, result: dict):
+            self._result = result
+
+        def analyze(self, prompt, context):
+            return dict(self._result)
+
+    def _state_with_llm(self, tmp, llm):
+        config = GatewayConfig()
+        config.database.path = str(Path(tmp) / "gateway.db")
+        state = GatewayState(config)
+        state.orchestrator.llm = llm  # inject the fake model LLM
+        return state
+
+    def _alert_from_sample(self, payload):
+        return RawAlert(
+            source=payload["source"],
+            product=payload["product"],
+            event_type=payload["event_type"],
+            severity=payload["severity"],
+            timestamp=payload["timestamp"],
+            payload=payload["payload"],
+            alert_id=payload["alert_id"],
+        )
+
+    def _weak_malicious_result(self):
+        return {
+            "classification": "malicious",
+            "confidence": 0.95,
+            "verdict": "【真实攻击】- malicious",
+            "reason": "Fastjson vulnerability detected.",
+            "analysis_dimensions": [
+                {"title": "Vulnerability", "status": "info", "evidence": "Fastjson"},
+                {"title": "Attack Type", "status": "info", "evidence": "RCE"},
+            ],
+            "business_impact": "High",
+            "missing_evidence": [],
+            "recommended_next_steps": [],
+        }
+
+    def test_sample_false_positive_overrides_wrong_model_malicious(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._state_with_llm(tmp, self._FakeModelLLM(self._weak_malicious_result()))
+            payload = generate_alert(product="rasp", scenario="false_positive", seed=5003)
+            result = state.orchestrator.handle_alert(self._alert_from_sample(payload))
+            # Structured sample ground truth wins over the model's malicious call.
+            self.assertEqual(result.classification, "benign")
+            self.assertIn("误报", result.explanation["verdict"])
+            statuses = {d["status"] for d in result.explanation.get("dimensions", [])}
+            self.assertTrue(statuses <= {"benign", "normal", "review"})
+            self.assertNotIn("risk", statuses)
+
+    def test_non_sample_keeps_classification_but_synthesizes_consistent_dims(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._state_with_llm(tmp, self._FakeModelLLM(self._weak_malicious_result()))
+            payload = json.loads(Path("samples/rasp_alert.json").read_text(encoding="utf-8"))
+            result = state.orchestrator.handle_alert(state.alert_from_payload(payload))
+            # No structured ground truth: model classification is kept (real JNDI
+            # attack), but all-info dimensions must be replaced with risk dims.
+            self.assertEqual(result.classification, "malicious")
+            dims = result.explanation.get("dimensions", [])
+            self.assertGreaterEqual(len(dims), 1)
+            self.assertTrue(any(d["status"] in {"risk", "blocked"} for d in dims),
+                            f"expected a risk/blocked dimension, got {dims}")
+            self.assertFalse(all(d["status"] == "info" for d in dims))
+
+    def test_consistent_model_result_is_trusted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            consistent = self._weak_malicious_result()
+            consistent["analysis_dimensions"] = [
+                {"title": "请求特征", "status": "risk", "evidence": "JNDI lookup to ldap sink"},
+                {"title": "处置动作", "status": "blocked", "evidence": "RASP blocked"},
+            ]
+            state = self._state_with_llm(tmp, self._FakeModelLLM(consistent))
+            payload = json.loads(Path("samples/rasp_alert.json").read_text(encoding="utf-8"))
+            result = state.orchestrator.handle_alert(state.alert_from_payload(payload))
+            self.assertEqual(result.classification, "malicious")
+            titles = {d["title"] for d in result.explanation["dimensions"]}
+            self.assertIn("请求特征", titles)
 
 
 class AlertProductRoutingTest(unittest.TestCase):
