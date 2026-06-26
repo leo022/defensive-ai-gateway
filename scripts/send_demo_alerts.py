@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 import urllib.request
+from collections import Counter
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -38,6 +39,40 @@ DEMO_ALERTS: list[tuple[str, str, str, int]] = [
     ("rasp", "false_positive", "误报-Canary防护巡检", 5003),
 ]
 
+# 10-alert coverage batch: 2 alerts per product, covering all 3 scenarios
+# (attack/suspicious/false_positive) and all 4 severities (critical/high/
+# medium/low). Seeds are tuned so WAF attack -> high (SQLi) and NDR attack
+# -> critical (exfiltration).
+COVERAGE_BATCH_10: list[tuple[str, str, str, int]] = [
+    ("waf", "attack", "WAF-SQL注入(high)", 7107),
+    ("waf", "suspicious", "WAF-SQL注入疑似(medium)", 7102),
+    ("hips", "attack", "HIPS-凭证访问横向(high)", 7201),
+    ("hips", "false_positive", "HIPS-补丁盘点脚本(medium)", 7202),
+    ("rasp", "attack", "RASP-命令执行(high)", 7301),
+    ("rasp", "false_positive", "RASP-Canary巡检(low)", 7302),
+    ("ndr", "attack", "NDR-数据外传(critical)", 7401),
+    ("ndr", "suspicious", "NDR-罕见出站TLS(medium)", 7402),
+    ("siem", "attack", "SIEM-横向移动(critical)", 7501),
+    ("siem", "suspicious", "SIEM-服务账号弱关联(medium)", 7502),
+]
+
+BATCHES = {"demo": DEMO_ALERTS, "coverage": COVERAGE_BATCH_10}
+
+
+def coverage_summary(payloads: list[tuple[str, dict]]) -> dict:
+    products = Counter(p["product"] for _, p in payloads)
+    scenarios = Counter(p.get("_scenario", "") for _, p in payloads)
+    severities = Counter(p["severity"] for _, p in payloads)
+    return {
+        "count": len(payloads),
+        "products": dict(sorted(products.items())),
+        "scenarios": dict(sorted(scenarios.items())),
+        "severities": dict(sorted(severities.items())),
+        "covers_all_products": set(products) == {"waf", "hips", "rasp", "ndr", "siem"},
+        "covers_all_scenarios": set(scenarios) == {"attack", "suspicious", "false_positive"},
+        "covers_all_severities": set(severities) == {"critical", "high", "medium", "low"},
+    }
+
 
 def send_alert(payload: dict, url: str, timeout: int) -> dict:
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -47,16 +82,22 @@ def send_alert(payload: dict, url: str, timeout: int) -> dict:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Send 15 curated demo alerts to the gateway")
+    parser = argparse.ArgumentParser(description="Send curated demo alerts to the gateway")
+    parser.add_argument("--batch", choices=BATCHES, default="demo", help="demo=15 alerts; coverage=10 alerts covering all systems/types/levels")
     parser.add_argument("--url", default="http://127.0.0.1:8080/api/alerts")
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--print-only", action="store_true", help="Print payloads without sending")
     args = parser.parse_args()
 
-    payloads = [
-        (label, generate_alert(product=product, scenario=scenario, seed=seed))
-        for product, scenario, label, seed in DEMO_ALERTS
-    ]
+    selected = BATCHES[args.batch]
+    payloads = []
+    for product, scenario, label, seed in selected:
+        payload = generate_alert(product=product, scenario=scenario, seed=seed)
+        payload["_scenario"] = scenario  # tag for coverage summary (stripped before send)
+        payloads.append((label, payload))
+
+    summary = coverage_summary(payloads)
+    print(json.dumps({"batch": args.batch, "coverage": summary}, ensure_ascii=False, indent=2))
 
     if args.print_only:
         print(json.dumps({"generated": len(payloads), "alerts": [p for _, p in payloads]}, ensure_ascii=False, indent=2))
@@ -64,6 +105,7 @@ def main() -> None:
 
     rows = []
     for label, payload in payloads:
+        payload.pop("_scenario", None)  # don't send the internal tag
         try:
             result = send_alert(payload, args.url, args.timeout)
         except Exception as exc:  # noqa: BLE001
