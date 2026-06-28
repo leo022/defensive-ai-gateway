@@ -27,7 +27,26 @@ class LocalHeuristicLLM(LLMClient):
 
     is_deterministic = True
 
-    HIGH_WORDS = ["rce", "sql", "xss", "c2", "exfil", "lateral", "credential", "webshell", "提权", "横向", "外传"]
+    HIGH_WORDS = [
+        "rce",
+        "sql",
+        "xss",
+        "c2",
+        "exfil",
+        "lateral",
+        "credential",
+        "webshell",
+        "jndi",
+        "ldap://",
+        "fastjson",
+        "deserialization",
+        "processbuilder",
+        "提权",
+        "横向",
+        "外传",
+        "反序列化",
+        "命令执行",
+    ]
     FALSE_POSITIVE_WORDS = [
         "false_positive",
         "false positive",
@@ -85,9 +104,12 @@ class LocalHeuristicLLM(LLMClient):
                 "missing_evidence": ["误报记忆只降低优先级，不替代对新异常特征的复核"],
                 "business_impact": "符合已批准误报模式时可降低告警噪声，但需防止攻击者伪装成已知模式。",
             }
-        if severity in {"critical", "high"} or score >= 2:
+        if self._strong_attack_signal(context, score, severity):
+            classification = "malicious"
+            confidence = min(0.92, 0.72 + score * 0.05)
+        elif severity in {"critical", "high"} or score >= 2:
             classification = "suspicious"
-            confidence = min(0.92, 0.62 + score * 0.08)
+            confidence = min(0.9, 0.62 + score * 0.08)
         elif score == 1:
             classification = "suspicious"
             confidence = 0.58
@@ -97,16 +119,12 @@ class LocalHeuristicLLM(LLMClient):
         return {
             "classification": classification,
             "confidence": confidence,
-            "verdict": "【需人工复核】- 本地规则分析器缺少结构化证据维度",
+            "verdict": self._verdict_from_classification(classification),
             "analysis_dimensions": self._fallback_dimensions(context, score, severity),
-            "reason": (
-                "研判结论：【需人工复核】- 本地规则分析器缺少结构化证据维度\n"
-                "分析报告：\n"
-                f"- 严重级别：输入严重级别为 {severity}\n"
-                f"- 关键词风险：命中 {score} 个高风险关键词\n"
-                "- 证据缺口：生产环境应替换为企业 LLM Gateway 或提供 evidence_assessment 字段"
-            ),
+            "reason": self._fallback_reason(context, classification, score, severity),
+            "recommended_next_steps": self._fallback_next_steps(context, classification),
             "missing_evidence": ["缺少样本 evidence_assessment 或企业 LLM 深度研判结果"],
+            "business_impact": self._fallback_business_impact(context, classification),
         }
 
     def _merge_memory_match(self, result: dict[str, Any], memory_match: dict[str, Any]) -> dict[str, Any]:
@@ -298,12 +316,179 @@ class LocalHeuristicLLM(LLMClient):
     def _fallback_dimensions(self, context: dict[str, Any], score: int, severity: str) -> list[dict[str, str]]:
         entities = context.get("entities") or {}
         evidence = context.get("evidence") or []
-        return [
-            {"title": "严重级别", "status": "info", "evidence": f"告警严重级别为 {severity}。"},
-            {"title": "关键词风险", "status": "info", "evidence": f"上下文命中 {score} 个高风险关键词。"},
-            {"title": "关键实体", "status": "info", "evidence": json.dumps(entities, ensure_ascii=False, sort_keys=True)},
-            {"title": "证据密度", "status": "info", "evidence": f"归一化证据 {len(evidence) if isinstance(evidence, list) else 0} 条。"},
+        classification = "malicious" if self._strong_attack_signal(context, score, severity) else ("suspicious" if severity in {"critical", "high"} or score else "insufficient_evidence")
+        status = {
+            "malicious": "risk",
+            "suspicious": "review",
+            "benign": "benign",
+        }.get(classification, "info")
+        by_type = self._evidence_by_type(evidence)
+        outline = context.get("report_outline") or ["综合判断", "关键证据", "处置动作", "证据缺口", "误报与白名单"]
+        dims = []
+        for title in outline:
+            detail = self._fallback_dimension_detail(str(context.get("product", "")), str(title), entities, by_type, score, severity)
+            dims.append({"title": str(title), "status": self._fallback_dimension_status(str(title), detail, status), "evidence": detail})
+        return dims
+
+    def _fallback_reason(self, context: dict[str, Any], classification: str, score: int, severity: str) -> str:
+        verdict = self._verdict_from_classification(classification)
+        lines = [f"研判结论：{verdict}", "分析报告："]
+        for item in self._fallback_dimensions(context, score, severity):
+            lines.append(f"- {item['title']}：{item['evidence']}")
+        return "\n".join(lines)
+
+    def _fallback_next_steps(self, context: dict[str, Any], classification: str) -> list[str]:
+        product = str(context.get("product") or "security").upper()
+        steps = [
+            f"只读复核 {product} 原始告警，确认规则、关键实体、处置动作和时间窗口",
+            "关联同一资产、同一来源、同一账号在前后 30 分钟内的相关告警",
         ]
+        if classification in {"suspicious", "malicious"}:
+            steps.append("补充产品原始日志或接入内网 LLM Gateway 后重新生成深度研判")
+        else:
+            steps.append("若确认业务合法，再评估最小范围白名单或规则调优")
+        return steps
+
+    def _fallback_business_impact(self, context: dict[str, Any], classification: str) -> str:
+        entities = context.get("entities") or {}
+        asset = entities.get("app") or entities.get("host") or entities.get("url") or entities.get("src_ip") or "相关资产"
+        if classification == "suspicious":
+            return f"{asset} 存在可疑安全信号，当前证据不足以确认影响范围；需优先补齐原始日志和关联证据。"
+        if classification == "malicious":
+            return f"{asset} 可能受到真实攻击影响，需要确认是否已被阻断以及是否存在后续横向、外联或数据风险。"
+        return f"{asset} 暂未形成明确攻击证据，主要风险是告警噪声或证据不足导致的误判。"
+
+    def _strong_attack_signal(self, context: dict[str, Any], score: int, severity: str) -> bool:
+        product = str(context.get("product") or "").lower()
+        evidence = context.get("evidence") or []
+        by_type = self._evidence_by_type(evidence)
+        if product == "rasp":
+            has_runtime_path = bool(by_type.get("sink") or by_type.get("stack_trace") or by_type.get("stacktrace"))
+            has_attack_context = bool(by_type.get("hook_data") or by_type.get("taint_source") or by_type.get("payload_category"))
+            if has_runtime_path and (has_attack_context or score >= 2):
+                return True
+        if product == "waf":
+            action = str((context.get("entities") or {}).get("action") or by_type.get("action") or "").lower()
+            return severity in {"critical", "high"} and score >= 2 and any(word in action for word in ["block", "阻断"])
+        if product in {"hips", "ndr", "siem"}:
+            return severity in {"critical", "high"} and score >= 2
+        return severity == "critical" and score >= 3
+
+    def _evidence_by_type(self, evidence: Any) -> dict[str, Any]:
+        by_type: dict[str, Any] = {}
+        if not isinstance(evidence, list):
+            return by_type
+        for item in evidence:
+            if isinstance(item, dict) and item.get("type") and item.get("type") not in by_type:
+                by_type[str(item["type"])] = item.get("value")
+        return by_type
+
+    def _fallback_dimension_detail(
+        self,
+        product: str,
+        title: str,
+        entities: dict[str, Any],
+        by_type: dict[str, Any],
+        score: int,
+        severity: str,
+    ) -> str:
+        product = product.lower()
+        if product == "rasp":
+            if "参数" in title:
+                return self._join_facts(
+                    [
+                        self._fact("方法", entities.get("method") or by_type.get("method")),
+                        self._fact("URL", entities.get("url") or by_type.get("url") or by_type.get("uri")),
+                        self._fact("污染源", by_type.get("taint_source")),
+                        self._fact("载荷摘要", by_type.get("payload_category")),
+                    ],
+                    "缺少参数、路径或污染源明细，无法完整判断入口特征。",
+                )
+            if "危险调用" in title:
+                return self._join_facts(
+                    [
+                        self._fact("sink", by_type.get("sink")),
+                        self._fact("stack", by_type.get("stack_trace") or by_type.get("stacktrace")),
+                    ],
+                    "缺少危险 sink 或调用栈，需要回看 RASP 原始 stacktrace。",
+                )
+            if "规则" in title:
+                return self._join_facts([self._fact("规则", entities.get("rule") or by_type.get("rule_id") or by_type.get("rule_name"))], "缺少 RASP 规则信息。")
+            if "上下文" in title:
+                return self._join_facts([self._fact("hook_data", by_type.get("hook_data")), self._fact("动作", entities.get("action") or by_type.get("action")), self._fact("应用", entities.get("app")), self._fact("主机", entities.get("host"))], "缺少 hook_data、动作或应用上下文。")
+            if "成功" in title:
+                action = entities.get("action") or by_type.get("action")
+                return f"产品动作为 {self._short(action)}；需要结合响应、异常和后续日志确认是否成功。" if action else "缺少动作、响应或异常证据，无法判断成功性。"
+            if "误报" in title:
+                return "如判定误报，白名单必须限定规则、路径/参数、应用、sink 或 stacktrace，避免宽泛放行。"
+        if product == "waf":
+            if "请求" in title:
+                return self._join_facts([self._fact("方法", entities.get("method") or by_type.get("method")), self._fact("URL", entities.get("url") or by_type.get("uri")), self._fact("来源", entities.get("src_ip"))], "缺少 URL、方法或来源。")
+            if "参数" in title:
+                return self._join_facts([self._fact("命中字段", by_type.get("matched_parameters")), self._fact("载荷摘要", by_type.get("payload_category"))], "缺少命中参数/Header 或载荷摘要。")
+            if "规则" in title:
+                return self._join_facts([self._fact("规则", entities.get("rule") or by_type.get("rule_id") or by_type.get("rule_name"))], "缺少 WAF 规则信息。")
+            if "响应" in title:
+                return self._join_facts([self._fact("动作", entities.get("action") or by_type.get("action")), self._fact("状态码", by_type.get("status"))], "缺少 WAF 动作或响应码。")
+        if product == "hips":
+            if "主机" in title:
+                return self._join_facts([self._fact("主机", entities.get("host")), self._fact("用户", entities.get("user")), self._fact("来源", entities.get("src_ip"))], "缺少主机、用户或登录来源。")
+            if "进程链" in title:
+                return self._join_facts([self._fact("进程", entities.get("process") or by_type.get("process_name")), self._fact("父进程", by_type.get("parent_process"))], "缺少父子进程证据。")
+            if "命令行" in title:
+                return self._join_facts([self._fact("命令行摘要", by_type.get("command_line"))], "缺少命令行或脚本摘要。")
+            if "规则" in title:
+                return self._join_facts([self._fact("规则", entities.get("rule") or by_type.get("rule_id")), self._fact("动作", entities.get("action") or by_type.get("action"))], "缺少 HIPS 规则或动作。")
+        if product == "ndr":
+            if "通信" in title:
+                return self._join_facts([self._fact("源", entities.get("src_ip") or entities.get("host")), self._fact("目的", entities.get("dst_ip") or by_type.get("sni")), self._fact("协议", by_type.get("protocol"))], "缺少源、目的或协议方向。")
+            if "时序" in title or "流量" in title:
+                return self._join_facts([self._fact("会话", by_type.get("session_count_30m")), self._fact("间隔", by_type.get("beacon_interval_seconds")), self._fact("出站字节", by_type.get("bytes_out"))], "缺少时序或流量证据。")
+            if "协议" in title or "指纹" in title:
+                return self._join_facts([self._fact("SNI", by_type.get("sni")), self._fact("JA3", by_type.get("ja3")), self._fact("JA4", by_type.get("ja4"))], "缺少 DNS/TLS/HTTP 指纹。")
+        if product == "siem":
+            if "时间线" in title:
+                return self._join_facts([self._fact("时间线", by_type.get("timeline"))], "缺少关键事件时间线。")
+            if "实体" in title:
+                return self._join_facts([self._fact("用户", entities.get("user")), self._fact("主机", entities.get("host")), self._fact("源", entities.get("src_ip"))], "缺少实体关系。")
+            if "攻击链" in title:
+                return self._join_facts([self._fact("摘要", by_type.get("case_summary")), self._fact("信号", by_type.get("signals"))], "缺少多源攻击链信号。")
+        if "误报" in title or "白名单" in title:
+            return "仅在业务合法、边界明确且有复核周期时建议白名单或规则调优。"
+        if "成功" in title or "危害" in title or "影响" in title or "数据" in title:
+            return "需要结合产品动作、后续日志和业务资产画像判断成功性与影响范围。"
+        if "关联" in title or "多源" in title:
+            return "缺少跨产品关联证据，需要补充 HIPS/RASP/NDR/WAF/SIEM 或应用日志。"
+        if "缺口" in title or "响应" in title:
+            return "当前为本地规则分析器输出，需补充原始日志、上下文和 Gateway 深度研判。"
+        return f"严重级别为 {severity}，上下文命中 {score} 个高风险关键词，关键实体为 {json.dumps(entities, ensure_ascii=False, sort_keys=True)}。"
+
+    def _fallback_dimension_status(self, title: str, detail: str, default: str) -> str:
+        if "缺少" in detail or "无法" in detail or "需要" in detail:
+            return "review"
+        if "动作" in title or "响应" in title or "成功" in title:
+            if any(word in detail.lower() for word in ["block", "blocked", "阻断", "拦截"]):
+                return "blocked"
+        if "误报" in title or "白名单" in title:
+            return "review"
+        return default
+
+    def _join_facts(self, facts: list[str], fallback: str) -> str:
+        compact = [item for item in facts if item]
+        return "；".join(compact) + "。" if compact else fallback
+
+    def _fact(self, label: str, value: Any) -> str:
+        if value in ("", None, [], {}):
+            return ""
+        return f"{label}={self._short(value)}"
+
+    def _short(self, value: Any) -> str:
+        if isinstance(value, (dict, list)):
+            text = json.dumps(value, ensure_ascii=False)
+        else:
+            text = str(value)
+        text = text.replace("\n", " ").strip()
+        return text[:120] + ("…" if len(text) > 120 else "")
 
     def _false_positive_memory_match(self, context: dict[str, Any]) -> dict[str, Any] | None:
         memories = (context.get("memory") or {}).get("product_long_term", [])

@@ -54,3 +54,6 @@ reason 字段必须按以下结构输出：
 
     def analysis_focus(self) -> list[str]:
         return ["规则命中", "URI/方法", "Header/参数类别", "状态码", "行为基线", "业务活动窗口", "多源关联", "历史规则调优", "白名单边界"]
+
+    def report_outline(self) -> list[str]:
+        return ["请求特征", "参数/Header", "规则匹配", "响应与处置", "行为基线", "关联证据", "成功与危害", "误报与白名单"]

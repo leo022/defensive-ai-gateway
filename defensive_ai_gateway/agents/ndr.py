@@ -56,3 +56,6 @@ reason 字段必须按以下结构输出：
 
     def analysis_focus(self) -> list[str]:
         return ["东西向/南北向路径", "周期性", "数据量", "DNS/TLS 指纹", "异常目的地", "多源关联", "资产重要性", "白名单边界"]
+
+    def report_outline(self) -> list[str]:
+        return ["通信主体", "时序与流量", "协议与指纹", "目的地信誉", "关联证据", "数据风险", "成功与危害", "误报与白名单"]

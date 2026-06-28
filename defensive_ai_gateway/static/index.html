@@ -4,8 +4,8 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light dark" />
-    <meta name="theme-color" content="#f6f8f5" />
-    <title>AI 安全告警研判与处置中心</title>
+    <meta name="theme-color" content="#f4f6f8" />
+    <title>安全运营研判中心</title>
     <script>
       (() => {
         const key = "dashboard-theme";
@@ -25,36 +25,64 @@
     <link rel="stylesheet" href="/style.css" />
   </head>
   <body>
-    <header>
-      <div>
-        <h1 data-i18n="appTitle">AI 安全告警研判与处置中心</h1>
-        <p data-i18n="appSubtitle">面向 HIPS / RASP / NDR / WAF / SIEM 的多源告警关联分析、风险定级与响应编排能力</p>
-      </div>
-      <nav class="top-actions">
-        <button class="nav-button active" type="button" data-view="dashboard">Dashboard</button>
-        <button class="nav-button" type="button" data-view="adapter" data-i18n="navAdapter">适配</button>
-        <button class="nav-button" type="button" data-view="settings" data-i18n="navSettings">配置</button>
-        <button id="refresh" type="button" data-i18n="refresh">刷新</button>
-      </nav>
-    </header>
-    <main>
-      <section id="dashboard-view" class="view active">
-        <section class="stats">
-          <div><span id="alerts">0</span><label data-i18n="alerts">告警</label></div>
-          <div><span id="cases">0</span><label>Case</label></div>
-          <div><span id="high">0</span><label data-i18n="highCritical">高危/严重</label></div>
-        </section>
-        <section class="panel">
-          <h2 data-i18n="latestCases">最新 Case</h2>
-          <div id="cases-list" class="case-list"></div>
-        </section>
-      </section>
-      <section id="settings-view" class="view">
-        <section class="panel settings-panel">
-          <h2 data-i18n="llmConfig">LLM 配置</h2>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand-block">
+          <span class="brand-mark" aria-hidden="true">DG</span>
+          <div>
+            <h1 data-i18n="appTitle">安全运营研判中心</h1>
+            <p data-i18n="appSubtitle">多源告警处置与证据治理</p>
+          </div>
+        </div>
+        <nav class="primary-nav" aria-label="Main">
+          <button class="nav-button active" type="button" data-view="dashboard" data-i18n="navDashboard">处置台</button>
+          <button class="nav-button" type="button" data-view="adapter" data-i18n="navAdapter">日志接入</button>
+          <button class="nav-button" type="button" data-view="settings" data-i18n="navSettings">运行配置</button>
+        </nav>
+        <div class="sidebar-footer">
+          <button id="theme-switch" class="utility-button" type="button" aria-label="切换深色或浅色模式" data-i18n-aria-label="themeAria"></button>
+          <button id="language-switch" class="utility-button language-switch" type="button" aria-label="Switch language"></button>
+        </div>
+      </aside>
+      <div class="workspace">
+        <header class="workspace-header">
+          <div>
+            <p class="eyebrow" data-i18n="workspaceEyebrow">Security Operations</p>
+            <h2 data-i18n="workspaceTitle">告警处置队列</h2>
+          </div>
+          <div class="header-actions">
+            <span class="environment-badge" data-i18n="environment">Offline-ready</span>
+            <button id="refresh" type="button" data-i18n="refresh">刷新</button>
+          </div>
+        </header>
+        <main>
+          <section id="dashboard-view" class="view active">
+            <section class="stats">
+              <div><span id="alerts">0</span><label data-i18n="alerts">告警总量</label></div>
+              <div><span id="cases">0</span><label>Open Cases</label></div>
+              <div><span id="high">0</span><label data-i18n="highCritical">高危与严重</label></div>
+            </section>
+            <section class="panel queue-panel">
+              <div class="panel-heading">
+                <div>
+                  <h2 data-i18n="latestCases">Case 队列</h2>
+                  <p data-i18n="latestCasesHint">按更新时间排序，展开查看证据、结论和动作。</p>
+                </div>
+              </div>
+              <div id="cases-list" class="case-list"></div>
+            </section>
+          </section>
+          <section id="settings-view" class="view">
+            <section class="panel settings-panel">
+              <div class="panel-heading">
+                <div>
+                  <h2 data-i18n="llmConfig">模型服务</h2>
+                  <p data-i18n="llmConfigHint">切换本地分析器、Ollama 或内网 Gateway。</p>
+                </div>
+              </div>
           <form id="llm-form" class="settings-form">
             <label>
-              <span>Provider</span>
+              <span data-i18n="provider">服务类型</span>
               <select id="llm-provider" name="provider">
                 <option value="local">local</option>
                 <option value="ollama">ollama</option>
@@ -62,19 +90,19 @@
               </select>
             </label>
             <label>
-              <span>LLM URL</span>
+              <span data-i18n="serviceUrl">服务 URL</span>
               <input id="llm-endpoint" name="endpoint" type="url" placeholder="http://127.0.0.1:11434/api/generate" />
             </label>
             <label>
-              <span>Model</span>
+              <span data-i18n="model">模型</span>
               <div class="model-picker">
                 <input id="llm-model" name="model" type="text" list="ollama-models" placeholder="gemma3:4b" />
-                <button type="button" id="load-llm-models" data-i18n="loadModels">拉取本地模型</button>
+              <button type="button" id="load-llm-models" data-i18n="loadModels">同步模型</button>
               </div>
               <datalist id="ollama-models"></datalist>
             </label>
             <label>
-              <span>API Key</span>
+              <span data-i18n="apiKey">访问凭据</span>
               <input id="llm-api-key" name="api_key" type="password" autocomplete="off" placeholder="留空则保留现有 Key" data-i18n-placeholder="apiKeyPlaceholder" />
             </label>
             <label>
@@ -88,35 +116,40 @@
             <div class="form-actions">
               <button type="submit" data-i18n="saveConfig">保存配置</button>
               <button type="button" id="reload-llm-config" data-i18n="reload">重新加载</button>
-              <button type="button" id="restore-llm-defaults" data-i18n="restoreDefaults">恢复默认配置</button>
+              <button type="button" id="restore-llm-defaults" data-i18n="restoreDefaults">恢复默认</button>
             </div>
             <p id="llm-config-status" class="form-status"></p>
           </form>
-        </section>
-      </section>
-      <section id="adapter-view" class="view">
-        <section class="adapter-grid">
-          <section class="panel">
-            <h2 data-i18n="logAdapter">日志自动适配</h2>
+            </section>
+          </section>
+          <section id="adapter-view" class="view">
+            <section class="adapter-grid">
+              <section class="panel">
+                <div class="panel-heading">
+                  <div>
+                    <h2 data-i18n="logAdapter">日志接入</h2>
+                    <p data-i18n="logAdapterHint">字段识别、映射确认和接入前校验。</p>
+                  </div>
+                </div>
             <form id="infer-form" class="settings-form profile-form">
               <label>
                 <span data-i18n="raspJsonLog">RASP JSON 日志</span>
                 <textarea id="source-log" spellcheck="false"></textarea>
               </label>
               <div class="form-actions">
-                <button type="submit" data-i18n="autoDetectFields">自动识别字段</button>
+                <button type="submit" data-i18n="autoDetectFields">识别字段</button>
                 <button type="button" id="load-sample-log" data-i18n="loadSample">加载示例</button>
-                <button type="button" id="save-inferred-profile" data-i18n="saveTemplate">保存模板</button>
+                <button type="button" id="save-inferred-profile" data-i18n="saveTemplate">保存映射</button>
               </div>
               <p id="profile-status" class="form-status"></p>
             </form>
             <div id="field-mapping-table" class="field-mapping-table"></div>
             <details class="advanced-profile">
-              <summary data-i18n="advancedConfig">高级配置</summary>
+              <summary data-i18n="advancedConfig">映射模板</summary>
               <div id="profile-list" class="profile-list"></div>
               <form id="profile-form" class="settings-form profile-form">
                 <label>
-                  <span data-i18n="profileJson">Profile JSON（字段映射）</span>
+                  <span data-i18n="profileJson">Profile JSON</span>
                   <textarea id="profile-json" spellcheck="false"></textarea>
                 </label>
                 <div class="form-actions">
@@ -125,26 +158,29 @@
                 </div>
               </form>
             </details>
-          </section>
-          <section class="panel">
-            <h2 data-i18n="dryRunPreview">Dry-run 预览</h2>
+              </section>
+              <section class="panel">
+                <div class="panel-heading">
+                  <div>
+                    <h2 data-i18n="dryRunPreview">映射校验</h2>
+                    <p data-i18n="dryRunPreviewHint">验证 RawAlert 与归一化事件是否符合接入要求。</p>
+                  </div>
+                </div>
             <form id="dry-run-form" class="settings-form profile-form">
               <div class="form-actions">
-                <button type="submit" data-i18n="runDryRun">运行 Dry-run</button>
+                <button type="submit" data-i18n="runDryRun">运行校验</button>
               </div>
             </form>
-            <pre id="dry-run-result" class="json-block dry-run-result" data-i18n="dryRunHint">粘贴一条脱敏 RASP JSON 日志，自动识别字段后运行 dry-run。</pre>
+            <pre id="dry-run-result" class="json-block dry-run-result" data-i18n="dryRunHint">等待日志与映射配置。</pre>
+              </section>
+            </section>
           </section>
-        </section>
-      </section>
-    </main>
-    <footer class="site-footer">
-      <div class="footer-actions">
-        <button id="theme-switch" class="theme-switch" type="button" aria-label="切换深色或浅色模式" data-i18n-aria-label="themeAria"></button>
-        <button id="language-switch" class="theme-switch language-switch" type="button" aria-label="Switch language"></button>
+        </main>
+        <footer class="app-footer">
+          <span>© 2026 Defensive AI Gateway · Designed &amp; engineered by TC</span>
+        </footer>
       </div>
-      <p>Copyright by tc</p>
-    </footer>
+    </div>
     <script src="/app.js"></script>
   </body>
 </html>

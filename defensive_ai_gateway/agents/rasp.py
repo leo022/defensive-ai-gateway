@@ -78,3 +78,6 @@ reason 字段必须按以下结构输出：
 
     def analysis_focus(self) -> list[str]:
         return ["接口敏感级", "异常参数", "真实用户/机器人", "危险调用栈", "hook_data 证据", "部署变更", "历史误报", "白名单边界"]
+
+    def report_outline(self) -> list[str]:
+        return ["参数特征", "危险调用", "规则匹配", "上下文", "成功与危害", "误报与白名单"]

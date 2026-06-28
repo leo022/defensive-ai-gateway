@@ -17,26 +17,26 @@ from defensive_ai_gateway.sample_alerts import generate_alert
 # (real attack / needs-manual-review / false-positive) and a spread of
 # severities (critical / high / medium / low).
 #
+# Ordered so the demo queue staggers alert type (scenario/product) and severity
+# instead of grouping by verdict or product.
+#
 # (product, scenario, label_zh, seed)
 DEMO_ALERTS: list[tuple[str, str, str, int]] = [
-    # --- 真实攻击 (real attacks) ---
-    ("siem", "attack", "真实攻击-横向移动/服务账号滥用", 1001),
-    ("hips", "attack", "真实攻击-凭证访问与横向移动", 2001),
-    ("ndr", "attack", "真实攻击-C2 beacon/数据外传", 3001),
-    ("waf", "attack", "真实攻击-SQL注入/路径遍历", 4001),
-    ("rasp", "attack", "真实攻击-反序列化/JNDI注入", 5001),
-    # --- 需人工排查 (needs manual review) ---
-    ("siem", "suspicious", "需人工排查-服务账号弱关联信号", 1002),
     ("hips", "suspicious", "需人工排查-编码PowerShell缺闭环", 2002),
-    ("ndr", "suspicious", "需人工排查-罕见出站TLS连接", 3002),
-    ("waf", "suspicious", "需人工排查-SQL/XSS疑似命中", 4002),
-    ("rasp", "suspicious", "需人工排查-SQL注入疑似触达", 5002),
-    # --- 误报 (false positives) ---
-    ("siem", "false_positive", "误报-已批准维护窗口", 1003),
-    ("hips", "false_positive", "误报-补丁盘点脚本", 2003),
-    ("ndr", "false_positive", "误报-备份复制流量突增", 3003),
+    ("siem", "attack", "真实攻击-横向移动/服务账号滥用", 1001),
     ("waf", "false_positive", "误报-合成浏览器/合作方批次", 4003),
+    ("rasp", "attack", "真实攻击-反序列化/JNDI注入", 5001),
+    ("siem", "suspicious", "需人工排查-服务账号弱关联信号", 1002),
+    ("ndr", "false_positive", "误报-备份复制流量突增", 3003),
+    ("waf", "suspicious", "需人工排查-SQL/XSS疑似命中", 4002),
+    ("ndr", "attack", "真实攻击-C2 beacon/数据外传", 3001),
+    ("siem", "false_positive", "误报-已批准维护窗口", 1003),
+    ("hips", "attack", "真实攻击-凭证访问与横向移动", 2001),
+    ("ndr", "suspicious", "需人工排查-罕见出站TLS连接", 3002),
     ("rasp", "false_positive", "误报-Canary防护巡检", 5003),
+    ("waf", "attack", "真实攻击-SQL注入/路径遍历", 4001),
+    ("hips", "false_positive", "误报-补丁盘点脚本", 2003),
+    ("rasp", "suspicious", "需人工排查-SQL注入疑似触达", 5002),
 ]
 
 # 10-alert coverage batch: 2 alerts per product, covering all 3 scenarios
@@ -44,15 +44,15 @@ DEMO_ALERTS: list[tuple[str, str, str, int]] = [
 # medium/low). Seeds are tuned so WAF attack -> high (SQLi) and NDR attack
 # -> critical (exfiltration).
 COVERAGE_BATCH_10: list[tuple[str, str, str, int]] = [
-    ("waf", "attack", "WAF-SQL注入(high)", 7107),
+    ("ndr", "attack", "NDR-数据外传(critical)", 7401),
     ("waf", "suspicious", "WAF-SQL注入疑似(medium)", 7102),
     ("hips", "attack", "HIPS-凭证访问横向(high)", 7201),
+    ("rasp", "false_positive", "RASP-Canary巡检(low)", 7302),
+    ("siem", "attack", "SIEM-横向移动(critical)", 7501),
+    ("ndr", "suspicious", "NDR-罕见出站TLS(medium)", 7402),
+    ("waf", "attack", "WAF-SQL注入(high)", 7107),
     ("hips", "false_positive", "HIPS-补丁盘点脚本(medium)", 7202),
     ("rasp", "attack", "RASP-命令执行(high)", 7301),
-    ("rasp", "false_positive", "RASP-Canary巡检(low)", 7302),
-    ("ndr", "attack", "NDR-数据外传(critical)", 7401),
-    ("ndr", "suspicious", "NDR-罕见出站TLS(medium)", 7402),
-    ("siem", "attack", "SIEM-横向移动(critical)", 7501),
     ("siem", "suspicious", "SIEM-服务账号弱关联(medium)", 7502),
 ]
 
