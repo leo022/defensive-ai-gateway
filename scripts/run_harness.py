@@ -12,7 +12,14 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from defensive_ai_gateway.config import GatewayConfig, load_config
 from defensive_ai_gateway.database import Repository
-from defensive_ai_gateway.log_adapter import LogAdapter, MappingProfile, default_mapping_profile, demo_rasp_profile
+from defensive_ai_gateway.log_adapter import (
+    LogAdapter,
+    MappingProfile,
+    default_mapping_profile,
+    demo_rasp_profile,
+    explicit_product,
+    fingerprint_product,
+)
 from defensive_ai_gateway.llm import LocalHeuristicLLM, build_llm
 from defensive_ai_gateway.memory import MemoryManager
 from defensive_ai_gateway.models import RawAlert
@@ -23,8 +30,12 @@ from defensive_ai_gateway.policy import PolicyEngine
 from defensive_ai_gateway.sample_alerts import PRODUCTS, SCENARIOS, generate_alerts
 
 
-def load_alert(path: Path) -> RawAlert:
+def load_alert(path: Path, adapter: LogAdapter | None = None) -> RawAlert:
     data = json.loads(path.read_text(encoding="utf-8"))
+    if adapter and not explicit_product(data) and fingerprint_product(data) == "rasp":
+        result = adapter.adapt(demo_rasp_profile(), data)
+        if result["ok"]:
+            return result["raw_alert"]
     return RawAlert(
         source=str(data.get("source", "harness")),
         product=str(data.get("product", "siem")),
@@ -126,7 +137,7 @@ def main():
         orchestrator = Orchestrator(repo, normalizer, memory, llm, policy)
         results = []
         for path in paths:
-            alert = load_alert_with_profile(path, adapter, profile) if profile else load_alert(path)
+            alert = load_alert_with_profile(path, adapter, profile) if profile else load_alert(path, adapter)
             result = orchestrator.handle_alert(alert)
             item = {
                 "sample": str(path),

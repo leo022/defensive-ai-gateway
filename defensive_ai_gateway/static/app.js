@@ -3,31 +3,46 @@ const THEME_KEY = "dashboard-theme";
 const LANGUAGE_KEY = "dashboard-language";
 const STRINGS = {
   zh: {
-    appTitle: "AI 安全告警研判与处置中心",
-    appSubtitle: "面向 HIPS / RASP / NDR / WAF / SIEM 的多源告警关联分析、风险定级与响应编排能力",
-    navAdapter: "适配",
-    navSettings: "配置",
+    appTitle: "安全运营研判中心",
+    appSubtitle: "多源告警处置与证据治理",
+    navDashboard: "处置台",
+    navAdapter: "日志接入",
+    navSettings: "运行配置",
+    workspaceEyebrow: "Security Operations",
+    workspaceTitle: "告警处置队列",
+    workspaceTitleDashboard: "告警处置队列",
+    workspaceTitleAdapter: "日志接入",
+    workspaceTitleSettings: "运行配置",
+    environment: "Offline-ready",
     refresh: "刷新",
-    alerts: "告警",
-    highCritical: "高危/严重",
-    latestCases: "最新 Case",
-    llmConfig: "LLM 配置",
+    alerts: "告警总量",
+    highCritical: "高危与严重",
+    latestCases: "Case 队列",
+    latestCasesHint: "按更新时间排序，展开查看证据、结论和动作。",
+    llmConfig: "模型服务",
+    llmConfigHint: "切换本地分析器、Ollama 或内网 Gateway。",
     apiKeyPlaceholder: "留空则保留现有 Key",
+    provider: "服务类型",
+    serviceUrl: "服务 URL",
+    model: "模型",
+    apiKey: "访问凭据",
     keyEnv: "Key 环境变量",
     timeoutSeconds: "超时秒数",
     saveConfig: "保存配置",
     reload: "重新加载",
-    logAdapter: "日志自动适配",
+    logAdapter: "日志接入",
+    logAdapterHint: "字段识别、映射确认和接入前校验。",
     raspJsonLog: "RASP JSON 日志",
-    autoDetectFields: "自动识别字段",
+    autoDetectFields: "识别字段",
     loadSample: "加载示例",
-    saveTemplate: "保存模板",
-    advancedConfig: "高级配置",
-    profileJson: "Profile JSON（字段映射）",
+    saveTemplate: "保存映射",
+    advancedConfig: "映射模板",
+    profileJson: "Profile JSON",
     saveProfile: "保存 Profile",
-    dryRunPreview: "Dry-run 预览",
-    runDryRun: "运行 Dry-run",
-    dryRunHint: "粘贴一条脱敏 RASP JSON 日志，自动识别字段后运行 dry-run。",
+    dryRunPreview: "映射校验",
+    dryRunPreviewHint: "验证 RawAlert 与归一化事件是否符合接入要求。",
+    runDryRun: "运行校验",
+    dryRunHint: "等待日志与映射配置。",
     themeAria: "切换深色或浅色模式",
     switchLight: "切换浅色模式",
     switchDark: "切换深色模式",
@@ -48,7 +63,7 @@ const STRINGS = {
     noActions: "暂无建议动作",
     noEvidence: "暂无归一化证据",
     confirmFalsePositive: "确认为业务误报",
-    aiAnalysis: "AI 分析结果",
+    aiAnalysis: "研判摘要",
     product: "产品",
     classification: "分类",
     confidence: "置信度",
@@ -70,7 +85,9 @@ const STRINGS = {
     type: "类型",
     value: "值",
     weightSource: "权重/来源",
-    agentRuns: "Agent 运行记录",
+    agentRuns: "研判运行记录",
+    rawPayload: "原始载荷",
+    runPayload: "运行明细",
     runCount: "{count} 次",
     expandCase: "展开 Case {id}",
     alertCountLong: "{count} 条告警",
@@ -81,7 +98,7 @@ const STRINGS = {
     memoryWritten: "已写入产品长期记忆：{id}，后续同类高相似告警会降低置信。",
     falsePositiveDone: "已确认业务误报，并写入记忆层：{id}",
     confirmFailed: "确认失败：{message}",
-    noCases: "暂无 Case，提交样例告警后会在这里展示。",
+    noCases: "暂无 Case。",
     refreshFailed: "刷新失败：{message}",
     enabled: "启用",
     disabled: "停用",
@@ -98,12 +115,12 @@ const STRINGS = {
     noMapping: "不映射",
     required: "必填",
     enhanced: "增强",
-    inferOk: "自动识别完成，可以运行 dry-run。",
-    inferNeedsRequired: "自动识别完成，但仍有必填字段需要补充。",
+    inferOk: "字段识别完成，可以运行校验。",
+    inferNeedsRequired: "字段识别完成，但仍有必填字段需要补充。",
     selectProfileFirst: "请先自动识别字段或选择一个 profile",
     templateSaved: "模板已保存：{id}",
-    dryRunOk: "Dry-run 通过，可以用于正式接入。",
-    dryRunFailed: "Dry-run 未通过，缺失字段：{fields}",
+    dryRunOk: "映射校验通过，可以用于正式接入。",
+    dryRunFailed: "映射校验未通过，缺失字段：{fields}",
     checkResult: "请查看结果",
     keySetKeep: "已设置，留空则保留",
     keyUnset: "未设置",
@@ -111,42 +128,57 @@ const STRINGS = {
     configLoadedNoKey: "已加载配置，API Key 当前未设置。",
     configSaved: "保存成功：{provider} / {model}",
     configRestored: "已恢复为配置文件与环境变量的默认 LLM 配置（如启动时的 local）。",
-    restoreDefaults: "恢复默认配置",
-    loadModels: "拉取本地模型",
+    restoreDefaults: "恢复默认",
+    loadModels: "同步模型",
     modelsLoaded: "已从 {endpoint} 拉取 {count} 个本地模型，可在 Model 下拉中选择。",
     modelsEmpty: "未在 {endpoint} 发现任何模型，请确认 Ollama 已启动。",
     modelsLoadFailed: "拉取模型失败：{error}",
     sampleLoaded: "已加载 RASP 示例日志。",
-    dryRunError: "Dry-run 失败：{message}",
+    dryRunError: "映射校验失败：{message}",
     fieldRequired: "必填",
     fieldEnhanced: "增强",
   },
   en: {
-    appTitle: "AI Security Alert Triage and Response Center",
-    appSubtitle: "Correlation analysis, risk grading, and response orchestration for HIPS / RASP / NDR / WAF / SIEM alerts",
-    navAdapter: "Adapter",
-    navSettings: "Settings",
+    appTitle: "Security Operations Triage Center",
+    appSubtitle: "Alert response and evidence governance",
+    navDashboard: "Queue",
+    navAdapter: "Log Intake",
+    navSettings: "Runtime",
+    workspaceEyebrow: "Security Operations",
+    workspaceTitle: "Alert Triage Queue",
+    workspaceTitleDashboard: "Alert Triage Queue",
+    workspaceTitleAdapter: "Log Intake",
+    workspaceTitleSettings: "Runtime Configuration",
+    environment: "Offline-ready",
     refresh: "Refresh",
-    alerts: "Alerts",
-    highCritical: "High/Critical",
-    latestCases: "Latest Cases",
-    llmConfig: "LLM Configuration",
+    alerts: "Total Alerts",
+    highCritical: "High and Critical",
+    latestCases: "Case Queue",
+    latestCasesHint: "Sorted by last update; expand a case to review evidence, verdict, and actions.",
+    llmConfig: "Model Service",
+    llmConfigHint: "Switch between local analyzer, Ollama, and the internal gateway.",
     apiKeyPlaceholder: "Leave blank to keep the existing key",
+    provider: "Service type",
+    serviceUrl: "Service URL",
+    model: "Model",
+    apiKey: "Credential",
     keyEnv: "Key environment variable",
     timeoutSeconds: "Timeout seconds",
     saveConfig: "Save configuration",
     reload: "Reload",
-    logAdapter: "Log Auto-Adapter",
+    logAdapter: "Log Intake",
+    logAdapterHint: "Field detection, mapping confirmation, and pre-ingestion validation.",
     raspJsonLog: "RASP JSON log",
-    autoDetectFields: "Auto-detect fields",
+    autoDetectFields: "Detect fields",
     loadSample: "Load sample",
-    saveTemplate: "Save template",
-    advancedConfig: "Advanced configuration",
-    profileJson: "Profile JSON (field mapping)",
+    saveTemplate: "Save mapping",
+    advancedConfig: "Mapping templates",
+    profileJson: "Profile JSON",
     saveProfile: "Save profile",
-    dryRunPreview: "Dry-run Preview",
-    runDryRun: "Run dry-run",
-    dryRunHint: "Paste a sanitized RASP JSON log, auto-detect fields, then run a dry-run.",
+    dryRunPreview: "Mapping Validation",
+    dryRunPreviewHint: "Validate RawAlert and normalized event output before ingestion.",
+    runDryRun: "Run validation",
+    dryRunHint: "Waiting for log and mapping configuration.",
     themeAria: "Toggle dark or light mode",
     switchLight: "Switch to light mode",
     switchDark: "Switch to dark mode",
@@ -167,7 +199,7 @@ const STRINGS = {
     noActions: "No recommended actions",
     noEvidence: "No normalized evidence",
     confirmFalsePositive: "Confirm business false positive",
-    aiAnalysis: "AI Analysis Result",
+    aiAnalysis: "Triage Summary",
     product: "Product",
     classification: "Classification",
     confidence: "Confidence",
@@ -189,7 +221,9 @@ const STRINGS = {
     type: "Type",
     value: "Value",
     weightSource: "Weight/Source",
-    agentRuns: "Agent Runs",
+    agentRuns: "Triage Runs",
+    rawPayload: "Raw payload",
+    runPayload: "Run detail",
     runCount: "{count} runs",
     expandCase: "Expand Case {id}",
     alertCountLong: "{count} alerts",
@@ -200,7 +234,7 @@ const STRINGS = {
     memoryWritten: "Written to product long-term memory: {id}. Similar future alerts will reduce confidence.",
     falsePositiveDone: "Business false positive confirmed and written to memory: {id}",
     confirmFailed: "Confirmation failed: {message}",
-    noCases: "No cases yet. Submit sample alerts to populate this view.",
+    noCases: "No cases.",
     refreshFailed: "Refresh failed: {message}",
     enabled: "Enabled",
     disabled: "Disabled",
@@ -217,12 +251,12 @@ const STRINGS = {
     noMapping: "Do not map",
     required: "Required",
     enhanced: "Enhanced",
-    inferOk: "Auto-detection completed. You can run a dry-run.",
-    inferNeedsRequired: "Auto-detection completed, but required fields still need mapping.",
+    inferOk: "Field detection completed. You can run validation.",
+    inferNeedsRequired: "Field detection completed, but required fields still need mapping.",
     selectProfileFirst: "Auto-detect fields or select a profile first",
     templateSaved: "Template saved: {id}",
-    dryRunOk: "Dry-run passed. Ready for production ingestion.",
-    dryRunFailed: "Dry-run failed. Missing fields: {fields}",
+    dryRunOk: "Mapping validation passed. Ready for production ingestion.",
+    dryRunFailed: "Mapping validation failed. Missing fields: {fields}",
     checkResult: "check the result",
     keySetKeep: "Set. Leave blank to keep it",
     keyUnset: "Not set",
@@ -231,12 +265,12 @@ const STRINGS = {
     configSaved: "Saved: {provider} / {model}",
     configRestored: "Restored the default LLM config from the config file and environment (e.g. startup local).",
     restoreDefaults: "Restore defaults",
-    loadModels: "Fetch local models",
+    loadModels: "Sync models",
     modelsLoaded: "Loaded {count} local model(s) from {endpoint}; pick one from the Model dropdown.",
     modelsEmpty: "No models found at {endpoint}. Is Ollama running?",
     modelsLoadFailed: "Failed to load models: {error}",
     sampleLoaded: "Loaded RASP sample log.",
-    dryRunError: "Dry-run failed: {message}",
+    dryRunError: "Mapping validation failed: {message}",
     fieldRequired: "Required",
     fieldEnhanced: "Enhanced",
   },
@@ -321,7 +355,20 @@ function applyLanguage() {
   if (lastFieldMappingResult) {
     renderFieldMappingTable(lastFieldMappingResult);
   }
+  const active = document.querySelector(".nav-button.active")?.dataset.view || "dashboard";
+  updateWorkspaceTitle(active);
   renderProfileList();
+}
+
+function updateWorkspaceTitle(name) {
+  const title = document.querySelector("[data-i18n='workspaceTitle']");
+  if (!title) return;
+  const key = {
+    dashboard: "workspaceTitleDashboard",
+    adapter: "workspaceTitleAdapter",
+    settings: "workspaceTitleSettings",
+  }[name] || "workspaceTitleDashboard";
+  title.textContent = tr(key);
 }
 
 function escapeHtml(value) {
@@ -570,7 +617,10 @@ function renderDetail(detail) {
           <dt>${escapeHtml(tr("adapterStatus"))}</dt><dd>${escapeHtml(adapter.mapping_status || "passed")}</dd>
         </dl>
         ${reviewTools(raw)}
-        <pre class="json-block">${pretty(raw.payload)}</pre>
+        <details class="json-details">
+          <summary>${escapeHtml(tr("rawPayload"))}</summary>
+          <pre class="json-block">${pretty(raw.payload)}</pre>
+        </details>
       </section>
 
       <section class="detail-card">
@@ -595,7 +645,10 @@ function renderDetail(detail) {
           <h3>${escapeHtml(tr("agentRuns"))}</h3>
           <span>${escapeHtml(tr("runCount", { count: detail.agent_runs?.length || 0 }))}</span>
         </div>
-        <pre class="json-block">${pretty(detail.agent_runs || [])}</pre>
+        <details class="json-details">
+          <summary>${escapeHtml(tr("runPayload"))}</summary>
+          <pre class="json-block">${pretty(detail.agent_runs || [])}</pre>
+        </details>
       </section>
     </div>
   `;
@@ -684,6 +737,7 @@ function setView(name) {
   document.querySelectorAll(".nav-button").forEach((btn) => {
     btn.classList.toggle("active", btn.dataset.view === name);
   });
+  updateWorkspaceTitle(name);
 }
 
 async function loadCases() {

@@ -27,8 +27,18 @@ class SecurityAgent(ABC):
     def analysis_focus(self) -> list[str]:
         raise NotImplementedError
 
+    def report_outline(self) -> list[str]:
+        """Product-specific report headings used by prompts and fallbacks.
+
+        The JSON contract stays stable for local, Ollama, and enterprise LLM
+        gateways. These headings only guide the content of ``reason`` and
+        ``analysis_dimensions`` so every backend produces the same analyst view.
+        """
+        return ["综合判断", "关键证据", "处置动作", "证据缺口", "误报与白名单"]
+
     def analyze(self, case_id: str, event: NormalizedEvent, memory: list[dict[str, Any]]) -> AgentResult:
         context = {
+            "result_contract_version": "security-analysis-v2",
             "product": event.product,
             "severity": event.severity,
             "event_type": event.event_type,
@@ -37,6 +47,7 @@ class SecurityAgent(ABC):
             "evidence_details": event.evidence,
             "memory": memory,
             "focus": self.analysis_focus(),
+            "report_outline": self.report_outline(),
         }
         prompt = self._build_prompt(context)
         llm_result = self.llm.analyze(prompt, context)
@@ -73,6 +84,10 @@ class SecurityAgent(ABC):
             + "\n\n你正在为银行 SOC 分析安全告警。请全程使用简体中文输出。只基于输入证据分析，不要编造不存在的事实，不要输出攻击利用步骤、payload 或真实凭证。"
             + "\n请以银行安全运营专家口吻回答，重点说明：攻击链判断、业务影响、证据强弱、仍需补充的证据、只读验证步骤。"
             + "\n输入中的 memory 为多层记忆：case_short_term（本 Case 短期记忆）、product_long_term（产品长期经验）、asset_profile（资产画像）、org_knowledge（组织知识/Playbook）、evidence_refs（不可改证据引用）。evidence_refs 只读，仅作引用，不得外泄原始敏感字段。"
+            + "\n输出契约对 local-rule-analyst、Ollama 和内网 LLM Gateway 完全一致：必须返回同一 JSON 字段集合，不能改字段名、不能把报告写到 JSON 外。"
+            + "\nreason 必须是可直接给 SOC 分析师阅读的报告，第一行固定为“研判结论：<verdict>”，第二行固定为“分析报告：”。"
+            + "\nanalysis_dimensions 必须按输入 report_outline 的小标题组织；每个维度只写结论化证据，不复写完整 payload。没有证据的维度也要说明缺口，而不是留空。"
+            + "\nverdict 只能使用三类格式：【真实攻击】- 原因、【误报】- 原因、【需人工复核】- 原因。SIEM 真实事件也归入【真实攻击】标签。"
             + "\n必须返回严格 JSON，字段如下："
             + '\n{"classification":"malicious|suspicious|benign|insufficient_evidence",'
             + '"confidence":0.0,'
@@ -98,11 +113,13 @@ class SecurityAgent(ABC):
     ) -> str:
         entity_bits = ", ".join(f"{k}={v}" for k, v in event.entities.items()) or "缺少关键实体"
         impact = llm_result.get("business_impact")
-        impact_text = f"业务影响：{impact}。" if impact else ""
-        reason_head = explanation.get("verdict") or self._first_reason_line(llm_result.get("reason", ""))
+        verdict = explanation.get("verdict") or self._first_reason_line(llm_result.get("reason", ""))
+        core_evidence = self._core_evidence_sentence(explanation.get("dimensions", []))
+        impact_value = self._strip_terminal(impact) if impact else "当前证据不足以量化影响范围"
+        impact_text = f"业务影响：{impact_value}。"
         return (
-            f"{self.product.upper()} {event.event_type} 被判定为 {classification}，置信度 {confidence:.2f}。"
-            f"关键实体：{entity_bits}。{impact_text}{reason_head}"
+            f"{verdict}。{self.product.upper()} {event.event_type} 判定为 {classification}，置信度 {confidence:.2f}。"
+            f"关键实体：{entity_bits}。核心依据：{self._strip_terminal(core_evidence)}。{impact_text}"
         )
 
     def _ensure_explainable_result(self, llm_result: dict[str, Any], event: NormalizedEvent) -> dict[str, Any]:
@@ -171,7 +188,7 @@ class SecurityAgent(ABC):
         if structured and structured.get("verdict"):
             return self._merge_with_structured(llm_result, structured)
         if llm_dims and llm_verdict and self._dimensions_support_classification(llm_dims, classification):
-            return llm_result
+            return self._complete_result_shape(llm_result, event, classification)
         return self._reconcile_ungrounded(llm_result, event, explanation, classification)
 
     def _merge_with_structured(self, llm_result: dict[str, Any], structured: dict[str, Any]) -> dict[str, Any]:
@@ -191,7 +208,7 @@ class SecurityAgent(ABC):
             merged["whitelist_recommendation"] = structured["whitelist_recommendation"]
         if not str(merged.get("reason", "")).strip():
             merged["reason"] = structured.get("reason", "")
-        return merged
+        return self._complete_result_shape(merged, None, structured["classification"])
 
     def _reconcile_ungrounded(
         self,
@@ -211,6 +228,32 @@ class SecurityAgent(ABC):
             merged["analysis_dimensions"] = self._synthesize_dimensions(event, classification)
         if not str(merged.get("verdict", "")).strip():
             merged["verdict"] = self._verdict_from_classification(classification)
+        return self._complete_result_shape(merged, event, classification)
+
+    def _complete_result_shape(
+        self,
+        llm_result: dict[str, Any],
+        event: NormalizedEvent | None,
+        classification: str,
+    ) -> dict[str, Any]:
+        """Fill optional-but-operational fields without changing the public
+        JSON contract expected from future Gateway responses."""
+        merged = dict(llm_result)
+        merged["classification"] = self._normalize_classification(merged.get("classification", classification))
+        merged["confidence"] = self._normalize_confidence(merged.get("confidence", 0.3))
+        merged["verdict"] = self._format_verdict(str(merged.get("verdict") or ""), merged["classification"])
+        dims = self._explanation(merged).get("dimensions", [])
+        if not dims and event is not None:
+            dims = self._synthesize_dimensions(event, merged["classification"])
+        merged["analysis_dimensions"] = dims
+        if not str(merged.get("reason", "")).strip():
+            merged["reason"] = self._reason_from_dimensions(merged["verdict"], dims)
+        if not isinstance(merged.get("recommended_next_steps"), list):
+            merged["recommended_next_steps"] = []
+        if not isinstance(merged.get("missing_evidence"), list):
+            merged["missing_evidence"] = []
+        if "business_impact" not in merged:
+            merged["business_impact"] = ""
         return merged
 
     # Dimension status ↔ classification consistency helpers -------------------
@@ -254,22 +297,10 @@ class SecurityAgent(ABC):
                 by_type[item["type"]] = item.get("value")
 
         dims: list[dict[str, str]] = []
-        rule = entities.get("rule") or by_type.get("rule_id") or by_type.get("rule_name")
-        if rule:
-            dims.append({"title": "检测规则", "status": status, "evidence": f"命中规则 {self._short(rule)}，与「{label}」判断相关。"})
-        indicators = self._collect_attack_indicators(event, by_type, entities)
-        if indicators:
-            dims.append({"title": "攻击特征", "status": status, "evidence": indicators})
-        sink = by_type.get("sink") or by_type.get("stack_trace") or by_type.get("stacktrace")
-        if sink:
-            dims.append({"title": "危险调用", "status": status, "evidence": f"调用栈/危险 sink 涉及 {self._short(sink)}。"})
-        action = entities.get("action") or by_type.get("action")
-        if action:
-            action_status = "blocked" if classification == "malicious" and self._looks_blocked(action) else status
-            dims.append({"title": "处置动作", "status": action_status, "evidence": f"安全产品动作：{self._short(action)}。"})
-        host = entities.get("host") or entities.get("src_ip")
-        if host:
-            dims.append({"title": "受影响实体", "status": status, "evidence": f"关键实体：{host}。"})
+        for title in self.report_outline():
+            evidence = self._evidence_for_report_title(title, event, by_type, entities, classification, label)
+            if evidence:
+                dims.append({"title": title, "status": self._status_for_report_title(title, classification, evidence), "evidence": evidence})
 
         if not dims:
             dims.append({"title": "综合判断", "status": status, "evidence": f"基于归一化证据的综合判断为「{label}」，缺少结构化分维度标注。"})
@@ -281,6 +312,168 @@ class SecurityAgent(ABC):
             }
         )
         return dims
+
+    def _evidence_for_report_title(
+        self,
+        title: str,
+        event: NormalizedEvent,
+        by_type: dict[str, Any],
+        entities: dict[str, Any],
+        classification: str,
+        label: str,
+    ) -> str:
+        product = event.product.lower()
+        text = title.lower()
+        action = entities.get("action") or by_type.get("action")
+        rule = entities.get("rule") or by_type.get("rule_id") or by_type.get("rule_name") or by_type.get("rule_info")
+        if product == "rasp":
+            if "参数" in title:
+                return self._join_facts(
+                    [
+                        self._fact("方法", entities.get("method") or by_type.get("method")),
+                        self._fact("路径/URL", entities.get("url") or by_type.get("url") or by_type.get("uri")),
+                        self._fact("污染源", by_type.get("taint_source")),
+                        self._fact("载荷摘要", by_type.get("payload_category")),
+                    ],
+                    "缺少请求参数、路径或污染源证据，无法完整判断入口特征。",
+                )
+            if "危险调用" in title:
+                return self._join_facts(
+                    [
+                        self._fact("sink", by_type.get("sink")),
+                        self._fact("stack", by_type.get("stack_trace") or by_type.get("stacktrace")),
+                        self._fact("异常", by_type.get("exception")),
+                    ],
+                    "未提取到危险 sink 或调用栈，需要补充 RASP 原始 stacktrace。",
+                )
+            if "规则" in title:
+                return f"命中规则 {self._short(rule)}，当前分类为「{label}」。" if rule else "缺少 rule_info/rule_id，无法校验规则与漏洞类型是否一致。"
+            if "上下文" in title:
+                return self._join_facts(
+                    [
+                        self._fact("hook_data", by_type.get("hook_data")),
+                        self._fact("动作", action),
+                        self._fact("应用", entities.get("app")),
+                        self._fact("主机", entities.get("host")),
+                        self._fact("来源", entities.get("src_ip")),
+                    ],
+                    "缺少 hook_data、动作或应用上下文，需回看原始 RASP 告警。",
+                )
+            if "成功" in title:
+                if action:
+                    blocked = "已阻断或拦截" if self._looks_blocked(action) else "未确认阻断"
+                    return f"RASP 动作为 {self._short(action)}，{blocked}；仍需结合响应、异常和后续日志确认是否造成影响。"
+                return "缺少 RASP 动作、响应或异常证据，无法判断攻击是否成功。"
+            if "误报" in title or "白名单" in title:
+                return "仅当确认业务合法且边界足够精确时才建议白名单；当前需限定规则、路径、参数、sink/stacktrace 和应用范围。"
+        if product == "waf":
+            if "请求" in title:
+                return self._join_facts([self._fact("方法", entities.get("method") or by_type.get("method")), self._fact("URL", entities.get("url") or by_type.get("uri")), self._fact("来源", entities.get("src_ip"))], "缺少 URL、方法或来源上下文。")
+            if "参数" in title or "header" in text:
+                return self._join_facts([self._fact("命中字段", by_type.get("matched_parameters")), self._fact("载荷摘要", by_type.get("payload_category"))], "缺少命中参数/Header 或载荷摘要。")
+            if "规则" in title:
+                return f"命中规则 {self._short(rule)}，需核对规则描述、命中字段和攻击类型是否一致。" if rule else "缺少 WAF 规则字段。"
+            if "响应" in title or "处置" in title:
+                return self._join_facts([self._fact("动作", action), self._fact("状态码", by_type.get("status"))], "缺少 WAF 动作或响应码。")
+            if "基线" in title:
+                return self._join_facts([self._fact("频率", by_type.get("session_count_30m")), self._fact("窗口", by_type.get("rate_window")), self._fact("基线", by_type.get("baseline"))], "缺少同源、同账号或同 URI 频率基线。")
+            if "关联" in title:
+                return self._join_facts([self._fact("关联", by_type.get("correlation") or by_type.get("related_events"))], "缺少 RASP/NDR/SIEM 或应用日志关联证据。")
+        if product == "hips":
+            if "主机" in title or "身份" in title:
+                return self._join_facts([self._fact("主机", entities.get("host")), self._fact("用户", entities.get("user")), self._fact("来源", entities.get("src_ip"))], "缺少主机、用户或登录来源。")
+            if "进程链" in title:
+                return self._join_facts([self._fact("进程", entities.get("process") or by_type.get("process_name")), self._fact("父进程", by_type.get("parent_process"))], "缺少父子进程证据。")
+            if "命令行" in title or "脚本" in title:
+                return self._join_facts([self._fact("命令行摘要", by_type.get("command_line"))], "缺少命令行或脚本摘要。")
+            if "行为" in title:
+                return self._join_facts([self._fact("近期上下文", by_type.get("recent_context")), self._fact("网络", by_type.get("dst_ip") or entities.get("dst_ip"))], "缺少文件、注册表、服务、网络等行为证据。")
+            if "规则" in title or "处置" in title:
+                return self._join_facts([self._fact("规则", rule), self._fact("动作", action)], "缺少 HIPS 规则或处置动作。")
+            if "基线" in title or "变更" in title:
+                return self._join_facts([self._fact("基线", by_type.get("baseline")), self._fact("近期上下文", by_type.get("recent_context"))], "缺少基线、变更单或历史误报证据。")
+        if product == "ndr":
+            if "通信" in title:
+                return self._join_facts([self._fact("源", entities.get("src_ip") or entities.get("host")), self._fact("目的", entities.get("dst_ip") or by_type.get("sni")), self._fact("协议", by_type.get("protocol"))], "缺少源、目的或协议方向。")
+            if "时序" in title or "流量" in title:
+                return self._join_facts([self._fact("会话", by_type.get("session_count_30m")), self._fact("间隔", by_type.get("beacon_interval_seconds")), self._fact("出/入", self._bytes_pair(by_type))], "缺少会话频率、周期或流量比例。")
+            if "协议" in title or "指纹" in title:
+                return self._join_facts([self._fact("SNI", by_type.get("sni")), self._fact("JA3", by_type.get("ja3")), self._fact("JA4", by_type.get("ja4"))], "缺少 DNS/TLS/HTTP 指纹。")
+            if "目的地" in title or "信誉" in title:
+                return self._join_facts([self._fact("目的", entities.get("dst_ip")), self._fact("SNI", by_type.get("sni")), self._fact("基线", by_type.get("baseline"))], "缺少目的地信誉、ASN、地理位置或首次出现时间。")
+            if "关联" in title:
+                return self._join_facts([self._fact("关联", by_type.get("correlation") or by_type.get("related_events"))], "缺少主机、应用或 SIEM 关联证据。")
+            if "数据" in title:
+                return self._join_facts([self._fact("出站字节", by_type.get("bytes_out")), self._fact("入站字节", by_type.get("bytes_in"))], "缺少外传规模或横向移动结果证据。")
+        if product == "siem":
+            if "时间线" in title:
+                return self._join_facts([self._fact("时间线", by_type.get("timeline"))], "缺少关键事件时间线。")
+            if "实体" in title:
+                return self._join_facts([self._fact("用户", entities.get("user")), self._fact("主机", entities.get("host")), self._fact("源", entities.get("src_ip")), self._fact("目的", entities.get("dst_ip"))], "缺少用户、主机、IP 或应用实体关系。")
+            if "攻击链" in title:
+                return self._join_facts([self._fact("摘要", by_type.get("case_summary")), self._fact("信号", by_type.get("signals"))], "缺少可映射到攻击阶段的多源信号。")
+            if "多源" in title:
+                return self._join_facts([self._fact("关联", by_type.get("correlation") or by_type.get("related_events")), self._fact("信号", by_type.get("signals"))], "缺少多源支持或冲突证据。")
+            if "影响" in title:
+                return self._join_facts([self._fact("业务影响", by_type.get("business_impact")), self._fact("实体", json.dumps(entities, ensure_ascii=False))], "缺少账号、主机、数据或监管影响证据。")
+            if "缺口" in title:
+                return self._join_facts([self._fact("缺口", by_type.get("missing_evidence"))], "需补充原始日志、时间线、实体关系和处置结果。")
+            if "响应" in title:
+                return "按当前严重级别和置信度确定升级优先级；只读验证优先，高影响动作需审批。"
+        if "综合" in title or "关键" in title:
+            indicators = self._collect_attack_indicators(event, by_type, entities)
+            return indicators or f"基于 {len(event.evidence or [])} 条归一化证据，当前分类为「{label}」。"
+        if "处置" in title:
+            return f"安全产品动作：{self._short(action)}。" if action else "缺少产品处置动作。"
+        if "缺口" in title:
+            return "需补充原始日志、关联事件、资产画像和业务上下文。"
+        return ""
+
+    def _status_for_report_title(self, title: str, classification: str, evidence: str) -> str:
+        if "缺少" in evidence or "无法" in evidence or "需补充" in evidence:
+            return "review" if classification in {"malicious", "suspicious"} else "info"
+        if "处置" in title or "响应" in title or "成功" in title:
+            if "已阻断" in evidence or "blocked" in evidence.lower() or "拦截" in evidence:
+                return "blocked"
+        if "误报" in title or "白名单" in title or classification == "benign":
+            return "benign" if classification == "benign" else "review"
+        return self._CLASSIFICATION_STATUS.get(classification, "info")
+
+    def _reason_from_dimensions(self, verdict: str, dims: list[dict[str, Any]]) -> str:
+        lines = [f"研判结论：{verdict}", "分析报告："]
+        for item in dims:
+            lines.append(f"- {item.get('title') or '证据维度'}：{item.get('evidence') or '无补充说明'}")
+        return "\n".join(lines)
+
+    def _core_evidence_sentence(self, dims: list[dict[str, Any]]) -> str:
+        selected = []
+        for item in dims:
+            status = self._normalize_dimension_status(item.get("status"))
+            if status in {"risk", "blocked", "review", "benign", "normal"}:
+                title = str(item.get("title") or "证据维度")
+                evidence = self._strip_terminal(self._short(item.get("evidence") or ""))
+                if evidence:
+                    selected.append(f"{title}：{evidence}")
+            if len(selected) >= 2:
+                break
+        return "；".join(selected) if selected else "当前仅有归一化证据，需结合原始日志复核"
+
+    def _strip_terminal(self, value: Any) -> str:
+        return str(value or "").strip().rstrip("。；; ")
+
+    def _join_facts(self, facts: list[str], fallback: str) -> str:
+        compact = [item for item in facts if item]
+        return "；".join(compact) + "。" if compact else fallback
+
+    def _fact(self, label: str, value: Any) -> str:
+        if value in ("", None, [], {}):
+            return ""
+        return f"{label}={self._short(value)}"
+
+    def _bytes_pair(self, by_type: dict[str, Any]) -> str:
+        if by_type.get("bytes_out") or by_type.get("bytes_in"):
+            return f"{by_type.get('bytes_out', '-')}/{by_type.get('bytes_in', '-')}"
+        return ""
 
     def _collect_attack_indicators(self, event: NormalizedEvent, by_type: dict[str, Any], entities: dict[str, Any]) -> str:
         parts: list[str] = []
@@ -414,7 +607,7 @@ class SecurityAgent(ABC):
         for tag in self._VERDICT_TAGS:
             if verdict.startswith(tag):
                 return verdict
-        if "真实攻击" in verdict or classification == "malicious":
+        if "真实攻击" in verdict or "真实事件" in verdict or classification == "malicious":
             tag = "【真实攻击】"
         elif "误报" in verdict or classification == "benign":
             tag = "【误报】"
@@ -422,6 +615,7 @@ class SecurityAgent(ABC):
             tag = "【需人工复核】"
         detail = verdict
         if detail:
+            detail = re.sub(r"^【(?:真实攻击|真实事件|误报|需人工复核)】[\s\-:：、，,]*", "", detail).strip()
             detail = re.sub(r"^(真实攻击|误报|需人工复核|恶意|良性)[\s\-:：、，,]*", "", detail).strip()
             detail = detail.strip("【】[]-—：:、，, ")
         if not detail:
