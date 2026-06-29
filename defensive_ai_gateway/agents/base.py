@@ -57,6 +57,16 @@ class SecurityAgent(ABC):
         context = self.policy.sanitize_context(context)
         prompt = self._build_prompt(context)
         llm_result = self.llm.analyze(prompt, context)
+        if not isinstance(llm_result, dict):
+            llm_result = {
+                "classification": "insufficient_evidence",
+                "confidence": 0.2,
+                "reason": f"LLM 返回非对象结果（{type(llm_result).__name__}），已降级为证据不足。",
+                "analysis_dimensions": [],
+                "recommended_next_steps": [],
+                "missing_evidence": ["LLM 返回格式不符合分析契约"],
+                "business_impact": "",
+            }
         llm_result = self._ensure_explainable_result(llm_result, event)
         classification = self._normalize_classification(llm_result.get("classification", "insufficient_evidence"))
         confidence = self._normalize_confidence(llm_result.get("confidence", 0.3))
@@ -553,6 +563,8 @@ class SecurityAgent(ABC):
         missing: list[str] = []
         success = ""
         for item in event.evidence:
+            if not isinstance(item, dict):
+                continue
             item_type = item.get("type")
             value = item.get("value")
             if item_type == "expected_verdict" and value:

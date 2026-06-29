@@ -9,7 +9,7 @@ from defensive_ai_gateway.app import GatewayState
 from defensive_ai_gateway.config import GatewayConfig
 from defensive_ai_gateway.database import Repository
 from defensive_ai_gateway.log_adapter import LogAdapter, demo_rasp_profile, mapping_profile_record
-from defensive_ai_gateway.llm import GatewayLLM, LLMClient, LocalHeuristicLLM
+from defensive_ai_gateway.llm import GatewayLLM, LLMClient, LocalHeuristicLLM, _parse_json_object
 from defensive_ai_gateway.memory import MemoryManager
 from defensive_ai_gateway.models import RawAlert
 from defensive_ai_gateway.normalizer import EventNormalizer
@@ -372,6 +372,38 @@ class PipelineTest(unittest.TestCase):
             self.assertIn("误报", result.explanation["verdict"])
             self.assertTrue(any(item.get("title") == "历史误报" for item in result.explanation.get("dimensions", [])))
 
+    def test_truncated_memory_context_keeps_dict_shape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            config.database.path = str(Path(tmp) / "gateway.db")
+            config.policy.max_context_bytes = 600
+            repo = Repository(config.database.path)
+            policy = PolicyEngine(config.policy)
+            memory = MemoryManager(repo, policy)
+            orchestrator = Orchestrator(repo, EventNormalizer(policy), memory, LocalHeuristicLLM(), policy)
+            repo.save_memory(
+                {
+                    "memory_id": "mem_rasp_fp_large",
+                    "layer": "product_long_term",
+                    "namespace": memory.product_namespace("rasp"),
+                    "retrieval_key": "cloudrasp_jndi_108",
+                    "content": "false_positive approved " + ("large-context " * 400),
+                    "source_case_id": "case_prior_rasp_fp",
+                    "scope": "rasp:false_positive_pattern",
+                    "trust_level": "medium",
+                    "status": "active",
+                    "sensitivity_ok": True,
+                    "approved_by": "analyst-lee",
+                    "expires_at_ms": None,
+                }
+            )
+            payload = json.loads(Path("samples/rasp_alert.json").read_text(encoding="utf-8"))
+
+            result = orchestrator.handle_alert(GatewayState(config).alert_from_payload(payload))
+
+            self.assertEqual(result.agent, "rasp-agent")
+            self.assertIn(result.classification, {"malicious", "suspicious", "insufficient_evidence", "benign"})
+
 
 class ModelReconciliationTest(unittest.TestCase):
     """Model-backed LLMs (ollama/gateway) must produce logically consistent
@@ -385,7 +417,7 @@ class ModelReconciliationTest(unittest.TestCase):
             self._result = result
 
         def analyze(self, prompt, context):
-            return dict(self._result)
+            return dict(self._result) if isinstance(self._result, dict) else self._result
 
     def _state_with_llm(self, tmp, llm):
         config = GatewayConfig()
@@ -459,6 +491,19 @@ class ModelReconciliationTest(unittest.TestCase):
             self.assertEqual(result.classification, "malicious")
             titles = {d["title"] for d in result.explanation["dimensions"]}
             self.assertIn("请求特征", titles)
+
+    def test_non_object_model_result_degrades_without_crashing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._state_with_llm(tmp, self._FakeModelLLM(["not", "an", "object"]))
+            payload = json.loads(Path("samples/rasp_alert.json").read_text(encoding="utf-8"))
+            result = state.orchestrator.handle_alert(state.alert_from_payload(payload))
+            self.assertEqual(result.classification, "insufficient_evidence")
+            self.assertTrue(result.explanation.get("dimensions"))
+
+    def test_ollama_array_json_degrades_to_dict(self):
+        parsed = _parse_json_object('[{"classification":"benign"}]')
+        self.assertIsInstance(parsed, dict)
+        self.assertEqual(parsed["classification"], "insufficient_evidence")
 
 
 class AlertProductRoutingTest(unittest.TestCase):

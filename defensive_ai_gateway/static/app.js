@@ -1,6 +1,14 @@
 const detailCache = new Map();
 const THEME_KEY = "dashboard-theme";
 const LANGUAGE_KEY = "dashboard-language";
+const SYSLOG_CONFIG_KEY = "dashboard-syslog-intake-config";
+const DEFAULT_SYSLOG_CONFIGS = [
+  { product: "rasp", label: "RASP", port: 1514, profile: "demo-rasp-json", saved: false },
+  { product: "waf", label: "WAF", port: 1515, profile: "waf-syslog-json", saved: false },
+  { product: "hips", label: "HIPS", port: 1516, profile: "hips-syslog-json", saved: false },
+  { product: "ndr", label: "NDR", port: 1517, profile: "ndr-syslog-json", saved: false },
+  { product: "siem", label: "SIEM", port: 1518, profile: "siem-syslog-json", saved: false },
+];
 const STRINGS = {
   zh: {
     appTitle: "安全运营研判中心",
@@ -30,6 +38,42 @@ const STRINGS = {
     timeoutSeconds: "超时秒数",
     saveConfig: "保存配置",
     reload: "重新加载",
+    intakeChannels: "告警接入通道",
+    intakeChannelsHint: "HTTP 接口继续保留，新增 UDP syslog collector 通道。",
+    httpChannelTitle: "现有 HTTP 告警入口",
+    httpChannelSubtitle: "适合已能主动调用接口的系统、脚本和联调工具。",
+    syslogChannelTitle: "新增 UDP Syslog 通道",
+    syslogChannelSubtitle: "适合服务区内只支持 syslog 推送的安全设备。",
+    channelProtocol: "协议",
+    channelEndpoint: "入口",
+    channelAuth: "鉴权",
+    channelTarget: "转发",
+    channelStatus: "状态",
+    channelRetained: "保留",
+    channelPlanned: "规划新增",
+    httpChannelAuth: "沿用网关 Bearer Token 策略",
+    flowSecuritySystem: "安全系统",
+    flowServiceIp: "服务区 IP:产品端口/udp",
+    flowGateway: "网关 HTTP 告警入口",
+    syslogConfigTitle: "Syslog 产品接收配置",
+    syslogConfigHint: "为每类安全系统配置 UDP 接收端口，保存后确认为对应产品日志接收。",
+    resetSyslogConfig: "恢复默认端口",
+    syslogProduct: "安全系统",
+    syslogUdpPort: "UDP 端口",
+    syslogProfile: "映射 Profile",
+    syslogConfirm: "接收确认",
+    syslogAction: "操作",
+    saveSyslogConfig: "保存",
+    syslogPendingStatus: "待保存",
+    syslogSavedStatus: "已保存为 {product} 日志接收：UDP {port}",
+    syslogSavedToast: "{product} 已配置为 UDP {port} 日志接收",
+    syslogPortInvalid: "端口必须在 1-65535 之间",
+    syslogDefaultsRestored: "已恢复默认 UDP 端口配置",
+    syslogOpsTitle: "安全系统侧配置",
+    syslogOpsText: "目的地址填写服务区暴露的 syslog collector IP，端口使用对应产品配置，协议 UDP。",
+    syslogMappingTitle: "字段处理策略",
+    syslogMappingText: "collector 优先解析 syslog message 中的 JSON；未匹配 profile 时按 SIEM 标准告警兜底。",
+    syslogDeployTitle: "k3s 部署对象",
     logAdapter: "日志接入",
     logAdapterHint: "字段识别、映射确认和接入前校验。",
     raspJsonLog: "RASP JSON 日志",
@@ -167,6 +211,42 @@ const STRINGS = {
     timeoutSeconds: "Timeout seconds",
     saveConfig: "Save configuration",
     reload: "Reload",
+    intakeChannels: "Alert Intake Channels",
+    intakeChannelsHint: "Keep the HTTP endpoint and add a UDP syslog collector path.",
+    httpChannelTitle: "Existing HTTP Alert Endpoint",
+    httpChannelSubtitle: "For systems, scripts, and test tools that can actively call the gateway API.",
+    syslogChannelTitle: "New UDP Syslog Channel",
+    syslogChannelSubtitle: "For security devices in the service zone that only push syslog.",
+    channelProtocol: "Protocol",
+    channelEndpoint: "Endpoint",
+    channelAuth: "Auth",
+    channelTarget: "Forwarding",
+    channelStatus: "Status",
+    channelRetained: "Retained",
+    channelPlanned: "Planned",
+    httpChannelAuth: "Uses the gateway Bearer Token policy",
+    flowSecuritySystem: "Security system",
+    flowServiceIp: "Service-zone IP:product port/udp",
+    flowGateway: "Gateway HTTP alert endpoint",
+    syslogConfigTitle: "Syslog Product Receiver Config",
+    syslogConfigHint: "Configure a UDP receiver port for each security system; saving confirms the product log receiver.",
+    resetSyslogConfig: "Restore default ports",
+    syslogProduct: "Security system",
+    syslogUdpPort: "UDP port",
+    syslogProfile: "Mapping profile",
+    syslogConfirm: "Receiver confirmation",
+    syslogAction: "Action",
+    saveSyslogConfig: "Save",
+    syslogPendingStatus: "Pending",
+    syslogSavedStatus: "Saved as {product} log receiver: UDP {port}",
+    syslogSavedToast: "{product} is configured as a UDP {port} log receiver",
+    syslogPortInvalid: "Port must be between 1 and 65535",
+    syslogDefaultsRestored: "Default UDP port configuration restored",
+    syslogOpsTitle: "Security System Setup",
+    syslogOpsText: "Use the service-zone syslog collector IP as the target, the configured product port, and UDP protocol.",
+    syslogMappingTitle: "Field Handling",
+    syslogMappingText: "The collector parses JSON in the syslog message first; unmatched sources fall back to SIEM-style standard alerts.",
+    syslogDeployTitle: "k3s manifest",
     logAdapter: "Log Intake",
     logAdapterHint: "Field detection, mapping confirmation, and pre-ingestion validation.",
     raspJsonLog: "RASP JSON log",
@@ -284,6 +364,7 @@ let inferredFields = [];
 let currentLanguage = "zh";
 let lastFieldMappingResult = null;
 let sampleRaspLog = null;
+let syslogConfigs = loadSyslogConfigs();
 async function loadSampleRaspLog() {
   if (sampleRaspLog) return sampleRaspLog;
   sampleRaspLog = await json("/api/samples/rasp-alert");
@@ -360,6 +441,127 @@ function applyLanguage() {
   const active = document.querySelector(".nav-button.active")?.dataset.view || "dashboard";
   updateWorkspaceTitle(active);
   renderProfileList();
+  renderSyslogConfigTable();
+}
+
+function defaultSyslogConfigs() {
+  return DEFAULT_SYSLOG_CONFIGS.map((item) => ({ ...item }));
+}
+
+function loadSyslogConfigs() {
+  let saved = [];
+  try {
+    saved = JSON.parse(localStorage.getItem(SYSLOG_CONFIG_KEY) || "[]");
+  } catch (err) {
+    saved = [];
+  }
+  const savedByProduct = new Map((Array.isArray(saved) ? saved : []).map((item) => [item.product, item]));
+  return defaultSyslogConfigs().map((item) => {
+    const persisted = savedByProduct.get(item.product) || {};
+    const port = Number(persisted.port || item.port);
+    return {
+      ...item,
+      port: Number.isInteger(port) && port >= 1 && port <= 65535 ? port : item.port,
+      profile: String(persisted.profile || item.profile),
+      saved: Boolean(persisted.saved),
+    };
+  });
+}
+
+function persistSyslogConfigs() {
+  try {
+    localStorage.setItem(SYSLOG_CONFIG_KEY, JSON.stringify(syslogConfigs));
+  } catch (err) {
+    // The current session still reflects the saved configuration when storage is unavailable.
+  }
+}
+
+function setSyslogConfigStatus(message, isError = false) {
+  const status = document.querySelector("#syslog-config-status");
+  if (!status) return;
+  status.textContent = message;
+  status.classList.toggle("error", isError);
+}
+
+function renderSyslogConfigTable() {
+  const container = document.querySelector("#syslog-config-table");
+  if (!container) return;
+  container.innerHTML = `
+    <table>
+      <thead>
+        <tr>
+          <th>${escapeHtml(tr("syslogProduct"))}</th>
+          <th>${escapeHtml(tr("syslogUdpPort"))}</th>
+          <th>${escapeHtml(tr("syslogProfile"))}</th>
+          <th>${escapeHtml(tr("syslogConfirm"))}</th>
+          <th>${escapeHtml(tr("syslogAction"))}</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${syslogConfigs
+          .map(
+            (item) => `
+              <tr data-product="${escapeHtml(item.product)}">
+                <td><strong>${escapeHtml(item.label)}</strong></td>
+                <td>
+                  <input
+                    class="syslog-port-input"
+                    type="number"
+                    min="1"
+                    max="65535"
+                    step="1"
+                    value="${escapeHtml(item.port)}"
+                    aria-label="${escapeHtml(`${item.label} ${tr("syslogUdpPort")}`)}"
+                  />
+                </td>
+                <td><code>${escapeHtml(item.profile)}</code></td>
+                <td>
+                  <span class="field-status ${item.saved ? "mapped" : "needs_review"}">
+                    ${escapeHtml(item.saved ? tr("syslogSavedStatus", { product: item.label, port: item.port }) : tr("syslogPendingStatus"))}
+                  </span>
+                </td>
+                <td>
+                  <button type="button" class="save-syslog-row" data-product="${escapeHtml(item.product)}">
+                    ${escapeHtml(tr("saveSyslogConfig"))}
+                  </button>
+                </td>
+              </tr>
+            `,
+          )
+          .join("")}
+      </tbody>
+    </table>
+  `;
+  container.querySelectorAll(".save-syslog-row").forEach((button) => {
+    button.addEventListener("click", () => saveSyslogConfigRow(button.dataset.product));
+  });
+}
+
+function saveSyslogConfigRow(product) {
+  const row = document.querySelector(`#syslog-config-table tr[data-product="${CSS.escape(product)}"]`);
+  const config = syslogConfigs.find((item) => item.product === product);
+  if (!row || !config) return;
+  const port = Number(row.querySelector(".syslog-port-input")?.value || 0);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    setSyslogConfigStatus(tr("syslogPortInvalid"), true);
+    showToast(tr("syslogPortInvalid"), "error");
+    return;
+  }
+  config.port = port;
+  config.saved = true;
+  persistSyslogConfigs();
+  renderSyslogConfigTable();
+  const message = tr("syslogSavedToast", { product: config.label, port });
+  setSyslogConfigStatus(message);
+  showToast(message);
+}
+
+function resetSyslogConfigs() {
+  syslogConfigs = defaultSyslogConfigs();
+  persistSyslogConfigs();
+  renderSyslogConfigTable();
+  setSyslogConfigStatus(tr("syslogDefaultsRestored"));
+  showToast(tr("syslogDefaultsRestored"));
 }
 
 function updateWorkspaceTitle(name) {
@@ -1174,6 +1376,7 @@ document.querySelector("#save-inferred-profile").addEventListener("click", () =>
 document.querySelector("#reload-profiles").addEventListener("click", () => {
   loadMappingProfiles().catch((err) => setProfileStatus(err.message || String(err), true));
 });
+document.querySelector("#reset-syslog-config").addEventListener("click", resetSyslogConfigs);
 document.querySelector("#dry-run-form").addEventListener("submit", (event) => {
   runDryRun(event).catch((err) => {
     document.querySelector("#dry-run-result").textContent = err.message || String(err);
