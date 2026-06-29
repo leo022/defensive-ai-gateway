@@ -286,6 +286,54 @@ class GatewayLLMHardeningTest(unittest.TestCase):
         out = _validate_result_shape({"classification": "definitely-attack", "confidence": 0.99}, "m")
         self.assertEqual(out["classification"], "insufficient_evidence")
 
+    def test_chinese_classification_normalized_not_downgraded(self):
+        from defensive_ai_gateway.llm import _validate_result_shape
+        out = _validate_result_shape({"classification": "真实攻击", "confidence": 0.9}, "m")
+        self.assertEqual(out["classification"], "malicious")
+        out = _validate_result_shape({"classification": "误报"}, "m")
+        self.assertEqual(out["classification"], "benign")
+
+
+class ClassificationNormalizeTest(unittest.TestCase):
+    def test_real_attack_chinese_maps_to_malicious(self):
+        from defensive_ai_gateway.agents.evidence_helpers import normalize_classification
+        self.assertEqual(normalize_classification("真实攻击"), "malicious")
+        self.assertEqual(normalize_classification("真实事件"), "malicious")
+        self.assertEqual(normalize_classification("真实"), "malicious")
+
+    def test_negated_malicious_not_false_positive(self):
+        from defensive_ai_gateway.agents.evidence_helpers import normalize_classification
+        # "非恶意" must not match the "恶意" substring → malicious.
+        self.assertEqual(normalize_classification("非恶意"), "benign")
+
+
+class StackFramesTest(unittest.TestCase):
+    def test_dict_frames_are_parsed(self):
+        from defensive_ai_gateway.log_adapter import LogAdapter
+        from defensive_ai_gateway.normalizer import EventNormalizer
+        adapter = LogAdapter(EventNormalizer(PolicyEngine(GatewayConfig().policy)))
+        frames = adapter._stack_frames([{"method": "Runtime.exec", "file": "X.java", "line": 12}])
+        self.assertTrue(len(frames) == 1)
+        self.assertIn("Runtime.exec", frames[0])
+
+
+class OversizedBodyTest(unittest.TestCase):
+    def test_negative_content_length_does_not_read_unbounded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            srv = _Server(_config(Path(tmp), token=""))
+            try:
+                # Content-Length: -1 must be treated as empty (clamped), not read-until-EOF.
+                import http.client
+                conn = http.client.HTTPConnection("127.0.0.1", srv.server.server_address[1], timeout=5)
+                conn.request("POST", "/api/alerts", body=b"", headers={"Content-Length": "-1", "Content-Type": "application/json"})
+                resp = conn.getresponse()
+                # An empty body is invalid JSON for /api/alerts → 400 (client error), not a hang/500.
+                self.assertIn(resp.status, (400, 500))
+                resp.read()
+                conn.close()
+            finally:
+                srv.stop()
+
 
 # Lightweight stand-in to avoid importing sqlite3 at module top for one assertion.
 class sqlite3_IntegrityError(Exception):

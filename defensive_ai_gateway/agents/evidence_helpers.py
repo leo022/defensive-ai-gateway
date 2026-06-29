@@ -37,3 +37,36 @@ def join_facts(facts: list[str], fallback: str) -> str:
 
 def strip_terminal(value: Any) -> str:
     return str(value or "").strip().rstrip("。；; ")
+
+
+# Ordered classification normalization. More specific / negated terms must come
+# before their substrings (e.g. "非恶意" before "恶意", "恶意攻击" before "恶意",
+# "真实攻击"/"真实事件" before "真实"). Shared by the agent and the LLM gateway
+# validator so a Chinese-labeled classification is handled consistently instead
+# of being downgraded to insufficient_evidence.
+_CLASSIFICATION_MAP: list[tuple[str, str]] = [
+    ("非恶意", "benign"),
+    ("恶意攻击", "malicious"),
+    ("恶意", "malicious"),
+    ("真实攻击", "malicious"),
+    ("真实事件", "malicious"),
+    ("真实", "malicious"),
+    ("误报", "benign"),
+    ("良性", "benign"),
+    ("可疑", "suspicious"),
+    ("疑似", "suspicious"),
+    ("证据不足", "insufficient_evidence"),
+    ("malicious", "malicious"),
+    ("suspicious", "suspicious"),
+    ("benign", "benign"),
+    ("insufficient_evidence", "insufficient_evidence"),
+    ("insufficient", "insufficient_evidence"),
+]
+
+
+def normalize_classification(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    for key, normalized in _CLASSIFICATION_MAP:
+        if key in text:
+            return normalized
+    return "insufficient_evidence"

@@ -729,6 +729,17 @@ class LogAdapter:
             return frames
         if isinstance(value, str):
             return [line.strip() for line in value.splitlines() if line.strip()]
+        if isinstance(value, dict):
+            # Structured frame objects (e.g. {"method": "...", "file": "...",
+            # "line": 12}) are a common vendor format — collapse them into a
+            # single symbol string so sink derivation still works.
+            parts = []
+            for key in ("method", "function", "class", "file", "line", "lineno"):
+                if value.get(key) is not None:
+                    parts.append(str(value[key]))
+            if parts:
+                return [" ".join(parts)]
+            return []
         return []
 
     def _frame_symbol(self, frame: str) -> str:

@@ -8,7 +8,7 @@ import urllib.request
 from typing import Any
 
 from .config import LLMConfig
-from .agents.evidence_helpers import fact, join_facts, short_text
+from .agents.evidence_helpers import fact, join_facts, normalize_classification, short_text
 
 
 class LLMClient:
@@ -598,10 +598,17 @@ def _validate_result_shape(parsed: Any, model: str) -> dict[str, Any]:
             "reason": "LLM 网关返回非对象 JSON，已降级为证据不足。",
             "model": model,
         }
-    classification = str(parsed.get("classification", "")).lower()
-    if classification not in {"malicious", "suspicious", "benign", "insufficient_evidence"}:
-        parsed = dict(parsed)
-        parsed["classification"] = "insufficient_evidence"
+    parsed = dict(parsed)
+    # Normalize Chinese classification labels (e.g. "真实攻击"/"误报") to the
+    # canonical enum before the allow-list check, so a compliant-in-spirit but
+    # Chinese-labeled gateway response is not downgraded to insufficient_evidence.
+    original = str(parsed.get("classification", "")).strip().lower()
+    normalized = normalize_classification(original)
+    parsed["classification"] = normalized
+    if normalized == "insufficient_evidence" and original and original not in {
+        "malicious", "suspicious", "benign", "insufficient_evidence", "insufficient",
+    }:
+        # Unknown classification text: downgrade and explain.
         if "confidence" not in parsed:
             parsed["confidence"] = 0.2
         parsed.setdefault("reason", "LLM 网关返回的 classification 不合规，已降级为证据不足。")
