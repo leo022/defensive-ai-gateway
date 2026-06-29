@@ -118,7 +118,15 @@ class PolicyEngine:
                 redacted[key] = value[:4] + [{"_truncated": f"{dropped} entries omitted to fit context budget"}]
         text = json.dumps(redacted, ensure_ascii=False, sort_keys=True)
         if len(text.encode("utf-8")) > max_bytes:
-            cap = max(0, max_bytes - len("...[TRUNCATED]".encode("utf-8")))
-            encoded = text.encode("utf-8")[:cap]
-            redacted = {"_truncated": encoded.decode("utf-8", errors="ignore") + "...[TRUNCATED]"}
+            # Final overflow: keep the scalar keys the analyzer needs to function
+            # (product/severity/event_type/entities/focus/report_outline) and drop
+            # the large evidence/memory lists entirely rather than replacing the
+            # whole dict — otherwise LocalHeuristicLLM loses product/evidence and
+            # silently degrades to keyword scoring.
+            redacted = {
+                k: v for k, v in redacted.items()
+                if k in ("product", "severity", "event_type", "entities", "focus", "report_outline")
+            }
+            redacted["evidence"] = [{"_truncated": "evidence omitted to fit context budget"}]
+            redacted["memory"] = [{"_truncated": "memory omitted to fit context budget"}]
         return redacted

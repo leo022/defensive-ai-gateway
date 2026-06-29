@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import re
 import sys
@@ -143,6 +144,11 @@ def main():
     parser.add_argument("--print-only", action="store_true", help="Print payloads without sending them")
     parser.add_argument("--url", default="http://127.0.0.1:8080/api/alerts")
     parser.add_argument("--timeout", type=int, default=180)
+    parser.add_argument(
+        "--token",
+        default=os.getenv("DEFENSIVE_AI_API_TOKEN", ""),
+        help="Gateway bearer token (defaults to env DEFENSIVE_AI_API_TOKEN). Set when the gateway requires auth.",
+    )
     args = parser.parse_args()
 
     if args.random:
@@ -163,9 +169,12 @@ def main():
         return
 
     responses = []
+    headers = {"Content-Type": "application/json"}
+    if args.token:
+        headers["Authorization"] = f"Bearer {args.token}"
     for payload in payloads:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(args.url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+        req = urllib.request.Request(args.url, data=data, headers=headers, method="POST")
         with urllib.request.urlopen(req, timeout=args.timeout) as resp:
             responses.append({"status": resp.status, "alert_id": payload.get("alert_id"), "response": json.loads(resp.read().decode("utf-8"))})
     print(json.dumps({"sent": len(responses), "results": responses}, ensure_ascii=False, indent=2))

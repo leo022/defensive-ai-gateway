@@ -8,7 +8,7 @@ from typing import Any
 from ..llm import LLMClient
 from ..models import AgentResult, NormalizedEvent, RecommendedAction, new_id
 from ..policy import PolicyEngine
-from .evidence_helpers import fact, join_facts, short_text, strip_terminal
+from .evidence_helpers import fact, join_facts, normalize_classification, short_text, strip_terminal
 
 
 class SecurityAgent(ABC):
@@ -192,12 +192,12 @@ class SecurityAgent(ABC):
         """
         structured = self._fallback_from_evidence(event)
         if structured and structured.get("verdict"):
-            return self._merge_with_structured(llm_result, structured)
+            return self._merge_with_structured(llm_result, structured, event)
         if llm_dims and llm_verdict and self._dimensions_support_classification(llm_dims, classification):
             return self._complete_result_shape(llm_result, event, classification)
         return self._reconcile_ungrounded(llm_result, event, explanation, classification)
 
-    def _merge_with_structured(self, llm_result: dict[str, Any], structured: dict[str, Any]) -> dict[str, Any]:
+    def _merge_with_structured(self, llm_result: dict[str, Any], structured: dict[str, Any], event: NormalizedEvent) -> dict[str, Any]:
         """Override the model's classification/verdict/dimensions with structured
         sample ground truth, keeping the model's free-text enrichments when they
         add value.
@@ -231,7 +231,11 @@ class SecurityAgent(ABC):
             merged["whitelist_recommendation"] = structured["whitelist_recommendation"]
         if not str(merged.get("reason", "")).strip():
             merged["reason"] = structured.get("reason", "")
-        return self._complete_result_shape(merged, None, structured["classification"])
+        # Pass the event so that, when the structured ground truth carries only
+        # an expected_verdict (no analysis_dimensions), _complete_result_shape
+        # synthesizes consistent dimensions from the evidence instead of leaving
+        # the dashboard with zero evidence dimensions.
+        return self._complete_result_shape(merged, event, structured["classification"])
 
     def _reconcile_ungrounded(
         self,
@@ -458,6 +462,14 @@ class SecurityAgent(ABC):
                 return self._join_facts([self._fact("缺口", by_type.get("missing_evidence"))], "需补充原始日志、时间线、实体关系和处置结果。")
             if "响应" in title:
                 return "按当前严重级别和置信度确定升级优先级；只读验证优先，高影响动作需审批。"
+        if "成功" in title or "危害" in title:
+            # Generic success/impact handler for products without a dedicated branch
+            # (WAF/HIPS/NDR/SIEM). Without this the "成功与危害" dimension promised
+            # by report_outline was silently dropped.
+            if action:
+                blocked = "已阻断或拦截" if self._looks_blocked(action) else "未确认阻断"
+                return f"产品动作为 {self._short(action)}，{blocked}；需结合响应、后续日志和资产影响确认是否造成实际危害。"
+            return "缺少产品处置动作或响应结果，无法判断攻击是否成功及实际危害。"
         if "综合" in title or "关键" in title:
             indicators = self._collect_attack_indicators(event, by_type, entities)
             return indicators or f"基于 {len(event.evidence or [])} 条归一化证据，当前分类为「{label}」。"
@@ -611,6 +623,7 @@ class SecurityAgent(ABC):
     _DIMENSION_STATUS_ALIASES = {
         "malicious": "risk",
         "high": "risk",
+        "critical": "risk",
         "allow": "normal",
         "low": "normal",
         "suspicious": "review",
@@ -729,25 +742,7 @@ class SecurityAgent(ABC):
         return ""
 
     def _normalize_classification(self, value: Any) -> str:
-        text = str(value).strip().lower()
-        mapping = {
-            "恶意": "malicious",
-            "恶意攻击": "malicious",
-            "malicious": "malicious",
-            "可疑": "suspicious",
-            "疑似": "suspicious",
-            "suspicious": "suspicious",
-            "良性": "benign",
-            "误报": "benign",
-            "benign": "benign",
-            "证据不足": "insufficient_evidence",
-            "insufficient": "insufficient_evidence",
-            "insufficient_evidence": "insufficient_evidence",
-        }
-        for key, normalized in mapping.items():
-            if key in text:
-                return normalized
-        return "insufficient_evidence"
+        return normalize_classification(value)
 
     def _normalize_confidence(self, value: Any) -> float:
         if isinstance(value, str):

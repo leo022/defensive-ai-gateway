@@ -443,10 +443,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             length = 0
+        # Clamp negatives: a Content-Length of -1 would otherwise make
+        # rfile.read(-1) read until EOF (unbounded memory). Treat as empty.
+        if length < 0:
+            length = 0
         if length > MAX_BODY_BYTES:
-            # Drain the oversized body so the client can finish its write and we
-            # can reply with 413 cleanly instead of resetting the connection.
-            remaining = length
+            # Reject without reading the (potentially gigantic) body. We cap the
+            # drain at MAX_BODY_BYTES so a hostile Content-Length can't pin a
+            # worker reading forever; the connection is then closed by the server.
+            remaining = MAX_BODY_BYTES
             while remaining > 0:
                 chunk = self.rfile.read(min(65536, remaining))
                 if not chunk:

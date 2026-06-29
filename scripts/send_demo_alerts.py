@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import urllib.request
 from collections import Counter
@@ -74,9 +75,12 @@ def coverage_summary(payloads: list[tuple[str, dict]]) -> dict:
     }
 
 
-def send_alert(payload: dict, url: str, timeout: int) -> dict:
+def send_alert(payload: dict, url: str, timeout: int, token: str = "") -> dict:
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return {"status": resp.status, "response": json.loads(resp.read().decode("utf-8"))}
 
@@ -87,6 +91,11 @@ def main() -> None:
     parser.add_argument("--url", default="http://127.0.0.1:8080/api/alerts")
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--print-only", action="store_true", help="Print payloads without sending")
+    parser.add_argument(
+        "--token",
+        default=os.getenv("DEFENSIVE_AI_API_TOKEN", ""),
+        help="Gateway bearer token (defaults to env DEFENSIVE_AI_API_TOKEN). Set when the gateway requires auth.",
+    )
     args = parser.parse_args()
 
     selected = BATCHES[args.batch]
@@ -107,7 +116,7 @@ def main() -> None:
     for label, payload in payloads:
         payload.pop("_scenario", None)  # don't send the internal tag
         try:
-            result = send_alert(payload, args.url, args.timeout)
+            result = send_alert(payload, args.url, args.timeout, args.token)
         except Exception as exc:  # noqa: BLE001
             rows.append({"label": label, "alert_id": payload.get("alert_id"), "error": str(exc)})
             continue
@@ -127,6 +136,10 @@ def main() -> None:
         )
 
     print(json.dumps({"sent": len(rows), "results": rows}, ensure_ascii=False, indent=2))
+    # Fail loudly if every send failed (e.g. auth misconfig) so CI/gates notice.
+    succeeded = [r for r in rows if "error" not in r]
+    if rows and not succeeded:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

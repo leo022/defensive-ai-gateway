@@ -49,6 +49,7 @@ const STRINGS = {
     languageButton: "English",
     languageAria: "Switch to English",
     statusRisk: "风险",
+    statusBlocked: "已阻断",
     statusNormal: "正常",
     statusReview: "复核",
     statusInfo: "信息",
@@ -185,6 +186,7 @@ const STRINGS = {
     languageButton: "中文",
     languageAria: "切换到中文",
     statusRisk: "Risk",
+    statusBlocked: "Blocked",
     statusNormal: "Normal",
     statusReview: "Review",
     statusInfo: "Info",
@@ -474,7 +476,11 @@ function showToast(message, type = "success") {
 
 function statusLabel(status) {
   const value = text(status).toLowerCase();
-  if (["risk", "malicious", "blocked", "high"].includes(value)) return tr("statusRisk");
+  // "blocked" has its own color class (status-dot.blocked) and means the action
+  // was already mitigated — give it a distinct label so text and color stay
+  // consistent instead of showing "风险" in a non-risk color.
+  if (value === "blocked") return tr("statusBlocked");
+  if (["risk", "malicious", "high"].includes(value)) return tr("statusRisk");
   if (["benign", "normal", "allow", "low"].includes(value)) return tr("statusNormal");
   if (["review", "suspicious", "medium"].includes(value)) return tr("statusReview");
   return tr("statusInfo");
