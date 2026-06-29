@@ -8,7 +8,7 @@ from .database import Repository
 from .models import AgentResult, new_id, now_ms
 
 # Multi-layer memory management, following the architecture design §8
-# "三层记忆 + 一层证据" and §6 Memory Manager / §11 记忆投毒控制.
+# "多层记忆 + 一层证据" and §6 Memory Manager / §11 记忆投毒控制.
 #
 # Layers (each with its own namespace + retrieval key + governance rule):
 #   case_short_term   — case_id / trace_id        — archived on case close; promote needs approval
@@ -190,28 +190,63 @@ class MemoryManager:
     ) -> None:
         if result.classification not in {"malicious", "suspicious", "benign"}:
             return
-        # 1) short-term case memory — always written, auto-expires (archive on close)
+        # Write short-term case memory + long-term candidate + asset profile as one
+        # atomic unit so a crash cannot leave a case with short-term memory but no
+        # long-term candidate (or vice-versa).
+        with self.repo.transaction():
+            # 1) short-term case memory — always written, auto-expires (archive on close)
+            self.repo.save_memory(
+                {
+                    "memory_id": new_id("mem"),
+                    "layer": LAYER_CASE_SHORT_TERM,
+                    "namespace": self.case_namespace(result.case_id),
+                    "retrieval_key": result.case_id,
+                    "content": self._case_short_term_content(result, trace_id),
+                    "source_case_id": result.case_id,
+                    "scope": f"case:{result.case_id}",
+                    "trust_level": TRUST_LOW,
+                    "status": STATUS_ACTIVE,
+                    "sensitivity_ok": True,
+                    "approved_by": "",
+                    "expires_at_ms": now_ms() + SHORT_TERM_TTL_MS,
+                },
+                _commit=False,
+            )
+            # 2) propose a long-term candidate — NOT auto-promoted; pending analyst approval
+            self._propose_long_term_locked(product, result, asset_id)
+            # 3) asset profile — low-trust operational context, useful for same-asset review
+            if asset_id:
+                self._record_asset_profile_locked(product, result, asset_id)
+
+    def _propose_long_term_locked(self, product: str, result: AgentResult, asset_id: str | None = None) -> str:
+        """Long-term candidate proposal assuming the caller holds a transaction.
+
+        Public ``propose_long_term`` wraps this in its own transaction for callers
+        that propose outside ``record_case_summary``.
+        """
+        memory_id = new_id("mem")
         self.repo.save_memory(
             {
-                "memory_id": new_id("mem"),
-                "layer": LAYER_CASE_SHORT_TERM,
-                "namespace": self.case_namespace(result.case_id),
+                "memory_id": memory_id,
+                "layer": LAYER_PRODUCT_LONG_TERM,
+                "namespace": self.product_namespace(product),
                 "retrieval_key": result.case_id,
-                "content": self._case_short_term_content(result, trace_id),
+                "content": self._long_term_candidate_content(product, result, asset_id),
                 "source_case_id": result.case_id,
-                "scope": f"case:{result.case_id}",
+                "scope": "",  # unset → blocks promotion (scope_clear gate)
                 "trust_level": TRUST_LOW,
-                "status": STATUS_ACTIVE,
+                "status": STATUS_PENDING,
                 "sensitivity_ok": True,
-                "approved_by": "",
-                "expires_at_ms": now_ms() + SHORT_TERM_TTL_MS,
-            }
+                "approved_by": "",  # unset → blocks promotion (analyst_approved gate)
+                "expires_at_ms": None,  # unset → blocks promotion (expiry_set gate)
+            },
+            _commit=False,
         )
-        # 2) propose a long-term candidate — NOT auto-promoted; pending analyst approval
-        self.propose_long_term(product, result, asset_id)
-        # 3) asset profile — low-trust operational context, useful for same-asset review
-        if asset_id:
-            self.record_asset_profile(product, result, asset_id)
+        self.repo.insert_memory_event(
+            new_id("mev"), memory_id, LAYER_PRODUCT_LONG_TERM, "proposed", "memory_manager",
+            {"case_id": result.case_id, "product": product, "asset_id": asset_id}, _commit=False,
+        )
+        return memory_id
 
     def _case_short_term_content(self, result: AgentResult, trace_id: str | None) -> str:
         return json.dumps(
@@ -236,28 +271,8 @@ class MemoryManager:
         Scope and expiry are intentionally unset so the promotion gates block it
         until an analyst confirms.
         """
-        memory_id = new_id("mem")
-        self.repo.save_memory(
-            {
-                "memory_id": memory_id,
-                "layer": LAYER_PRODUCT_LONG_TERM,
-                "namespace": self.product_namespace(product),
-                "retrieval_key": result.case_id,
-                "content": self._long_term_candidate_content(product, result, asset_id),
-                "source_case_id": result.case_id,
-                "scope": "",  # unset → blocks promotion (scope_clear gate)
-                "trust_level": TRUST_LOW,
-                "status": STATUS_PENDING,
-                "sensitivity_ok": True,
-                "approved_by": "",  # unset → blocks promotion (analyst_approved gate)
-                "expires_at_ms": None,  # unset → blocks promotion (expiry_set gate)
-            }
-        )
-        self.repo.insert_memory_event(
-            new_id("mev"), memory_id, LAYER_PRODUCT_LONG_TERM, "proposed", "memory_manager",
-            {"case_id": result.case_id, "product": product, "asset_id": asset_id},
-        )
-        return memory_id
+        with self.repo.transaction():
+            return self._propose_long_term_locked(product, result, asset_id)
 
     def _long_term_candidate_content(self, product: str, result: AgentResult, asset_id: str | None) -> str:
         whitelist = result.explanation.get("whitelist_recommendation") or {}
@@ -290,6 +305,11 @@ class MemoryManager:
         return sorted(self._extract_similarity_features(" ".join(text_parts)))[:16]
 
     def record_asset_profile(self, product: str, result: AgentResult, asset_id: str) -> str:
+        with self.repo.transaction():
+            return self._record_asset_profile_locked(product, result, asset_id)
+
+    def _record_asset_profile_locked(self, product: str, result: AgentResult, asset_id: str) -> str:
+        """Caller holds a transaction."""
         memory_id = new_id("mem")
         self.repo.save_memory(
             {
@@ -317,11 +337,12 @@ class MemoryManager:
                 "sensitivity_ok": True,
                 "approved_by": "memory_manager",
                 "expires_at_ms": now_ms() + QUARTERLY_REVIEW_MS,
-            }
+            },
+            _commit=False,
         )
         self.repo.insert_memory_event(
             new_id("mev"), memory_id, LAYER_ASSET_PROFILE, "asset_profile_recorded", "memory_manager",
-            {"case_id": result.case_id, "product": product, "asset_id": asset_id},
+            {"case_id": result.case_id, "product": product, "asset_id": asset_id}, _commit=False,
         )
         return memory_id
 
@@ -362,35 +383,42 @@ class MemoryManager:
             sort_keys=True,
         )
         memory_id = new_id("mem")
-        self.repo.save_memory(
-            {
-                "memory_id": memory_id,
-                "layer": LAYER_PRODUCT_LONG_TERM,
-                "namespace": self.product_namespace(product),
-                "retrieval_key": features.get("rule_id") or raw.get("event_type") or linked_alert.get("alert_id", ""),
-                "content": content,
-                "source_case_id": linked_alert.get("case_id", ""),
-                "scope": f"{product}:business_false_positive:{features.get('event_type') or raw.get('event_type')}",
-                "trust_level": TRUST_MEDIUM,
-                "status": STATUS_ACTIVE,
-                "sensitivity_ok": True,
-                "approved_by": analyst,
-                "expires_at_ms": expires_at_ms or now_ms() + QUARTERLY_REVIEW_MS,
-            }
-        )
-        self.repo.insert_memory_event(
-            new_id("mev"),
-            memory_id,
-            LAYER_PRODUCT_LONG_TERM,
-            "human_confirmed_business_false_positive",
-            analyst,
-            {
-                "alert_id": linked_alert.get("alert_id"),
-                "case_id": linked_alert.get("case_id"),
-                "reason": reason,
-                "features": features,
-            },
-        )
+        # Atomic: the FP memory and its audit event commit together. The HTTP layer's
+        # companion audit_log row is written in the same logical action (see
+        # GatewayState.confirm_alert_false_positive) so a crash cannot leave a
+        # promoted FP memory without a trace.
+        with self.repo.transaction():
+            self.repo.save_memory(
+                {
+                    "memory_id": memory_id,
+                    "layer": LAYER_PRODUCT_LONG_TERM,
+                    "namespace": self.product_namespace(product),
+                    "retrieval_key": features.get("rule_id") or raw.get("event_type") or linked_alert.get("alert_id", ""),
+                    "content": content,
+                    "source_case_id": linked_alert.get("case_id", ""),
+                    "scope": f"{product}:business_false_positive:{features.get('event_type') or raw.get('event_type')}",
+                    "trust_level": TRUST_MEDIUM,
+                    "status": STATUS_ACTIVE,
+                    "sensitivity_ok": True,
+                    "approved_by": analyst,
+                    "expires_at_ms": expires_at_ms or now_ms() + QUARTERLY_REVIEW_MS,
+                },
+                _commit=False,
+            )
+            self.repo.insert_memory_event(
+                new_id("mev"),
+                memory_id,
+                LAYER_PRODUCT_LONG_TERM,
+                "human_confirmed_business_false_positive",
+                analyst,
+                {
+                    "alert_id": linked_alert.get("alert_id"),
+                    "case_id": linked_alert.get("case_id"),
+                    "reason": reason,
+                    "features": features,
+                },
+                _commit=False,
+            )
         return {"memory_id": memory_id, "features": features}
 
     def extract_false_positive_features(self, linked_alert: dict[str, Any]) -> dict[str, Any]:
@@ -501,33 +529,42 @@ class MemoryManager:
     ) -> PromotionOutcome:
         ok, reasons = self.promotion_check(memory_id, approved_by, scope, expires_at_ms)
         if not ok:
-            self.repo.insert_memory_event(
-                new_id("mev"), memory_id, LAYER_PRODUCT_LONG_TERM, "rejected",
-                approved_by or "memory_manager", {"reasons": reasons},
-            )
+            with self.repo.transaction():
+                self.repo.insert_memory_event(
+                    new_id("mev"), memory_id, LAYER_PRODUCT_LONG_TERM, "rejected",
+                    approved_by or "memory_manager", {"reasons": reasons}, _commit=False,
+                )
             return PromotionOutcome(False, reasons, memory_id)
-        self.repo.update_memory(
-            memory_id,
-            status=STATUS_ACTIVE,
-            approved_by=approved_by,
-            expires_at_ms=expires_at_ms,
-            trust_level=TRUST_MEDIUM,
-        )
-        if scope:
-            self.repo.update_memory(memory_id, scope=scope)
-        if retrieval_key:
-            self.repo.update_memory(memory_id, retrieval_key=retrieval_key)
-        self.repo.insert_memory_event(
-            new_id("mev"), memory_id, LAYER_PRODUCT_LONG_TERM, "promoted", approved_by,
-            {"scope": scope, "expires_at_ms": expires_at_ms, "retrieval_key": retrieval_key},
-        )
+        # Atomic promotion: status, scope, retrieval_key and the audit event commit
+        # together so a failure mid-sequence cannot leave an ``active`` memory with
+        # empty scope/retrieval_key (which would violate the very gates just checked).
+        with self.repo.transaction():
+            self.repo.update_memory(
+                memory_id,
+                status=STATUS_ACTIVE,
+                approved_by=approved_by,
+                expires_at_ms=expires_at_ms,
+                trust_level=TRUST_MEDIUM,
+                _commit=False,
+            )
+            if scope:
+                self.repo.update_memory(memory_id, scope=scope, _commit=False)
+            if retrieval_key:
+                self.repo.update_memory(memory_id, retrieval_key=retrieval_key, _commit=False)
+            self.repo.insert_memory_event(
+                new_id("mev"), memory_id, LAYER_PRODUCT_LONG_TERM, "promoted", approved_by,
+                {"scope": scope, "expires_at_ms": expires_at_ms, "retrieval_key": retrieval_key},
+                _commit=False,
+            )
         return PromotionOutcome(True, [], memory_id)
 
     def reject(self, memory_id: str, actor: str, reason: str) -> None:
-        self.repo.update_memory(memory_id, status=STATUS_REVOKED)
-        self.repo.insert_memory_event(
-            new_id("mev"), memory_id, LAYER_PRODUCT_LONG_TERM, "rejected", actor, {"reason": reason}
-        )
+        with self.repo.transaction():
+            self.repo.update_memory(memory_id, status=STATUS_REVOKED, _commit=False)
+            self.repo.insert_memory_event(
+                new_id("mev"), memory_id, LAYER_PRODUCT_LONG_TERM, "rejected", actor, {"reason": reason},
+                _commit=False,
+            )
 
     # ---- governance: expiry, poisoning, conflicts, archival ----------
 
@@ -536,20 +573,23 @@ class MemoryManager:
         now_ms_value = now_ms_value if now_ms_value is not None else now_ms()
         expired: list[str] = []
         for m in self.repo.memory_due_for_expiry(now_ms_value):
-            self.repo.update_memory(m["memory_id"], status=STATUS_EXPIRED, trust_level=TRUST_LOW)
-            self.repo.insert_memory_event(
-                new_id("mev"), m["memory_id"], m["layer"], "expired", "memory_manager",
-                {"expired_at": now_ms_value, "was_expires_at": m["expires_at_ms"]},
-            )
+            with self.repo.transaction():
+                self.repo.update_memory(m["memory_id"], status=STATUS_EXPIRED, trust_level=TRUST_LOW, _commit=False)
+                self.repo.insert_memory_event(
+                    new_id("mev"), m["memory_id"], m["layer"], "expired", "memory_manager",
+                    {"expired_at": now_ms_value, "was_expires_at": m["expires_at_ms"]},
+                    _commit=False,
+                )
             expired.append(m["memory_id"])
         return expired
 
     def quarantine(self, memory_id: str, actor: str, reason: str) -> None:
         """Isolate a low-trust / suspected-poisoned memory (§11 记忆投毒控制)."""
-        self.repo.update_memory(memory_id, status=STATUS_QUARANTINED, trust_level=TRUST_LOW)
-        self.repo.insert_memory_event(
-            new_id("mev"), memory_id, "", "quarantined", actor, {"reason": reason}
-        )
+        with self.repo.transaction():
+            self.repo.update_memory(memory_id, status=STATUS_QUARANTINED, trust_level=TRUST_LOW, _commit=False)
+            self.repo.insert_memory_event(
+                new_id("mev"), memory_id, "", "quarantined", actor, {"reason": reason}, _commit=False,
+            )
 
     def detect_conflicts(self, product: str) -> list[dict[str, Any]]:
         """Detect duplicate/conflicting long-term memories for a product and quarantine the dupes."""

@@ -8,6 +8,7 @@ import urllib.request
 from typing import Any
 
 from .config import LLMConfig
+from .agents.evidence_helpers import fact, join_facts, short_text
 
 
 class LLMClient:
@@ -474,21 +475,13 @@ class LocalHeuristicLLM(LLMClient):
         return default
 
     def _join_facts(self, facts: list[str], fallback: str) -> str:
-        compact = [item for item in facts if item]
-        return "；".join(compact) + "。" if compact else fallback
+        return join_facts(facts, fallback)
 
     def _fact(self, label: str, value: Any) -> str:
-        if value in ("", None, [], {}):
-            return ""
-        return f"{label}={self._short(value)}"
+        return fact(label, value)
 
     def _short(self, value: Any) -> str:
-        if isinstance(value, (dict, list)):
-            text = json.dumps(value, ensure_ascii=False)
-        else:
-            text = str(value)
-        text = text.replace("\n", " ").strip()
-        return text[:120] + ("…" if len(text) > 120 else "")
+        return short_text(value)
 
     def _false_positive_memory_match(self, context: dict[str, Any]) -> dict[str, Any] | None:
         memories = (context.get("memory") or {}).get("product_long_term", [])
@@ -567,13 +560,53 @@ class GatewayLLM(LLMClient):
     def analyze(self, prompt: str, context: dict[str, Any]) -> dict[str, Any]:
         if not self.config.endpoint:
             raise RuntimeError("LLM endpoint is not configured")
+        # ``context`` is already redacted + size-bounded by SecurityAgent.analyze
+        # before reaching here, so we forward it verbatim to the gateway.
         payload = json.dumps({"model": self.config.model, "prompt": prompt, "context": context}, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(self.config.endpoint, data=payload, headers={"Content-Type": "application/json"}, method="POST")
         api_key = self.config.api_key or os.getenv(self.config.api_key_env)
         if api_key:
             req.add_header("Authorization", f"Bearer {api_key}")
-        with urllib.request.urlopen(req, timeout=self.config.timeout_seconds) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(req, timeout=self.config.timeout_seconds) as resp:
+                if resp.status >= 400:
+                    raise RuntimeError(f"LLM gateway returned HTTP {resp.status}")
+                body = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"LLM gateway HTTP {exc.code}: {exc.read().decode('utf-8', errors='ignore')[:200]}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"LLM gateway unreachable: {exc.reason}") from exc
+        try:
+            parsed = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"LLM gateway returned non-JSON response: {body[:200]}") from exc
+        return _validate_result_shape(parsed, self.config.model)
+
+
+def _validate_result_shape(parsed: Any, model: str) -> dict[str, Any]:
+    """Ensure an LLM result conforms to the analysis contract.
+
+    The enterprise gateway is the least-constrained backend (no grammar
+    enforcement like Ollama's ``format``), so we validate the response here and
+    fall back to a safe ``insufficient_evidence`` shell on any mismatch rather
+    than letting a malformed dict propagate to reconciliation.
+    """
+    if not isinstance(parsed, dict):
+        return {
+            "classification": "insufficient_evidence",
+            "confidence": 0.2,
+            "reason": "LLM 网关返回非对象 JSON，已降级为证据不足。",
+            "model": model,
+        }
+    classification = str(parsed.get("classification", "")).lower()
+    if classification not in {"malicious", "suspicious", "benign", "insufficient_evidence"}:
+        parsed = dict(parsed)
+        parsed["classification"] = "insufficient_evidence"
+        if "confidence" not in parsed:
+            parsed["confidence"] = 0.2
+        parsed.setdefault("reason", "LLM 网关返回的 classification 不合规，已降级为证据不足。")
+    parsed.setdefault("model", model)
+    return parsed
 
 
 # JSON Schema for Ollama structured outputs. Mirrors the result contract that
@@ -649,6 +682,11 @@ class OllamaLLM(LLMClient):
                 result["model_fallback"] = "gemma3:4b not found; used gemma3:latest"
                 return result
             raise RuntimeError(f"Ollama HTTP {exc.code}: {body}") from exc
+        except urllib.error.URLError as exc:
+            # Connection refused / DNS / timeout — surface as a RuntimeError so the
+            # orchestrator can degrade to the deterministic heuristic rather than
+            # abort the whole alert.
+            raise RuntimeError(f"Ollama unreachable: {exc.reason}") from exc
 
     def _generate(self, model: str, prompt: str) -> dict[str, Any]:
         payload = {
@@ -661,8 +699,11 @@ class OllamaLLM(LLMClient):
             # 强制字段名与枚举值，显著提升本地小模型的字段遵循率。
             "format": OLLAMA_ANALYSIS_SCHEMA,
             "options": {
-                "temperature": 0.1,
+                # temperature 0 + fixed seed for reproducible harness replay; a
+                # failing sample should fail consistently rather than pass on retry.
+                "temperature": 0,
                 "top_p": 0.9,
+                "seed": 0,
             },
         }
         req = urllib.request.Request(

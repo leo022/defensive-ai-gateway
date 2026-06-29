@@ -11,6 +11,10 @@ metadata:
 type: Opaque
 stringData:
   DEFENSIVE_AI_LLM_API_KEY: ""
+  # Shared bearer token for the HTTP API. Set a strong random value in production;
+  # all mutating endpoints and /api/config/llm* require Authorization: Bearer <token>.
+  # Pair with mTLS at the ingress for defense in depth.
+  DEFENSIVE_AI_API_TOKEN: ""
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -33,8 +37,13 @@ data:
     policy:
       mode: "read_only"
       max_prompt_chars: 12000
+      max_context_bytes: 20000
       require_approval_for: [block, isolate, change_policy, disable_account]
       redact_fields: [password, token, cookie, authorization, customer_id, id_card, phone, email, session]
+    auth:
+      api_token: ""
+      allow_loopback_no_token: true
+      require_token_when_remote: true
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -122,11 +131,17 @@ spec:
       port: 8080
       targetPort: http
 ---
+# Ingress: production must terminate TLS here and, for bank SOC, enforce mutual
+# TLS (client certificate) on the upstream so only trusted SOC/collector clients
+# can reach the gateway. The application-level bearer token (DEFENSIVE_AI_API_TOKEN)
+# is a second layer, not a replacement for transport security.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: defensive-ai-gateway
   namespace: defensive-ai-gateway
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-passthrough: "false"
 spec:
   rules:
     - host: defensive-ai-gateway.local

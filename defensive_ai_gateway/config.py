@@ -31,6 +31,7 @@ class LLMConfig:
 class PolicyConfig:
     mode: str = "read_only"
     max_prompt_chars: int = 12000
+    max_context_bytes: int = 20000
     require_approval_for: list[str] = field(default_factory=lambda: ["block", "isolate", "change_policy", "disable_account"])
     redact_fields: list[str] = field(
         default_factory=lambda: [
@@ -48,11 +49,32 @@ class PolicyConfig:
 
 
 @dataclass
+class AuthConfig:
+    """HTTP API authentication.
+
+    For a banking SOC gateway every mutating endpoint (and the LLM config
+    endpoints) must be authenticated. The lightest stdlib-only mechanism is a
+    shared bearer token read from the environment. When no token is configured
+    the gateway falls back to loopback-only access so local dev/tests stay
+    usable; production must set ``api_token`` and front the service with mTLS /
+    a reverse proxy (see deploy/k3s).
+    """
+    api_token: str = ""
+    # When True (default), requests originating from 127.0.0.1/::1 are accepted
+    # even without a token — keeps local dev and the test harness working.
+    allow_loopback_no_token: bool = True
+    # When True, an unauthenticated non-loopback request with no token
+    # configured is rejected (fail-closed for network-exposed deployments).
+    require_token_when_remote: bool = True
+
+
+@dataclass
 class GatewayConfig:
     server: ServerConfig = field(default_factory=ServerConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
+    auth: AuthConfig = field(default_factory=AuthConfig)
 
 
 def _parse_scalar(value: str) -> Any:
@@ -113,6 +135,7 @@ def load_config(path: str | None = None) -> GatewayConfig:
     database = raw.get("database", {})
     llm = raw.get("llm", {})
     policy = raw.get("policy", {})
+    auth = raw.get("auth", {})
     api_key_env = str(llm.get("api_key_env", "DEFENSIVE_AI_LLM_API_KEY"))
 
     config = GatewayConfig(
@@ -132,6 +155,7 @@ def load_config(path: str | None = None) -> GatewayConfig:
         policy=PolicyConfig(
             mode=str(policy.get("mode", "read_only")),
             max_prompt_chars=int(policy.get("max_prompt_chars", 12000)),
+            max_context_bytes=int(policy.get("max_context_bytes", 20000)),
             require_approval_for=list(policy.get("require_approval_for", ["block", "isolate", "change_policy", "disable_account"])),
             redact_fields=list(
                 policy.get(
@@ -139,6 +163,17 @@ def load_config(path: str | None = None) -> GatewayConfig:
                     ["password", "token", "cookie", "authorization", "customer_id", "id_card", "phone", "email", "session"],
                 )
             ),
+        ),
+        auth=AuthConfig(
+            api_token=str(os.getenv("DEFENSIVE_AI_API_TOKEN", auth.get("api_token", ""))),
+            allow_loopback_no_token=str(
+                os.getenv("DEFENSIVE_AI_AUTH_LOOPBACK", "1" if auth.get("allow_loopback_no_token", True) else "0")
+            )
+            in {"1", "true", "True", "yes"},
+            require_token_when_remote=str(
+                os.getenv("DEFENSIVE_AI_AUTH_REQUIRE_REMOTE_TOKEN", "1" if auth.get("require_token_when_remote", True) else "0")
+            )
+            in {"1", "true", "True", "yes"},
         ),
     )
     return config
