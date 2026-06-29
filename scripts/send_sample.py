@@ -6,6 +6,7 @@ import os
 import random
 import re
 import sys
+import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -175,8 +176,18 @@ def main():
     for payload in payloads:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(args.url, data=data, headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=args.timeout) as resp:
-            responses.append({"status": resp.status, "alert_id": payload.get("alert_id"), "response": json.loads(resp.read().decode("utf-8"))})
+        try:
+            with urllib.request.urlopen(req, timeout=args.timeout) as resp:
+                responses.append({"status": resp.status, "alert_id": payload.get("alert_id"), "response": json.loads(resp.read().decode("utf-8"))})
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            try:
+                response = json.loads(body)
+            except json.JSONDecodeError:
+                response = body
+            responses.append({"status": exc.code, "alert_id": payload.get("alert_id"), "error": response})
+            print(json.dumps({"sent": len(responses) - 1, "failed": 1, "results": responses}, ensure_ascii=False, indent=2))
+            raise SystemExit(1) from None
     print(json.dumps({"sent": len(responses), "results": responses}, ensure_ascii=False, indent=2))
 
 

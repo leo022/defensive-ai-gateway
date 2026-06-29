@@ -837,6 +837,254 @@ h4 {
   white-space: nowrap;
 }
 
+.intake-plan-panel {
+  overflow: hidden;
+}
+
+.intake-channel-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  padding: 16px 16px 0;
+}
+
+.intake-channel-card {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-2);
+  padding: 14px;
+}
+
+.intake-channel-card.recommended {
+  border-color: var(--brand-line);
+  background: var(--brand-bg);
+}
+
+.channel-title-row {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+}
+
+.channel-icon {
+  display: inline-grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink-strong);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.channel-icon.udp {
+  border-color: var(--brand-line);
+  color: var(--brand-strong);
+}
+
+.channel-title-row h3 {
+  color: var(--ink-strong);
+  font-size: 14px;
+  font-weight: 760;
+}
+
+.channel-title-row p {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.channel-kv {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 8px 10px;
+  margin: 0;
+}
+
+.channel-kv dt {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 720;
+}
+
+.channel-kv dd {
+  min-width: 0;
+  margin: 0;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.channel-kv code,
+.intake-notes code {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink-strong);
+  padding: 2px 6px;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 12px;
+}
+
+.syslog-config-block {
+  display: grid;
+  gap: 12px;
+  margin: 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 14px;
+}
+
+.syslog-config-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.syslog-config-heading h3 {
+  color: var(--ink-strong);
+  font-size: 14px;
+  font-weight: 760;
+}
+
+.syslog-config-heading p {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.syslog-config-heading button,
+.save-syslog-row {
+  white-space: nowrap;
+}
+
+.syslog-config-table {
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.syslog-config-table table {
+  width: 100%;
+  min-width: 760px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  border-collapse: separate;
+  border-spacing: 0;
+  overflow: hidden;
+  table-layout: fixed;
+}
+
+.syslog-config-table th,
+.syslog-config-table td {
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  vertical-align: middle;
+  font-size: 12px;
+}
+
+.syslog-config-table tr:last-child td {
+  border-bottom: 0;
+}
+
+.syslog-config-table th {
+  background: var(--surface-3);
+  color: var(--muted);
+  font-weight: 760;
+}
+
+.syslog-config-table input {
+  width: 120px;
+  max-width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink);
+  padding: 7px 8px;
+}
+
+.syslog-config-table code {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--ink);
+  padding: 2px 6px;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 12px;
+}
+
+.save-syslog-row {
+  border-color: var(--brand-line);
+  background: var(--brand-bg);
+  color: var(--brand-strong);
+  font-weight: 760;
+}
+
+.intake-flow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 16px;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-3);
+  padding: 10px 12px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 720;
+  white-space: nowrap;
+}
+
+.intake-flow span:not([aria-hidden="true"]) {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--ink);
+  padding: 4px 9px;
+}
+
+.intake-flow span[aria-hidden="true"] {
+  color: var(--brand-strong);
+}
+
+.intake-notes {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  padding: 0 16px 16px;
+}
+
+.intake-notes div {
+  min-width: 0;
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}
+
+.intake-notes strong {
+  display: block;
+  color: var(--ink-strong);
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.intake-notes p {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
 .adapter-grid {
   display: grid;
   grid-template-columns: minmax(380px, 0.9fr) minmax(440px, 1.1fr);
@@ -1135,7 +1383,9 @@ h4 {
   }
 
   .detail-grid,
-  .adapter-grid {
+  .adapter-grid,
+  .intake-channel-grid,
+  .intake-notes {
     grid-template-columns: 1fr;
   }
 
@@ -1161,7 +1411,8 @@ h4 {
   .header-actions,
   .primary-nav,
   .sidebar-footer,
-  .form-actions {
+  .form-actions,
+  .syslog-config-heading {
     align-items: stretch;
     flex-direction: column;
   }
@@ -1169,7 +1420,8 @@ h4 {
   .nav-button,
   .utility-button,
   .header-actions button,
-  .form-actions button {
+  .form-actions button,
+  .syslog-config-heading button {
     width: 100%;
   }
 

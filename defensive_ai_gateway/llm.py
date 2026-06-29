@@ -484,7 +484,10 @@ class LocalHeuristicLLM(LLMClient):
         return short_text(value)
 
     def _false_positive_memory_match(self, context: dict[str, Any]) -> dict[str, Any] | None:
-        memories = (context.get("memory") or {}).get("product_long_term", [])
+        memory_context = context.get("memory") or {}
+        if not isinstance(memory_context, dict):
+            return None
+        memories = memory_context.get("product_long_term", [])
         if not isinstance(memories, list):
             return None
         alert_text = json.dumps(
@@ -725,7 +728,7 @@ class OllamaLLM(LLMClient):
         parsed = _parse_json_object(response)
         parsed.setdefault("reason", "Ollama 本地模型完成分析。")
         parsed.setdefault("model", model)
-        return parsed
+        return _validate_result_shape(parsed, model)
 
 
 def _parse_json_object(text: str) -> dict[str, Any]:
@@ -735,12 +738,16 @@ def _parse_json_object(text: str) -> dict[str, Any]:
     # <think>...</think>; strip it so we parse only the final answer.
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
     except json.JSONDecodeError:
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if match:
             try:
-                return json.loads(match.group(0))
+                parsed = json.loads(match.group(0))
+                if isinstance(parsed, dict):
+                    return parsed
             except json.JSONDecodeError:
                 pass
     return {

@@ -123,6 +123,80 @@
             </section>
           </section>
           <section id="adapter-view" class="view">
+            <section class="panel intake-plan-panel">
+              <div class="panel-heading">
+                <div>
+                  <h2 data-i18n="intakeChannels">告警接入通道</h2>
+                  <p data-i18n="intakeChannelsHint">HTTP 接口继续保留，新增 UDP syslog collector 通道。</p>
+                </div>
+              </div>
+              <div class="intake-channel-grid">
+                <article class="intake-channel-card">
+                  <div class="channel-title-row">
+                    <span class="channel-icon" aria-hidden="true">H</span>
+                    <div>
+                      <h3 data-i18n="httpChannelTitle">现有 HTTP 告警入口</h3>
+                      <p data-i18n="httpChannelSubtitle">适合已能主动调用接口的系统、脚本和联调工具。</p>
+                    </div>
+                  </div>
+                  <dl class="channel-kv">
+                    <dt data-i18n="channelProtocol">协议</dt><dd>HTTP JSON</dd>
+                    <dt data-i18n="channelEndpoint">入口</dt><dd><code>POST /api/alerts</code></dd>
+                    <dt data-i18n="channelAuth">鉴权</dt><dd data-i18n="httpChannelAuth">沿用网关 Bearer Token 策略</dd>
+                    <dt data-i18n="channelStatus">状态</dt><dd><span class="field-status mapped" data-i18n="channelRetained">保留</span></dd>
+                  </dl>
+                </article>
+                <article class="intake-channel-card recommended">
+                  <div class="channel-title-row">
+                    <span class="channel-icon udp" aria-hidden="true">U</span>
+                    <div>
+                      <h3 data-i18n="syslogChannelTitle">新增 UDP Syslog 通道</h3>
+                      <p data-i18n="syslogChannelSubtitle">适合服务区内只支持 syslog 推送的安全设备。</p>
+                    </div>
+                  </div>
+                  <dl class="channel-kv">
+                    <dt data-i18n="channelProtocol">协议</dt><dd>Syslog UDP</dd>
+                    <dt data-i18n="channelEndpoint">入口</dt><dd><code>syslog-collector:&lt;产品端口&gt;/udp</code></dd>
+                    <dt data-i18n="channelTarget">转发</dt><dd><code>POST /api/alerts</code></dd>
+                    <dt data-i18n="channelStatus">状态</dt><dd><span class="field-status needs_review" data-i18n="channelPlanned">规划新增</span></dd>
+                  </dl>
+                </article>
+              </div>
+              <div class="syslog-config-block">
+                <div class="syslog-config-heading">
+                  <div>
+                    <h3 data-i18n="syslogConfigTitle">Syslog 产品接收配置</h3>
+                    <p data-i18n="syslogConfigHint">为每类安全系统配置 UDP 接收端口，保存后确认为对应产品日志接收。</p>
+                  </div>
+                  <button type="button" id="reset-syslog-config" data-i18n="resetSyslogConfig">恢复默认端口</button>
+                </div>
+                <div id="syslog-config-table" class="syslog-config-table"></div>
+                <p id="syslog-config-status" class="form-status"></p>
+              </div>
+              <div class="intake-flow">
+                <span data-i18n="flowSecuritySystem">安全系统</span>
+                <span aria-hidden="true">→</span>
+                <span data-i18n="flowServiceIp">服务区 IP:产品端口/udp</span>
+                <span aria-hidden="true">→</span>
+                <span>Vector</span>
+                <span aria-hidden="true">→</span>
+                <span data-i18n="flowGateway">网关 HTTP 告警入口</span>
+              </div>
+              <div class="intake-notes">
+                <div>
+                  <strong data-i18n="syslogOpsTitle">安全系统侧配置</strong>
+                  <p data-i18n="syslogOpsText">目的地址填写服务区暴露的 syslog collector IP，端口使用对应产品配置，协议 UDP。</p>
+                </div>
+                <div>
+                  <strong data-i18n="syslogMappingTitle">字段处理策略</strong>
+                  <p data-i18n="syslogMappingText">collector 优先解析 syslog message 中的 JSON；未匹配 profile 时按 SIEM 标准告警兜底。</p>
+                </div>
+                <div>
+                  <strong data-i18n="syslogDeployTitle">k3s 部署对象</strong>
+                  <p><code>deploy/k3s/syslog-collector-vector.yaml</code></p>
+                </div>
+              </div>
+            </section>
             <section class="adapter-grid">
               <section class="panel">
                 <div class="panel-heading">

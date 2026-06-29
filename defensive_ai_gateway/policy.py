@@ -116,6 +116,13 @@ class PolicyEngine:
             if isinstance(value, list) and len(value) > 4:
                 dropped = len(value) - 4
                 redacted[key] = value[:4] + [{"_truncated": f"{dropped} entries omitted to fit context budget"}]
+            elif isinstance(value, dict):
+                for layer, entries in list(value.items()):
+                    if len(json.dumps(redacted, ensure_ascii=False, sort_keys=True).encode("utf-8")) <= max_bytes:
+                        break
+                    if isinstance(entries, list) and len(entries) > 4:
+                        dropped = len(entries) - 4
+                        value[layer] = entries[:4] + [{"_truncated": f"{dropped} entries omitted to fit context budget"}]
         text = json.dumps(redacted, ensure_ascii=False, sort_keys=True)
         if len(text.encode("utf-8")) > max_bytes:
             # Final overflow: keep the scalar keys the analyzer needs to function
@@ -128,5 +135,5 @@ class PolicyEngine:
                 if k in ("product", "severity", "event_type", "entities", "focus", "report_outline")
             }
             redacted["evidence"] = [{"_truncated": "evidence omitted to fit context budget"}]
-            redacted["memory"] = [{"_truncated": "memory omitted to fit context budget"}]
+            redacted["memory"] = {"_truncated": "memory omitted to fit context budget"}
         return redacted
