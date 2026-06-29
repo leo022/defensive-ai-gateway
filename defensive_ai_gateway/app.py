@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import mimetypes
 import threading
@@ -31,6 +32,19 @@ from .policy import PolicyEngine
 
 
 _STANDARD_ALERT_KEYS = ("event_type", "severity", "alert_id", "source", "timestamp")
+
+# Hard cap on inbound request bodies to prevent memory-exhaustion DoS. A security
+# alert payload is small JSON; anything larger is rejected before json.loads.
+MAX_BODY_BYTES = 2_000_000
+
+# Hosts permitted for the Ollama model-picker SSRF surface. The picker is meant
+# to reach a local Ollama instance only; cloud-metadata / internal probes are
+# refused. Production LLM endpoints go through the gateway adapter, not here.
+_ALLOWED_OLLAMA_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+class _PayloadTooLarge(Exception):
+    """Raised when an inbound body exceeds ``MAX_BODY_BYTES``."""
 
 
 def _looks_like_standard_alert(payload: dict) -> bool:
@@ -131,6 +145,16 @@ class GatewayState:
             provider = llm.provider
             endpoint = (endpoint_override or llm.endpoint).strip()
         tags_url = _ollama_tags_url(endpoint)
+        # SSRF guard: the model picker may only reach a local Ollama instance.
+        host = (urlparse(tags_url).hostname or "").lower()
+        if host not in _ALLOWED_OLLAMA_HOSTS:
+            return {
+                "ok": False,
+                "provider": provider,
+                "endpoint": tags_url,
+                "models": [],
+                "error": f"refused: host '{host}' is not in the local Ollama allowlist",
+            }
         try:
             req = urllib.request.Request(tags_url, headers={"Accept": "application/json"}, method="GET")
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -238,8 +262,19 @@ class GatewayState:
             return result["raw_alert"]
 
         # 显式带 product 字段的标准告警：走快速路径，按顶层字段构造。
+        # 入站 product 视为建议值：若内容指纹识别到不同 product，记审计供复盘
+        # （路由可被外部影响，故不盲信顶层 product 字段）。
         product = explicit_product(payload)
         if product:
+            detected = fingerprint_product(payload)
+            if detected and detected != product:
+                self.repo.insert_audit(
+                    new_id("audit"),
+                    new_id("trace"),
+                    "gateway",
+                    "product_mismatch",
+                    {"declared_product": product, "fingerprint_product": detected, "alert_id": payload.get("alert_id") or payload.get("id")},
+                )
             return _build_raw_alert(payload, product)
 
         # 无显式 product 的厂商原生日志：按内容指纹识别 product；若该产品已注册
@@ -338,20 +373,25 @@ class GatewayState:
             analyst = str(body.get("analyst") or "soc-analyst")
             reason = str(body.get("reason") or "人工确认该告警符合业务场景下的误报模式")
             expires_at_ms = int(body["expires_at_ms"]) if body.get("expires_at_ms") else None
-            outcome = self.memory.confirm_business_false_positive(linked, analyst, reason, expires_at_ms)
-            self.repo.insert_audit(
-                new_id("audit"),
-                str(linked.get("case_id") or alert_id),
-                analyst,
-                "confirm_business_false_positive",
-                {
-                    "alert_id": alert_id,
-                    "case_id": linked.get("case_id"),
-                    "memory_id": outcome["memory_id"],
-                    "features": outcome["features"],
-                    "reason": reason,
-                },
-            )
+            # Atomic: the FP memory write and its audit_log row commit together.
+            # confirm_business_false_positive opens a nested transaction (no-op
+            # commit); the outer block owns the commit including the audit insert.
+            with self.repo.transaction():
+                outcome = self.memory.confirm_business_false_positive(linked, analyst, reason, expires_at_ms)
+                self.repo.insert_audit(
+                    new_id("audit"),
+                    str(linked.get("case_id") or alert_id),
+                    analyst,
+                    "confirm_business_false_positive",
+                    {
+                        "alert_id": alert_id,
+                        "case_id": linked.get("case_id"),
+                        "memory_id": outcome["memory_id"],
+                        "features": outcome["features"],
+                        "reason": reason,
+                    },
+                    _commit=False,
+                )
             return {"ok": True, "alert_id": alert_id, **outcome}
 
 
@@ -366,22 +406,78 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    # ---- auth -----------------------------------------------------------
+
+    def _client_is_loopback(self) -> bool:
+        host = self.client_address[0] if self.client_address else ""
+        return host in {"127.0.0.1", "::1", ""}
+
+    def _authorized(self) -> bool:
+        """Authorize a request against the configured shared bearer token.
+
+        - If a token is configured, the request must carry ``Authorization: Bearer
+          <token>`` (constant-time compare).
+        - If no token is configured, loopback clients are accepted (dev/tests);
+          non-loopback clients are rejected when ``require_token_when_remote``.
+        """
+        auth = self.state.config.auth
+        if auth.api_token:
+            header = self.headers.get("Authorization", "")
+            expected = f"Bearer {auth.api_token}"
+            return hmac.compare_digest(header, expected)
+        if self._client_is_loopback():
+            return auth.allow_loopback_no_token
+        return not auth.require_token_when_remote
+
+    def _require_auth(self) -> bool:
+        """Return True if the request is authorized, else send 401."""
+        if self._authorized():
+            return True
+        self._json(401, {"error": "unauthorized"})
+        return False
+
+    # ---- body / errors --------------------------------------------------
+
     def _read_json(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0"))
-        raw = self.rfile.read(length)
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        if length > MAX_BODY_BYTES:
+            # Drain the oversized body so the client can finish its write and we
+            # can reply with 413 cleanly instead of resetting the connection.
+            remaining = length
+            while remaining > 0:
+                chunk = self.rfile.read(min(65536, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+            raise _PayloadTooLarge()
+        raw = self.rfile.read(length) if length > 0 else b""
         if not raw:
             return {}
         return json.loads(raw.decode("utf-8"))
+
+    def _client_error(self, exc: Exception) -> None:
+        self._json(400, {"error": str(exc)})
+
+    def _server_error(self, exc: Exception) -> None:
+        # Never leak internal exception text (paths/SQL/stack) to the client; log it.
+        print(f"[gateway] internal error: {exc!r}")
+        self._json(500, {"error": "internal server error"})
 
     def do_GET(self):  # noqa: N802
         parsed = urlparse(self.path)
         if parsed.path == "/api/health":
             self._json(200, {"ok": True, "stats": self.state.repo.stats()})
             return
-        if parsed.path == "/api/config/llm":
-            self._json(200, self.state.llm_config_payload())
-            return
-        if parsed.path == "/api/config/llm/models":
+        if parsed.path in ("/api/config/llm", "/api/config/llm/models"):
+            # Sensitive: exposes provider/endpoint and probes the LLM backend.
+            if not self._require_auth():
+                return
+            if parsed.path == "/api/config/llm":
+                self._json(200, self.state.llm_config_payload())
+                return
             endpoint = parse_qs(parsed.query).get("endpoint", [""])[0]
             self._json(200, self.state.list_ollama_models(endpoint))
             return
@@ -432,72 +528,115 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802
         parsed = urlparse(self.path)
+        # Every mutating endpoint requires authentication.
+        if not self._require_auth():
+            return
         if parsed.path == "/api/config/llm":
             try:
                 updated = self.state.update_llm_config(self._read_json())
                 self._json(200, {"ok": True, "llm": updated})
+            except _PayloadTooLarge:
+                self._json(413, {"error": "request body too large"})
+            except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                self._client_error(exc)
             except Exception as exc:
-                self._json(400, {"error": str(exc)})
+                self._server_error(exc)
             return
         if parsed.path == "/api/config/llm/reload":
             try:
                 reloaded = self.state.reload_llm_defaults()
                 self._json(200, {"ok": True, "llm": reloaded})
+            except _PayloadTooLarge:
+                self._json(413, {"error": "request body too large"})
+            except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                self._client_error(exc)
             except Exception as exc:
-                self._json(400, {"error": str(exc)})
+                self._server_error(exc)
             return
         if parsed.path == "/api/mapping-profiles":
             try:
                 saved = self.state.save_mapping_profile(self._read_json())
                 self._json(200, {"ok": True, "profile": saved})
+            except _PayloadTooLarge:
+                self._json(413, {"error": "request body too large"})
+            except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                self._client_error(exc)
             except Exception as exc:
-                self._json(400, {"error": str(exc)})
+                self._server_error(exc)
             return
         if parsed.path == "/api/mapping-profiles/dry-run":
             try:
                 self._json(200, self.state.dry_run_mapping_profile(self._read_json()))
+            except _PayloadTooLarge:
+                self._json(413, {"error": "request body too large"})
+            except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                self._client_error(exc)
             except Exception as exc:
-                self._json(400, {"error": str(exc)})
+                self._server_error(exc)
             return
         if parsed.path == "/api/mapping-profiles/infer":
             try:
                 self._json(200, self.state.infer_mapping_profile(self._read_json()))
+            except _PayloadTooLarge:
+                self._json(413, {"error": "request body too large"})
+            except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                self._client_error(exc)
             except Exception as exc:
-                self._json(400, {"error": str(exc)})
+                self._server_error(exc)
             return
         if parsed.path == "/api/memory/sweep":
             try:
                 self._json(200, self.state.sweep_memory(self._read_json()))
+            except _PayloadTooLarge:
+                self._json(413, {"error": "request body too large"})
+            except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                self._client_error(exc)
             except Exception as exc:
-                self._json(400, {"error": str(exc)})
+                self._server_error(exc)
             return
         if parsed.path.startswith("/api/memory/") and parsed.path.endswith("/promote"):
             memory_id = parsed.path.split("/")[-2]
             try:
                 self._json(200, self.state.promote_memory(memory_id, self._read_json()))
+            except _PayloadTooLarge:
+                self._json(413, {"error": "request body too large"})
+            except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                self._client_error(exc)
             except Exception as exc:
-                self._json(400, {"error": str(exc)})
+                self._server_error(exc)
             return
         if parsed.path.startswith("/api/memory/") and parsed.path.endswith("/reject"):
             memory_id = parsed.path.split("/")[-2]
             try:
                 self._json(200, self.state.reject_memory(memory_id, self._read_json()))
+            except _PayloadTooLarge:
+                self._json(413, {"error": "request body too large"})
+            except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                self._client_error(exc)
             except Exception as exc:
-                self._json(400, {"error": str(exc)})
+                self._server_error(exc)
             return
         if parsed.path.startswith("/api/memory/") and parsed.path.endswith("/quarantine"):
             memory_id = parsed.path.split("/")[-2]
             try:
                 self._json(200, self.state.quarantine_memory(memory_id, self._read_json()))
+            except _PayloadTooLarge:
+                self._json(413, {"error": "request body too large"})
+            except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                self._client_error(exc)
             except Exception as exc:
-                self._json(400, {"error": str(exc)})
+                self._server_error(exc)
             return
         if parsed.path.startswith("/api/alerts/") and parsed.path.endswith("/confirm-false-positive"):
             alert_id = unquote(parsed.path.split("/")[-2])
             try:
                 self._json(200, self.state.confirm_alert_false_positive(alert_id, self._read_json()))
+            except _PayloadTooLarge:
+                self._json(413, {"error": "request body too large"})
+            except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                self._client_error(exc)
             except Exception as exc:
-                self._json(400, {"error": str(exc)})
+                self._server_error(exc)
             return
         if parsed.path != "/api/alerts":
             self._json(404, {"error": "not found"})
@@ -508,20 +647,30 @@ class GatewayHandler(BaseHTTPRequestHandler):
             alert = self.state.alert_from_payload(payload, profile_id)
             result = self.state.orchestrator.handle_alert(alert)
             self._json(202, result.to_dict())
+        except _PayloadTooLarge:
+            self._json(413, {"error": "request body too large"})
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            self._client_error(exc)
         except Exception as exc:  # pragma: no cover - surfaced to local operator
-            self._json(400, {"error": str(exc)})
+            self._server_error(exc)
 
     def _serve_static(self, path: str):
-        static_dir = Path(__file__).parent / "static"
+        static_dir = (Path(__file__).parent / "static").resolve()
         if path in {"", "/"}:
             target = static_dir / "index.html"
         else:
             target = static_dir / path.lstrip("/")
-        if not target.exists() or not target.is_file():
+        # Path-traversal guard: resolved target must stay inside static_dir.
+        try:
+            resolved = target.resolve()
+        except (OSError, ValueError):
             self._json(404, {"error": "not found"})
             return
-        content = target.read_bytes()
-        mime = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+        if not resolved.is_relative_to(static_dir) or not resolved.is_file():
+            self._json(404, {"error": "not found"})
+            return
+        content = resolved.read_bytes()
+        mime = mimetypes.guess_type(str(resolved))[0] or "application/octet-stream"
         self.send_response(200)
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(content)))

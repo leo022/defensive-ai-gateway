@@ -8,6 +8,7 @@ from typing import Any
 from ..llm import LLMClient
 from ..models import AgentResult, NormalizedEvent, RecommendedAction, new_id
 from ..policy import PolicyEngine
+from .evidence_helpers import fact, join_facts, short_text, strip_terminal
 
 
 class SecurityAgent(ABC):
@@ -44,11 +45,16 @@ class SecurityAgent(ABC):
             "event_type": event.event_type,
             "entities": event.entities,
             "evidence": event.evidence,
-            "evidence_details": event.evidence,
             "memory": memory,
             "focus": self.analysis_focus(),
             "report_outline": self.report_outline(),
         }
+        # Single choke point before any LLM call: deep-redact sensitive fields/
+        # patterns and bound the context size so secrets never leave the process
+        # and the model never receives an unbounded payload. The prompt is built
+        # from this same sanitized context so truncation is consistent across the
+        # prompt string and the context channel.
+        context = self.policy.sanitize_context(context)
         prompt = self._build_prompt(context)
         llm_result = self.llm.analyze(prompt, context)
         llm_result = self._ensure_explainable_result(llm_result, event)
@@ -194,8 +200,25 @@ class SecurityAgent(ABC):
     def _merge_with_structured(self, llm_result: dict[str, Any], structured: dict[str, Any]) -> dict[str, Any]:
         """Override the model's classification/verdict/dimensions with structured
         sample ground truth, keeping the model's free-text enrichments when they
-        add value."""
+        add value.
+
+        When the model disagrees with the structured truth, the override is
+        flagged (``ground_truth_override``) and noted in ``reason`` rather than
+        applied silently — so a mislabeled sample cannot suppress a correct model
+        verdict without leaving an auditable trace for the analyst.
+        """
         merged = dict(llm_result)
+        model_cls = self._normalize_classification(llm_result.get("classification", "insufficient_evidence"))
+        structured_cls = self._normalize_classification(structured["classification"])
+        if model_cls and model_cls != structured_cls:
+            merged["_ground_truth_override"] = {
+                "model_classification": model_cls,
+                "structured_classification": structured_cls,
+                "note": "样本结构化真值与模型结论冲突，已以真值为准并标记供人工复核。",
+            }
+            note = f"[证据锚定] 模型判定为「{model_cls}」，与样本结构化真值「{structured_cls}」不一致，已采用真值并标记供复核。"
+            existing = str(merged.get("reason", "")).strip()
+            merged["reason"] = (note + "\n" + existing) if existing else note
         merged["classification"] = structured["classification"]
         merged["verdict"] = structured["verdict"]
         merged["analysis_dimensions"] = structured["analysis_dimensions"]
@@ -282,7 +305,22 @@ class SecurityAgent(ABC):
         return True
 
     def _dimensions_support_classification(self, dims: list[dict[str, Any]], classification: str) -> bool:
-        return any(self._status_supports_classification(d.get("status"), classification) for d in dims if isinstance(d, dict))
+        """Quorum check: the model's dimensions must actually back its classification.
+
+        A single supporting dimension among many ``info`` gaps is not enough (that
+        is the common high-confidence-verdict-with-all-info-dims failure). Require
+        either two or more supporting dimensions, or a single supporting dimension
+        when it is the only dimension present.
+        """
+        valid = [d for d in dims if isinstance(d, dict)]
+        if not valid:
+            return False
+        supporting = sum(
+            1 for d in valid if self._status_supports_classification(d.get("status"), classification)
+        )
+        if supporting >= 2:
+            return True
+        return supporting >= 1 and len(valid) < 2
 
     def _synthesize_dimensions(self, event: NormalizedEvent, classification: str) -> list[dict[str, str]]:
         """Build Chinese dimensions with statuses consistent with ``classification``
@@ -459,16 +497,13 @@ class SecurityAgent(ABC):
         return "；".join(selected) if selected else "当前仅有归一化证据，需结合原始日志复核"
 
     def _strip_terminal(self, value: Any) -> str:
-        return str(value or "").strip().rstrip("。；; ")
+        return strip_terminal(value)
 
     def _join_facts(self, facts: list[str], fallback: str) -> str:
-        compact = [item for item in facts if item]
-        return "；".join(compact) + "。" if compact else fallback
+        return join_facts(facts, fallback)
 
     def _fact(self, label: str, value: Any) -> str:
-        if value in ("", None, [], {}):
-            return ""
-        return f"{label}={self._short(value)}"
+        return fact(label, value)
 
     def _bytes_pair(self, by_type: dict[str, Any]) -> str:
         if by_type.get("bytes_out") or by_type.get("bytes_in"):
@@ -493,12 +528,7 @@ class SecurityAgent(ABC):
         return "；".join(parts)
 
     def _short(self, value: Any) -> str:
-        if isinstance(value, (dict, list)):
-            text = json.dumps(value, ensure_ascii=False)
-        else:
-            text = str(value)
-        text = text.replace("\n", " ").strip()
-        return text[:100] + ("…" if len(text) > 100 else "")
+        return short_text(value)
 
     def _looks_blocked(self, action: Any) -> bool:
         return any(w in str(action).lower() for w in ("block", "阻断", "intercept", "prevent", "deny"))
@@ -652,12 +682,15 @@ class SecurityAgent(ABC):
             )
         verdict = str(llm_result.get("verdict") or self._parse_verdict(reason) or "").strip()
         whitelist = llm_result.get("whitelist_recommendation") or self._parse_whitelist(llm_result)
-        return {
+        explanation = {
             "verdict": verdict,
             "dimensions": normalized_dimensions,
             "whitelist_recommendation": whitelist,
             "raw_reason": reason,
         }
+        if llm_result.get("_ground_truth_override"):
+            explanation["ground_truth_override"] = llm_result["_ground_truth_override"]
+        return explanation
 
     def _parse_verdict(self, reason: str) -> str:
         for line in reason.splitlines():

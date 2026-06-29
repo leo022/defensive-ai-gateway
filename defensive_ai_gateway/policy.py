@@ -92,3 +92,33 @@ class PolicyEngine:
         if len(text) <= self.config.max_prompt_chars:
             return text
         return text[: self.config.max_prompt_chars] + "...[TRUNCATED]"
+
+    def sanitize_context(self, context: dict[str, Any]) -> dict[str, Any]:
+        """Redact + bound the size of any payload sent to an LLM.
+
+        Single choke point for the model-bound context channel: deep-redacts
+        sensitive fields/patterns (so secrets never leave the process even when
+        the prompt is built from a different path) and drops list-valued
+        evidence/memory tails when the serialized form exceeds
+        ``max_context_bytes``. Structured trimming — rather than slicing the JSON
+        string — avoids producing unparseable or mid-UTF8 payloads for the model.
+        """
+        redacted = self.redact(context)
+        if not isinstance(redacted, dict):
+            return redacted
+        max_bytes = getattr(self.config, "max_context_bytes", 20000)
+        # Bound total size by trimming large list fields first (evidence/memory are
+        # the usual offenders), preserving top-level keys and scalar context.
+        for key in ("evidence", "memory"):
+            if len(json.dumps(redacted, ensure_ascii=False, sort_keys=True).encode("utf-8")) <= max_bytes:
+                break
+            value = redacted.get(key)
+            if isinstance(value, list) and len(value) > 4:
+                dropped = len(value) - 4
+                redacted[key] = value[:4] + [{"_truncated": f"{dropped} entries omitted to fit context budget"}]
+        text = json.dumps(redacted, ensure_ascii=False, sort_keys=True)
+        if len(text.encode("utf-8")) > max_bytes:
+            cap = max(0, max_bytes - len("...[TRUNCATED]".encode("utf-8")))
+            encoded = text.encode("utf-8")[:cap]
+            redacted = {"_truncated": encoded.decode("utf-8", errors="ignore") + "...[TRUNCATED]"}
+        return redacted

@@ -11,6 +11,15 @@ llm:
 policy:
   mode: "read_only"
   max_prompt_chars: 12000
+  max_context_bytes: 20000
   require_approval_for: [block, isolate, change_policy, disable_account]
   redact_fields: [password, token, cookie, authorization, customer_id, id_card, phone, email, session]
+auth:
+  # Production must set DEFENSIVE_AI_API_TOKEN (env or secret) and front the
+  # gateway with mTLS / a reverse proxy. With a token configured, all mutating
+  # endpoints and the LLM config endpoints require Authorization: Bearer <token>.
+  # Loopback clients are still accepted without a token for local ops.
+  api_token: ""
+  allow_loopback_no_token: true
+  require_token_when_remote: true
 
