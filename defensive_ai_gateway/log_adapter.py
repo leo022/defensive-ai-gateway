@@ -10,6 +10,7 @@ from .normalizer import EventNormalizer
 
 
 SUPPORTED_PRODUCTS = {"hips", "rasp", "ndr", "waf", "siem"}
+PRODUCT_LABELS = {"hips": "HIPS", "rasp": "RASP", "ndr": "NDR", "waf": "WAF", "siem": "SIEM"}
 DEFAULT_REQUIRED_FIELDS = ["alert_id", "product", "event_type", "severity", "timestamp"]
 
 # product → 默认自动套用的 mapping profile_id。仅对“无显式 product 字段、靠内容
@@ -43,8 +44,8 @@ def fingerprint_product(payload: dict[str, Any]) -> str | None:
     return None
 
 DEFAULT_REQUIRED_FIELD_HINTS = {
-    "alert_id": "映射到 RASP 日志中的唯一告警 ID，例如 $.metadata.id、$.alert.id 或 $.id。",
-    "product": "映射到产品类型，RASP 接入可使用 {\"literal\": \"rasp\"}。",
+    "alert_id": "映射到日志中的唯一告警 ID，例如 $.metadata.id、$.alert.id、$.alert_id 或 $.id。",
+    "product": "映射到产品类型；若原始日志缺少该字段，可使用对应产品 literal。",
     "event_type": "映射到规则名称、攻击类型或事件类型，例如 $.rule.name、$.attack.type 或 $.event.type。",
     "severity": "映射到严重级别，例如 $.risk.level、$.severity 或 $.level。",
     "timestamp": "映射到事件时间，例如 $.time、$.timestamp 或 $.@timestamp。",
@@ -436,12 +437,14 @@ class LogAdapter:
         result.pop("raw_alert", None)
         return result
 
-    def infer_mapping_profile(self, log: dict[str, Any], profile_id: str = "auto-rasp-json") -> dict[str, Any]:
+    def infer_mapping_profile(self, log: dict[str, Any], profile_id: str = "auto-rasp-json", product: str = "rasp") -> dict[str, Any]:
         flat = self._flatten_paths(log)
         fields: list[dict[str, Any]] = []
         mappings: dict[str, Any] = {}
+        product = product if product in SUPPORTED_PRODUCTS else "rasp"
+        product_label = PRODUCT_LABELS.get(product, product.upper())
 
-        product_signal = self._product_signal(log, flat)
+        product_signal = self._product_signal(log, flat, product)
         for spec in INFER_FIELD_SPECS:
             target = str(spec["target"])
             match = self._best_path_match(flat, list(spec["candidates"]))
@@ -456,7 +459,14 @@ class LogAdapter:
                 status = "needs_review" if product_signal["confidence"] < 0.9 else "mapped"
                 confidence = product_signal["confidence"]
                 sample_value = product_signal["product"]
-                candidates.insert(0, {"path": "__literal:rasp", "value": "rasp", "confidence": product_signal["confidence"]})
+                candidates.insert(
+                    0,
+                    {
+                        "path": f"__literal:{product_signal['product']}",
+                        "value": product_signal["product"],
+                        "confidence": product_signal["confidence"],
+                    },
+                )
             elif match:
                 status = "mapped" if match["confidence"] >= 0.82 else "needs_review"
                 confidence = match["confidence"]
@@ -496,16 +506,21 @@ class LogAdapter:
 
         profile = MappingProfile(
             profile_id=profile_id,
-            name="Auto RASP JSON 日志",
+            name=f"Auto {product_label} JSON 日志",
             version="v1",
-            description="由一条 RASP JSON 日志自动识别生成；可保存为正式 Mapping Profile。",
+            description=f"由一条 {product_label} JSON 日志自动识别生成；可保存为正式 Mapping Profile。",
             mappings=mappings,
-            product_map={"runtime_app_protection": "rasp", "runtime_application_self_protection": "rasp", "rasp": "rasp"},
+            product_map={
+                "runtime_app_protection": "rasp",
+                "runtime_application_self_protection": "rasp",
+                **{item: item for item in SUPPORTED_PRODUCTS},
+                product_label.lower(): product,
+            },
             evidence_fields=[
-                {"type": "rule_id", "path": self._first_mapping_path(mappings.get("entities.rule")), "why_it_matters": "RASP 规则 ID 用于关联误报记忆和调优范围。"},
+                {"type": "rule_id", "path": self._first_mapping_path(mappings.get("entities.rule")), "why_it_matters": f"{product_label} 规则 ID 用于关联误报记忆和调优范围。"},
                 {"type": "stack_trace", "path": self._first_mapping_path(mappings.get("payload.stack_trace")), "why_it_matters": "调用栈用于确认用户输入是否触达危险 sink。"},
-                {"type": "sink", "path": mappings.get("payload.sink"), "why_it_matters": "危险 sink 是判断 RASP 告警成功性和影响面的核心字段。"},
-                {"type": "action", "path": self._first_mapping_path(mappings.get("entities.action")), "why_it_matters": "RASP 处置动作影响攻击是否已被阻断。"},
+                {"type": "sink", "path": mappings.get("payload.sink"), "why_it_matters": "危险 sink 是判断应用侧告警成功性和影响面的核心字段。"},
+                {"type": "action", "path": self._first_mapping_path(mappings.get("entities.action")), "why_it_matters": f"{product_label} 处置动作影响攻击是否已被阻断。"},
             ],
         )
         profile.evidence_fields = [item for item in profile.evidence_fields if item.get("path")]
@@ -596,18 +611,32 @@ class LogAdapter:
         scored.sort(key=lambda item: (-float(item["confidence"]), len(str(item["path"]))))
         return scored
 
-    def _product_signal(self, log: dict[str, Any], flat: dict[str, Any]) -> dict[str, Any] | None:
+    def _product_signal(self, log: dict[str, Any], flat: dict[str, Any], fallback_product: str = "rasp") -> dict[str, Any] | None:
         text = json.dumps(log, ensure_ascii=False).lower()
-        rasp_needles = ["rasp", "stacktrace", "stack_trace", "hook_data", "taint", "sink"]
-        hits = sum(1 for needle in rasp_needles if needle in text)
         product_match = self._best_path_match(flat, ["product", "device.type", "source.product", "event.product"])
-        if product_match and "rasp" in str(product_match["value"]).lower():
-            return {"product": "rasp", "confidence": 0.98}
-        if hits >= 2:
-            return {"product": "rasp", "confidence": 0.88}
-        if hits == 1:
-            return {"product": "rasp", "confidence": 0.72}
-        return {"product": "rasp", "confidence": 0.62}
+        if product_match:
+            value = str(product_match["value"]).lower()
+            for product in SUPPORTED_PRODUCTS:
+                if product in value:
+                    return {"product": product, "confidence": 0.98}
+
+        fingerprints = {
+            "rasp": ["rasp", "stacktrace", "stack_trace", "hook_data", "taint", "sink"],
+            "waf": ["waf", "xff", "http", "uri", "matched_parameters", "web_attack"],
+            "hips": ["hips", "powershell", "process", "command_line", "file_hash", "parent_process"],
+            "ndr": ["ndr", "ja3", "bytes_out", "bytes_in", "dst_ip", "beacon"],
+            "siem": ["siem", "correlation", "timeline", "offense", "case"],
+        }
+        scores = {
+            product: sum(1 for needle in needles if needle in text)
+            for product, needles in fingerprints.items()
+        }
+        best_product, best_score = max(scores.items(), key=lambda item: item[1])
+        if best_score >= 2:
+            return {"product": best_product, "confidence": 0.88}
+        if best_score == 1:
+            return {"product": best_product, "confidence": 0.72}
+        return {"product": fallback_product if fallback_product in SUPPORTED_PRODUCTS else "rasp", "confidence": 0.62}
 
     def _mapping_label(self, mapping: Any) -> str:
         if isinstance(mapping, dict) and "literal" in mapping:

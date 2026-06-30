@@ -17,6 +17,7 @@ from .log_adapter import (
     AUTO_PROFILE,
     LogAdapter,
     MappingProfile,
+    SUPPORTED_PRODUCTS,
     default_mapping_profile,
     demo_rasp_profile,
     explicit_product,
@@ -29,6 +30,7 @@ from .models import RawAlert, new_id
 from .normalizer import EventNormalizer
 from .orchestrator import Orchestrator
 from .policy import PolicyEngine
+from .processing import AlertProcessor, AlertQueueFull
 
 
 _STANDARD_ALERT_KEYS = ("event_type", "severity", "alert_id", "source", "timestamp")
@@ -93,6 +95,52 @@ class GatewayState:
         self.log_adapter = LogAdapter(self.normalizer)
         self._seed_mapping_profiles()
         self.orchestrator = Orchestrator(self.repo, self.normalizer, self.memory, self.llm, self.policy)
+        self.alert_processor = (
+            AlertProcessor(
+                self._handle_queued_alert,
+                max_size=config.processing.queue_max_size,
+                workers=config.processing.workers,
+            )
+            if config.processing.async_enabled
+            else None
+        )
+        if self.alert_processor:
+            self.alert_processor.start()
+
+    def _handle_queued_alert(self, alert: RawAlert):
+        return self.orchestrator.handle_alert(alert)
+
+    def stop_alert_processor(self) -> None:
+        if self.alert_processor:
+            self.alert_processor.stop()
+
+    def processing_stats(self) -> dict:
+        if not self.alert_processor:
+            return {
+                "enabled": False,
+                "queue_max_size": 0,
+                "workers": 0,
+                "queued": 0,
+                "inflight": 0,
+                "submitted": 0,
+                "processed": 0,
+                "failed": 0,
+                "rejected": 0,
+            }
+        return self.alert_processor.stats().to_dict()
+
+    def submit_alert(self, alert: RawAlert) -> dict:
+        if self.alert_processor:
+            self.alert_processor.submit(alert)
+            return {
+                "ok": True,
+                "status": "queued",
+                "alert_id": alert.alert_id,
+                "product": alert.product,
+                "queue": self.processing_stats(),
+            }
+        result = self.orchestrator.handle_alert(alert)
+        return result.to_dict()
 
     def _seed_mapping_profiles(self) -> None:
         self.repo.delete_mapping_profile("demo-waf-json")
@@ -241,14 +289,31 @@ class GatewayState:
             log = payload.get("log")
             if not isinstance(log, dict):
                 raise ValueError("log must be a JSON object")
-            profile_id = str(payload.get("profile_id") or "auto-rasp-json").strip() or "auto-rasp-json"
-            return self.log_adapter.infer_mapping_profile(log, profile_id)
+            product = str(payload.get("product") or "rasp").strip().lower() or "rasp"
+            if product not in SUPPORTED_PRODUCTS:
+                raise ValueError(f"unsupported product: {product}")
+            profile_id = str(payload.get("profile_id") or f"auto-{product}-json").strip() or f"auto-{product}-json"
+            return self.log_adapter.infer_mapping_profile(log, profile_id, product)
 
     def rasp_sample_log(self) -> dict:
         """Return the canonical RASP vendor-format sample used by the Dashboard
         日志自动适配 "加载示例" button. Sourced from samples_syslog/ so the UI
         example stays in sync with the raw vendor-format samples."""
-        sample_path = Path(__file__).resolve().parent.parent / "samples_syslog" / "rasp" / "rasp_alert.json"
+        return self.sample_log("rasp")
+
+    def sample_log(self, product: str) -> dict:
+        product = str(product or "").strip().lower()
+        if product not in SUPPORTED_PRODUCTS:
+            raise ValueError(f"unsupported product: {product}")
+        root = Path(__file__).resolve().parent.parent
+        vendor_sample = root / "samples_syslog" / product / f"{product}_alert.json"
+        standard_sample = root / "samples" / f"{product}_alert.json"
+        siem_case_sample = root / "samples" / "siem_case.json"
+        sample_path = vendor_sample if vendor_sample.exists() else standard_sample
+        if not sample_path.exists() and product == "siem":
+            sample_path = siem_case_sample
+        if not sample_path.exists():
+            raise ValueError(f"sample log not found for product: {product}")
         return json.loads(sample_path.read_text(encoding="utf-8"))
 
     def alert_from_payload(self, payload: dict, profile_id: str = "") -> RawAlert:
@@ -474,7 +539,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802
         parsed = urlparse(self.path)
         if parsed.path == "/api/health":
-            self._json(200, {"ok": True, "stats": self.state.repo.stats()})
+            self._json(200, {"ok": True, "stats": self.state.repo.stats(), "processing": self.state.processing_stats()})
             return
         if parsed.path in ("/api/config/llm", "/api/config/llm/models"):
             # Sensitive: exposes provider/endpoint and probes the LLM backend.
@@ -491,6 +556,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/samples/rasp-alert":
             self._json(200, self.state.rasp_sample_log())
+            return
+        if parsed.path.startswith("/api/samples/") and parsed.path.endswith("-alert"):
+            product = parsed.path.rsplit("/", 1)[-1][: -len("-alert")]
+            try:
+                self._json(200, self.state.sample_log(product))
+            except ValueError as exc:
+                self._json(404, {"error": str(exc)})
             return
         if parsed.path.startswith("/api/mapping-profiles/"):
             profile_id = parsed.path.rsplit("/", 1)[-1]
@@ -650,10 +722,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
             payload = self._read_json()
             profile_id = parse_qs(parsed.query).get("profile", [""])[0]
             alert = self.state.alert_from_payload(payload, profile_id)
-            result = self.state.orchestrator.handle_alert(alert)
-            self._json(202, result.to_dict())
+            result = self.state.submit_alert(alert)
+            self._json(202, result)
         except _PayloadTooLarge:
             self._json(413, {"error": "request body too large"})
+        except AlertQueueFull as exc:
+            self._json(429, {"error": str(exc), "processing": self.state.processing_stats()})
         except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
             self._client_error(exc)
         except Exception as exc:  # pragma: no cover - surfaced to local operator
@@ -686,9 +760,20 @@ class GatewayHandler(BaseHTTPRequestHandler):
         print(f"[gateway] {self.address_string()} {fmt % args}")
 
 
+class GatewayHTTPServer(ThreadingHTTPServer):
+    def __init__(self, server_address, request_handler_class, state: GatewayState):
+        self.state = state
+        super().__init__(server_address, request_handler_class)
+
+    def server_close(self):
+        self.state.stop_alert_processor()
+        super().server_close()
+
+
 def build_server(config: GatewayConfig, config_path: str = "") -> ThreadingHTTPServer:
-    GatewayHandler.state = GatewayState(config, config_path=config_path)
-    return ThreadingHTTPServer((config.server.host, config.server.port), GatewayHandler)
+    state = GatewayState(config, config_path=config_path)
+    handler_class = type("GatewayHandler", (GatewayHandler,), {"state": state})
+    return GatewayHTTPServer((config.server.host, config.server.port), handler_class, state)
 
 
 def main(argv: list[str] | None = None):

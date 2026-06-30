@@ -16,13 +16,13 @@ python3 scripts/run_harness.py --samples samples
 python3 scripts/run_harness.py --samples samples --fail-on-low-confidence 0.5
 ```
 
-使用配置中的真实 LLM provider，例如本地 Ollama：
+使用配置中的 LLM provider，例如默认的本地规则分析器，或手动切换后的本地 Ollama：
 
 ```bash
 python3 scripts/run_harness.py --samples samples --config config/dev.yaml --use-config-llm
 ```
 
-当前开发配置指向 `http://127.0.0.1:11434/api/generate`，模型名为 `gemma3:4b`。如果本地 Ollama 只有 `gemma3:latest`，适配器会自动降级并在结果中标记 fallback。
+当前开发配置默认使用 `local-rule-analyst`，无需启动 Ollama。如果把 provider 切换为 `ollama`，可使用 `http://127.0.0.1:11434/api/generate` 这类本地端点；当模型名为 `gemma3:4b` 但本机只有 `gemma3:latest` 时，适配器会自动降级并在结果中标记 fallback。
 
 ## 真实日志适配回放
 

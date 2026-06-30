@@ -9,8 +9,9 @@ Defensive AI Gateway is an MVP for banking security operations. It is designed t
 - Python standard library first: the initial version avoids pip/npm dependencies to reduce supply-chain review friction during internal migration.
 - SQLite fact store: ready for PoC use and replaceable with PostgreSQL for production.
 - HTTP API + static Dashboard: ingests HIPS/RASP/NDR/WAF/SIEM alerts and displays cases in real time.
+- Async alert queue: the HTTP intake path authenticates, maps, and queues alerts while background workers run analysis, avoiding high-QPS intake blocking.
 - Agent/Skill/Harness layering: product-specific prompts, memory namespaces, policy checks, and offline replay evolve independently.
-- Pluggable LLM: the development configuration defaults to local Ollama `gemma3:4b`; if only `gemma3:latest` is available, it falls back automatically. The test harness can still use the deterministic local analyzer.
+- Pluggable LLM: the development configuration defaults to the deterministic local analyzer `local-rule-analyst`; switch to local Ollama or an internal LLM Gateway from the Dashboard when you need model-backed validation.
 - Random samples + memory-based noise reduction: sample scripts can generate attack / false-positive alerts, and approved product long-term memory helps identify repeated false positives from the same system.
 
 ## Quick Start
@@ -61,21 +62,28 @@ python3 scripts/run_harness.py --samples samples --config config/dev.yaml --use-
 bash scripts/package_offline.sh ../outputs
 ```
 
-`--use-config-llm` calls the local Ollama endpoint configured in `config/dev.yaml`. Make sure Ollama is running and has `gemma3:4b` or `gemma3:latest`.
+`--use-config-llm` uses the default `local-rule-analyst` from `config/dev.yaml`. To replay with a model-backed LLM, switch the config or Dashboard to local Ollama / an internal LLM Gateway first.
 
 ## k3s and Syslog Ingestion
 
 For production ingestion, deploy an independent collector in k3s to receive syslog and forward it to the gateway HTTP endpoint:
 
 ```text
-Security Product -> Syslog UDP/TCP 1514 -> Vector -> POST /api/alerts
+Security Product -> Syslog UDP/TCP 15140-15144 -> Collector -> POST /api/alerts
 ```
 
 Reference manifests:
 
 - `deploy/k3s/gateway.yaml`: gateway Deployment, Service, Ingress, PVC, and production configuration.
-- `deploy/k3s/syslog-collector-vector.yaml`: Vector syslog collector that listens on TCP/UDP `1514` and converts syslog into standard alert JSON.
+- `deploy/k3s/syslog-collector-vector.yaml`: Vector syslog collector reference manifest that converts syslog into standard alert JSON.
 - `docs/SYSLOG_INGESTION.md`: security product configuration, Mapping Profile integration, and operations notes.
+
+You can locally simulate five security devices sending syslog to different TCP ports and verify that routing does not confuse product types:
+
+```bash
+python3 -m defensive_ai_gateway --config config/dev.yaml
+python3 scripts/simulate_syslog_ports.py --config config/dev.yaml
+```
 
 ## Project Structure
 

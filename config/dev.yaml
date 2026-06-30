@@ -4,12 +4,25 @@ server:
 database:
   path: "data/gateway.db"
 llm:
-  provider: "ollama"
-  endpoint: "http://127.0.0.1:11434/api/generate"
-  model: "deepseek-r1:7b"
-  timeout_seconds: 300
+  provider: "local"
+  endpoint: ""
+  model: "local-rule-analyst"
+  timeout_seconds: 30
 policy:
   mode: "read_only"
   max_prompt_chars: 12000
   require_approval_for: [block, isolate, change_policy, disable_account]
   redact_fields: [password, token, cookie, authorization, customer_id, id_card, phone, email, session]
+processing:
+  async_enabled: true
+  queue_max_size: 5000
+  workers: 4
+syslog:
+  product_ports:
+    waf: 15140
+    hips: 15141
+    ndr: 15142
+    rasp: 15143
+    siem: 15144
+  gateway_profiles:
+    rasp: "demo-rasp-json"

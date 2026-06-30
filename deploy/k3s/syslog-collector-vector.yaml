@@ -8,23 +8,88 @@ data:
     [api]
     enabled = false
 
-    [sources.syslog_udp]
+    [sources.syslog_waf_udp]
     type = "syslog"
-    address = "0.0.0.0:1514"
+    address = "0.0.0.0:15140"
     mode = "udp"
 
-    [sources.syslog_tcp]
+    [sources.syslog_waf_tcp]
     type = "syslog"
-    address = "0.0.0.0:1514"
+    address = "0.0.0.0:15140"
     mode = "tcp"
 
+    [sources.syslog_hips_udp]
+    type = "syslog"
+    address = "0.0.0.0:15141"
+    mode = "udp"
+
+    [sources.syslog_hips_tcp]
+    type = "syslog"
+    address = "0.0.0.0:15141"
+    mode = "tcp"
+
+    [sources.syslog_ndr_udp]
+    type = "syslog"
+    address = "0.0.0.0:15142"
+    mode = "udp"
+
+    [sources.syslog_ndr_tcp]
+    type = "syslog"
+    address = "0.0.0.0:15142"
+    mode = "tcp"
+
+    [sources.syslog_rasp_udp]
+    type = "syslog"
+    address = "0.0.0.0:15143"
+    mode = "udp"
+
+    [sources.syslog_rasp_tcp]
+    type = "syslog"
+    address = "0.0.0.0:15143"
+    mode = "tcp"
+
+    [sources.syslog_siem_udp]
+    type = "syslog"
+    address = "0.0.0.0:15144"
+    mode = "udp"
+
+    [sources.syslog_siem_tcp]
+    type = "syslog"
+    address = "0.0.0.0:15144"
+    mode = "tcp"
+
+    [transforms.tag_waf_syslog]
+    type = "remap"
+    inputs = ["syslog_waf_udp", "syslog_waf_tcp"]
+    source = '.port_product = "waf"; .destination_port = 15140'
+
+    [transforms.tag_hips_syslog]
+    type = "remap"
+    inputs = ["syslog_hips_udp", "syslog_hips_tcp"]
+    source = '.port_product = "hips"; .destination_port = 15141'
+
+    [transforms.tag_ndr_syslog]
+    type = "remap"
+    inputs = ["syslog_ndr_udp", "syslog_ndr_tcp"]
+    source = '.port_product = "ndr"; .destination_port = 15142'
+
+    [transforms.tag_rasp_syslog]
+    type = "remap"
+    inputs = ["syslog_rasp_udp", "syslog_rasp_tcp"]
+    source = '.port_product = "rasp"; .destination_port = 15143'
+
+    [transforms.tag_siem_syslog]
+    type = "remap"
+    inputs = ["syslog_siem_udp", "syslog_siem_tcp"]
+    source = '.port_product = "siem"; .destination_port = 15144'
+
     # 1) 来源识别 + 按已保存的 mapping profile 分类。
-    #    识别优先级：syslog appname 标签（运维侧给每类设备打的标签）> 日志内容指纹。
+    #    识别优先级：目的端口标签 > syslog appname 标签 > 日志内容指纹。
     #    识别到 product 后映射到 Dashboard「日志自动适配」中已保存的 profile_id；
     #    gateway_profile 为空表示未配置 profile，走下方 standard 路径（collector 侧归一化）。
     [transforms.classify_source]
     type = "remap"
-    inputs = ["syslog_udp", "syslog_tcp"]
+    inputs = ["tag_waf_syslog", "tag_hips_syslog", "tag_ndr_syslog", "tag_rasp_syslog", "tag_siem_syslog"]
     source = '''
     raw = .
     structured = parse_json(.message) ?? {}
@@ -33,7 +98,11 @@ data:
     }
 
     appname = downcase(to_string(.appname) ?? "")
-    product = downcase(to_string(structured.product) ?? to_string(structured.event.product) ?? "")
+    port_product = downcase(to_string(.port_product) ?? "")
+    product = port_product
+    if product == "" {
+      product = downcase(to_string(structured.product) ?? to_string(structured.event.product) ?? "")
+    }
 
     # cloudrasp 原生 RASP 指纹：data_type=attack_event
     if product == "" && to_string(structured.data_type) == "attack_event" {
@@ -176,10 +245,34 @@ spec:
           args: ["--config", "/etc/vector/vector.toml"]
           ports:
             - name: syslog-udp
-              containerPort: 1514
+              containerPort: 15140
               protocol: UDP
             - name: syslog-tcp
-              containerPort: 1514
+              containerPort: 15140
+              protocol: TCP
+            - name: hips-udp
+              containerPort: 15141
+              protocol: UDP
+            - name: hips-tcp
+              containerPort: 15141
+              protocol: TCP
+            - name: ndr-udp
+              containerPort: 15142
+              protocol: UDP
+            - name: ndr-tcp
+              containerPort: 15142
+              protocol: TCP
+            - name: rasp-udp
+              containerPort: 15143
+              protocol: UDP
+            - name: rasp-tcp
+              containerPort: 15143
+              protocol: TCP
+            - name: siem-udp
+              containerPort: 15144
+              protocol: UDP
+            - name: siem-tcp
+              containerPort: 15144
               protocol: TCP
           volumeMounts:
             - name: config
@@ -203,11 +296,43 @@ spec:
   selector:
     app: syslog-collector-vector
   ports:
-    - name: syslog-udp
-      port: 1514
+    - name: waf-udp
+      port: 15140
       targetPort: syslog-udp
       protocol: UDP
-    - name: syslog-tcp
-      port: 1514
+    - name: waf-tcp
+      port: 15140
       targetPort: syslog-tcp
+      protocol: TCP
+    - name: hips-udp
+      port: 15141
+      targetPort: hips-udp
+      protocol: UDP
+    - name: hips-tcp
+      port: 15141
+      targetPort: hips-tcp
+      protocol: TCP
+    - name: ndr-udp
+      port: 15142
+      targetPort: ndr-udp
+      protocol: UDP
+    - name: ndr-tcp
+      port: 15142
+      targetPort: ndr-tcp
+      protocol: TCP
+    - name: rasp-udp
+      port: 15143
+      targetPort: rasp-udp
+      protocol: UDP
+    - name: rasp-tcp
+      port: 15143
+      targetPort: rasp-tcp
+      protocol: TCP
+    - name: siem-udp
+      port: 15144
+      targetPort: siem-udp
+      protocol: UDP
+    - name: siem-tcp
+      port: 15144
+      targetPort: siem-tcp
       protocol: TCP

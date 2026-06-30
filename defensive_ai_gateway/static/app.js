@@ -2,6 +2,13 @@ const detailCache = new Map();
 const THEME_KEY = "dashboard-theme";
 const LANGUAGE_KEY = "dashboard-language";
 const SYSLOG_CONFIG_KEY = "dashboard-syslog-intake-config";
+const LOG_PRODUCT_OPTIONS = [
+  { product: "waf", label: "WAF" },
+  { product: "hips", label: "HIPS" },
+  { product: "ndr", label: "NDR" },
+  { product: "rasp", label: "RASP" },
+  { product: "siem", label: "SIEM" },
+];
 const DEFAULT_SYSLOG_CONFIGS = [
   { product: "rasp", label: "RASP", port: 1514, profile: "demo-rasp-json", saved: false },
   { product: "waf", label: "WAF", port: 1515, profile: "waf-syslog-json", saved: false },
@@ -77,6 +84,8 @@ const STRINGS = {
     logAdapter: "日志接入",
     logAdapterHint: "字段识别、映射确认和接入前校验。",
     raspJsonLog: "RASP JSON 日志",
+    logSourceType: "日志类型",
+    securityAlertLog: "安全设备告警日志",
     autoDetectFields: "识别字段",
     loadSample: "加载示例",
     saveTemplate: "保存映射",
@@ -152,7 +161,7 @@ const STRINGS = {
     mappingEmpty: "自动识别后会在这里显示字段确认结果。",
     requiredMissing: "缺少必填字段：{fields}",
     recommendedMissing: "必填字段已识别，建议补充：{fields}",
-    mappingPassed: "必填字段与关键 RASP 字段已识别",
+    mappingPassed: "必填字段与关键设备字段已识别",
     standardField: "标准字段",
     detectedPath: "识别路径",
     sampleValue: "样例值",
@@ -178,7 +187,7 @@ const STRINGS = {
     modelsLoaded: "已从 {endpoint} 拉取 {count} 个本地模型，可在 Model 下拉中选择。",
     modelsEmpty: "未在 {endpoint} 发现任何模型，请确认 Ollama 已启动。",
     modelsLoadFailed: "拉取模型失败：{error}",
-    sampleLoaded: "已加载 RASP 示例日志。",
+    sampleLoaded: "已加载 {product} 示例日志。",
     dryRunError: "映射校验失败：{message}",
     fieldRequired: "必填",
     fieldEnhanced: "增强",
@@ -250,6 +259,8 @@ const STRINGS = {
     logAdapter: "Log Intake",
     logAdapterHint: "Field detection, mapping confirmation, and pre-ingestion validation.",
     raspJsonLog: "RASP JSON log",
+    logSourceType: "Log type",
+    securityAlertLog: "Security device alert log",
     autoDetectFields: "Detect fields",
     loadSample: "Load sample",
     saveTemplate: "Save mapping",
@@ -325,7 +336,7 @@ const STRINGS = {
     mappingEmpty: "Field confirmation results will appear here after auto-detection.",
     requiredMissing: "Missing required fields: {fields}",
     recommendedMissing: "Required fields are mapped. Recommended additions: {fields}",
-    mappingPassed: "Required fields and key RASP fields are mapped",
+    mappingPassed: "Required fields and key device fields are mapped",
     standardField: "Standard field",
     detectedPath: "Detected path",
     sampleValue: "Sample value",
@@ -351,7 +362,7 @@ const STRINGS = {
     modelsLoaded: "Loaded {count} local model(s) from {endpoint}; pick one from the Model dropdown.",
     modelsEmpty: "No models found at {endpoint}. Is Ollama running?",
     modelsLoadFailed: "Failed to load models: {error}",
-    sampleLoaded: "Loaded RASP sample log.",
+    sampleLoaded: "Loaded {product} sample log.",
     dryRunError: "Mapping validation failed: {message}",
     fieldRequired: "Required",
     fieldEnhanced: "Enhanced",
@@ -363,12 +374,13 @@ let inferredProfile = null;
 let inferredFields = [];
 let currentLanguage = "zh";
 let lastFieldMappingResult = null;
-let sampleRaspLog = null;
+const sampleLogCache = new Map();
 let syslogConfigs = loadSyslogConfigs();
-async function loadSampleRaspLog() {
-  if (sampleRaspLog) return sampleRaspLog;
-  sampleRaspLog = await json("/api/samples/rasp-alert");
-  return sampleRaspLog;
+async function loadSampleLog(product = selectedLogProduct()) {
+  if (sampleLogCache.has(product)) return sampleLogCache.get(product);
+  const sample = await json(`/api/samples/${encodeURIComponent(product)}-alert`);
+  sampleLogCache.set(product, sample);
+  return sample;
 }
 
 async function json(url, options) {
@@ -442,6 +454,27 @@ function applyLanguage() {
   updateWorkspaceTitle(active);
   renderProfileList();
   renderSyslogConfigTable();
+  renderLogProductOptions();
+}
+
+function renderLogProductOptions() {
+  const select = document.querySelector("#log-product-select");
+  if (!select) return;
+  const current = selectedLogProduct();
+  select.innerHTML = LOG_PRODUCT_OPTIONS.map((item) => {
+    const label = `${item.label} JSON ${currentLanguage === "en" ? "log" : "日志"}`;
+    return `<option value="${escapeHtml(item.product)}" ${item.product === current ? "selected" : ""}>${escapeHtml(label)}</option>`;
+  }).join("");
+}
+
+function selectedLogProduct() {
+  const value = document.querySelector("#log-product-select")?.value || "waf";
+  return LOG_PRODUCT_OPTIONS.some((item) => item.product === value) ? value : "waf";
+}
+
+function selectedLogProductLabel() {
+  const product = selectedLogProduct();
+  return LOG_PRODUCT_OPTIONS.find((item) => item.product === product)?.label || product.toUpperCase();
 }
 
 function defaultSyslogConfigs() {
@@ -1054,8 +1087,9 @@ function selectProfile(profileId) {
   inferredProfile = profile;
   setProfileJson(profile);
   const sourceLog = document.querySelector("#source-log");
-  if (profile?.profile_id === "demo-rasp-json" && !sourceLog.value.trim() && sampleRaspLog) {
-    sourceLog.value = JSON.stringify(sampleRaspLog, null, 2);
+  const selectedProduct = selectedLogProduct();
+  if (profile?.profile_id === `demo-${selectedProduct}-json` && !sourceLog.value.trim() && sampleLogCache.has(selectedProduct)) {
+    sourceLog.value = JSON.stringify(sampleLogCache.get(selectedProduct), null, 2);
   }
   renderProfileList();
 }
@@ -1171,10 +1205,11 @@ function updateInferredMapping(event) {
 async function inferMappingProfile(event) {
   event.preventDefault();
   const log = currentLog();
+  const product = selectedLogProduct();
   const result = await json("/api/mapping-profiles/infer", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ log, profile_id: "auto-rasp-json" }),
+    body: JSON.stringify({ log, product, profile_id: `auto-${product}-json` }),
   });
   inferredProfile = result.profile;
   inferredFields = result.fields || [];
@@ -1363,12 +1398,22 @@ document.querySelector("#infer-form").addEventListener("submit", (event) => {
   inferMappingProfile(event).catch((err) => setProfileStatus(err.message || String(err), true));
 });
 document.querySelector("#load-sample-log").addEventListener("click", () => {
-  loadSampleRaspLog()
+  const product = selectedLogProduct();
+  loadSampleLog(product)
     .then((sample) => {
       document.querySelector("#source-log").value = JSON.stringify(sample, null, 2);
-      setProfileStatus(tr("sampleLoaded"));
+      setProfileStatus(tr("sampleLoaded", { product: selectedLogProductLabel() }));
     })
     .catch((err) => setProfileStatus(err.message || String(err), true));
+});
+document.querySelector("#log-product-select").addEventListener("change", () => {
+  inferredProfile = null;
+  inferredFields = [];
+  lastFieldMappingResult = null;
+  setProfileJson({});
+  renderFieldMappingTable(null);
+  document.querySelector("#dry-run-result").textContent = tr("dryRunHint");
+  setProfileStatus("");
 });
 document.querySelector("#save-inferred-profile").addEventListener("click", () => {
   saveCurrentProfile().catch((err) => setProfileStatus(err.message || String(err), true));
@@ -1395,6 +1440,7 @@ document.querySelectorAll(".nav-button").forEach((btn) => {
   });
 });
 
-Promise.all([loadSampleRaspLog(), loadCases(), loadLlmConfig(), loadMappingProfiles()]).catch((err) =>
+renderLogProductOptions();
+Promise.all([loadSampleLog(selectedLogProduct()), loadCases(), loadLlmConfig(), loadMappingProfiles()]).catch((err) =>
   showToast(err.message || String(err), "error"),
 );

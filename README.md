@@ -9,8 +9,9 @@
 - Python 标准库优先：第一版不依赖 pip/npm，降低内网迁移和供应链审查成本。
 - SQLite 事实库：PoC 阶段开箱即用，生产可替换为 PostgreSQL。
 - HTTP API + 静态 Dashboard：接收 HIPS/RASP/NDR/WAF/SIEM 告警，实时查看 Case。
+- 异步告警队列：HTTP 入口只做鉴权、映射和入队，后台 worker 分析，避免高 QPS 告警阻塞入口。
 - Agent/Skill/Harness 分层：产品专属提示词、记忆命名空间、策略检查和离线回放分开演进。
-- LLM 可插拔：开发配置默认连接本地 Ollama `gemma3:4b`；如本机只有 `gemma3:latest`，会自动降级。测试 harness 默认仍可使用 deterministic 本地分析器。
+- LLM 可插拔：开发配置默认使用 deterministic 本地规则分析器 `local-rule-analyst`；需要真实模型验证时，可在 Dashboard 切换到本地 Ollama 或内网 LLM Gateway。
 - 随机样例 + 记忆降噪：样例脚本可随机生成 attack / false_positive 告警；已批准产品长期记忆可辅助同系统重复告警的误报分辨。
 
 ## 快速启动
@@ -63,21 +64,28 @@ python3 scripts/run_harness.py --samples samples --config config/dev.yaml --use-
 bash scripts/package_offline.sh ../outputs
 ```
 
-`--use-config-llm` 会按 `config/dev.yaml` 调用本地 Ollama。确认本机 Ollama 已启动，并已具备 `gemma3:4b` 或 `gemma3:latest`。
+`--use-config-llm` 会按 `config/dev.yaml` 使用默认的 `local-rule-analyst`。如需回放真实模型效果，可先在配置或 Dashboard 中切换到本地 Ollama / 内网 LLM Gateway。
 
 ## k3s 与 Syslog 接入
 
 生产接入推荐在 k3s 中用独立 collector 接收 syslog，再转发到网关 HTTP 入口：
 
 ```text
-Security Product -> Syslog UDP/TCP 1514 -> Vector -> POST /api/alerts
+Security Product -> Syslog UDP/TCP 15140-15144 -> Collector -> POST /api/alerts
 ```
 
 参考清单：
 
 - `deploy/k3s/gateway.yaml`：网关 Deployment、Service、Ingress、PVC 和生产配置。
-- `deploy/k3s/syslog-collector-vector.yaml`：Vector syslog collector，监听 TCP/UDP `1514` 并转成标准告警 JSON。
+- `deploy/k3s/syslog-collector-vector.yaml`：Vector syslog collector 参考清单，接收 syslog 并转成标准告警 JSON。
 - `docs/SYSLOG_INGESTION.md`：安全设备配置、Mapping Profile 接入和运维注意事项。
+
+本地可以模拟五类设备分别通过不同 TCP 端口发送 syslog，并验证路由不会把安全系统识别错：
+
+```bash
+python3 -m defensive_ai_gateway --config config/dev.yaml
+python3 scripts/simulate_syslog_ports.py --config config/dev.yaml
+```
 
 ## 工程结构
 

@@ -126,6 +126,8 @@ def main() -> None:
                 "label": label,
                 "alert_id": payload.get("alert_id"),
                 "status": result["status"],
+                "queue_status": body.get("status"),
+                "queued_product": body.get("product"),
                 "case_id": body.get("case_id"),
                 "classification": body.get("classification"),
                 "severity": body.get("severity"),

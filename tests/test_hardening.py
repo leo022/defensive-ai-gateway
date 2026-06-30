@@ -155,6 +155,39 @@ class HttpAuthTest(unittest.TestCase):
             finally:
                 srv.stop()
 
+    def test_alert_post_returns_queued_without_waiting_for_analysis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(Path(tmp), token="")
+            config.processing.async_enabled = True
+            config.processing.queue_max_size = 10
+            config.processing.workers = 1
+            srv = _Server(config)
+            release = threading.Event()
+            try:
+                def slow_handler(alert):
+                    release.wait(1)
+                    return None
+
+                srv.server.state.orchestrator.handle_alert = slow_handler
+                payload = {
+                    "alert_id": "async-intake-001",
+                    "source": "test",
+                    "product": "waf",
+                    "event_type": "queue_test",
+                    "severity": "high",
+                    "timestamp": "2026-06-30T10:00:00+08:00",
+                    "payload": {"uri": "/health"},
+                }
+                status, body = srv.post("/api/alerts", payload, token="")
+
+                self.assertEqual(status, 202)
+                self.assertEqual(body["status"], "queued")
+                self.assertEqual(body["alert_id"], "async-intake-001")
+                self.assertEqual(body["queue"]["submitted"], 1)
+            finally:
+                release.set()
+                srv.stop()
+
 
 class ContextRedactionTest(unittest.TestCase):
     def test_sensitive_fields_in_evidence_are_redacted_before_llm(self):
