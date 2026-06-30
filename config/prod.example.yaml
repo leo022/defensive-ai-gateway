@@ -22,4 +22,16 @@ auth:
   api_token: ""
   allow_loopback_no_token: true
   require_token_when_remote: true
-
+processing:
+  async_enabled: true
+  queue_max_size: 20000
+  workers: 8
+syslog:
+  product_ports:
+    waf: 15140
+    hips: 15141
+    ndr: 15142
+    rasp: 15143
+    siem: 15144
+  gateway_profiles:
+    rasp: "demo-rasp-json"

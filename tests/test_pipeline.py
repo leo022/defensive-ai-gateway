@@ -16,6 +16,7 @@ from defensive_ai_gateway.normalizer import EventNormalizer
 from defensive_ai_gateway.orchestrator import Orchestrator
 from defensive_ai_gateway.policy import PolicyEngine
 from defensive_ai_gateway.sample_alerts import generate_alert, generate_alerts
+from defensive_ai_gateway.syslog_router import SyslogPortRouter
 
 
 class PipelineTest(unittest.TestCase):
@@ -140,6 +141,25 @@ class PipelineTest(unittest.TestCase):
             incomplete = state.infer_mapping_profile({"log": {"device": {"type": "runtime_app_protection"}}})
             self.assertFalse(incomplete["ok"])
             self.assertIn("alert_id", incomplete["required_missing"])
+
+    def test_auto_infer_mapping_profile_for_security_device_samples(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            config.database.path = str(Path(tmp) / "gateway.db")
+            state = GatewayState(config)
+
+            for product in ["waf", "hips", "ndr", "siem"]:
+                with self.subTest(product=product):
+                    raw_log = state.sample_log(product)
+                    inferred = state.infer_mapping_profile(
+                        {"log": raw_log, "product": product, "profile_id": f"auto-{product}-json"}
+                    )
+
+                    self.assertTrue(inferred["ok"], inferred)
+                    self.assertEqual(inferred["profile"]["profile_id"], f"auto-{product}-json")
+                    result = state.dry_run_mapping_profile({"profile": inferred["profile"], "log": raw_log})
+                    self.assertTrue(result["ok"], result["errors"])
+                    self.assertEqual(result["raw_alert_preview"]["product"], product)
 
     def test_auto_infer_real_rasp_event_items_format_derives_sink(self):
         tmp = tempfile.TemporaryDirectory()
@@ -565,6 +585,48 @@ class AlertProductRoutingTest(unittest.TestCase):
             )
             self.assertEqual(alert.product, "waf")
             self.assertNotIn("adapter", alert.payload)
+
+    def test_syslog_port_router_keeps_security_systems_separate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._state(tmp)
+            router = SyslogPortRouter(state.config.syslog.product_ports, state.config.syslog.gateway_profiles)
+            root = Path(__file__).parent.parent
+
+            for product, port in sorted(state.config.syslog.product_ports.items(), key=lambda item: item[1]):
+                with self.subTest(product=product, port=port):
+                    raw = (root / "samples_syslog" / product / f"{product}_alert.json").read_bytes()
+                    routed = router.route(port, raw, hostname=f"{product}-device-01", appname=product)
+                    alert = state.alert_from_payload(routed.payload, routed.profile_id)
+
+                    self.assertEqual(routed.product, product)
+                    self.assertEqual(alert.product, product)
+                    self.assertNotEqual(alert.product, "siem" if product != "siem" else "waf")
+                    if product == "rasp":
+                        self.assertEqual(routed.profile_id, "demo-rasp-json")
+                        self.assertEqual(alert.payload["adapter"]["profile_id"], "demo-rasp-json")
+
+    def test_syslog_port_route_wins_over_conflicting_content_product(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._state(tmp)
+            router = SyslogPortRouter(state.config.syslog.product_ports, state.config.syslog.gateway_profiles)
+            waf_port = state.config.syslog.product_ports["waf"]
+
+            routed = router.route(
+                waf_port,
+                {
+                    "alert": {"id": "conflicting-product-001"},
+                    "device": {"type": "hips", "vendor": "mis-tagged-device"},
+                    "event": {"type": "should still route as waf"},
+                    "risk": {"level": "high"},
+                },
+                hostname="waf-device-01",
+                appname="waf",
+            )
+            alert = state.alert_from_payload(routed.payload, routed.profile_id)
+
+            self.assertEqual(routed.product, "waf")
+            self.assertEqual(alert.product, "waf")
+            self.assertIn("declared_product_mismatch:hips", routed.warnings)
 
 
 if __name__ == "__main__":

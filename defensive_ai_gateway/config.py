@@ -69,12 +69,44 @@ class AuthConfig:
 
 
 @dataclass
+class ProcessingConfig:
+    """Inbound alert processing backpressure controls."""
+
+    async_enabled: bool = True
+    queue_max_size: int = 5000
+    workers: int = 4
+
+
+@dataclass
+class SyslogConfig:
+    """Port-based syslog routing for collector/demo validation.
+
+    Production should still run a dedicated collector, but keeping the same
+    product-to-port contract in application config lets tests and local demos
+    verify that mixed security systems are not misclassified by content alone.
+    """
+
+    product_ports: dict[str, int] = field(
+        default_factory=lambda: {
+            "waf": 15140,
+            "hips": 15141,
+            "ndr": 15142,
+            "rasp": 15143,
+            "siem": 15144,
+        }
+    )
+    gateway_profiles: dict[str, str] = field(default_factory=lambda: {"rasp": "demo-rasp-json"})
+
+
+@dataclass
 class GatewayConfig:
     server: ServerConfig = field(default_factory=ServerConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     auth: AuthConfig = field(default_factory=AuthConfig)
+    processing: ProcessingConfig = field(default_factory=ProcessingConfig)
+    syslog: SyslogConfig = field(default_factory=SyslogConfig)
 
 
 def _parse_scalar(value: str) -> Any:
@@ -136,7 +168,10 @@ def load_config(path: str | None = None) -> GatewayConfig:
     llm = raw.get("llm", {})
     policy = raw.get("policy", {})
     auth = raw.get("auth", {})
+    processing = raw.get("processing", {})
+    syslog = raw.get("syslog", {})
     api_key_env = str(llm.get("api_key_env", "DEFENSIVE_AI_LLM_API_KEY"))
+    default_syslog = SyslogConfig()
 
     config = GatewayConfig(
         server=ServerConfig(
@@ -174,6 +209,24 @@ def load_config(path: str | None = None) -> GatewayConfig:
                 os.getenv("DEFENSIVE_AI_AUTH_REQUIRE_REMOTE_TOKEN", "1" if auth.get("require_token_when_remote", True) else "0")
             )
             in {"1", "true", "True", "yes"},
+        ),
+        processing=ProcessingConfig(
+            async_enabled=str(
+                os.getenv("DEFENSIVE_AI_ASYNC_ALERTS", "1" if processing.get("async_enabled", True) else "0")
+            )
+            in {"1", "true", "True", "yes"},
+            queue_max_size=int(os.getenv("DEFENSIVE_AI_QUEUE_MAX_SIZE", processing.get("queue_max_size", 5000))),
+            workers=int(os.getenv("DEFENSIVE_AI_WORKERS", processing.get("workers", 4))),
+        ),
+        syslog=SyslogConfig(
+            product_ports={
+                **default_syslog.product_ports,
+                **{str(k): int(v) for k, v in dict(syslog.get("product_ports", {}) or {}).items()},
+            },
+            gateway_profiles={
+                **default_syslog.gateway_profiles,
+                **{str(k): str(v) for k, v in dict(syslog.get("gateway_profiles", {}) or {}).items()},
+            },
         ),
     )
     return config

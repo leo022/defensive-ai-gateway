@@ -1,0 +1,39 @@
+{
+  "event": {
+    "id": "ndr-native-20260630-001",
+    "time": "2026-06-30T09:33:37+08:00",
+    "type": "Rare outbound TLS beacon or exfiltration pattern"
+  },
+  "device": {
+    "vendor": "network-sensor",
+    "type": "ndr",
+    "sensor": "ndr-core-east-01"
+  },
+  "risk": {
+    "level": "medium"
+  },
+  "rule": {
+    "id": "NDR-EXFIL-RATIO-031",
+    "name": "Possible data exfiltration over TLS"
+  },
+  "host": {
+    "name": "pay-api-prod-03"
+  },
+  "source": {
+    "ip": "10.30.2.206"
+  },
+  "destination": {
+    "ip": "198.51.100.194",
+    "port": 443,
+    "sni": "telemetry-edge.example"
+  },
+  "network": {
+    "protocol": "tls",
+    "ja3": "771,4865-4866-4867,0-11-10,23-24,0",
+    "bytes_out": 38218249,
+    "bytes_in": 543581,
+    "session_count_30m": 86,
+    "beacon_interval_seconds": 60
+  },
+  "action": "observed"
+}

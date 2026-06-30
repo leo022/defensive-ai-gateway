@@ -1,0 +1,37 @@
+{
+  "metadata": {
+    "id": "hips-native-20260630-001"
+  },
+  "device": {
+    "vendor": "endpoint-guard",
+    "type": "hips",
+    "sensor": "agent-patch-srv-02"
+  },
+  "severity": "high",
+  "timestamp": "2026-06-30T09:21:47+08:00",
+  "rule": {
+    "id": "HIPS-WIN-CRED-042",
+    "name": "PowerShell credential access behavior chain"
+  },
+  "host": {
+    "name": "patch-srv-02"
+  },
+  "process": {
+    "name": "powershell.exe",
+    "path": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+    "pid": 3040,
+    "parent_name": "psexesvc.exe",
+    "parent_pid": 1782,
+    "command_line": "encoded command observed; raw command withheld"
+  },
+  "source": {
+    "ip": "10.12.9.133",
+    "user": "svc-reporting"
+  },
+  "action": "blocked_process_tree",
+  "behavior": [
+    "credential store access attempt",
+    "remote thread creation blocked",
+    "attempted connection to core database segment"
+  ]
+}

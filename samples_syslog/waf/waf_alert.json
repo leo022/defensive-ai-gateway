@@ -1,0 +1,39 @@
+{
+  "alert": {
+    "id": "waf-native-20260630-001",
+    "category": "web_attack_sqli_anomaly"
+  },
+  "device": {
+    "vendor": "edge-waf",
+    "type": "waf",
+    "name": "waf-gw-prod-01"
+  },
+  "risk": {
+    "level": "high"
+  },
+  "event": {
+    "time": "2026-06-30T09:15:31+08:00",
+    "type": "SQL injection anomaly threshold exceeded"
+  },
+  "rule": {
+    "id": "WAF-942-SQLI",
+    "name": "SQL injection anomaly threshold exceeded"
+  },
+  "http": {
+    "client_ip": "203.0.113.208",
+    "method": "POST",
+    "uri": "/openbanking/v2/payments/search",
+    "request_id": "req-waf-native-001",
+    "status": 403,
+    "xff": "203.0.113.208"
+  },
+  "application": {
+    "name": "mobile-payment-api"
+  },
+  "action": "blocked",
+  "matched_parameters": [
+    "beneficiaryName",
+    "remarks"
+  ],
+  "payload_category": "SQL boolean expression markers observed; raw payload withheld"
+}

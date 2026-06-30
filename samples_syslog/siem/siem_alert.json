@@ -1,0 +1,52 @@
+{
+  "alert": {
+    "id": "siem-native-20260630-001"
+  },
+  "device": {
+    "vendor": "soc-correlation",
+    "type": "siem"
+  },
+  "priority": "critical",
+  "event_time": "2026-06-30T09:42:37+08:00",
+  "event": {
+    "type": "multi_product_lateral_movement_and_privilege_case"
+  },
+  "rule": {
+    "id": "SIEM-CORR-LATERAL-PRIV-009",
+    "name": "High value asset lateral movement with suspicious admin share and PowerShell chain"
+  },
+  "host": {
+    "name": "core-db-22"
+  },
+  "source": {
+    "ip": "10.12.9.156",
+    "user": "adm.db"
+  },
+  "signals": [
+    {
+      "product": "ndr",
+      "event": "rare_smb_admin_share_access",
+      "details": "ADMIN$ and C$ shares outside baseline"
+    },
+    {
+      "product": "hips",
+      "event": "encoded_powershell_spawned_by_wmi_provider",
+      "process_name": "powershell.exe"
+    },
+    {
+      "product": "iam",
+      "event": "service_account_login_from_new_workstation",
+      "mfa_status": "not_applicable_service_account"
+    }
+  ],
+  "correlation_logic": {
+    "window_minutes": 15,
+    "entity_join": [
+      "user",
+      "src_ip",
+      "host"
+    ],
+    "threshold": "3 distinct security domains"
+  },
+  "action": "case_created"
+}
