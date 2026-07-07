@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from defensive_ai_gateway.app import GatewayState
 from defensive_ai_gateway.config import GatewayConfig
@@ -11,7 +12,7 @@ from defensive_ai_gateway.database import Repository
 from defensive_ai_gateway.log_adapter import LogAdapter, demo_rasp_profile, mapping_profile_record
 from defensive_ai_gateway.llm import GatewayLLM, LLMClient, LocalHeuristicLLM, _parse_json_object
 from defensive_ai_gateway.memory import MemoryManager
-from defensive_ai_gateway.models import RawAlert
+from defensive_ai_gateway.models import AgentResult, RawAlert, RecommendedAction
 from defensive_ai_gateway.normalizer import EventNormalizer
 from defensive_ai_gateway.orchestrator import Orchestrator
 from defensive_ai_gateway.policy import PolicyEngine
@@ -257,6 +258,42 @@ class PipelineTest(unittest.TestCase):
             evidence_text = json.dumps(linked[0]["normalized_event"]["evidence"], ensure_ascii=False)
             self.assertNotIn("demo-secret-token", evidence_text)
 
+    def test_case_list_keeps_creation_order_and_filters(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repository(str(Path(tmp) / "gateway.db"))
+
+            def result(case_id: str, severity: str, created_at_ms: int) -> AgentResult:
+                return AgentResult(
+                    case_id=case_id,
+                    agent="test-agent",
+                    classification="suspicious",
+                    confidence=0.8,
+                    severity=severity,
+                    summary=f"{case_id} summary",
+                    evidence=[],
+                    missing_evidence=[],
+                    recommended_actions=[RecommendedAction(action="review", mode="observe", rationale="test")],
+                    dashboard_cards=[],
+                    created_at_ms=created_at_ms,
+                )
+
+            base = 1_700_000_000_000
+            repo.upsert_case(result("case_a", "high", base), "waf")
+            repo.upsert_case(result("case_b", "critical", base + 1000), "rasp")
+            repo.upsert_case(result("case_c", "low", base + 2000), "waf")
+
+            self.assertEqual([item["case_id"] for item in repo.list_cases()], ["case_c", "case_b", "case_a"])
+            repo.update_case_status("case_a", "confirmed_attack")
+            self.assertEqual([item["case_id"] for item in repo.list_cases()], ["case_c", "case_b", "case_a"])
+
+            self.assertEqual([item["case_id"] for item in repo.list_cases(product="waf")], ["case_c", "case_a"])
+            self.assertEqual([item["case_id"] for item in repo.list_cases(severity="critical")], ["case_b"])
+            self.assertEqual([item["case_id"] for item in repo.list_cases(status="confirmed_attack")], ["case_a"])
+            self.assertEqual(
+                [item["case_id"] for item in repo.list_cases(created_from_ms=base + 500, created_to_ms=base + 1500)],
+                ["case_b"],
+            )
+
     def test_llm_config_update_hides_key_and_rebuilds_client(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = GatewayConfig()
@@ -280,6 +317,49 @@ class PipelineTest(unittest.TestCase):
             self.assertNotIn("api_key", updated)
             self.assertIsInstance(state.llm, GatewayLLM)
             self.assertEqual(state.config.llm.api_key, "secret-value")
+
+    def test_case_disposition_updates_status_and_audit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            config.database.path = str(Path(tmp) / "gateway.db")
+            state = GatewayState(config)
+            payload = generate_alert(product="waf", scenario="attack", seed=7)
+            result = state.orchestrator.handle_alert(state.alert_from_payload(payload))
+            case_id = result.case_id
+
+            updated = state.update_case_disposition(
+                case_id,
+                {
+                    "status": "confirmed_attack",
+                    "actor": "analyst-lee",
+                    "reason": "verified exploit evidence",
+                },
+            )
+
+            self.assertTrue(updated["ok"])
+            self.assertEqual(updated["case"]["status"], "confirmed_attack")
+            self.assertEqual(state.repo.get_case(case_id)["status"], "confirmed_attack")
+            self.assertEqual(state.repo.stats()["cases"], 0)
+            self.assertEqual(state.repo.stats()["unresolved_cases"], 1)
+            audit = state.repo.conn.execute(
+                "SELECT actor, action, detail_json FROM audit_log WHERE trace_id = ? ORDER BY created_at_ms DESC LIMIT 1",
+                (case_id,),
+            ).fetchone()
+            self.assertEqual(audit["actor"], "analyst-lee")
+            self.assertEqual(audit["action"], "confirm_case_attack")
+            self.assertEqual(json.loads(audit["detail_json"])["status"], "confirmed_attack")
+
+            with self.assertRaisesRegex(ValueError, "unsupported case disposition"):
+                state.update_case_disposition(case_id, {"status": "block_host"})
+
+            state.update_case_disposition(case_id, {"status": "closed", "actor": "analyst-lee"})
+            stats = state.repo.stats()
+            self.assertEqual(stats["cases"], 0)
+            self.assertEqual(stats["total_cases"], 1)
+
+            state.orchestrator.handle_alert(state.alert_from_payload(payload))
+            self.assertEqual(state.repo.get_case(case_id)["status"], "closed")
+            self.assertEqual(state.repo.stats()["cases"], 0)
 
     def test_random_sample_generation_is_repeatable_and_varied(self):
         first = generate_alerts(3, product="waf", scenario="random", seed=42)
@@ -627,6 +707,33 @@ class AlertProductRoutingTest(unittest.TestCase):
             self.assertEqual(routed.product, "waf")
             self.assertEqual(alert.product, "waf")
             self.assertIn("declared_product_mismatch:hips", routed.warnings)
+
+    def test_runtime_syslog_config_activates_saved_tcp_or_udp_listener(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            config.database.path = str(Path(tmp) / "gateway.db")
+            config.processing.async_enabled = False
+            state = GatewayState(config)
+            tcp_port = 25140
+            udp_port = 25141
+
+            try:
+                with patch("defensive_ai_gateway.syslog_receiver._SyslogListener.start", return_value=None):
+                    tcp_payload = state.update_syslog_config({"product": "waf", "port": tcp_port, "protocol": "tcp"})
+                    waf_config = next(item for item in tcp_payload["configs"] if item["product"] == "waf")
+                    self.assertEqual(waf_config["protocol"], "tcp")
+                    self.assertTrue(waf_config["saved"])
+
+                    udp_payload = state.update_syslog_config({"product": "hips", "port": udp_port, "protocol": "udp"})
+                    hips_config = next(item for item in udp_payload["configs"] if item["product"] == "hips")
+                    self.assertEqual(hips_config["protocol"], "udp")
+                    self.assertTrue(hips_config["saved"])
+
+                listeners = state.syslog_config_payload()["listeners"]
+                self.assertIn({"product": "waf", "port": tcp_port, "protocol": "tcp", "active": True}, listeners)
+                self.assertIn({"product": "hips", "port": udp_port, "protocol": "udp", "active": True}, listeners)
+            finally:
+                state.stop()
 
 
 if __name__ == "__main__":

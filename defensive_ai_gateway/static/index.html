@@ -35,7 +35,8 @@
           </div>
         </div>
         <nav class="primary-nav" aria-label="Main">
-          <button class="nav-button active" type="button" data-view="dashboard" data-i18n="navDashboard">处置台</button>
+          <button class="nav-button active" type="button" data-view="monitor" data-i18n="navMonitor">监控大屏</button>
+          <button class="nav-button" type="button" data-view="dashboard" data-i18n="navDashboard">处置台</button>
           <button class="nav-button" type="button" data-view="adapter" data-i18n="navAdapter">日志接入</button>
           <button class="nav-button" type="button" data-view="settings" data-i18n="navSettings">运行配置</button>
         </nav>
@@ -48,27 +49,137 @@
         <header class="workspace-header">
           <div>
             <p class="eyebrow" data-i18n="workspaceEyebrow">Security Operations</p>
-            <h2 data-i18n="workspaceTitle">告警处置队列</h2>
+            <h2 data-i18n="workspaceTitle">实时监控大屏</h2>
           </div>
           <div class="header-actions">
-            <span class="environment-badge" data-i18n="environment">Offline-ready</span>
             <button id="refresh" type="button" data-i18n="refresh">刷新</button>
           </div>
         </header>
         <main>
-          <section id="dashboard-view" class="view active">
-            <section class="stats">
-              <div><span id="alerts">0</span><label data-i18n="alerts">告警总量</label></div>
-              <div><span id="cases">0</span><label>Open Cases</label></div>
-              <div><span id="high">0</span><label data-i18n="highCritical">高危与严重</label></div>
+          <section id="monitor-view" class="view active">
+            <section class="dashboard-hero" aria-label="Security operations overview">
+              <div>
+                <p class="eyebrow" data-i18n="dashboardEyebrow">Realtime SOC Overview</p>
+                <h2 data-i18n="dashboardTitle">实时监控大屏</h2>
+                <p data-i18n="dashboardSubtitle">集中监控告警趋势、处置压力、接入健康和模型运行状态。</p>
+              </div>
+              <div class="dashboard-controls">
+                <div class="runtime-pill" id="runtime-status">
+                  <span class="runtime-dot unknown" aria-hidden="true"></span>
+                  <span data-i18n="runtimeChecking">检查中</span>
+                </div>
+                <button id="refresh-mode-toggle" class="mode-toggle" type="button" aria-pressed="false">
+                  <span data-i18n="autoRefreshOn">自动刷新</span>
+                </button>
+                <span id="last-refresh" class="last-refresh">-</span>
+              </div>
             </section>
+
+            <section class="stats dashboard-kpis">
+              <div><span id="alerts">0</span><label data-i18n="alerts">告警总量</label></div>
+              <div><span id="cases">0</span><label data-i18n="openCases">Open Cases</label></div>
+              <div><span id="high">0</span><label data-i18n="highCritical">高危与严重</label></div>
+              <div><span id="queue-depth">0</span><label data-i18n="queueDepth">待处理队列</label></div>
+            </section>
+
+            <section class="dashboard-grid">
+              <section class="panel health-panel">
+                <div class="panel-heading">
+                  <div>
+                    <h2 data-i18n="healthTitle">应用健康度</h2>
+                    <p data-i18n="healthHint">综合 API、分析队列、模型服务与日志接入状态。</p>
+                  </div>
+                  <span id="health-score" class="health-score">--</span>
+                </div>
+                <div id="health-checks" class="health-checks"></div>
+              </section>
+
+              <section class="panel">
+                <div class="panel-heading">
+                  <div>
+                    <h2 data-i18n="intakeHealthTitle">接入通道</h2>
+                    <p data-i18n="intakeHealthHint">HTTP 入口与 Syslog 监听状态。</p>
+                  </div>
+                </div>
+                <div id="intake-health" class="intake-health"></div>
+              </section>
+
+              <section class="panel">
+                <div class="panel-heading">
+                  <div>
+                    <h2 data-i18n="distributionTitle">告警分布</h2>
+                    <p data-i18n="distributionHint">按安全产品聚合最近 Case，辅助识别噪声来源。</p>
+                  </div>
+                </div>
+                <div id="product-distribution" class="distribution-list"></div>
+              </section>
+
+              <section class="panel">
+                <div class="panel-heading">
+                  <div>
+                    <h2 data-i18n="handlingTitle">处置情况</h2>
+                    <p data-i18n="handlingHint">按研判结论观察真实攻击、待复核与误报占比。</p>
+                  </div>
+                </div>
+                <div id="classification-distribution" class="distribution-list"></div>
+              </section>
+            </section>
+          </section>
+
+          <section id="dashboard-view" class="view">
             <section class="panel queue-panel">
               <div class="panel-heading">
                 <div>
                   <h2 data-i18n="latestCases">Case 队列</h2>
-                  <p data-i18n="latestCasesHint">按更新时间排序，展开查看证据、结论和动作。</p>
+                  <p data-i18n="latestCasesHint">按创建时间排序，处置后队列顺序保持不变。</p>
                 </div>
               </div>
+              <form id="case-search-form" class="case-search-form">
+                <label>
+                  <span data-i18n="caseSearchProduct">系统</span>
+                  <select id="case-filter-product" name="product">
+                    <option value="" data-i18n="caseSearchAll">全部</option>
+                    <option value="waf">WAF</option>
+                    <option value="hips">HIPS</option>
+                    <option value="ndr">NDR</option>
+                    <option value="rasp">RASP</option>
+                    <option value="siem">SIEM</option>
+                  </select>
+                </label>
+                <label>
+                  <span data-i18n="caseSearchSeverity">风险等级</span>
+                  <select id="case-filter-severity" name="severity">
+                    <option value="" data-i18n="caseSearchAll">全部</option>
+                    <option value="critical" data-i18n="severityCritical">严重</option>
+                    <option value="high" data-i18n="severityHigh">高</option>
+                    <option value="medium" data-i18n="severityMedium">中</option>
+                    <option value="low" data-i18n="severityLow">低</option>
+                  </select>
+                </label>
+                <label>
+                  <span data-i18n="caseSearchStatus">处置状态</span>
+                  <select id="case-filter-status" name="status">
+                    <option value="" data-i18n="caseSearchAll">全部</option>
+                    <option value="open" data-i18n="caseStatusOpen">待处置</option>
+                    <option value="under_review" data-i18n="caseStatusUnderReview">人工复核</option>
+                    <option value="confirmed_attack" data-i18n="caseStatusConfirmedAttack">确认攻击</option>
+                    <option value="false_positive" data-i18n="caseStatusFalsePositive">业务误报</option>
+                    <option value="closed" data-i18n="caseStatusClosed">已关闭</option>
+                  </select>
+                </label>
+                <label>
+                  <span data-i18n="caseSearchFrom">开始时间</span>
+                  <input id="case-filter-from" name="from" type="datetime-local" />
+                </label>
+                <label>
+                  <span data-i18n="caseSearchTo">结束时间</span>
+                  <input id="case-filter-to" name="to" type="datetime-local" />
+                </label>
+                <div class="case-search-actions">
+                  <button type="submit" data-i18n="caseSearchSubmit">搜索</button>
+                  <button type="button" id="case-search-reset" data-i18n="caseSearchReset">重置</button>
+                </div>
+              </form>
               <div id="cases-list" class="case-list"></div>
             </section>
           </section>
@@ -127,7 +238,7 @@
               <div class="panel-heading">
                 <div>
                   <h2 data-i18n="intakeChannels">告警接入通道</h2>
-                  <p data-i18n="intakeChannelsHint">HTTP 接口继续保留，新增 UDP syslog collector 通道。</p>
+                  <p data-i18n="intakeChannelsHint">HTTP 接口继续保留，新增可选 TCP/UDP syslog collector 通道。</p>
                 </div>
               </div>
               <div class="intake-channel-grid">
@@ -148,15 +259,15 @@
                 </article>
                 <article class="intake-channel-card recommended">
                   <div class="channel-title-row">
-                    <span class="channel-icon udp" aria-hidden="true">U</span>
+                    <span class="channel-icon udp" aria-hidden="true">S</span>
                     <div>
-                      <h3 data-i18n="syslogChannelTitle">新增 UDP Syslog 通道</h3>
-                      <p data-i18n="syslogChannelSubtitle">适合服务区内只支持 syslog 推送的安全设备。</p>
+                      <h3 data-i18n="syslogChannelTitle">新增 Syslog 通道</h3>
+                      <p data-i18n="syslogChannelSubtitle">支持 TCP/UDP；长报文推荐 TCP，避免 UDP 分片后截断或丢包。</p>
                     </div>
                   </div>
                   <dl class="channel-kv">
-                    <dt data-i18n="channelProtocol">协议</dt><dd>Syslog UDP</dd>
-                    <dt data-i18n="channelEndpoint">入口</dt><dd><code>syslog-collector:&lt;产品端口&gt;/udp</code></dd>
+                    <dt data-i18n="channelProtocol">协议</dt><dd>Syslog TCP/UDP</dd>
+                    <dt data-i18n="channelEndpoint">入口</dt><dd><code>syslog-collector:&lt;产品端口&gt;/&lt;协议&gt;</code></dd>
                     <dt data-i18n="channelTarget">转发</dt><dd><code>POST /api/alerts</code></dd>
                     <dt data-i18n="channelStatus">状态</dt><dd><span class="field-status needs_review" data-i18n="channelPlanned">规划新增</span></dd>
                   </dl>
@@ -166,7 +277,7 @@
                 <div class="syslog-config-heading">
                   <div>
                     <h3 data-i18n="syslogConfigTitle">Syslog 产品接收配置</h3>
-                    <p data-i18n="syslogConfigHint">为每类安全系统配置 UDP 接收端口，保存后确认为对应产品日志接收。</p>
+                    <p data-i18n="syslogConfigHint">为每类安全系统配置接收端口和协议；syslog 报文非常长时推荐 TCP，已作为默认项。</p>
                   </div>
                   <button type="button" id="reset-syslog-config" data-i18n="resetSyslogConfig">恢复默认端口</button>
                 </div>
@@ -176,7 +287,7 @@
               <div class="intake-flow">
                 <span data-i18n="flowSecuritySystem">安全系统</span>
                 <span aria-hidden="true">→</span>
-                <span data-i18n="flowServiceIp">服务区 IP:产品端口/udp</span>
+                <span data-i18n="flowServiceIp">服务区 IP:产品端口/协议</span>
                 <span aria-hidden="true">→</span>
                 <span>Vector</span>
                 <span aria-hidden="true">→</span>
@@ -185,7 +296,7 @@
               <div class="intake-notes">
                 <div>
                   <strong data-i18n="syslogOpsTitle">安全系统侧配置</strong>
-                  <p data-i18n="syslogOpsText">目的地址填写服务区暴露的 syslog collector IP，端口使用对应产品配置，协议 UDP。</p>
+                  <p data-i18n="syslogOpsText">目的地址填写服务区暴露的 syslog collector IP，端口和协议使用对应产品配置。</p>
                 </div>
                 <div>
                   <strong data-i18n="syslogMappingTitle">字段处理策略</strong>

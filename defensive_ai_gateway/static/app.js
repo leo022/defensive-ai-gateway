@@ -2,6 +2,11 @@ const detailCache = new Map();
 const THEME_KEY = "dashboard-theme";
 const LANGUAGE_KEY = "dashboard-language";
 const SYSLOG_CONFIG_KEY = "dashboard-syslog-intake-config";
+const REFRESH_PAUSED_KEY = "dashboard-refresh-paused";
+const LEGACY_OFFLINE_MODE_KEY = "dashboard-offline-mode";
+const COLLAPSIBLE_TEXT_LIMIT = 280;
+const COLLAPSIBLE_TEXT_LINE_LIMIT = 8;
+const DASHBOARD_REFRESH_MS = 15000;
 const LOG_PRODUCT_OPTIONS = [
   { product: "waf", label: "WAF" },
   { product: "hips", label: "HIPS" },
@@ -10,30 +15,80 @@ const LOG_PRODUCT_OPTIONS = [
   { product: "siem", label: "SIEM" },
 ];
 const DEFAULT_SYSLOG_CONFIGS = [
-  { product: "rasp", label: "RASP", port: 1514, profile: "demo-rasp-json", saved: false },
-  { product: "waf", label: "WAF", port: 1515, profile: "waf-syslog-json", saved: false },
-  { product: "hips", label: "HIPS", port: 1516, profile: "hips-syslog-json", saved: false },
-  { product: "ndr", label: "NDR", port: 1517, profile: "ndr-syslog-json", saved: false },
-  { product: "siem", label: "SIEM", port: 1518, profile: "siem-syslog-json", saved: false },
+  { product: "waf", label: "WAF", port: 15140, protocol: "tcp", profile: "waf-syslog-json", saved: false },
+  { product: "hips", label: "HIPS", port: 15141, protocol: "tcp", profile: "hips-syslog-json", saved: false },
+  { product: "ndr", label: "NDR", port: 15142, protocol: "tcp", profile: "ndr-syslog-json", saved: false },
+  { product: "rasp", label: "RASP", port: 15143, protocol: "tcp", profile: "demo-rasp-json", saved: false },
+  { product: "siem", label: "SIEM", port: 15144, protocol: "tcp", profile: "siem-syslog-json", saved: false },
 ];
 const STRINGS = {
   zh: {
     appTitle: "安全运营研判中心",
     appSubtitle: "多源告警处置与证据治理",
+    navMonitor: "监控大屏",
     navDashboard: "处置台",
     navAdapter: "日志接入",
     navSettings: "运行配置",
     workspaceEyebrow: "Security Operations",
-    workspaceTitle: "告警处置队列",
+    workspaceTitle: "实时监控大屏",
+    workspaceTitleMonitor: "实时监控大屏",
     workspaceTitleDashboard: "告警处置队列",
     workspaceTitleAdapter: "日志接入",
     workspaceTitleSettings: "运行配置",
-    environment: "Offline-ready",
+    dashboardEyebrow: "Realtime SOC Overview",
+    dashboardTitle: "实时监控大屏",
+    dashboardSubtitle: "集中监控告警趋势、处置压力、接入健康和模型运行状态。",
+    runtimeChecking: "检查中",
+    runtimeHealthy: "运行正常",
+    runtimeDegraded: "部分降级",
+    runtimeCritical: "需要关注",
+    autoRefreshOn: "自动刷新",
+    autoRefreshPaused: "暂停刷新",
+    lastRefresh: "更新于 {time}",
+    openCases: "待处置 Case",
+    queueDepth: "待处理队列",
+    healthTitle: "系统健康度",
+    healthHint: "综合 API、分析队列、模型服务与日志接入状态。",
+    healthScore: "{score} 分",
+    distributionTitle: "产品告警分布",
+    distributionHint: "按安全产品聚合最近 Case，快速定位噪声来源和重点防线。",
+    handlingTitle: "处置结论",
+    handlingHint: "按研判结论观察真实攻击、待复核与误报占比。",
+    intakeHealthTitle: "接入与监听",
+    intakeHealthHint: "HTTP 入口与 Syslog 监听状态。",
+    healthApi: "API 服务",
+    healthQueue: "分析队列",
+    healthModel: "模型服务",
+    healthSyslog: "Syslog 监听",
+    healthOk: "正常",
+    healthWarn: "降级",
+    healthBad: "异常",
+    queueIdle: "队列空闲",
+    queueBacklog: "{count} 条等待分析",
+    queueSync: "同步分析模式",
+    modelLocal: "本地规则分析器",
+    modelRemote: "{provider} / {model}",
+    syslogActive: "{active}/{total} 个监听在线",
+    syslogInactive: "未启用监听",
+    httpActive: "HTTP 接入在线",
+    noDistribution: "暂无分布数据",
     refresh: "刷新",
     alerts: "告警总量",
     highCritical: "高危与严重",
     latestCases: "Case 队列",
-    latestCasesHint: "按更新时间排序，展开查看证据、结论和动作。",
+    latestCasesHint: "按创建时间排序，处置后队列顺序保持不变。",
+    caseSearchProduct: "系统",
+    caseSearchSeverity: "风险等级",
+    caseSearchStatus: "处置状态",
+    caseSearchFrom: "开始时间",
+    caseSearchTo: "结束时间",
+    caseSearchAll: "全部",
+    caseSearchSubmit: "搜索",
+    caseSearchReset: "重置",
+    severityCritical: "严重",
+    severityHigh: "高",
+    severityMedium: "中",
+    severityLow: "低",
     llmConfig: "模型服务",
     llmConfigHint: "切换本地分析器、Ollama 或内网 Gateway。",
     apiKeyPlaceholder: "留空则保留现有 Key",
@@ -46,11 +101,11 @@ const STRINGS = {
     saveConfig: "保存配置",
     reload: "重新加载",
     intakeChannels: "告警接入通道",
-    intakeChannelsHint: "HTTP 接口继续保留，新增 UDP syslog collector 通道。",
+    intakeChannelsHint: "HTTP 接口继续保留，新增可选 TCP/UDP syslog collector 通道。",
     httpChannelTitle: "现有 HTTP 告警入口",
     httpChannelSubtitle: "适合已能主动调用接口的系统、脚本和联调工具。",
-    syslogChannelTitle: "新增 UDP Syslog 通道",
-    syslogChannelSubtitle: "适合服务区内只支持 syslog 推送的安全设备。",
+    syslogChannelTitle: "新增 Syslog 通道",
+    syslogChannelSubtitle: "支持 TCP/UDP；长报文推荐 TCP，避免 UDP 分片后截断或丢包。",
     channelProtocol: "协议",
     channelEndpoint: "入口",
     channelAuth: "鉴权",
@@ -60,24 +115,28 @@ const STRINGS = {
     channelPlanned: "规划新增",
     httpChannelAuth: "沿用网关 Bearer Token 策略",
     flowSecuritySystem: "安全系统",
-    flowServiceIp: "服务区 IP:产品端口/udp",
+    flowServiceIp: "服务区 IP:产品端口/协议",
     flowGateway: "网关 HTTP 告警入口",
     syslogConfigTitle: "Syslog 产品接收配置",
-    syslogConfigHint: "为每类安全系统配置 UDP 接收端口，保存后确认为对应产品日志接收。",
+    syslogConfigHint: "为每类安全系统配置接收端口和协议；syslog 报文非常长时推荐 TCP，已作为默认项。",
     resetSyslogConfig: "恢复默认端口",
     syslogProduct: "安全系统",
-    syslogUdpPort: "UDP 端口",
+    syslogPort: "端口",
+    syslogProtocol: "协议",
     syslogProfile: "映射 Profile",
     syslogConfirm: "接收确认",
     syslogAction: "操作",
     saveSyslogConfig: "保存",
     syslogPendingStatus: "待保存",
-    syslogSavedStatus: "已保存为 {product} 日志接收：UDP {port}",
-    syslogSavedToast: "{product} 已配置为 UDP {port} 日志接收",
+    syslogSavedStatus: "已保存为 {product} 日志接收：{protocol} {port}",
+    syslogSavedToast: "{product} 已配置为 {protocol} {port} 日志接收，配置已生效",
     syslogPortInvalid: "端口必须在 1-65535 之间",
-    syslogDefaultsRestored: "已恢复默认 UDP 端口配置",
+    syslogProtocolInvalid: "协议必须选择 TCP 或 UDP",
+    syslogDefaultsRestored: "已恢复默认 TCP 端口配置，请保存需要生效的行",
+    syslogConfigLoadFailed: "加载 Syslog 配置失败：{message}",
+    syslogConfigApiUnavailable: "当前后端尚未加载 Syslog 动态配置接口，已显示本地默认值；请重启网关服务后再保存使端口生效。",
     syslogOpsTitle: "安全系统侧配置",
-    syslogOpsText: "目的地址填写服务区暴露的 syslog collector IP，端口使用对应产品配置，协议 UDP。",
+    syslogOpsText: "目的地址填写服务区暴露的 syslog collector IP，端口和协议使用对应产品配置。",
     syslogMappingTitle: "字段处理策略",
     syslogMappingText: "collector 优先解析 syslog message 中的 JSON；未匹配 profile 时按 SIEM 标准告警兜底。",
     syslogDeployTitle: "k3s 部署对象",
@@ -116,7 +175,25 @@ const STRINGS = {
     tuning: "白名单/调优建议",
     noActions: "暂无建议动作",
     noEvidence: "暂无归一化证据",
+    expandLongText: "展开全文",
+    collapseLongText: "收起",
     confirmFalsePositive: "确认为业务误报",
+    caseDisposition: "Case 处置",
+    caseStatusOpen: "待处置",
+    caseStatusUnderReview: "人工复核",
+    caseStatusConfirmedAttack: "确认攻击",
+    caseStatusFalsePositive: "业务误报",
+    caseStatusClosed: "已关闭",
+    markAttack: "确认攻击",
+    escalateReview: "升级复核",
+    closeCase: "关闭",
+    reopenCase: "重开",
+    dispositionSaved: "Case 已更新为：{status}",
+    dispositionFailed: "处置失败：{message}",
+    dispositionReasonAttack: "分析师确认该 Case 为真实攻击，进入人工响应流程。",
+    dispositionReasonReview: "证据需要人工复核，暂不做自动化处置。",
+    dispositionReasonClose: "分析师关闭该 Case，不执行生产动作。",
+    dispositionReasonReopen: "分析师重新打开 Case。",
     aiAnalysis: "研判摘要",
     product: "产品",
     classification: "分类",
@@ -195,20 +272,70 @@ const STRINGS = {
   en: {
     appTitle: "Security Operations Triage Center",
     appSubtitle: "Alert response and evidence governance",
+    navMonitor: "Monitoring",
     navDashboard: "Queue",
     navAdapter: "Log Intake",
     navSettings: "Runtime",
     workspaceEyebrow: "Security Operations",
-    workspaceTitle: "Alert Triage Queue",
+    workspaceTitle: "Realtime Monitoring",
+    workspaceTitleMonitor: "Realtime Monitoring",
     workspaceTitleDashboard: "Alert Triage Queue",
     workspaceTitleAdapter: "Log Intake",
     workspaceTitleSettings: "Runtime Configuration",
-    environment: "Offline-ready",
+    dashboardEyebrow: "Realtime SOC Overview",
+    dashboardTitle: "Realtime Monitoring",
+    dashboardSubtitle: "Monitor alert trends, response pressure, intake health, and model runtime status.",
+    runtimeChecking: "Checking",
+    runtimeHealthy: "Healthy",
+    runtimeDegraded: "Degraded",
+    runtimeCritical: "Attention needed",
+    autoRefreshOn: "Auto refresh",
+    autoRefreshPaused: "Refresh paused",
+    lastRefresh: "Updated {time}",
+    openCases: "Open Cases",
+    queueDepth: "Queue Depth",
+    healthTitle: "System Health",
+    healthHint: "Combines API, analysis queue, model service, and log intake status.",
+    healthScore: "{score} pts",
+    distributionTitle: "Product Distribution",
+    distributionHint: "Recent cases grouped by security product to spot noisy sources and priority controls.",
+    handlingTitle: "Response Verdicts",
+    handlingHint: "Verdict mix across malicious, review, benign, and insufficient evidence.",
+    intakeHealthTitle: "Intake and Listeners",
+    intakeHealthHint: "HTTP endpoint and Syslog listener status.",
+    healthApi: "API Service",
+    healthQueue: "Analysis Queue",
+    healthModel: "Model Service",
+    healthSyslog: "Syslog Listeners",
+    healthOk: "OK",
+    healthWarn: "Degraded",
+    healthBad: "Fault",
+    queueIdle: "Queue idle",
+    queueBacklog: "{count} waiting",
+    queueSync: "Synchronous mode",
+    modelLocal: "Local rule analyzer",
+    modelRemote: "{provider} / {model}",
+    syslogActive: "{active}/{total} listeners online",
+    syslogInactive: "No listener enabled",
+    httpActive: "HTTP intake online",
+    noDistribution: "No distribution data",
     refresh: "Refresh",
     alerts: "Total Alerts",
     highCritical: "High and Critical",
     latestCases: "Case Queue",
-    latestCasesHint: "Sorted by last update; expand a case to review evidence, verdict, and actions.",
+    latestCasesHint: "Sorted by creation time; disposition changes keep the queue order stable.",
+    caseSearchProduct: "System",
+    caseSearchSeverity: "Risk level",
+    caseSearchStatus: "Disposition",
+    caseSearchFrom: "Start time",
+    caseSearchTo: "End time",
+    caseSearchAll: "All",
+    caseSearchSubmit: "Search",
+    caseSearchReset: "Reset",
+    severityCritical: "Critical",
+    severityHigh: "High",
+    severityMedium: "Medium",
+    severityLow: "Low",
     llmConfig: "Model Service",
     llmConfigHint: "Switch between local analyzer, Ollama, and the internal gateway.",
     apiKeyPlaceholder: "Leave blank to keep the existing key",
@@ -221,11 +348,11 @@ const STRINGS = {
     saveConfig: "Save configuration",
     reload: "Reload",
     intakeChannels: "Alert Intake Channels",
-    intakeChannelsHint: "Keep the HTTP endpoint and add a UDP syslog collector path.",
+    intakeChannelsHint: "Keep the HTTP endpoint and add a TCP/UDP syslog collector path.",
     httpChannelTitle: "Existing HTTP Alert Endpoint",
     httpChannelSubtitle: "For systems, scripts, and test tools that can actively call the gateway API.",
-    syslogChannelTitle: "New UDP Syslog Channel",
-    syslogChannelSubtitle: "For security devices in the service zone that only push syslog.",
+    syslogChannelTitle: "New Syslog Channel",
+    syslogChannelSubtitle: "Supports TCP/UDP; TCP is recommended for long messages to avoid UDP fragmentation loss.",
     channelProtocol: "Protocol",
     channelEndpoint: "Endpoint",
     channelAuth: "Auth",
@@ -235,24 +362,28 @@ const STRINGS = {
     channelPlanned: "Planned",
     httpChannelAuth: "Uses the gateway Bearer Token policy",
     flowSecuritySystem: "Security system",
-    flowServiceIp: "Service-zone IP:product port/udp",
+    flowServiceIp: "Service-zone IP:product port/protocol",
     flowGateway: "Gateway HTTP alert endpoint",
     syslogConfigTitle: "Syslog Product Receiver Config",
-    syslogConfigHint: "Configure a UDP receiver port for each security system; saving confirms the product log receiver.",
+    syslogConfigHint: "Configure a receiver port and protocol for each security system. TCP is the default recommendation for very long syslog messages.",
     resetSyslogConfig: "Restore default ports",
     syslogProduct: "Security system",
-    syslogUdpPort: "UDP port",
+    syslogPort: "Port",
+    syslogProtocol: "Protocol",
     syslogProfile: "Mapping profile",
     syslogConfirm: "Receiver confirmation",
     syslogAction: "Action",
     saveSyslogConfig: "Save",
     syslogPendingStatus: "Pending",
-    syslogSavedStatus: "Saved as {product} log receiver: UDP {port}",
-    syslogSavedToast: "{product} is configured as a UDP {port} log receiver",
+    syslogSavedStatus: "Saved as {product} log receiver: {protocol} {port}",
+    syslogSavedToast: "{product} is configured as a {protocol} {port} log receiver and is active",
     syslogPortInvalid: "Port must be between 1 and 65535",
-    syslogDefaultsRestored: "Default UDP port configuration restored",
+    syslogProtocolInvalid: "Protocol must be TCP or UDP",
+    syslogDefaultsRestored: "Default TCP port configuration restored. Save the rows that should become active.",
+    syslogConfigLoadFailed: "Failed to load Syslog config: {message}",
+    syslogConfigApiUnavailable: "The backend has not loaded the dynamic Syslog config API yet. Local defaults are shown; restart the gateway before saving ports.",
     syslogOpsTitle: "Security System Setup",
-    syslogOpsText: "Use the service-zone syslog collector IP as the target, the configured product port, and UDP protocol.",
+    syslogOpsText: "Use the service-zone syslog collector IP as the target, with the configured product port and protocol.",
     syslogMappingTitle: "Field Handling",
     syslogMappingText: "The collector parses JSON in the syslog message first; unmatched sources fall back to SIEM-style standard alerts.",
     syslogDeployTitle: "k3s manifest",
@@ -291,7 +422,25 @@ const STRINGS = {
     tuning: "Whitelist / Tuning recommendation",
     noActions: "No recommended actions",
     noEvidence: "No normalized evidence",
+    expandLongText: "Expand full text",
+    collapseLongText: "Collapse",
     confirmFalsePositive: "Confirm business false positive",
+    caseDisposition: "Case disposition",
+    caseStatusOpen: "Open",
+    caseStatusUnderReview: "Under review",
+    caseStatusConfirmedAttack: "Confirmed attack",
+    caseStatusFalsePositive: "Business false positive",
+    caseStatusClosed: "Closed",
+    markAttack: "Confirm attack",
+    escalateReview: "Escalate",
+    closeCase: "Close",
+    reopenCase: "Reopen",
+    dispositionSaved: "Case updated: {status}",
+    dispositionFailed: "Disposition failed: {message}",
+    dispositionReasonAttack: "Analyst confirmed this case as a real attack for human response.",
+    dispositionReasonReview: "Evidence requires human review; no automated response executed.",
+    dispositionReasonClose: "Analyst closed this case without executing production actions.",
+    dispositionReasonReopen: "Analyst reopened this case.",
     aiAnalysis: "Triage Summary",
     product: "Product",
     classification: "Classification",
@@ -376,6 +525,8 @@ let currentLanguage = "zh";
 let lastFieldMappingResult = null;
 const sampleLogCache = new Map();
 let syslogConfigs = loadSyslogConfigs();
+let refreshPaused = false;
+let dashboardRefreshTimer = null;
 async function loadSampleLog(product = selectedLogProduct()) {
   if (sampleLogCache.has(product)) return sampleLogCache.get(product);
   const sample = await json(`/api/samples/${encodeURIComponent(product)}-alert`);
@@ -389,8 +540,59 @@ async function json(url, options) {
   return res.json();
 }
 
+function isApiNotFoundError(err) {
+  const message = err?.message || String(err);
+  try {
+    return JSON.parse(message).error === "not found";
+  } catch (parseErr) {
+    return message.includes('"error"') && message.includes("not found");
+  }
+}
+
 function fmtTime(ms) {
   return ms ? new Date(ms).toLocaleString() : "-";
+}
+
+function formatDatetimeLocal(date) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return [
+    date.getFullYear(),
+    pad(date.getMonth() + 1),
+    pad(date.getDate()),
+  ].join("-") + `T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function setDefaultCaseDateRange() {
+  const fromInput = document.querySelector("#case-filter-from");
+  const toInput = document.querySelector("#case-filter-to");
+  if (!fromInput || !toInput) return;
+  const now = new Date();
+  const from = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+  fromInput.value = formatDatetimeLocal(from);
+  toInput.value = formatDatetimeLocal(now);
+  fromInput.defaultValue = fromInput.value;
+  toInput.defaultValue = toInput.value;
+}
+
+function datetimeLocalMs(value) {
+  if (!value) return null;
+  const ms = new Date(value).getTime();
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function caseSearchQuery() {
+  const params = new URLSearchParams({ limit: "50" });
+  const product = document.querySelector("#case-filter-product")?.value || "";
+  const severity = document.querySelector("#case-filter-severity")?.value || "";
+  const status = document.querySelector("#case-filter-status")?.value || "";
+  const createdFrom = datetimeLocalMs(document.querySelector("#case-filter-from")?.value || "");
+  const createdTo = datetimeLocalMs(document.querySelector("#case-filter-to")?.value || "");
+  if (product) params.set("product", product);
+  if (severity) params.set("severity", severity);
+  if (status) params.set("status", status);
+  if (createdFrom !== null) params.set("created_from_ms", String(createdFrom));
+  if (createdTo !== null) params.set("created_to_ms", String(createdTo));
+  return params.toString();
 }
 
 function text(value) {
@@ -450,11 +652,12 @@ function applyLanguage() {
   if (lastFieldMappingResult) {
     renderFieldMappingTable(lastFieldMappingResult);
   }
-  const active = document.querySelector(".nav-button.active")?.dataset.view || "dashboard";
+  const active = document.querySelector(".nav-button.active")?.dataset.view || "monitor";
   updateWorkspaceTitle(active);
   renderProfileList();
   renderSyslogConfigTable();
   renderLogProductOptions();
+  updateRefreshModeUi();
 }
 
 function renderLogProductOptions() {
@@ -492,13 +695,49 @@ function loadSyslogConfigs() {
   return defaultSyslogConfigs().map((item) => {
     const persisted = savedByProduct.get(item.product) || {};
     const port = Number(persisted.port || item.port);
+    const protocol = String(persisted.protocol || item.protocol || "tcp").toLowerCase();
     return {
       ...item,
       port: Number.isInteger(port) && port >= 1 && port <= 65535 ? port : item.port,
+      protocol: ["tcp", "udp"].includes(protocol) ? protocol : item.protocol,
       profile: String(persisted.profile || item.profile),
       saved: Boolean(persisted.saved),
     };
   });
+}
+
+function mergeSyslogConfigs(items) {
+  const incoming = new Map((Array.isArray(items) ? items : []).map((item) => [item.product, item]));
+  syslogConfigs = defaultSyslogConfigs().map((item) => {
+    const updated = incoming.get(item.product) || {};
+    const port = Number(updated.port || item.port);
+    const protocol = String(updated.protocol || item.protocol || "tcp").toLowerCase();
+    return {
+      ...item,
+      label: String(updated.label || item.label),
+      port: Number.isInteger(port) && port >= 1 && port <= 65535 ? port : item.port,
+      protocol: ["tcp", "udp"].includes(protocol) ? protocol : item.protocol,
+      profile: String(updated.profile || item.profile),
+      saved: Boolean(updated.saved),
+    };
+  });
+}
+
+async function loadSyslogConfig() {
+  let payload = null;
+  try {
+    payload = await json("/api/config/syslog");
+  } catch (err) {
+    if (!isApiNotFoundError(err)) throw err;
+    mergeSyslogConfigs(loadSyslogConfigs());
+    renderSyslogConfigTable();
+    setSyslogConfigStatus(tr("syslogConfigApiUnavailable"));
+    return { configs: syslogConfigs, unavailable: true };
+  }
+  mergeSyslogConfigs(payload.configs || []);
+  persistSyslogConfigs();
+  renderSyslogConfigTable();
+  return payload;
 }
 
 function persistSyslogConfigs() {
@@ -524,7 +763,8 @@ function renderSyslogConfigTable() {
       <thead>
         <tr>
           <th>${escapeHtml(tr("syslogProduct"))}</th>
-          <th>${escapeHtml(tr("syslogUdpPort"))}</th>
+          <th>${escapeHtml(tr("syslogPort"))}</th>
+          <th>${escapeHtml(tr("syslogProtocol"))}</th>
           <th>${escapeHtml(tr("syslogProfile"))}</th>
           <th>${escapeHtml(tr("syslogConfirm"))}</th>
           <th>${escapeHtml(tr("syslogAction"))}</th>
@@ -544,13 +784,23 @@ function renderSyslogConfigTable() {
                     max="65535"
                     step="1"
                     value="${escapeHtml(item.port)}"
-                    aria-label="${escapeHtml(`${item.label} ${tr("syslogUdpPort")}`)}"
+                    aria-label="${escapeHtml(`${item.label} ${tr("syslogPort")}`)}"
                   />
+                </td>
+                <td>
+                  <select class="syslog-protocol-input" aria-label="${escapeHtml(`${item.label} ${tr("syslogProtocol")}`)}">
+                    <option value="tcp" ${item.protocol === "tcp" ? "selected" : ""}>TCP</option>
+                    <option value="udp" ${item.protocol === "udp" ? "selected" : ""}>UDP</option>
+                  </select>
                 </td>
                 <td><code>${escapeHtml(item.profile)}</code></td>
                 <td>
                   <span class="field-status ${item.saved ? "mapped" : "needs_review"}">
-                    ${escapeHtml(item.saved ? tr("syslogSavedStatus", { product: item.label, port: item.port }) : tr("syslogPendingStatus"))}
+                    ${escapeHtml(
+                      item.saved
+                        ? tr("syslogSavedStatus", { product: item.label, port: item.port, protocol: item.protocol.toUpperCase() })
+                        : tr("syslogPendingStatus"),
+                    )}
                   </span>
                 </td>
                 <td>
@@ -566,25 +816,42 @@ function renderSyslogConfigTable() {
     </table>
   `;
   container.querySelectorAll(".save-syslog-row").forEach((button) => {
-    button.addEventListener("click", () => saveSyslogConfigRow(button.dataset.product));
+    button.addEventListener("click", () => {
+      saveSyslogConfigRow(button.dataset.product).catch((err) => {
+        const message = isApiNotFoundError(err) ? tr("syslogConfigApiUnavailable") : err.message || String(err);
+        setSyslogConfigStatus(message, true);
+        showToast(message, "error");
+      });
+    });
   });
 }
 
-function saveSyslogConfigRow(product) {
+async function saveSyslogConfigRow(product) {
   const row = document.querySelector(`#syslog-config-table tr[data-product="${CSS.escape(product)}"]`);
   const config = syslogConfigs.find((item) => item.product === product);
   if (!row || !config) return;
   const port = Number(row.querySelector(".syslog-port-input")?.value || 0);
+  const protocol = String(row.querySelector(".syslog-protocol-input")?.value || "").toLowerCase();
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     setSyslogConfigStatus(tr("syslogPortInvalid"), true);
     showToast(tr("syslogPortInvalid"), "error");
     return;
   }
-  config.port = port;
-  config.saved = true;
+  if (!["tcp", "udp"].includes(protocol)) {
+    setSyslogConfigStatus(tr("syslogProtocolInvalid"), true);
+    showToast(tr("syslogProtocolInvalid"), "error");
+    return;
+  }
+  const result = await json("/api/config/syslog", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ product, port, protocol }),
+  });
+  mergeSyslogConfigs(result.syslog?.configs || []);
+  const saved = syslogConfigs.find((item) => item.product === product) || config;
   persistSyslogConfigs();
   renderSyslogConfigTable();
-  const message = tr("syslogSavedToast", { product: config.label, port });
+  const message = tr("syslogSavedToast", { product: saved.label, port: saved.port, protocol: saved.protocol.toUpperCase() });
   setSyslogConfigStatus(message);
   showToast(message);
 }
@@ -601,10 +868,11 @@ function updateWorkspaceTitle(name) {
   const title = document.querySelector("[data-i18n='workspaceTitle']");
   if (!title) return;
   const key = {
+    monitor: "workspaceTitleMonitor",
     dashboard: "workspaceTitleDashboard",
     adapter: "workspaceTitleAdapter",
     settings: "workspaceTitleSettings",
-  }[name] || "workspaceTitleDashboard";
+  }[name] || "workspaceTitleMonitor";
   title.textContent = tr(key);
 }
 
@@ -709,6 +977,189 @@ function showToast(message, type = "success") {
   }, 4200);
 }
 
+function loadRefreshPreference() {
+  try {
+    const stored = localStorage.getItem(REFRESH_PAUSED_KEY);
+    refreshPaused = stored === null ? localStorage.getItem(LEGACY_OFFLINE_MODE_KEY) === "true" : stored === "true";
+  } catch (err) {
+    refreshPaused = false;
+  }
+  updateRefreshModeUi();
+}
+
+function saveRefreshPreference(paused) {
+  refreshPaused = Boolean(paused);
+  try {
+    localStorage.setItem(REFRESH_PAUSED_KEY, String(refreshPaused));
+    localStorage.removeItem(LEGACY_OFFLINE_MODE_KEY);
+  } catch (err) {
+    // The current session still honors the selected refresh mode when storage is unavailable.
+  }
+  updateRefreshModeUi();
+  scheduleDashboardRefresh();
+}
+
+function updateRefreshModeUi() {
+  const button = document.querySelector("#refresh-mode-toggle");
+  if (!button) return;
+  button.setAttribute("aria-pressed", String(refreshPaused));
+  button.classList.toggle("active", refreshPaused);
+  const label = button.querySelector("span") || button;
+  label.textContent = tr(refreshPaused ? "autoRefreshPaused" : "autoRefreshOn");
+}
+
+function scheduleDashboardRefresh() {
+  if (dashboardRefreshTimer) {
+    window.clearInterval(dashboardRefreshTimer);
+    dashboardRefreshTimer = null;
+  }
+  if (refreshPaused) return;
+  dashboardRefreshTimer = window.setInterval(() => {
+    if (document.querySelector("#monitor-view")?.classList.contains("active")) {
+      loadCases({ quiet: true }).catch((err) => showToast(err.message || String(err), "error"));
+    }
+  }, DASHBOARD_REFRESH_MS);
+}
+
+function countBy(items, field) {
+  const counts = new Map();
+  for (const item of items || []) {
+    const value = text(item[field] || "unknown").toLowerCase();
+    counts.set(value, (counts.get(value) || 0) + 1);
+  }
+  return [...counts.entries()].sort((a, b) => b[1] - a[1]);
+}
+
+function renderDistribution(containerId, rows, total, labelForValue = (value) => value) {
+  const container = document.querySelector(containerId);
+  if (!container) return;
+  if (!rows.length || !total) {
+    container.innerHTML = `<p class="empty">${escapeHtml(tr("noDistribution"))}</p>`;
+    return;
+  }
+  container.innerHTML = rows
+    .map(([value, count]) => {
+      const percent = Math.round((count / total) * 100);
+      return `
+        <div class="distribution-row">
+          <div>
+            <strong>${escapeHtml(labelForValue(value))}</strong>
+            <span>${escapeHtml(String(count))}</span>
+          </div>
+          <div class="distribution-bar" aria-hidden="true"><i style="width: ${percent}%"></i></div>
+          <small>${percent}%</small>
+        </div>
+      `;
+    })
+    .join("");
+}
+
+function healthItem(status, title, detail) {
+  return { status, title, detail };
+}
+
+function buildHealthItems(health, llmConfig, syslogPayload) {
+  const processing = health?.processing || {};
+  const llmProvider = llmConfig?.provider || "local";
+  const llmConfigured = llmProvider === "local" || Boolean(llmConfig?.endpoint);
+  const listeners = Array.isArray(syslogPayload?.listeners) ? syslogPayload.listeners : [];
+  const configs = Array.isArray(syslogPayload?.configs) ? syslogPayload.configs : syslogConfigs;
+  const activeListeners = listeners.filter((item) => item.active).length || configs.filter((item) => item.saved).length;
+  const queued = Number(processing.queued || 0);
+  const failed = Number(processing.failed || 0);
+  const rejected = Number(processing.rejected || 0);
+  return [
+    healthItem(health?.ok ? "ok" : "bad", tr("healthApi"), health?.ok ? tr("healthOk") : tr("healthBad")),
+    healthItem(
+      failed || rejected ? "warn" : "ok",
+      tr("healthQueue"),
+      processing.enabled ? (queued ? tr("queueBacklog", { count: queued }) : tr("queueIdle")) : tr("queueSync"),
+    ),
+    healthItem(
+      llmConfigured ? "ok" : "bad",
+      tr("healthModel"),
+      llmProvider === "local" ? tr("modelLocal") : tr("modelRemote", { provider: llmProvider, model: llmConfig?.model || "-" }),
+    ),
+    healthItem(
+      activeListeners ? "ok" : "warn",
+      tr("healthSyslog"),
+      configs.length ? tr("syslogActive", { active: activeListeners, total: configs.length }) : tr("syslogInactive"),
+    ),
+  ];
+}
+
+function renderHealth(items) {
+  const container = document.querySelector("#health-checks");
+  const scoreNode = document.querySelector("#health-score");
+  const runtime = document.querySelector("#runtime-status");
+  if (!container || !scoreNode || !runtime) return;
+  const score = Math.round(
+    items.reduce((sum, item) => sum + (item.status === "ok" ? 25 : item.status === "warn" ? 15 : 0), 0),
+  );
+  const runtimeStatus = items.some((item) => item.status === "bad") ? "bad" : items.some((item) => item.status === "warn") ? "warn" : "ok";
+  const runtimeLabel = runtimeStatus === "ok" ? tr("runtimeHealthy") : runtimeStatus === "warn" ? tr("runtimeDegraded") : tr("runtimeCritical");
+  scoreNode.textContent = tr("healthScore", { score });
+  scoreNode.className = `health-score ${runtimeStatus}`;
+  runtime.innerHTML = `
+    <span class="runtime-dot ${runtimeStatus}" aria-hidden="true"></span>
+    <span>${escapeHtml(runtimeLabel)}</span>
+  `;
+  container.innerHTML = items
+    .map(
+      (item) => `
+        <article class="health-check ${escapeHtml(item.status)}">
+          <span class="runtime-dot ${escapeHtml(item.status)}" aria-hidden="true"></span>
+          <div>
+            <strong>${escapeHtml(item.title)}</strong>
+            <p>${escapeHtml(item.detail)}</p>
+          </div>
+          <small>${escapeHtml(item.status === "ok" ? tr("healthOk") : item.status === "warn" ? tr("healthWarn") : tr("healthBad"))}</small>
+        </article>
+      `,
+    )
+    .join("");
+}
+
+function renderIntakeHealth(syslogPayload) {
+  const container = document.querySelector("#intake-health");
+  if (!container) return;
+  const configs = Array.isArray(syslogPayload?.configs) ? syslogPayload.configs : syslogConfigs;
+  container.innerHTML = `
+    <article class="intake-health-row ok">
+      <strong>HTTP</strong>
+      <span>${escapeHtml(tr("httpActive"))}</span>
+      <code>POST /api/alerts</code>
+    </article>
+    ${configs
+      .map(
+        (item) => `
+          <article class="intake-health-row ${item.saved ? "ok" : "warn"}">
+            <strong>${escapeHtml(item.label || text(item.product).toUpperCase())}</strong>
+            <span>${escapeHtml(item.saved ? tr("healthOk") : tr("healthWarn"))}</span>
+            <code>${escapeHtml(String(item.port))}/${escapeHtml(String(item.protocol || "tcp").toUpperCase())}</code>
+          </article>
+        `,
+      )
+      .join("")}
+  `;
+}
+
+function renderDashboard(health, cases, llmConfig, syslogPayload) {
+  const processing = health?.processing || {};
+  document.querySelector("#alerts").textContent = health?.stats?.alerts ?? 0;
+  document.querySelector("#cases").textContent = health?.stats?.open_cases ?? health?.stats?.cases ?? 0;
+  document.querySelector("#high").textContent = health?.stats?.high_or_critical_cases ?? 0;
+  document.querySelector("#queue-depth").textContent = processing.queued ?? 0;
+  const productRows = countBy(cases, "product").map(([product, count]) => [product.toUpperCase(), count]);
+  const classificationRows = countBy(cases, "classification");
+  renderDistribution("#product-distribution", productRows, cases.length);
+  renderDistribution("#classification-distribution", classificationRows, cases.length, (value) => value.replaceAll("_", " "));
+  renderHealth(buildHealthItems(health, llmConfig, syslogPayload));
+  renderIntakeHealth(syslogPayload);
+  const lastRefresh = document.querySelector("#last-refresh");
+  if (lastRefresh) lastRefresh.textContent = tr("lastRefresh", { time: fmtTime(Date.now()) });
+}
+
 function statusLabel(status) {
   const value = text(status).toLowerCase();
   // "blocked" has its own color class (status-dot.blocked) and means the action
@@ -775,6 +1226,101 @@ function actionRows(actions) {
     .join("");
 }
 
+function caseStatusLabel(status) {
+  const key = {
+    open: "caseStatusOpen",
+    under_review: "caseStatusUnderReview",
+    confirmed_attack: "caseStatusConfirmedAttack",
+    false_positive: "caseStatusFalsePositive",
+    closed: "caseStatusClosed",
+  }[status || "open"];
+  return key ? tr(key) : text(status || "open");
+}
+
+function caseStatusClass(status) {
+  return text(status || "open").replaceAll("_", "-");
+}
+
+function dispositionActions(status) {
+  const current = status || "open";
+  if (current === "closed" || current === "false_positive") {
+    return [{ status: "open", label: tr("reopenCase"), reason: tr("dispositionReasonReopen") }];
+  }
+  const actions = [];
+  if (current !== "confirmed_attack") {
+    actions.push({ status: "confirmed_attack", label: tr("markAttack"), reason: tr("dispositionReasonAttack") });
+  }
+  if (current !== "under_review") {
+    actions.push({ status: "under_review", label: tr("escalateReview"), reason: tr("dispositionReasonReview") });
+  }
+  actions.push({ status: "closed", label: tr("closeCase"), reason: tr("dispositionReasonClose") });
+  return actions;
+}
+
+function caseDispositionControls(detail) {
+  const status = detail.status || "open";
+  const actions = dispositionActions(status);
+  return `
+    <div class="case-disposition">
+      <div class="case-disposition-head">
+        <span>${escapeHtml(tr("caseDisposition"))}</span>
+        <strong class="case-status ${escapeHtml(caseStatusClass(status))}">${escapeHtml(caseStatusLabel(status))}</strong>
+      </div>
+      <div class="case-disposition-actions">
+        ${actions
+          .map(
+            (item) => `
+              <button
+                class="case-disposition-button"
+                type="button"
+                data-case-id="${escapeHtml(detail.case_id)}"
+                data-status="${escapeHtml(item.status)}"
+                data-reason="${escapeHtml(item.reason)}"
+              >${escapeHtml(item.label)}</button>
+            `,
+          )
+          .join("")}
+      </div>
+      <p class="case-disposition-status" data-case-disposition-status="${escapeHtml(detail.case_id)}"></p>
+    </div>
+  `;
+}
+
+function evidenceValueText(item) {
+  const value = item.value ?? item.text ?? item;
+  if (value === null || value === undefined || value === "") return "-";
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value);
+  } catch (err) {
+    return String(value);
+  }
+}
+
+function shouldCollapseText(value) {
+  const lineCount = value.split(/\r\n|\r|\n/).length;
+  return value.length > COLLAPSIBLE_TEXT_LIMIT || lineCount > COLLAPSIBLE_TEXT_LINE_LIMIT;
+}
+
+function collapsibleText(value) {
+  const escaped = escapeHtml(value);
+  if (!shouldCollapseText(value)) {
+    return `<span class="evidence-value">${escaped}</span>`;
+  }
+  return `
+    <div class="collapsible-text" data-expanded="false">
+      <div class="collapsible-text-content">${escaped}</div>
+      <button
+        class="collapsible-text-toggle"
+        type="button"
+        aria-expanded="false"
+        data-expand-label="${escapeHtml(tr("expandLongText"))}"
+        data-collapse-label="${escapeHtml(tr("collapseLongText"))}"
+      >${escapeHtml(tr("expandLongText"))}</button>
+    </div>
+  `;
+}
+
 function evidenceRows(evidence) {
   if (!evidence || !evidence.length) {
     return `<tr><td colspan="3" class="empty">${escapeHtml(tr("noEvidence"))}</td></tr>`;
@@ -784,7 +1330,7 @@ function evidenceRows(evidence) {
       (item) => `
         <tr>
           <td>${escapeHtml(item.type || item.key || "evidence")}</td>
-          <td>${escapeHtml(item.value ?? item.text ?? JSON.stringify(item))}</td>
+          <td>${collapsibleText(evidenceValueText(item))}</td>
           <td>${escapeHtml(item.weight || item.source || "-")}</td>
         </tr>
       `,
@@ -829,6 +1375,7 @@ function renderDetail(detail) {
           <dt>${escapeHtml(tr("updatedAt"))}</dt><dd>${fmtTime(detail.updated_at_ms)}</dd>
         </dl>
         <p class="summary">${escapeHtml(detail.summary)}</p>
+        ${caseDispositionControls(detail)}
         ${explanationBlock(latestRun.explanation)}
         <h4>${escapeHtml(tr("recommendedActions"))}</h4>
         <ul class="action-list">${actionRows(latestRun.recommended_actions)}</ul>
@@ -904,9 +1451,10 @@ function renderCase(item) {
       <span class="case-chevron">›</span>
       <strong class="case-product">${escapeHtml(item.product).toUpperCase()}</strong>
       <span class="badge ${escapeHtml(item.severity)}">${escapeHtml(item.severity)}</span>
+      <span class="case-status ${escapeHtml(caseStatusClass(item.status))}">${escapeHtml(caseStatusLabel(item.status))}</span>
       <span class="case-summary">${escapeHtml(item.summary)}</span>
       <span class="linked-count">${escapeHtml(tr("alertCountLong", { count: item.alert_count || 0 }))}</span>
-      <small class="case-time">${fmtTime(item.updated_at_ms)}</small>
+      <small class="case-time">${fmtTime(item.created_at_ms)}</small>
     </button>
     <div class="case-collapse" hidden></div>
   `;
@@ -939,9 +1487,44 @@ async function toggleCase(wrapper, caseId) {
     }
   }
   panel.innerHTML = renderDetail(detailCache.get(caseId));
+  panel.querySelectorAll(".case-disposition-button").forEach((button) => {
+    button.addEventListener("click", () => updateCaseDisposition(button, caseId));
+  });
   panel.querySelectorAll(".review-button").forEach((button) => {
     button.addEventListener("click", () => confirmBusinessFalsePositive(button, caseId));
   });
+}
+
+async function updateCaseDisposition(button, caseId) {
+  const status = button.dataset.status;
+  const statusNode = document.querySelector(`[data-case-disposition-status="${CSS.escape(caseId)}"]`);
+  const buttons = [...document.querySelectorAll(`.case-disposition-button[data-case-id="${CSS.escape(caseId)}"]`)];
+  buttons.forEach((item) => {
+    item.disabled = true;
+  });
+  if (statusNode) statusNode.textContent = caseStatusLabel(status);
+  try {
+    const result = await json(`/api/cases/${encodeURIComponent(caseId)}/disposition`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        status,
+        actor: "dashboard-analyst",
+        reason: button.dataset.reason || "",
+      }),
+    });
+    detailCache.set(caseId, { ...detailCache.get(caseId), ...result.case });
+    if (statusNode) statusNode.textContent = tr("dispositionSaved", { status: caseStatusLabel(result.case.status) });
+    await loadCases();
+    showToast(tr("dispositionSaved", { status: caseStatusLabel(result.case.status) }));
+  } catch (err) {
+    buttons.forEach((item) => {
+      item.disabled = false;
+    });
+    const message = err.message || String(err);
+    if (statusNode) statusNode.textContent = tr("dispositionFailed", { message });
+    showToast(tr("dispositionFailed", { message }), "error");
+  }
 }
 
 async function confirmBusinessFalsePositive(button, caseId) {
@@ -972,6 +1555,16 @@ async function confirmBusinessFalsePositive(button, caseId) {
   }
 }
 
+function toggleCollapsibleText(button) {
+  const wrapper = button.closest(".collapsible-text");
+  if (!wrapper) return;
+  const expanded = wrapper.dataset.expanded === "true";
+  const nextExpanded = !expanded;
+  wrapper.dataset.expanded = String(nextExpanded);
+  button.setAttribute("aria-expanded", String(nextExpanded));
+  button.textContent = nextExpanded ? button.dataset.collapseLabel : button.dataset.expandLabel;
+}
+
 function setView(name) {
   document.querySelectorAll(".view").forEach((view) => view.classList.remove("active"));
   document.querySelector(`#${name}-view`).classList.add("active");
@@ -981,27 +1574,38 @@ function setView(name) {
   updateWorkspaceTitle(name);
 }
 
-async function loadCases() {
+async function loadDashboardRuntime() {
+  const syslogFallback = { configs: syslogConfigs, listeners: [], unavailable: true };
+  const caseQuery = caseSearchQuery();
+  const [health, casesData, llmConfig, syslogPayload] = await Promise.all([
+    json("/api/health"),
+    json(`/api/cases?${caseQuery}`),
+    json("/api/config/llm"),
+    json("/api/config/syslog").catch((err) => {
+      if (isApiNotFoundError(err)) return syslogFallback;
+      throw err;
+    }),
+  ]);
+  return { health, cases: casesData.cases || [], llmConfig, syslogPayload };
+}
+
+async function loadCases(options = {}) {
   const list = document.querySelector("#cases-list");
   try {
-    const health = await json("/api/health");
-    document.querySelector("#alerts").textContent = health.stats.alerts;
-    document.querySelector("#cases").textContent = health.stats.cases;
-    document.querySelector("#high").textContent = health.stats.high_or_critical_cases;
-
-    const data = await json("/api/cases?limit=50");
+    const { health, cases, llmConfig, syslogPayload } = await loadDashboardRuntime();
+    renderDashboard(health, cases, llmConfig, syslogPayload);
     list.innerHTML = "";
     detailCache.clear();
-    if (!data.cases.length) {
+    if (!cases.length) {
       list.innerHTML = `<div class="empty-state">${escapeHtml(tr("noCases"))}</div>`;
       return;
     }
-    for (const item of data.cases) {
+    for (const item of cases) {
       list.appendChild(renderCase(item));
     }
   } catch (err) {
-    list.innerHTML = `<div class="empty-state">${escapeHtml(err.stack || String(err))}</div>`;
-    showToast(tr("refreshFailed", { message: err.message || String(err) }), "error");
+    if (list) list.innerHTML = `<div class="empty-state">${escapeHtml(err.stack || String(err))}</div>`;
+    if (!options.quiet) showToast(tr("refreshFailed", { message: err.message || String(err) }), "error");
   }
 }
 
@@ -1349,6 +1953,7 @@ async function saveLlmConfig(event) {
 
 loadLanguagePreference();
 loadThemePreference();
+loadRefreshPreference();
 
 if (window.matchMedia) {
   const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -1364,6 +1969,23 @@ if (window.matchMedia) {
 }
 
 document.querySelector("#refresh").addEventListener("click", loadCases);
+document.querySelector("#case-search-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  loadCases().catch((err) => showToast(err.message || String(err), "error"));
+});
+document.querySelector("#case-search-reset").addEventListener("click", () => {
+  document.querySelector("#case-search-form").reset();
+  setDefaultCaseDateRange();
+  loadCases().catch((err) => showToast(err.message || String(err), "error"));
+});
+document.querySelector("#refresh-mode-toggle").addEventListener("click", () => {
+  saveRefreshPreference(!refreshPaused);
+});
+document.addEventListener("click", (event) => {
+  const button = event.target.closest(".collapsible-text-toggle");
+  if (!button) return;
+  toggleCollapsibleText(button);
+});
 document.querySelector("#theme-switch").addEventListener("click", (event) => {
   saveThemePreference(event.currentTarget.dataset.themeValue);
 });
@@ -1436,11 +2058,16 @@ document.querySelectorAll(".nav-button").forEach((btn) => {
     }
     if (btn.dataset.view === "adapter") {
       loadMappingProfiles().catch((err) => setProfileStatus(err.message || String(err), true));
+      loadSyslogConfig().catch((err) =>
+        setSyslogConfigStatus(tr("syslogConfigLoadFailed", { message: err.message || String(err) }), true),
+      );
     }
   });
 });
 
+setDefaultCaseDateRange();
 renderLogProductOptions();
-Promise.all([loadSampleLog(selectedLogProduct()), loadCases(), loadLlmConfig(), loadMappingProfiles()]).catch((err) =>
+Promise.all([loadSampleLog(selectedLogProduct()), loadCases(), loadLlmConfig(), loadMappingProfiles(), loadSyslogConfig()]).catch((err) =>
   showToast(err.message || String(err), "error"),
 );
+scheduleDashboardRefresh();

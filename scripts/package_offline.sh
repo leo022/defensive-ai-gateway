@@ -9,7 +9,10 @@ ARCHIVE="$OUT_DIR/defensive-ai-gateway-mvp.tar.gz"
 
 cd "$ROOT_DIR"
 tar \
+  --exclude="./.git" \
   --exclude="./data" \
+  --exclude="./dist" \
+  --exclude="./outputs" \
   --exclude="./__pycache__" \
   --exclude="./.pytest_cache" \
   --exclude="./.DS_Store" \

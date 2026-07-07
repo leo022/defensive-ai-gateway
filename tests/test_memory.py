@@ -298,6 +298,8 @@ class MemoryGovernanceAPITest(unittest.TestCase):
             self.assertEqual(content["confirmation_type"], "business_false_positive")
             self.assertIn("rule_id", content["features"])
             self.assertGreaterEqual(len(content["features"]["similarity_features"]), 1)
+            self.assertEqual(state.repo.get_case(result.case_id)["status"], "false_positive")
+            self.assertEqual(state.repo.stats()["cases"], 0)
 
 
 if __name__ == "__main__":

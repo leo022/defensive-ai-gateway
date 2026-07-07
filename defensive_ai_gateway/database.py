@@ -125,7 +125,7 @@ CREATE INDEX IF NOT EXISTS idx_memory_expiry ON memory_entries(status, expires_a
 CREATE INDEX IF NOT EXISTS idx_memory_events_mem ON memory_events(memory_id);
 """
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class Repository:
@@ -211,6 +211,13 @@ class Repository:
                     (now_ms(),),
                 )
 
+            if current < 3:
+                # v3: case disposition remains in the existing cases.status field.
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO schema_version(version, applied_at_ms) VALUES (3, ?)",
+                    (now_ms(),),
+                )
+
             self.conn.commit()
 
     def insert_raw_alert(self, alert: RawAlert, _commit: bool = True) -> None:
@@ -279,8 +286,12 @@ class Repository:
         with self._lock:
             # cases is a live aggregate: updated as new alerts land on the same
             # deterministic case_id, so upsert (preserving created_at_ms) is correct.
-            existing = self.conn.execute("SELECT created_at_ms FROM cases WHERE case_id = ?", (result.case_id,)).fetchone()
+            existing = self.conn.execute(
+                "SELECT created_at_ms, status FROM cases WHERE case_id = ?",
+                (result.case_id,),
+            ).fetchone()
             created = existing["created_at_ms"] if existing else result.created_at_ms
+            status = existing["status"] if existing else "open"
             self.conn.execute(
                 """
                 INSERT OR REPLACE INTO cases
@@ -290,7 +301,7 @@ class Repository:
                 (
                     result.case_id,
                     product,
-                    "open",
+                    status,
                     result.severity,
                     result.classification,
                     result.confidence,
@@ -335,6 +346,24 @@ class Repository:
             )
             if _commit:
                 self.conn.commit()
+
+    def update_case_status(self, case_id: str, status: str, _commit: bool = True) -> dict[str, Any] | None:
+        with self._lock:
+            updated_at = now_ms()
+            cur = self.conn.execute(
+                """
+                UPDATE cases
+                SET status = ?, updated_at_ms = ?
+                WHERE case_id = ?
+                """,
+                (status, updated_at, case_id),
+            )
+            if cur.rowcount == 0:
+                return None
+            if _commit:
+                self.conn.commit()
+            row = self.conn.execute("SELECT * FROM cases WHERE case_id = ?", (case_id,)).fetchone()
+            return dict(row) if row else None
 
     # ---- mapping profiles -------------------------------------------------
 
@@ -613,10 +642,36 @@ class Repository:
             if _commit:
                 self.conn.commit()
 
-    def list_cases(self, limit: int = 50) -> list[dict[str, Any]]:
+    def list_cases(
+        self,
+        limit: int = 50,
+        product: str | None = None,
+        severity: str | None = None,
+        status: str | None = None,
+        created_from_ms: int | None = None,
+        created_to_ms: int | None = None,
+    ) -> list[dict[str, Any]]:
         with self._lock:
+            clauses: list[str] = []
+            params: list[Any] = []
+            if product:
+                clauses.append("c.product = ?")
+                params.append(product.lower())
+            if severity:
+                clauses.append("c.severity = ?")
+                params.append(severity.lower())
+            if status:
+                clauses.append("c.status = ?")
+                params.append(status.lower())
+            if created_from_ms is not None:
+                clauses.append("c.created_at_ms >= ?")
+                params.append(created_from_ms)
+            if created_to_ms is not None:
+                clauses.append("c.created_at_ms <= ?")
+                params.append(created_to_ms)
+            where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
             rows = self.conn.execute(
-                """
+                f"""
                 SELECT
                   c.case_id,
                   c.product,
@@ -635,9 +690,10 @@ class Repository:
                     WHERE l.case_id = c.case_id
                     ORDER BY l.created_at_ms DESC LIMIT 1
                   ) AS latest_alert_id
-                FROM cases c ORDER BY c.updated_at_ms DESC LIMIT ?
+                FROM cases c {where}
+                ORDER BY c.created_at_ms DESC, c.case_id ASC LIMIT ?
                 """,
-                (limit,),
+                (*params, limit),
             ).fetchall()
             return [dict(row) for row in rows]
 
@@ -749,10 +805,25 @@ class Repository:
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
-            case_count = self.conn.execute("SELECT COUNT(*) c FROM cases").fetchone()["c"]
+            open_filter = "status = 'open'"
+            unresolved_filter = "status NOT IN ('closed', 'false_positive')"
+            case_count = self.conn.execute(f"SELECT COUNT(*) c FROM cases WHERE {open_filter}").fetchone()["c"]
+            unresolved_case_count = self.conn.execute(
+                f"SELECT COUNT(*) c FROM cases WHERE {unresolved_filter}"
+            ).fetchone()["c"]
+            total_case_count = self.conn.execute("SELECT COUNT(*) c FROM cases").fetchone()["c"]
             alert_count = self.conn.execute("SELECT COUNT(*) c FROM raw_alerts").fetchone()["c"]
-            high_count = self.conn.execute("SELECT COUNT(*) c FROM cases WHERE severity IN ('high', 'critical')").fetchone()["c"]
-            return {"cases": case_count, "alerts": alert_count, "high_or_critical_cases": high_count}
+            high_count = self.conn.execute(
+                f"SELECT COUNT(*) c FROM cases WHERE {open_filter} AND severity IN ('high', 'critical')"
+            ).fetchone()["c"]
+            return {
+                "cases": case_count,
+                "open_cases": case_count,
+                "unresolved_cases": unresolved_case_count,
+                "total_cases": total_case_count,
+                "alerts": alert_count,
+                "high_or_critical_cases": high_count,
+            }
 
 
 class _Transaction:

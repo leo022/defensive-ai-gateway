@@ -3,4 +3,6 @@ __pycache__/
 *.pyc
 .pytest_cache/
 *.tar.gz
+dist/k3s-images/*.tar
+dist/k3s-images/*.tar.sha256
 .DS_Store
