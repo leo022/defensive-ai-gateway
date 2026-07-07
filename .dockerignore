@@ -1,0 +1,9 @@
+.git
+data
+dist
+outputs
+__pycache__
+.pytest_cache
+.DS_Store
+*.pyc
+*.tar.gz

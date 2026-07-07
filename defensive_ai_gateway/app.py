@@ -31,6 +31,8 @@ from .normalizer import EventNormalizer
 from .orchestrator import Orchestrator
 from .policy import PolicyEngine
 from .processing import AlertProcessor, AlertQueueFull
+from .syslog_receiver import SyslogListenerSpec, SyslogReceiverManager
+from .syslog_router import SyslogPortRouter
 
 
 _STANDARD_ALERT_KEYS = ("event_type", "severity", "alert_id", "source", "timestamp")
@@ -43,6 +45,13 @@ MAX_BODY_BYTES = 2_000_000
 # to reach a local Ollama instance only; cloud-metadata / internal probes are
 # refused. Production LLM endpoints go through the gateway adapter, not here.
 _ALLOWED_OLLAMA_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+_CASE_DISPOSITIONS = {
+    "under_review": "escalate_case_review",
+    "confirmed_attack": "confirm_case_attack",
+    "closed": "close_case",
+    "open": "reopen_case",
+}
 
 
 class _PayloadTooLarge(Exception):
@@ -82,6 +91,32 @@ def _ollama_tags_url(endpoint: str) -> str:
     return "http://127.0.0.1:11434/api/tags"
 
 
+def _query_first(query: dict[str, list[str]], key: str, default: str = "") -> str:
+    return str(query.get(key, [default])[0] or "").strip()
+
+
+def _query_int(query: dict[str, list[str]], key: str, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
+    try:
+        value = int(_query_first(query, key, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    if min_value is not None:
+        value = max(value, min_value)
+    if max_value is not None:
+        value = min(value, max_value)
+    return value
+
+
+def _query_optional_int(query: dict[str, list[str]], key: str) -> int | None:
+    raw = _query_first(query, key)
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 class GatewayState:
     def __init__(self, config: GatewayConfig, config_path: str = ""):
         self.config = config
@@ -95,6 +130,7 @@ class GatewayState:
         self.log_adapter = LogAdapter(self.normalizer)
         self._seed_mapping_profiles()
         self.orchestrator = Orchestrator(self.repo, self.normalizer, self.memory, self.llm, self.policy)
+        self.syslog_receiver = SyslogReceiverManager(config.server.host, self._handle_syslog_message)
         self.alert_processor = (
             AlertProcessor(
                 self._handle_queued_alert,
@@ -113,6 +149,17 @@ class GatewayState:
     def stop_alert_processor(self) -> None:
         if self.alert_processor:
             self.alert_processor.stop()
+
+    def stop(self) -> None:
+        self.syslog_receiver.stop()
+        self.stop_alert_processor()
+
+    def _handle_syslog_message(self, spec: SyslogListenerSpec, data: bytes, peer: str) -> None:
+        with self.lock:
+            router = SyslogPortRouter(self.config.syslog.product_ports, self.config.syslog.gateway_profiles)
+            routed = router.route(spec.port, data, hostname=peer, appname=spec.product)
+            alert = self.alert_from_payload(routed.payload, routed.profile_id)
+        self.submit_alert(alert)
 
     def processing_stats(self) -> dict:
         if not self.alert_processor:
@@ -243,6 +290,72 @@ class GatewayState:
             self.llm = build_llm(config.llm)
             self.orchestrator = Orchestrator(self.repo, self.normalizer, self.memory, self.llm, self.policy)
             return self.llm_config_payload()
+
+    # ---- runtime syslog intake ---------------------------------------------
+
+    def syslog_config_payload(self) -> dict:
+        labels = {"waf": "WAF", "hips": "HIPS", "ndr": "NDR", "rasp": "RASP", "siem": "SIEM"}
+        with self.lock:
+            active = {
+                (item["product"], item["port"], item["protocol"])
+                for item in self.syslog_receiver.status()
+                if item.get("active")
+            }
+            configs = []
+            for product in sorted(SUPPORTED_PRODUCTS):
+                port = int(self.config.syslog.product_ports.get(product, 0))
+                protocol = str(self.config.syslog.product_protocols.get(product, "tcp")).lower()
+                configs.append(
+                    {
+                        "product": product,
+                        "label": labels.get(product, product.upper()),
+                        "port": port,
+                        "protocol": protocol if protocol in {"tcp", "udp"} else "tcp",
+                        "profile": self.config.syslog.gateway_profiles.get(product, f"{product}-syslog-json"),
+                        "saved": (product, port, protocol) in active,
+                    }
+                )
+            return {
+                "recommended_protocol": "tcp",
+                "recommendation_reason": "syslog 报文较长时推荐 TCP；UDP 无传输确认，长报文分片后更容易截断或丢包。",
+                "configs": configs,
+                "listeners": self.syslog_receiver.status(),
+            }
+
+    def update_syslog_config(self, payload: dict) -> dict:
+        product = str(payload.get("product") or "").strip().lower()
+        if product not in SUPPORTED_PRODUCTS:
+            raise ValueError(f"unsupported product: {product}")
+        port = int(payload.get("port", 0))
+        if port < 1 or port > 65535:
+            raise ValueError("port must be between 1 and 65535")
+        protocol = str(payload.get("protocol") or "tcp").strip().lower()
+        if protocol not in {"tcp", "udp"}:
+            raise ValueError("protocol must be tcp or udp")
+
+        with self.lock:
+            old_product_ports = dict(self.config.syslog.product_ports)
+            old_product_protocols = dict(self.config.syslog.product_protocols)
+            product_ports = dict(self.config.syslog.product_ports)
+            product_protocols = dict(self.config.syslog.product_protocols)
+            product_ports[product] = port
+            product_protocols[product] = protocol
+            seen_ports: dict[int, str] = {}
+            for item_product, item_port in product_ports.items():
+                item_port = int(item_port)
+                if item_port in seen_ports and seen_ports[item_port] != item_product:
+                    raise ValueError(f"port {item_port} is already used by {seen_ports[item_port]}")
+                seen_ports[item_port] = item_product
+
+            self.config.syslog.product_ports = product_ports
+            self.config.syslog.product_protocols = product_protocols
+            try:
+                self.syslog_receiver.update_product(SyslogListenerSpec(product, port, protocol))
+            except Exception:
+                self.config.syslog.product_ports = old_product_ports
+                self.config.syslog.product_protocols = old_product_protocols
+                raise
+            return self.syslog_config_payload()
 
     # ---- log mapping profiles ----------------------------------------------
 
@@ -430,6 +543,31 @@ class GatewayState:
                 conflicts.extend(self.memory.detect_conflicts(product))
             return {"expired": expired, "conflicts": conflicts}
 
+    def update_case_disposition(self, case_id: str, body: dict) -> dict | None:
+        status = str(body.get("status") or "").strip().lower()
+        if status not in _CASE_DISPOSITIONS:
+            raise ValueError(f"unsupported case disposition: {status}")
+        actor = str(body.get("actor") or "dashboard-analyst").strip() or "dashboard-analyst"
+        reason = str(body.get("reason") or "").strip()
+        with self.lock:
+            with self.repo.transaction():
+                updated = self.repo.update_case_status(case_id, status, _commit=False)
+                if not updated:
+                    return None
+                self.repo.insert_audit(
+                    new_id("audit"),
+                    case_id,
+                    actor,
+                    _CASE_DISPOSITIONS[status],
+                    {
+                        "case_id": case_id,
+                        "status": status,
+                        "reason": reason,
+                    },
+                    _commit=False,
+                )
+                return {"ok": True, "case": updated}
+
     def confirm_alert_false_positive(self, alert_id: str, body: dict) -> dict:
         with self.lock:
             linked = self.repo.get_linked_alert(alert_id)
@@ -443,6 +581,9 @@ class GatewayState:
             # commit); the outer block owns the commit including the audit insert.
             with self.repo.transaction():
                 outcome = self.memory.confirm_business_false_positive(linked, analyst, reason, expires_at_ms)
+                case_id = str(linked.get("case_id") or "")
+                if case_id:
+                    self.repo.update_case_status(case_id, "false_positive", _commit=False)
                 self.repo.insert_audit(
                     new_id("audit"),
                     str(linked.get("case_id") or alert_id),
@@ -551,6 +692,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
             endpoint = parse_qs(parsed.query).get("endpoint", [""])[0]
             self._json(200, self.state.list_ollama_models(endpoint))
             return
+        if parsed.path == "/api/config/syslog":
+            if not self._require_auth():
+                return
+            self._json(200, self.state.syslog_config_payload())
+            return
         if parsed.path == "/api/mapping-profiles":
             self._json(200, {"profiles": self.state.list_mapping_profiles()})
             return
@@ -574,8 +720,20 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/cases":
             query = parse_qs(parsed.query)
-            limit = int(query.get("limit", ["50"])[0])
-            self._json(200, {"cases": self.state.repo.list_cases(limit)})
+            limit = _query_int(query, "limit", 50, min_value=1, max_value=500)
+            self._json(
+                200,
+                {
+                    "cases": self.state.repo.list_cases(
+                        limit=limit,
+                        product=_query_first(query, "product") or None,
+                        severity=_query_first(query, "severity") or None,
+                        status=_query_first(query, "status") or None,
+                        created_from_ms=_query_optional_int(query, "created_from_ms"),
+                        created_to_ms=_query_optional_int(query, "created_to_ms"),
+                    )
+                },
+            )
             return
         if parsed.path.startswith("/api/cases/"):
             case_id = unquote(parsed.path.rsplit("/", 1)[-1])
@@ -626,6 +784,17 @@ class GatewayHandler(BaseHTTPRequestHandler):
             except _PayloadTooLarge:
                 self._json(413, {"error": "request body too large"})
             except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                self._client_error(exc)
+            except Exception as exc:
+                self._server_error(exc)
+            return
+        if parsed.path == "/api/config/syslog":
+            try:
+                updated = self.state.update_syslog_config(self._read_json())
+                self._json(200, {"ok": True, "syslog": updated})
+            except _PayloadTooLarge:
+                self._json(413, {"error": "request body too large"})
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
                 self._client_error(exc)
             except Exception as exc:
                 self._server_error(exc)
@@ -704,6 +873,21 @@ class GatewayHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._server_error(exc)
             return
+        if parsed.path.startswith("/api/cases/") and parsed.path.endswith("/disposition"):
+            case_id = unquote(parsed.path.split("/")[-2])
+            try:
+                updated = self.state.update_case_disposition(case_id, self._read_json())
+                if not updated:
+                    self._json(404, {"error": "case not found"})
+                else:
+                    self._json(200, updated)
+            except _PayloadTooLarge:
+                self._json(413, {"error": "request body too large"})
+            except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                self._client_error(exc)
+            except Exception as exc:
+                self._server_error(exc)
+            return
         if parsed.path.startswith("/api/alerts/") and parsed.path.endswith("/confirm-false-positive"):
             alert_id = unquote(parsed.path.split("/")[-2])
             try:
@@ -766,7 +950,7 @@ class GatewayHTTPServer(ThreadingHTTPServer):
         super().__init__(server_address, request_handler_class)
 
     def server_close(self):
-        self.state.stop_alert_processor()
+        self.state.stop()
         super().server_close()
 
 

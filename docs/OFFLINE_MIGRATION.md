@@ -25,10 +25,17 @@ tar --exclude "data" --exclude "__pycache__" -czf defensive-ai-gateway.tar.gz .
 ```bash
 tar -xzf defensive-ai-gateway.tar.gz -C /opt/defensive-ai-gateway
 cd /opt/defensive-ai-gateway
+bash install.sh
 python3 -m defensive_ai_gateway --config config/prod.yaml
 ```
 
 Dashboard 默认由同一服务提供静态页面，可通过生产配置中的监听地址访问。当前页面支持 Case 展开、日志适配 Profile 配置与 dry-run、LLM 配置、浅色/深色模式和人工确认业务误报。
+
+如需用 systemd 托管服务，可在解压目录执行：
+
+```bash
+sudo bash install.sh --systemd --enable --start
+```
 
 ## 4. 迁移后第一批测试
 

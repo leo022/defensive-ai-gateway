@@ -95,6 +95,15 @@ class SyslogConfig:
             "siem": 15144,
         }
     )
+    product_protocols: dict[str, str] = field(
+        default_factory=lambda: {
+            "waf": "tcp",
+            "hips": "tcp",
+            "ndr": "tcp",
+            "rasp": "tcp",
+            "siem": "tcp",
+        }
+    )
     gateway_profiles: dict[str, str] = field(default_factory=lambda: {"rasp": "demo-rasp-json"})
 
 
@@ -222,6 +231,10 @@ def load_config(path: str | None = None) -> GatewayConfig:
             product_ports={
                 **default_syslog.product_ports,
                 **{str(k): int(v) for k, v in dict(syslog.get("product_ports", {}) or {}).items()},
+            },
+            product_protocols={
+                **default_syslog.product_protocols,
+                **{str(k): str(v).lower() for k, v in dict(syslog.get("product_protocols", {}) or {}).items()},
             },
             gateway_profiles={
                 **default_syslog.gateway_profiles,

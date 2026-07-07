@@ -66,6 +66,19 @@ bash scripts/package_offline.sh ../outputs
 
 `--use-config-llm` 会按 `config/dev.yaml` 使用默认的 `local-rule-analyst`。如需回放真实模型效果，可先在配置或 Dashboard 中切换到本地 Ollama / 内网 LLM Gateway。
 
+离线包解压后可以先运行安装检查脚本，生成生产配置和数据目录：
+
+```bash
+bash install.sh
+python3 -m defensive_ai_gateway --config config/prod.yaml
+```
+
+如需安装为 systemd 服务：
+
+```bash
+sudo bash install.sh --systemd --enable --start
+```
+
 ## k3s 与 Syslog 接入
 
 生产接入推荐在 k3s 中用独立 collector 接收 syslog，再转发到网关 HTTP 入口：
@@ -79,6 +92,15 @@ Security Product -> Syslog UDP/TCP 15140-15144 -> Collector -> POST /api/alerts
 - `deploy/k3s/gateway.yaml`：网关 Deployment、Service、Ingress、PVC 和生产配置。
 - `deploy/k3s/syslog-collector-vector.yaml`：Vector syslog collector 参考清单，接收 syslog 并转成标准告警 JSON。
 - `docs/SYSLOG_INGESTION.md`：安全设备配置、Mapping Profile 接入和运维注意事项。
+
+如果目标服务器不安装 Python，可用 k3s 部署物料：
+
+```bash
+bash deploy/k3s/build-offline-images.sh --include-vector
+bash scripts/package_k3s_deploy.sh
+```
+
+生成的 `dist/defensive-ai-gateway-k3s-deploy.tar.gz` 包含 k3s 清单、Secret 模板、镜像构建/导入脚本和源码包。
 
 本地可以模拟五类设备分别通过不同 TCP 端口发送 syslog，并验证路由不会把安全系统识别错：
 
