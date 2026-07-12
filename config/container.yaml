@@ -1,0 +1,35 @@
+# Zero-configuration container defaults for a trusted, isolated internal network.
+# Set DEFENSIVE_AI_API_TOKEN to require Bearer authentication for all protected APIs.
+server:
+  host: "0.0.0.0"
+  port: 8080
+database:
+  path: "/data/gateway.db"
+llm:
+  provider: "local"
+  endpoint: ""
+  model: "local-rule-analyst"
+  timeout_seconds: 30
+policy:
+  mode: "read_only"
+  max_prompt_chars: 12000
+  max_context_bytes: 20000
+  require_approval_for: [block, isolate, change_policy, disable_account]
+  redact_fields: [password, token, cookie, authorization, customer_id, id_card, phone, email, session]
+auth:
+  api_token: ""
+  allow_loopback_no_token: true
+  require_token_when_remote: false
+processing:
+  async_enabled: true
+  queue_max_size: 20000
+  workers: 4
+syslog:
+  product_ports:
+    waf: 15140
+    hips: 15141
+    ndr: 15142
+    rasp: 15143
+    siem: 15144
+  gateway_profiles:
+    rasp: "demo-rasp-json"

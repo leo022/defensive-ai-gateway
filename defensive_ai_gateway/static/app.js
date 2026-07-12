@@ -200,6 +200,25 @@ const STRINGS = {
     confidence: "置信度",
     updatedAt: "更新时间",
     recommendedActions: "建议动作",
+    validationGate: "验证门禁",
+    validationPassed: "通过",
+    validationReview: "需复核",
+    validationBlocked: "已阻断",
+    noValidationFindings: "未发现证据或策略违规",
+    approvalQueue: "处置审批",
+    approvalPending: "待审批",
+    approvalApproved: "已批准",
+    approvalRejected: "已拒绝",
+    approvalCancelled: "已取消",
+    executionNotRun: "未执行生产动作",
+    rollbackCondition: "回滚条件",
+    approveAction: "批准",
+    rejectAction: "拒绝",
+    approvalReasonPrompt: "请输入审批理由。批准仅表示授权给既有处置流程，本系统不会执行生产动作。",
+    approvalDecisionDefault: "Dashboard 分析师已复核证据与回滚条件",
+    approvalSaved: "审批状态已更新：{status}（未执行）",
+    approvalFailed: "审批失败：{message}",
+    noApprovals: "当前 Case 无可流转审批项",
     missingEvidence: "缺失证据",
     none: "暂无",
     linkedRawAlerts: "关联原始告警",
@@ -261,6 +280,10 @@ const STRINGS = {
     configRestored: "已恢复为配置文件与环境变量的默认 LLM 配置（如启动时的 local）。",
     restoreDefaults: "恢复默认",
     loadModels: "同步模型",
+    testConnection: "测试连接",
+    testConnecting: "测试中...",
+    testConnOk: "{message}",
+    testConnFailed: "{message}",
     modelsLoaded: "已从 {endpoint} 拉取 {count} 个本地模型，可在 Model 下拉中选择。",
     modelsEmpty: "未在 {endpoint} 发现任何模型，请确认 Ollama 已启动。",
     modelsLoadFailed: "拉取模型失败：{error}",
@@ -447,6 +470,25 @@ const STRINGS = {
     confidence: "Confidence",
     updatedAt: "Updated at",
     recommendedActions: "Recommended actions",
+    validationGate: "Validation gate",
+    validationPassed: "Passed",
+    validationReview: "Review required",
+    validationBlocked: "Blocked",
+    noValidationFindings: "No evidence or policy violations found",
+    approvalQueue: "Response approvals",
+    approvalPending: "Pending",
+    approvalApproved: "Approved",
+    approvalRejected: "Rejected",
+    approvalCancelled: "Cancelled",
+    executionNotRun: "No production action executed",
+    rollbackCondition: "Rollback condition",
+    approveAction: "Approve",
+    rejectAction: "Reject",
+    approvalReasonPrompt: "Enter a decision reason. Approval only authorizes the existing response workflow; this gateway executes no production action.",
+    approvalDecisionDefault: "Dashboard analyst reviewed the evidence and rollback condition",
+    approvalSaved: "Approval updated: {status} (not executed)",
+    approvalFailed: "Approval failed: {message}",
+    noApprovals: "No approval item can be routed for this case",
     missingEvidence: "Missing evidence",
     none: "None",
     linkedRawAlerts: "Linked Raw Alerts",
@@ -508,6 +550,10 @@ const STRINGS = {
     configRestored: "Restored the default LLM config from the config file and environment (e.g. startup local).",
     restoreDefaults: "Restore defaults",
     loadModels: "Sync models",
+    testConnection: "Test connection",
+    testConnecting: "Testing...",
+    testConnOk: "{message}",
+    testConnFailed: "{message}",
     modelsLoaded: "Loaded {count} local model(s) from {endpoint}; pick one from the Model dropdown.",
     modelsEmpty: "No models found at {endpoint}. Is Ollama running?",
     modelsLoadFailed: "Failed to load models: {error}",
@@ -591,7 +637,9 @@ function caseSearchQuery() {
   if (severity) params.set("severity", severity);
   if (status) params.set("status", status);
   if (createdFrom !== null) params.set("created_from_ms", String(createdFrom));
-  if (createdTo !== null) params.set("created_to_ms", String(createdTo));
+  // datetime-local has minute precision. Treat the selected end minute as
+  // inclusive so real-time cases created at :SS are not hidden until next minute.
+  if (createdTo !== null) params.set("created_to_ms", String(createdTo + 59_999));
   return params.toString();
 }
 
@@ -1351,6 +1399,60 @@ function reviewTools(raw) {
   `;
 }
 
+function validationStatusLabel(status) {
+  return tr({ passed: "validationPassed", review: "validationReview", blocked: "validationBlocked" }[status] || "validationReview");
+}
+
+function validationBlock(validation) {
+  if (!validation) return "";
+  const findings = validation.findings || [];
+  return `
+    <div class="validation-gate ${escapeHtml(validation.status || "review")}">
+      <div class="case-disposition-head">
+        <span>${escapeHtml(tr("validationGate"))}</span>
+        <strong>${escapeHtml(validationStatusLabel(validation.status))}</strong>
+      </div>
+      <ul class="plain-list">
+        ${findings.length
+          ? findings.map((item) => `<li><strong>${escapeHtml(item.code)}</strong> ${escapeHtml(item.message)}</li>`).join("")
+          : `<li>${escapeHtml(tr("noValidationFindings"))}</li>`}
+      </ul>
+    </div>
+  `;
+}
+
+function approvalStatusLabel(status) {
+  return tr({ pending: "approvalPending", approved: "approvalApproved", rejected: "approvalRejected", cancelled: "approvalCancelled" }[status] || "approvalPending");
+}
+
+function approvalBlock(approvals, caseId) {
+  return `
+    <div class="approval-queue">
+      <h4>${escapeHtml(tr("approvalQueue"))}</h4>
+      ${(approvals || []).length
+        ? approvals.map((item) => `
+            <article class="approval-item ${escapeHtml(item.status)}">
+              <div class="case-disposition-head">
+                <strong>${escapeHtml(approvalStatusLabel(item.status))}</strong>
+                <span>${escapeHtml(tr("executionNotRun"))}</span>
+              </div>
+              <p>${escapeHtml(item.action?.action || "")}</p>
+              <small>${escapeHtml(item.action?.rationale || "")}</small>
+              <dl class="kv"><dt>${escapeHtml(tr("rollbackCondition"))}</dt><dd>${escapeHtml(item.action?.rollback || "-")}</dd></dl>
+              ${item.status === "pending" ? `
+                <div class="approval-actions">
+                  <button type="button" class="approval-decision" data-case-id="${escapeHtml(caseId)}" data-approval-id="${escapeHtml(item.approval_id)}" data-decision="approved">${escapeHtml(tr("approveAction"))}</button>
+                  <button type="button" class="approval-decision" data-case-id="${escapeHtml(caseId)}" data-approval-id="${escapeHtml(item.approval_id)}" data-decision="rejected">${escapeHtml(tr("rejectAction"))}</button>
+                </div>
+              ` : ""}
+            </article>
+          `).join("")
+        : `<p class="empty">${escapeHtml(tr("noApprovals"))}</p>`}
+      <p class="approval-status" data-approval-status="${escapeHtml(caseId)}"></p>
+    </div>
+  `;
+}
+
 function renderDetail(detail) {
   const latestRun = detail.agent_runs?.[0]?.result || {};
   const linked = detail.linked_alerts || [];
@@ -1359,6 +1461,7 @@ function renderDetail(detail) {
   const normalized = firstLink.normalized_event || {};
   const adapter = raw.payload?.adapter || {};
   const missing = latestRun.missing_evidence || [];
+  const validation = detail.validation_runs?.[0] || latestRun.explanation?.validation;
 
   return `
     <div class="detail-grid">
@@ -1376,6 +1479,7 @@ function renderDetail(detail) {
         </dl>
         <p class="summary">${escapeHtml(detail.summary)}</p>
         ${caseDispositionControls(detail)}
+        ${validationBlock(validation)}
         ${explanationBlock(latestRun.explanation)}
         <h4>${escapeHtml(tr("recommendedActions"))}</h4>
         <ul class="action-list">${actionRows(latestRun.recommended_actions)}</ul>
@@ -1387,6 +1491,7 @@ function renderDetail(detail) {
               : `<li class="empty">${escapeHtml(tr("none"))}</li>`
           }
         </ul>
+        ${approvalBlock(detail.approvals || [], detail.case_id)}
       </section>
 
       <section class="detail-card">
@@ -1487,12 +1592,47 @@ async function toggleCase(wrapper, caseId) {
     }
   }
   panel.innerHTML = renderDetail(detailCache.get(caseId));
+  bindDetailActions(panel, caseId);
+}
+
+function bindDetailActions(panel, caseId) {
   panel.querySelectorAll(".case-disposition-button").forEach((button) => {
     button.addEventListener("click", () => updateCaseDisposition(button, caseId));
   });
   panel.querySelectorAll(".review-button").forEach((button) => {
     button.addEventListener("click", () => confirmBusinessFalsePositive(button, caseId));
   });
+  panel.querySelectorAll(".approval-decision").forEach((button) => {
+    button.addEventListener("click", () => decideApproval(button, panel, caseId));
+  });
+}
+
+async function decideApproval(button, panel, caseId) {
+  const decision = button.dataset.decision;
+  const reason = window.prompt(tr("approvalReasonPrompt"), tr("approvalDecisionDefault"));
+  if (reason === null) return;
+  const statusNode = panel.querySelector(`[data-approval-status="${CSS.escape(caseId)}"]`);
+  const buttons = [...panel.querySelectorAll(".approval-decision")];
+  buttons.forEach((item) => { item.disabled = true; });
+  try {
+    const result = await json(`/api/approvals/${encodeURIComponent(button.dataset.approvalId)}/decision`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision, actor: "dashboard-analyst", reason: reason.trim() || tr("approvalDecisionDefault") }),
+    });
+    const detail = detailCache.get(caseId);
+    detail.approvals = (detail.approvals || []).map((item) => item.approval_id === result.approval.approval_id ? result.approval : item);
+    panel.innerHTML = renderDetail(detail);
+    bindDetailActions(panel, caseId);
+    const message = tr("approvalSaved", { status: approvalStatusLabel(result.approval.status) });
+    panel.querySelector(`[data-approval-status="${CSS.escape(caseId)}"]`).textContent = message;
+    showToast(message);
+  } catch (err) {
+    buttons.forEach((item) => { item.disabled = false; });
+    const message = tr("approvalFailed", { message: err.message || String(err) });
+    if (statusNode) statusNode.textContent = message;
+    showToast(message, "error");
+  }
 }
 
 async function updateCaseDisposition(button, caseId) {
@@ -1951,6 +2091,41 @@ async function saveLlmConfig(event) {
   setConfigStatus(tr("configSaved", { provider: result.llm.provider, model: result.llm.model }));
 }
 
+async function testLlmConnection() {
+  const button = document.querySelector("#test-llm-connection");
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = tr("testConnecting");
+  try {
+    const payload = {
+      provider: document.querySelector("#llm-provider").value,
+      endpoint: document.querySelector("#llm-endpoint").value,
+      model: document.querySelector("#llm-model").value,
+      api_key: document.querySelector("#llm-api-key").value,
+      api_key_env: document.querySelector("#llm-api-key-env").value,
+      timeout_seconds: Number(document.querySelector("#llm-timeout").value || 30),
+    };
+    const result = await json("/api/config/llm/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (result.ok) {
+      setConfigStatus(tr("testConnOk", { message: result.message }));
+      showToast(tr("testConnOk", { message: result.message }));
+    } else {
+      setConfigStatus(tr("testConnFailed", { message: result.message }), true);
+      showToast(tr("testConnFailed", { message: result.message }), "error");
+    }
+  } catch (err) {
+    const message = err.message || String(err);
+    setConfigStatus(tr("testConnFailed", { message }), true);
+  } finally {
+    button.disabled = false;
+    button.textContent = originalText;
+  }
+}
+
 loadLanguagePreference();
 loadThemePreference();
 loadRefreshPreference();
@@ -1969,6 +2144,9 @@ if (window.matchMedia) {
 }
 
 document.querySelector("#refresh").addEventListener("click", loadCases);
+document.querySelector("#test-llm-connection").addEventListener("click", () => {
+  testLlmConnection().catch((err) => setConfigStatus(err.message || String(err), true));
+});
 document.querySelector("#case-search-form").addEventListener("submit", (event) => {
   event.preventDefault();
   loadCases().catch((err) => showToast(err.message || String(err), "error"));

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
-from .models import NormalizedEvent, RawAlert, new_id
+from .models import NormalizedEvent, RawAlert
 from .policy import PolicyEngine
 
 
@@ -31,7 +32,10 @@ class EventNormalizer:
         evidence = self._build_evidence(alert, payload, flat)
         tags = self._sensitivity_tags(alert.payload)
         return NormalizedEvent(
-            event_id=new_id("event"),
+            # The source alert ID is the ingestion idempotency key. Making the
+            # normalized-event ID deterministic lets a retry reuse immutable
+            # evidence instead of creating a second analysis/case link.
+            event_id=self._event_id(alert.alert_id),
             source=alert.source,
             product=alert.product.lower(),
             event_type=alert.event_type,
@@ -42,6 +46,11 @@ class EventNormalizer:
             sensitivity_tags=tags,
             raw_ref=alert.alert_id,
         )
+
+    @staticmethod
+    def _event_id(alert_id: str) -> str:
+        digest = hashlib.sha256(str(alert_id).encode("utf-8")).hexdigest()
+        return f"event_{digest[:32]}"
 
     def _flatten(self, value: Any, prefix: str = "") -> dict[str, Any]:
         out: dict[str, Any] = {}

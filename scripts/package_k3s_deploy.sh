@@ -7,6 +7,7 @@ BUNDLE_NAME="${BUNDLE_NAME:-defensive-ai-gateway-k3s-deploy}"
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/${BUNDLE_NAME}.XXXXXX")"
 BUNDLE_DIR="$STAGE/$BUNDLE_NAME"
 ARCHIVE="$OUT_DIR/$BUNDLE_NAME.tar.gz"
+trap 'rm -rf "$STAGE"' EXIT
 
 mkdir -p "$OUT_DIR" "$BUNDLE_DIR"
 
@@ -39,32 +40,6 @@ cat > "$BUNDLE_DIR/install.sh" <<'EOF'
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_FILE="${K3S_ENV_FILE:-$ROOT_DIR/.env}"
-ALLOW_EMPTY_TOKEN=0
-SHOW_HELP=0
-
-for arg in "$@"; do
-  case "$arg" in
-    --allow-empty-token)
-      ALLOW_EMPTY_TOKEN=1
-      ;;
-    -h|--help)
-      SHOW_HELP=1
-      ;;
-  esac
-done
-
-if [ ! -f "$ENV_FILE" ] && [ "$ALLOW_EMPTY_TOKEN" -ne 1 ] && [ "$SHOW_HELP" -ne 1 ]; then
-  cat >&2 <<MSG
-[k3s-install] ERROR: $ENV_FILE not found.
-[k3s-install] Copy .env.example to .env, edit DEFENSIVE_AI_API_TOKEN, then rerun:
-[k3s-install]   cp .env.example .env
-[k3s-install]   vi .env
-[k3s-install]   bash install.sh
-MSG
-  exit 1
-fi
-
 exec bash "$ROOT_DIR/deploy/k3s/install-k3s-bundle.sh" "$@"
 EOF
 chmod +x "$BUNDLE_DIR/install.sh"
@@ -88,7 +63,7 @@ chmod +x "$BUNDLE_DIR/install.sh"
 cat > "$BUNDLE_DIR/README.md" <<'EOF'
 # Defensive AI Gateway k3s 部署包
 
-此包用于企业内网 k3s 离线部署。目标服务器不需要安装 Python，网关运行时由容器镜像提供；已有部署可通过重复执行安装脚本覆盖更新。
+此包用于企业内网 k3s 离线部署。目标服务器不需要安装 Python、不需要访问镜像仓库，也不需要预先填写应用配置。导入后默认使用本地确定性分析器和 SQLite，并通过节点 `8080` 端口直接访问。
 
 ## 内容
 
@@ -96,7 +71,7 @@ cat > "$BUNDLE_DIR/README.md" <<'EOF'
 - `deploy/docker/Dockerfile`：镜像构建文件。
 - `deploy/k3s/`：k3s 清单、Secret 模板、构建和部署脚本。
 - `images/`：已打包的离线镜像 tar，以及对应 `.sha256`。
-- `.env.example`：生产 Secret 环境变量模板。
+- `.env.example`：可选的鉴权和企业 LLM Secret 模板。
 - `install.sh`：一键导入镜像并部署/覆盖当前 k3s 物料。
 
 ## 直接部署或覆盖
@@ -104,9 +79,21 @@ cat > "$BUNDLE_DIR/README.md" <<'EOF'
 在 k3s 服务器解压后：
 
 ```bash
+bash install.sh
+```
+
+部署完成后直接访问：
+
+```text
+http://<内网服务器IP>:8080
+```
+
+如需启用 Bearer Token，再创建 `.env` 后重复安装：
+
+```bash
 cp .env.example .env
 vi .env
-bash install.sh
+bash install.sh --require-token
 ```
 
 如需同时部署 syslog collector：
@@ -141,4 +128,10 @@ bash install.sh --with-syslog
 EOF
 
 tar -czf "$ARCHIVE" -C "$STAGE" "$BUNDLE_NAME"
+if command -v sha256sum >/dev/null 2>&1; then
+  archive_sha="$(sha256sum "$ARCHIVE" | awk '{print $1}')"
+else
+  archive_sha="$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')"
+fi
+printf '%s  %s\n' "$archive_sha" "$(basename "$ARCHIVE")" > "$ARCHIVE.sha256"
 echo "$ARCHIVE"

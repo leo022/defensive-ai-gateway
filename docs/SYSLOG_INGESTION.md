@@ -29,6 +29,13 @@ kubectl apply -f deploy/k3s/gateway.yaml
 kubectl apply -f deploy/k3s/syslog-collector-vector.yaml
 ```
 
+`syslog-collector-vector` reads `DEFENSIVE_AI_API_TOKEN` from the same
+`defensive-ai-gateway-secrets` Secret as the gateway and sends it as a Bearer
+token on every HTTP sink request. Create or update that Secret before enabling
+the collector (the bundled `install-k3s-bundle.sh` script does this). Vector
+fails fast when the token is empty, rather than silently losing alerts to 401
+responses.
+
 安全设备侧配置：
 
 - 目的地址：k3s 节点 IP，或 `syslog-collector` Service 的 LoadBalancer IP

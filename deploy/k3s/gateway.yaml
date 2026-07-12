@@ -3,6 +3,8 @@ kind: Namespace
 metadata:
   name: defensive-ai-gateway
 ---
+# Empty values provide zero-configuration startup. Supplying
+# DEFENSIVE_AI_API_TOKEN later immediately enables Bearer authentication.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -11,39 +13,7 @@ metadata:
 type: Opaque
 stringData:
   DEFENSIVE_AI_LLM_API_KEY: ""
-  # Shared bearer token for the HTTP API. Set a strong random value in production;
-  # all mutating endpoints and /api/config/llm* require Authorization: Bearer <token>.
-  # Pair with mTLS at the ingress for defense in depth.
   DEFENSIVE_AI_API_TOKEN: ""
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: defensive-ai-gateway-config
-  namespace: defensive-ai-gateway
-data:
-  prod.yaml: |
-    server:
-      host: "0.0.0.0"
-      port: 8080
-    database:
-      path: "/var/lib/defensive-ai-gateway/gateway.db"
-    llm:
-      provider: "gateway"
-      endpoint: "https://llm-gateway.internal.example/v1/security/analyze"
-      api_key_env: "DEFENSIVE_AI_LLM_API_KEY"
-      model: "enterprise-sec-analyst"
-      timeout_seconds: 30
-    policy:
-      mode: "read_only"
-      max_prompt_chars: 12000
-      max_context_bytes: 20000
-      require_approval_for: [block, isolate, change_policy, disable_account]
-      redact_fields: [password, token, cookie, authorization, customer_id, id_card, phone, email, session]
-    auth:
-      api_token: ""
-      allow_loopback_no_token: true
-      require_token_when_remote: true
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -64,6 +34,9 @@ metadata:
   namespace: defensive-ai-gateway
 spec:
   replicas: 1
+  # hostPort cannot run old and new pods concurrently on a single-node k3s host.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: defensive-ai-gateway
@@ -72,51 +45,75 @@ spec:
       labels:
         app: defensive-ai-gateway
     spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
       securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
         fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: gateway
           image: defensive-ai-gateway:latest
-          imagePullPolicy: IfNotPresent
-          command: ["python", "-m", "defensive_ai_gateway"]
-          args: ["--config", "/etc/defensive-ai-gateway/prod.yaml"]
+          # The deployment bundle imports this image into containerd. Never try
+          # an external registry in an air-gapped environment.
+          imagePullPolicy: Never
           envFrom:
             - secretRef:
                 name: defensive-ai-gateway-secrets
           ports:
             - name: http
               containerPort: 8080
+              hostPort: 8080
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            failureThreshold: 30
+            periodSeconds: 2
+            timeoutSeconds: 2
           readinessProbe:
             httpGet:
               path: /api/health
               port: http
-            initialDelaySeconds: 5
             periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /api/health
               port: http
-            initialDelaySeconds: 15
             periodSeconds: 20
+            timeoutSeconds: 2
+            failureThreshold: 3
           volumeMounts:
-            - name: config
-              mountPath: /etc/defensive-ai-gateway
-              readOnly: true
             - name: data
-              mountPath: /var/lib/defensive-ai-gateway
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
           securityContext:
             allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: false
+            readOnlyRootFilesystem: true
             runAsNonRoot: true
             runAsUser: 10001
+            runAsGroup: 10001
+            capabilities:
+              drop:
+                - ALL
       volumes:
-        - name: config
-          configMap:
-            name: defensive-ai-gateway-config
         - name: data
           persistentVolumeClaim:
             claimName: defensive-ai-gateway-data
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
 ---
+# ClusterIP remains available to in-cluster collectors. hostPort above exposes
+# the same application directly at http://<k3s-node-ip>:8080.
 apiVersion: v1
 kind: Service
 metadata:
@@ -130,27 +127,3 @@ spec:
     - name: http
       port: 8080
       targetPort: http
----
-# Ingress: production must terminate TLS here and, for bank SOC, enforce mutual
-# TLS (client certificate) on the upstream so only trusted SOC/collector clients
-# can reach the gateway. The application-level bearer token (DEFENSIVE_AI_API_TOKEN)
-# is a second layer, not a replacement for transport security.
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: defensive-ai-gateway
-  namespace: defensive-ai-gateway
-  annotations:
-    nginx.ingress.kubernetes.io/ssl-passthrough: "false"
-spec:
-  rules:
-    - host: defensive-ai-gateway.local
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: defensive-ai-gateway
-                port:
-                  number: 8080

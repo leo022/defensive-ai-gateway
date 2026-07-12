@@ -48,6 +48,47 @@ class RecommendedAction:
 
 
 @dataclass
+class ValidationFinding:
+    code: str
+    severity: str
+    message: str
+    evidence_refs: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ValidationResult:
+    validation_id: str
+    case_id: str
+    event_id: str
+    status: str
+    validator: str
+    validator_version: str
+    findings: list[ValidationFinding]
+    checks: dict[str, bool]
+    created_at_ms: int = field(default_factory=now_ms)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ApprovalRequest:
+    approval_id: str
+    case_id: str
+    event_id: str
+    action: str
+    rationale: str
+    rollback: str
+    mode: str = "approve_required"
+    status: str = "pending"
+    requested_by: str = "response-advisor"
+    created_at_ms: int = field(default_factory=now_ms)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class AgentResult:
     case_id: str
     agent: str

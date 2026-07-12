@@ -17,6 +17,7 @@ from defensive_ai_gateway.llm import GatewayLLM
 from defensive_ai_gateway.memory import MemoryManager
 from defensive_ai_gateway.models import AgentResult, NormalizedEvent, RawAlert, new_id
 from defensive_ai_gateway.policy import PolicyEngine
+from defensive_ai_gateway.processing import AlertProcessor
 
 
 def _config(tmp: Path, *, token: str = "") -> GatewayConfig:
@@ -366,6 +367,32 @@ class OversizedBodyTest(unittest.TestCase):
                 conn.close()
             finally:
                 srv.stop()
+
+
+class AlertProcessorShutdownTest(unittest.TestCase):
+    def test_stop_is_bounded_when_worker_is_busy_and_queue_is_full(self):
+        """Shutdown must not block trying to enqueue a sentinel into a full queue."""
+        started = threading.Event()
+        release = threading.Event()
+
+        def handler(alert):
+            started.set()
+            release.wait(2)
+
+        processor = AlertProcessor(handler, max_size=1, workers=1)
+        processor.start()
+        processor.submit(RawAlert("test", "waf", "first", "low", "t", {}, "first"))
+        self.assertTrue(started.wait(1))
+        processor.submit(RawAlert("test", "waf", "second", "low", "t", {}, "second"))
+
+        import time
+
+        started_at = time.monotonic()
+        processor.stop(timeout=0.05)
+        self.assertLess(time.monotonic() - started_at, 0.25)
+
+        release.set()
+        self.assertTrue(processor.wait_for_idle(timeout=1))
 
 
 # Lightweight stand-in to avoid importing sqlite3 at module top for one assertion.

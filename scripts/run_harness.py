@@ -107,6 +107,11 @@ def main():
     parser = argparse.ArgumentParser(description="Replay sample alerts through the local harness")
     parser.add_argument("--samples", default="samples", help="Directory containing *.json alert samples")
     parser.add_argument("--fail-on-low-confidence", type=float, default=0.0)
+    parser.add_argument(
+        "--fail-on-validation-review",
+        action="store_true",
+        help="Fail when Validator returns review or blocked instead of passed",
+    )
     parser.add_argument("--config", default="config/dev.yaml")
     parser.add_argument("--use-config-llm", action="store_true", help="Use the LLM provider from config instead of deterministic local analyzer")
     parser.add_argument("--random-count", type=int, default=0, help="Append N randomized sample alerts to the replay")
@@ -153,10 +158,17 @@ def main():
                 "whitelist_recommendation": result.explanation.get("whitelist_recommendation"),
                 "missing_evidence": result.missing_evidence,
                 "recommended_actions": [action.action for action in result.recommended_actions],
+                "skill": result.explanation.get("skill", {}),
+                "validation": result.explanation.get("validation", {}),
+                "approval_request_ids": result.explanation.get("approval_request_ids", []),
             }
             results.append(item)
             if args.fail_on_low_confidence and result.confidence < args.fail_on_low_confidence:
                 raise SystemExit(f"Low confidence for {path}: {result.confidence}")
+            if args.fail_on_validation_review and item["validation"].get("status") != "passed":
+                raise SystemExit(
+                    f"Validation gate failed for {path}: {item['validation'].get('status', 'missing')}"
+                )
         for idx, payload in enumerate(
             generate_alerts(args.random_count, product=args.random_product, scenario=args.random_scenario, seed=args.seed),
             start=1,
@@ -184,12 +196,36 @@ def main():
                 "whitelist_recommendation": result.explanation.get("whitelist_recommendation"),
                 "missing_evidence": result.missing_evidence,
                 "recommended_actions": [action.action for action in result.recommended_actions],
+                "skill": result.explanation.get("skill", {}),
+                "validation": result.explanation.get("validation", {}),
+                "approval_request_ids": result.explanation.get("approval_request_ids", []),
             }
             results.append(item)
             if args.fail_on_low_confidence and result.confidence < args.fail_on_low_confidence:
                 raise SystemExit(f"Low confidence for randomized alert {idx}: {result.confidence}")
+            if args.fail_on_validation_review and item["validation"].get("status") != "passed":
+                raise SystemExit(
+                    f"Validation gate failed for randomized alert {idx}: "
+                    f"{item['validation'].get('status', 'missing')}"
+                )
 
-    print(json.dumps({"samples": len(results), "static_samples": len(paths), "random_samples": args.random_count, "results": results}, ensure_ascii=False, indent=2))
+    validation_counts: dict[str, int] = {}
+    for item in results:
+        status = str(item.get("validation", {}).get("status") or "missing")
+        validation_counts[status] = validation_counts.get(status, 0) + 1
+    print(
+        json.dumps(
+            {
+                "samples": len(results),
+                "static_samples": len(paths),
+                "random_samples": args.random_count,
+                "validation": validation_counts,
+                "results": results,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

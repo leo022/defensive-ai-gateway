@@ -258,6 +258,65 @@ class PipelineTest(unittest.TestCase):
             evidence_text = json.dumps(linked[0]["normalized_event"]["evidence"], ensure_ascii=False)
             self.assertNotIn("demo-secret-token", evidence_text)
 
+    def test_replayed_alert_reuses_immutable_event_and_result(self):
+        """Delivery retries must not repeat LLM analysis or create extra links."""
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            repo = Repository(str(Path(tmp) / "gateway.db"))
+            policy = PolicyEngine(config.policy)
+            orchestrator = Orchestrator(repo, EventNormalizer(policy), MemoryManager(repo), LocalHeuristicLLM(), policy)
+            payload = json.loads(Path("samples/waf_alert.json").read_text(encoding="utf-8"))
+            alert = RawAlert(
+                source=payload["source"],
+                product=payload["product"],
+                event_type=payload["event_type"],
+                severity=payload["severity"],
+                timestamp=payload["timestamp"],
+                payload=payload["payload"],
+                alert_id=payload["alert_id"],
+            )
+
+            first = orchestrator.handle_alert(alert)
+            replay = orchestrator.handle_alert(alert)
+
+            self.assertEqual(replay.to_dict(), first.to_dict())
+            self.assertEqual(repo.conn.execute("SELECT COUNT(*) FROM raw_alerts").fetchone()[0], 1)
+            self.assertEqual(repo.conn.execute("SELECT COUNT(*) FROM normalized_events").fetchone()[0], 1)
+            self.assertEqual(repo.conn.execute("SELECT COUNT(*) FROM case_alert_links").fetchone()[0], 1)
+            self.assertEqual(repo.conn.execute("SELECT COUNT(*) FROM agent_runs").fetchone()[0], 1)
+            event_id = repo.conn.execute("SELECT event_id FROM normalized_events").fetchone()[0]
+            self.assertEqual(repo.conn.execute("SELECT event_id FROM agent_runs").fetchone()[0], event_id)
+
+    def test_correlated_alert_updates_existing_case_without_replacing_links(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            repo = Repository(str(Path(tmp) / "gateway.db"))
+            policy = PolicyEngine(config.policy)
+            orchestrator = Orchestrator(repo, EventNormalizer(policy), MemoryManager(repo), LocalHeuristicLLM(), policy)
+            payload = json.loads(Path("samples/waf_alert.json").read_text(encoding="utf-8"))
+            first_alert = RawAlert(
+                source=payload["source"], product=payload["product"], event_type=payload["event_type"],
+                severity=payload["severity"], timestamp=payload["timestamp"], payload=payload["payload"],
+                alert_id=payload["alert_id"],
+            )
+            second_alert = RawAlert(
+                source=payload["source"], product=payload["product"], event_type=payload["event_type"],
+                severity=payload["severity"], timestamp=payload["timestamp"], payload=payload["payload"],
+                alert_id=f"{payload['alert_id']}-retry-correlation",
+            )
+
+            first = orchestrator.handle_alert(first_alert)
+            created_at = repo.get_case(first.case_id)["created_at_ms"]
+            self.assertIsNotNone(repo.update_case_status(first.case_id, "under_review"))
+            second = orchestrator.handle_alert(second_alert)
+
+            self.assertEqual(second.case_id, first.case_id)
+            detail = repo.get_case(first.case_id)
+            self.assertEqual(detail["status"], "under_review")
+            self.assertEqual(detail["created_at_ms"], created_at)
+            self.assertEqual(len(detail["linked_alerts"]), 2)
+            self.assertEqual(len(detail["agent_runs"]), 2)
+
     def test_case_list_keeps_creation_order_and_filters(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Repository(str(Path(tmp) / "gateway.db"))

@@ -1,6 +1,6 @@
 # 多层记忆管理（Multi-layer Memory）
 
-本模块实现《银行业防御AI代理网关架构设计方案》第 8 章“三层记忆 + 一层证据”设计，并落地第 6 章 Memory Manager 与第 11 章记忆投毒控制。代码见 `defensive_ai_gateway/memory.py` 与 `database.py`。
+本模块实现《银行业防御AI代理网关架构设计方案》第 8 章"四层记忆 + 一层证据"（case_short_term / product_long_term / asset_profile / org_knowledge + evidence）设计，并落地第 6 章 Memory Manager 与第 11 章记忆投毒控制。代码见 `defensive_ai_gateway/memory.py` 与 `database.py`。
 
 端到端架构图与 memory 在 alert processing 中的位置见 `docs/DEMO_ARCHITECTURE.md`。
 

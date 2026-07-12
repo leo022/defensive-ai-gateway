@@ -7,6 +7,8 @@ GATEWAY_IMAGE="${GATEWAY_IMAGE:-defensive-ai-gateway:latest}"
 VECTOR_IMAGE="${VECTOR_IMAGE:-timberio/vector:0.39.0-alpine}"
 PLATFORM="${PLATFORM:-linux/amd64}"
 INCLUDE_VECTOR=0
+APP_VERSION="${APP_VERSION:-$(git -C "$ROOT_DIR" describe --always --dirty 2>/dev/null || echo dev)}"
+VCS_REF="${VCS_REF:-$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || echo unknown)}"
 
 usage() {
   cat <<'EOF'
@@ -76,7 +78,21 @@ mkdir -p "$OUT_DIR"
 
 echo "[build] gateway image: $GATEWAY_IMAGE"
 echo "[build] platform: $PLATFORM"
-docker buildx build --platform "$PLATFORM" --load -t "$GATEWAY_IMAGE" -f "$ROOT_DIR/deploy/docker/Dockerfile" "$ROOT_DIR"
+docker buildx build \
+  --platform "$PLATFORM" \
+  --load \
+  --build-arg "APP_VERSION=$APP_VERSION" \
+  --build-arg "VCS_REF=$VCS_REF" \
+  -t "$GATEWAY_IMAGE" \
+  -f "$ROOT_DIR/deploy/docker/Dockerfile" \
+  "$ROOT_DIR"
+
+BUILT_PLATFORM="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$GATEWAY_IMAGE")"
+if [ "$BUILT_PLATFORM" != "$PLATFORM" ]; then
+  echo "built image platform mismatch: expected $PLATFORM, got $BUILT_PLATFORM" >&2
+  exit 1
+fi
+echo "[build] verified image platform: $BUILT_PLATFORM"
 
 GATEWAY_TAR="$OUT_DIR/$(image_file_name "$GATEWAY_IMAGE").tar"
 docker save "$GATEWAY_IMAGE" -o "$GATEWAY_TAR"

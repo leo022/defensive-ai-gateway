@@ -16,6 +16,12 @@ python3 scripts/run_harness.py --samples samples
 python3 scripts/run_harness.py --samples samples --fail-on-low-confidence 0.5
 ```
 
+第二阶段可同时启用 Validator 发布门禁；任何 `review` 或 `blocked` 都会让回放以非零状态退出：
+
+```bash
+python3 scripts/run_harness.py --samples samples --fail-on-validation-review
+```
+
 使用配置中的 LLM provider，例如默认的本地规则分析器，或手动切换后的本地 Ollama：
 
 ```bash
@@ -63,7 +69,8 @@ Harness 输出 JSON，顶层字段包括：
 - `samples`：总回放数量。
 - `static_samples`：来自 `samples/*.json` 的数量。
 - `random_samples`：随机生成数量。
-- `results`：每条样例的 `case_id`、`agent`、`classification`、`severity`、`confidence`、`verdict`、`analysis_dimensions`、`whitelist_recommendation`、`missing_evidence` 和 `recommended_actions`。
+- `validation`：Validator 的 `passed/review/blocked` 汇总。
+- `results`：每条样例除分析字段外还包含 `skill`、`validation` 与 `approval_request_ids`。
 - `mapping_profile`：当使用 profile 回放静态样本时记录 profile id。
 
 这些字段与 Dashboard 展开的 Case 信息来自同一 `AgentResult` 与 SQLite schema，因此可作为 prompt、normalizer、policy、memory 变更的回归对照。

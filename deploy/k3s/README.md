@@ -1,11 +1,11 @@
 # k3s 离线部署物料
 
-这套物料用于服务器不直接安装 Python 的部署方式。Python 运行时会封装在网关镜像里，目标服务器只需要有 k3s/containerd、kubectl 和可用的存储。
+这套物料用于服务器不直接安装 Python 的部署方式。Python 运行时和离线默认配置封装在网关镜像里，目标服务器只需要有 k3s/containerd、kubectl 和 k3s 默认 local-path 存储。
 
 ## 物料清单
 
 - `deploy/docker/Dockerfile`：网关镜像构建文件。
-- `deploy/k3s/gateway.yaml`：Namespace、ConfigMap、PVC、Deployment、Service、Ingress。
+- `deploy/k3s/gateway.yaml`：Namespace、Secret、PVC、Deployment 和 Service；通过节点 `hostPort: 8080` 直接暴露。
 - `deploy/k3s/syslog-collector-vector.yaml`：可选的 Vector syslog collector。
 - `deploy/k3s/env.example`：生产 Secret 环境变量模板。
 - `deploy/k3s/build-offline-images.sh`：在构建机上构建并导出离线镜像 tar。
@@ -62,17 +62,18 @@ tar -xzf defensive-ai-gateway-k3s-deploy.tar.gz
 cd defensive-ai-gateway-k3s-deploy
 ```
 
-准备 Secret：
-
-```bash
-cp .env.example .env
-vi .env
-```
-
 部署网关：
 
 ```bash
 bash install.sh
+```
+
+无需创建 `.env`。默认使用本地确定性分析器，数据写入 PVC，并允许可信隔离内网直接使用。启用 Bearer Token 时再执行：
+
+```bash
+cp .env.example .env
+vi .env
+bash install.sh --require-token
 ```
 
 如果同时部署 syslog collector：
@@ -81,7 +82,7 @@ bash install.sh
 bash install.sh --with-syslog
 ```
 
-重复执行 `bash install.sh` 会重新校验并导入镜像，`kubectl apply` 覆盖已有 Namespace、ConfigMap、Deployment、Service、Ingress 等清单，更新 Secret，并重启网关 Deployment。
+重复执行 `bash install.sh` 会重新校验并导入镜像，`kubectl apply` 覆盖已有 Deployment、Service、PVC 等物料，更新可选 Secret，并重启网关 Deployment。
 
 ## 4. 验证
 
@@ -89,8 +90,13 @@ bash install.sh --with-syslog
 kubectl -n defensive-ai-gateway get pods
 kubectl -n defensive-ai-gateway get svc
 kubectl -n defensive-ai-gateway rollout status deployment/defensive-ai-gateway
-kubectl -n defensive-ai-gateway port-forward svc/defensive-ai-gateway 8080:8080
 curl http://127.0.0.1:8080/api/health
 ```
 
-生产环境应通过 Ingress/TLS/mTLS 暴露服务，不建议直接开放 Pod 或 NodePort。
+局域网客户端直接访问：
+
+```text
+http://<k3s节点内网IP>:8080
+```
+
+零配置模式以隔离内网为前提。跨安全域或生产长期运行时，应设置 `DEFENSIVE_AI_API_TOKEN`，并由现有反向代理补充 TLS/mTLS 和来源访问控制。

@@ -953,6 +953,72 @@ h4 {
   font-size: 12px;
 }
 
+.validation-gate,
+.approval-queue {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+
+.validation-gate.passed .case-disposition-head strong {
+  color: var(--success);
+}
+
+.validation-gate.review .case-disposition-head strong {
+  color: var(--warning);
+}
+
+.validation-gate.blocked .case-disposition-head strong {
+  color: var(--risk);
+}
+
+.approval-item {
+  display: grid;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-2);
+  padding: 11px;
+}
+
+.approval-item p,
+.approval-item small {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.approval-item small {
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.approval-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.approval-decision {
+  min-height: 30px;
+  padding: 5px 10px;
+  font-size: 12px;
+  font-weight: 720;
+}
+
+.approval-decision:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.approval-status {
+  min-height: 18px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .verdict-box {
   display: grid;
   gap: 4px;

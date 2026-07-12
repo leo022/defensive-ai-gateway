@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -43,7 +44,7 @@ class AlertProcessor:
 
     def __init__(self, handler: Callable[[RawAlert], object], *, max_size: int = 5000, workers: int = 4):
         self._handler = handler
-        self._queue: queue.Queue[RawAlert | None] = queue.Queue(maxsize=max(1, int(max_size)))
+        self._queue: queue.Queue[RawAlert] = queue.Queue(maxsize=max(1, int(max_size)))
         self._worker_count = max(1, int(workers))
         self._threads: list[threading.Thread] = []
         self._lock = threading.Lock()
@@ -59,54 +60,62 @@ class AlertProcessor:
         with self._lock:
             if self._started:
                 return
+            if self._stopped:
+                raise RuntimeError("cannot start a stopped alert processor")
             self._started = True
-        for idx in range(self._worker_count):
-            thread = threading.Thread(target=self._run, name=f"alert-worker-{idx + 1}", daemon=True)
-            thread.start()
-            self._threads.append(thread)
+            for idx in range(self._worker_count):
+                thread = threading.Thread(target=self._run, name=f"alert-worker-{idx + 1}", daemon=True)
+                thread.start()
+                self._threads.append(thread)
 
     def submit(self, alert: RawAlert) -> None:
         with self._lock:
             if self._stopped:
                 self._rejected += 1
                 raise AlertQueueFull("alert processor is stopped")
-        try:
-            self._queue.put_nowait(alert)
-        except queue.Full as exc:
-            with self._lock:
+            try:
+                self._queue.put_nowait(alert)
+            except queue.Full as exc:
                 self._rejected += 1
-            raise AlertQueueFull("alert queue is full") from exc
-        with self._lock:
+                raise AlertQueueFull("alert queue is full") from exc
             self._submitted += 1
 
     def wait_for_idle(self, timeout: float | None = None) -> bool:
         """Wait until all submitted work has been processed.
 
-        ``queue.Queue.join`` has no timeout, so tests use a short polling loop.
+        ``queue.Queue.join`` has no timeout. Polling its unfinished-task count
+        avoids creating a disposable waiting thread for every health/test call.
         """
         if timeout is None:
             self._queue.join()
             return self.stats().inflight == 0
-        finished = threading.Event()
+        deadline = time.monotonic() + max(0, timeout)
+        while True:
+            if self._queue.unfinished_tasks == 0:
+                stats = self.stats()
+                if stats.inflight == 0 and stats.queued == 0:
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
 
-        def waiter() -> None:
-            self._queue.join()
-            finished.set()
+    def stop(self, timeout: float = 5.0) -> None:
+        """Stop accepting work and drain the queue without a shutdown deadlock.
 
-        thread = threading.Thread(target=waiter, daemon=True)
-        thread.start()
-        ok = finished.wait(timeout)
-        return bool(ok and self.stats().inflight == 0 and self.stats().queued == 0)
-
-    def stop(self) -> None:
+        The previous sentinel-based shutdown could block forever when all workers
+        were busy and the bounded queue was full. Workers now poll with a short
+        timeout, drain accepted alerts, then exit once the queue is empty. The
+        join has one shared deadline so server shutdown remains bounded even when
+        an LLM call is slow or unavailable.
+        """
         with self._lock:
             if self._stopped:
                 return
             self._stopped = True
-        for _ in self._threads:
-            self._queue.put(None)
-        for thread in self._threads:
-            thread.join(timeout=2)
+            threads = list(self._threads)
+        deadline = time.monotonic() + max(0, timeout)
+        for thread in threads:
+            thread.join(timeout=max(0, deadline - time.monotonic()))
 
     def stats(self) -> AlertProcessorStats:
         with self._lock:
@@ -124,10 +133,13 @@ class AlertProcessor:
 
     def _run(self) -> None:
         while True:
-            item = self._queue.get()
-            if item is None:
-                self._queue.task_done()
-                return
+            try:
+                item = self._queue.get(timeout=0.2)
+            except queue.Empty:
+                with self._lock:
+                    if self._stopped:
+                        return
+                continue
             with self._lock:
                 self._inflight += 1
             try:

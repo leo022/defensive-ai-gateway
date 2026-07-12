@@ -4,6 +4,7 @@ import argparse
 import hmac
 import json
 import mimetypes
+import os
 import threading
 import urllib.error
 import urllib.request
@@ -31,6 +32,7 @@ from .normalizer import EventNormalizer
 from .orchestrator import Orchestrator
 from .policy import PolicyEngine
 from .processing import AlertProcessor, AlertQueueFull
+from .skills import SkillRegistry
 from .syslog_receiver import SyslogListenerSpec, SyslogReceiverManager
 from .syslog_router import SyslogPortRouter
 
@@ -126,10 +128,13 @@ class GatewayState:
         self.policy = PolicyEngine(config.policy)
         self.normalizer = EventNormalizer(self.policy)
         self.memory = MemoryManager(self.repo, self.policy)
+        self.skills = SkillRegistry()
         self.llm = build_llm(config.llm)
         self.log_adapter = LogAdapter(self.normalizer)
         self._seed_mapping_profiles()
-        self.orchestrator = Orchestrator(self.repo, self.normalizer, self.memory, self.llm, self.policy)
+        self.orchestrator = Orchestrator(
+            self.repo, self.normalizer, self.memory, self.llm, self.policy, skills=self.skills
+        )
         self.syslog_receiver = SyslogReceiverManager(config.server.host, self._handle_syslog_message)
         self.alert_processor = (
             AlertProcessor(
@@ -223,7 +228,9 @@ class GatewayState:
             )
             self.config.llm = updated
             self.llm = build_llm(updated)
-            self.orchestrator = Orchestrator(self.repo, self.normalizer, self.memory, self.llm, self.policy)
+            self.orchestrator = Orchestrator(
+                self.repo, self.normalizer, self.memory, self.llm, self.policy, skills=self.skills
+            )
             return self.llm_config_payload()
 
     def list_ollama_models(self, endpoint_override: str = "") -> dict:
@@ -275,6 +282,161 @@ class GatewayState:
                 "error": str(exc),
             }
 
+    def test_llm_connection(self, payload: dict) -> dict:
+        """Test LLM connectivity using the supplied form values (before saving).
+
+        Accepts the form fields directly so the operator can verify reachability
+        and credentials without persisting the configuration first. This mirrors
+        the ``list_ollama_models`` pattern but generalizes across all three
+        providers: local (always ok), ollama (hit /api/tags), and gateway (light
+        POST with auth).
+        """
+        provider = str(payload.get("provider", "")).strip().lower()
+        endpoint = str(payload.get("endpoint", "")).strip()
+        api_key = str(payload.get("api_key", "")).strip()
+        api_key_env = str(payload.get("api_key_env", "DEFENSIVE_AI_LLM_API_KEY")).strip() or "DEFENSIVE_AI_LLM_API_KEY"
+        model = str(payload.get("model", "")).strip()
+        timeout = max(1, min(int(payload.get("timeout_seconds", 15)), 30))
+
+        if provider == "local":
+            return {
+                "ok": True,
+                "provider": "local",
+                "message": "本地分析器在进程内运行，无需网络连接。",
+                "detail": "",
+            }
+
+        if provider == "ollama":
+            tags_url = _ollama_tags_url(endpoint)
+            host = (urlparse(tags_url).hostname or "").lower()
+            if host not in _ALLOWED_OLLAMA_HOSTS:
+                return {
+                    "ok": False,
+                    "provider": "ollama",
+                    "endpoint": tags_url,
+                    "message": f"Ollama 主机 '{host}' 不在本地允许列表中。",
+                    "detail": "",
+                }
+            try:
+                req = urllib.request.Request(tags_url, headers={"Accept": "application/json"}, method="GET")
+                with urllib.request.urlopen(req, timeout=min(timeout, 10)) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                models = [str(m.get("name") or m.get("model", "")) for m in data.get("models", [])]
+                return {
+                    "ok": True,
+                    "provider": "ollama",
+                    "endpoint": tags_url,
+                    "message": f"Ollama 可达，已加载 {len(models)} 个模型。",
+                    "detail": f"{len(models)} 个模型",
+                }
+            except urllib.error.HTTPError as exc:
+                return {
+                    "ok": False,
+                    "provider": "ollama",
+                    "endpoint": tags_url,
+                    "message": f"Ollama 返回 HTTP {exc.code}，请确认服务已启动。",
+                    "detail": exc.read().decode("utf-8", errors="ignore")[:200],
+                }
+            except urllib.error.URLError as exc:
+                return {
+                    "ok": False,
+                    "provider": "ollama",
+                    "endpoint": tags_url,
+                    "message": f"Ollama 不可达：{exc.reason}",
+                    "detail": str(exc.reason),
+                }
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "provider": "ollama",
+                    "endpoint": tags_url,
+                    "message": f"Ollama 探测失败：{exc}",
+                    "detail": str(exc),
+                }
+
+        # gateway (and any future provider) — send a lightweight authenticated POST
+        # and verify the endpoint returns valid JSON.
+        if not endpoint:
+            return {
+                "ok": False,
+                "provider": provider or "gateway",
+                "endpoint": "",
+                "message": "Gateway endpoint 未配置，请先填写服务 URL。",
+                "detail": "",
+            }
+
+        # Resolve the api_key: form override → saved config → env var.
+        with self.lock:
+            saved_key = self.config.llm.api_key
+            saved_key_env = self.config.llm.api_key_env
+        resolved_key = api_key or saved_key or os.getenv(api_key_env) or os.getenv(saved_key_env)
+
+        test_payload = json.dumps(
+            {"model": model or "probe", "prompt": "connectivity-test", "context": {}},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        try:
+            req = urllib.request.Request(
+                endpoint,
+                data=test_payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            if resolved_key:
+                req.add_header("Authorization", f"Bearer {resolved_key}")
+            with urllib.request.urlopen(req, timeout=min(timeout, 15)) as resp:
+                body = resp.read().decode("utf-8")
+                if resp.status >= 400:
+                    return {
+                        "ok": False,
+                        "provider": provider,
+                        "endpoint": endpoint,
+                        "message": f"Gateway 返回 HTTP {resp.status}，请检查凭据和端点。",
+                        "detail": body[:200],
+                    }
+                try:
+                    json.loads(body)
+                except json.JSONDecodeError:
+                    return {
+                        "ok": False,
+                        "provider": provider,
+                        "endpoint": endpoint,
+                        "message": "Gateway 返回了非 JSON 响应，请确认端点正确。",
+                        "detail": body[:200],
+                    }
+                return {
+                    "ok": True,
+                    "provider": provider,
+                    "endpoint": endpoint,
+                    "message": f"Gateway 可达，端点返回正常 JSON 响应。",
+                    "detail": f"HTTP {resp.status}",
+                }
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="ignore")
+            return {
+                "ok": False,
+                "provider": provider,
+                "endpoint": endpoint,
+                "message": f"Gateway 返回 HTTP {exc.code}，请检查凭据。",
+                "detail": body[:200],
+            }
+        except urllib.error.URLError as exc:
+            return {
+                "ok": False,
+                "provider": provider,
+                "endpoint": endpoint,
+                "message": f"Gateway 不可达：{exc.reason}",
+                "detail": str(exc.reason),
+            }
+        except OSError as exc:
+            return {
+                "ok": False,
+                "provider": provider,
+                "endpoint": endpoint,
+                "message": f"网络错误：{exc}",
+                "detail": str(exc),
+            }
+
     def reload_llm_defaults(self) -> dict:
         """Reload the LLM configuration from the config file + environment.
 
@@ -288,7 +450,9 @@ class GatewayState:
             config = load_config(self.config_path)
             self.config = config
             self.llm = build_llm(config.llm)
-            self.orchestrator = Orchestrator(self.repo, self.normalizer, self.memory, self.llm, self.policy)
+            self.orchestrator = Orchestrator(
+                self.repo, self.normalizer, self.memory, self.llm, self.policy, skills=self.skills
+            )
             return self.llm_config_payload()
 
     # ---- runtime syslog intake ---------------------------------------------
@@ -568,6 +732,42 @@ class GatewayState:
                 )
                 return {"ok": True, "case": updated}
 
+    def decide_approval(self, approval_id: str, body: dict) -> dict:
+        decision = str(body.get("decision") or "").strip().lower()
+        actor = str(body.get("actor") or "").strip()
+        reason = str(body.get("reason") or "").strip()
+        if decision not in {"approved", "rejected", "cancelled"}:
+            raise ValueError(f"unsupported approval decision: {decision}")
+        if not actor:
+            raise ValueError("approval actor is required")
+        if not reason:
+            raise ValueError("approval decision reason is required")
+        with self.lock:
+            existing = self.repo.get_approval(approval_id)
+            if not existing:
+                raise KeyError("approval not found")
+            with self.repo.transaction():
+                updated = self.repo.decide_approval(
+                    approval_id, decision, actor, reason, _commit=False
+                )
+                if not updated:
+                    raise ValueError("approval is no longer pending")
+                self.repo.insert_audit(
+                    new_id("audit"),
+                    str(updated["case_id"]),
+                    actor,
+                    "approval_decided",
+                    {
+                        "approval_id": approval_id,
+                        "case_id": updated["case_id"],
+                        "decision": decision,
+                        "reason": reason,
+                        "execution_status": "not_executed",
+                    },
+                    _commit=False,
+                )
+                return {"ok": True, "approval": updated}
+
     def confirm_alert_false_positive(self, alert_id: str, body: dict) -> dict:
         with self.lock:
             linked = self.repo.get_linked_alert(alert_id)
@@ -647,27 +847,38 @@ class GatewayHandler(BaseHTTPRequestHandler):
     def _read_json(self) -> dict:
         try:
             length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            length = 0
+        except (TypeError, ValueError) as exc:
+            # Do not leave an unframed body on a persistent connection: it could
+            # be interpreted as the start of a later HTTP request.
+            self.close_connection = True
+            raise ValueError("invalid Content-Length") from exc
         # Clamp negatives: a Content-Length of -1 would otherwise make
         # rfile.read(-1) read until EOF (unbounded memory). Treat as empty.
         if length < 0:
             length = 0
         if length > MAX_BODY_BYTES:
-            # Reject without reading the (potentially gigantic) body. We cap the
-            # drain at MAX_BODY_BYTES so a hostile Content-Length can't pin a
-            # worker reading forever; the connection is then closed by the server.
-            remaining = MAX_BODY_BYTES
-            while remaining > 0:
-                chunk = self.rfile.read(min(65536, remaining))
-                if not chunk:
-                    break
-                remaining -= len(chunk)
+            # Drain at most the permitted body size before closing. This lets a
+            # normal client finish writing and receive its 413, while the short
+            # socket timeout bounds a peer that advertises a huge body but sends
+            # it slowly. Closing prevents any remaining bytes from becoming a
+            # later HTTP request on this connection.
+            self.close_connection = True
+            original_timeout = self.connection.gettimeout()
+            try:
+                self.connection.settimeout(0.25)
+                self.rfile.read(MAX_BODY_BYTES)
+            except OSError:
+                pass
+            finally:
+                self.connection.settimeout(original_timeout)
             raise _PayloadTooLarge()
         raw = self.rfile.read(length) if length > 0 else b""
         if not raw:
             return {}
-        return json.loads(raw.decode("utf-8"))
+        payload = json.loads(raw.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("JSON body must be an object")
+        return payload
 
     def _client_error(self, exc: Exception) -> None:
         self._json(400, {"error": str(exc)})
@@ -699,6 +910,26 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/mapping-profiles":
             self._json(200, {"profiles": self.state.list_mapping_profiles()})
+            return
+        if parsed.path == "/api/skills":
+            if not self._require_auth():
+                return
+            self._json(200, {"skills": self.state.skills.list()})
+            return
+        if parsed.path == "/api/approvals":
+            if not self._require_auth():
+                return
+            query = parse_qs(parsed.query)
+            self._json(
+                200,
+                {
+                    "approvals": self.state.repo.list_approvals(
+                        case_id=_query_first(query, "case_id") or None,
+                        status=_query_first(query, "status") or None,
+                        limit=_query_int(query, "limit", 100, min_value=1, max_value=500),
+                    )
+                },
+            )
             return
         if parsed.path == "/api/samples/rasp-alert":
             self._json(200, self.state.rasp_sample_log())
@@ -781,6 +1012,17 @@ class GatewayHandler(BaseHTTPRequestHandler):
             try:
                 reloaded = self.state.reload_llm_defaults()
                 self._json(200, {"ok": True, "llm": reloaded})
+            except _PayloadTooLarge:
+                self._json(413, {"error": "request body too large"})
+            except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                self._client_error(exc)
+            except Exception as exc:
+                self._server_error(exc)
+            return
+        if parsed.path == "/api/config/llm/test":
+            try:
+                result = self.state.test_llm_connection(self._read_json())
+                self._json(200, result)
             except _PayloadTooLarge:
                 self._json(413, {"error": "request body too large"})
             except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
@@ -884,6 +1126,19 @@ class GatewayHandler(BaseHTTPRequestHandler):
             except _PayloadTooLarge:
                 self._json(413, {"error": "request body too large"})
             except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                self._client_error(exc)
+            except Exception as exc:
+                self._server_error(exc)
+            return
+        if parsed.path.startswith("/api/approvals/") and parsed.path.endswith("/decision"):
+            approval_id = unquote(parsed.path.split("/")[-2])
+            try:
+                self._json(200, self.state.decide_approval(approval_id, self._read_json()))
+            except _PayloadTooLarge:
+                self._json(413, {"error": "request body too large"})
+            except KeyError:
+                self._json(404, {"error": "approval not found"})
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
                 self._client_error(exc)
             except Exception as exc:
                 self._server_error(exc)

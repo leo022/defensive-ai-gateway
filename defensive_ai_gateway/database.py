@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS cases (
 CREATE TABLE IF NOT EXISTS agent_runs (
   run_id TEXT PRIMARY KEY,
   case_id TEXT NOT NULL,
+  event_id TEXT NOT NULL DEFAULT '',
   agent TEXT NOT NULL,
   product TEXT NOT NULL,
   prompt_version TEXT NOT NULL,
@@ -116,16 +117,51 @@ CREATE TABLE IF NOT EXISTS mapping_profiles (
   created_at_ms INTEGER NOT NULL,
   updated_at_ms INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS validation_runs (
+  validation_id TEXT PRIMARY KEY,
+  case_id TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  validator TEXT NOT NULL,
+  validator_version TEXT NOT NULL,
+  status TEXT NOT NULL,
+  result_json TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  FOREIGN KEY (case_id) REFERENCES cases(case_id),
+  FOREIGN KEY (event_id) REFERENCES normalized_events(event_id),
+  CHECK (status IN ('passed','review','blocked'))
+);
+CREATE TABLE IF NOT EXISTS action_approvals (
+  approval_id TEXT PRIMARY KEY,
+  case_id TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  action_json TEXT NOT NULL,
+  status TEXT NOT NULL,
+  requested_by TEXT NOT NULL,
+  decided_by TEXT NOT NULL DEFAULT '',
+  decision_reason TEXT NOT NULL DEFAULT '',
+  execution_status TEXT NOT NULL DEFAULT 'not_executed',
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  FOREIGN KEY (case_id) REFERENCES cases(case_id),
+  FOREIGN KEY (event_id) REFERENCES normalized_events(event_id),
+  CHECK (status IN ('pending','approved','rejected','cancelled')),
+  CHECK (execution_status = 'not_executed')
+);
 CREATE INDEX IF NOT EXISTS idx_normalized_alert ON normalized_events(alert_id);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_case ON agent_runs(case_id);
 CREATE INDEX IF NOT EXISTS idx_case_links_alert ON case_alert_links(alert_id);
 CREATE INDEX IF NOT EXISTS idx_case_links_case ON case_alert_links(case_id);
+CREATE INDEX IF NOT EXISTS idx_case_links_case_created ON case_alert_links(case_id, created_at_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_memory_lookup ON memory_entries(layer, namespace, status);
+CREATE INDEX IF NOT EXISTS idx_memory_lookup_created ON memory_entries(layer, namespace, status, created_at_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_memory_expiry ON memory_entries(status, expires_at_ms);
 CREATE INDEX IF NOT EXISTS idx_memory_events_mem ON memory_events(memory_id);
+CREATE INDEX IF NOT EXISTS idx_validation_case ON validation_runs(case_id, created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_approvals_case ON action_approvals(case_id, created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_approvals_status ON action_approvals(status, created_at_ms DESC);
 """
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 
 class Repository:
@@ -218,15 +254,55 @@ class Repository:
                     (now_ms(),),
                 )
 
+            if current < 4:
+                # v4: durable idempotency for alert retries plus indexes for the
+                # high-volume case list and layered-memory retrieval paths.
+                run_columns = {
+                    row["name"]
+                    for row in self.conn.execute("PRAGMA table_info(agent_runs)").fetchall()
+                }
+                if "event_id" not in run_columns:
+                    self.conn.execute("ALTER TABLE agent_runs ADD COLUMN event_id TEXT NOT NULL DEFAULT ''")
+                self.conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_runs_event ON agent_runs(event_id)")
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_case_links_case_created "
+                    "ON case_alert_links(case_id, created_at_ms DESC)"
+                )
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_memory_lookup_created "
+                    "ON memory_entries(layer, namespace, status, created_at_ms DESC)"
+                )
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO schema_version(version, applied_at_ms) VALUES (4, ?)",
+                    (now_ms(),),
+                )
+
+            if current < 5:
+                # v5 tables are created by SCHEMA for both new and existing DBs.
+                # Record the migration only after verifying their required safety
+                # columns exist, so a partial upgrade cannot be reported healthy.
+                approval_columns = {
+                    row["name"] for row in self.conn.execute("PRAGMA table_info(action_approvals)").fetchall()
+                }
+                required = {"approval_id", "status", "execution_status", "action_json"}
+                if not required.issubset(approval_columns):
+                    raise RuntimeError("action_approvals schema is incomplete")
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO schema_version(version, applied_at_ms) VALUES (5, ?)",
+                    (now_ms(),),
+                )
+
             self.conn.commit()
 
-    def insert_raw_alert(self, alert: RawAlert, _commit: bool = True) -> None:
+    def insert_raw_alert(self, alert: RawAlert, _commit: bool = True) -> bool:
         with self._lock:
-            # raw_alerts upsert is intentional: a re-delivered alert with the same
-            # id should not duplicate, and the payload is the source of truth.
-            self.conn.execute(
+            # ``INSERT OR REPLACE`` deletes the old row before re-inserting it.
+            # That violates the normalized_events foreign key on a retry. An
+            # alert_id is our idempotency key, so preserve the first raw evidence
+            # and let the caller reuse its immutable normalized event instead.
+            cur = self.conn.execute(
                 """
-                INSERT OR REPLACE INTO raw_alerts
+                INSERT OR IGNORE INTO raw_alerts
                 (alert_id, source, product, event_type, severity, timestamp, payload_json, created_at_ms)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
@@ -243,6 +319,7 @@ class Repository:
             )
             if _commit:
                 self.conn.commit()
+            return cur.rowcount > 0
 
     def insert_normalized_event(self, event: NormalizedEvent, _commit: bool = True) -> bool:
         """Append-only insert of a normalized event.
@@ -284,46 +361,52 @@ class Repository:
 
     def upsert_case(self, result: AgentResult, product: str, _commit: bool = True) -> None:
         with self._lock:
-            # cases is a live aggregate: updated as new alerts land on the same
-            # deterministic case_id, so upsert (preserving created_at_ms) is correct.
-            existing = self.conn.execute(
-                "SELECT created_at_ms, status FROM cases WHERE case_id = ?",
-                (result.case_id,),
-            ).fetchone()
-            created = existing["created_at_ms"] if existing else result.created_at_ms
-            status = existing["status"] if existing else "open"
+            # Cases are a live aggregate. SQLite ``REPLACE`` deletes the existing
+            # parent row before inserting, which breaks its agent-run and alert-link
+            # foreign keys. A true conflict update preserves created_at_ms and the
+            # analyst-controlled status while refreshing the latest assessment.
             self.conn.execute(
                 """
-                INSERT OR REPLACE INTO cases
+                INSERT INTO cases
                 (case_id, product, status, severity, classification, confidence, summary, created_at_ms, updated_at_ms)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(case_id) DO UPDATE SET
+                  product = excluded.product,
+                  severity = excluded.severity,
+                  classification = excluded.classification,
+                  confidence = excluded.confidence,
+                  summary = excluded.summary,
+                  updated_at_ms = excluded.updated_at_ms
                 """,
                 (
                     result.case_id,
                     product,
-                    status,
+                    "open",
                     result.severity,
                     result.classification,
                     result.confidence,
                     result.summary,
-                    created,
+                    result.created_at_ms,
                     now_ms(),
                 ),
             )
             if _commit:
                 self.conn.commit()
 
-    def insert_agent_run(self, run_id: str, result: AgentResult, product: str, prompt_version: str, _commit: bool = True) -> None:
+    def insert_agent_run(
+        self, run_id: str, result: AgentResult, product: str, prompt_version: str, event_id: str, _commit: bool = True
+    ) -> None:
         with self._lock:
             self.conn.execute(
                 """
                 INSERT INTO agent_runs
-                (run_id, case_id, agent, product, prompt_version, result_json, created_at_ms)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                (run_id, case_id, event_id, agent, product, prompt_version, result_json, created_at_ms)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
                     result.case_id,
+                    event_id,
                     result.agent,
                     product,
                     prompt_version,
@@ -333,6 +416,147 @@ class Repository:
             )
             if _commit:
                 self.conn.commit()
+
+    def insert_validation(self, validation: dict[str, Any], _commit: bool = True) -> None:
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO validation_runs
+                (validation_id, case_id, event_id, validator, validator_version, status, result_json, created_at_ms)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    validation["validation_id"],
+                    validation["case_id"],
+                    validation["event_id"],
+                    validation["validator"],
+                    validation["validator_version"],
+                    validation["status"],
+                    json.dumps(validation, ensure_ascii=False, sort_keys=True),
+                    int(validation["created_at_ms"]),
+                ),
+            )
+            if _commit:
+                self.conn.commit()
+
+    def insert_approval(self, approval: dict[str, Any], _commit: bool = True) -> bool:
+        with self._lock:
+            action_json = json.dumps(
+                {
+                    "action": approval["action"],
+                    "rationale": approval["rationale"],
+                    "rollback": approval["rollback"],
+                    "mode": approval["mode"],
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            cur = self.conn.execute(
+                """
+                INSERT OR IGNORE INTO action_approvals
+                (approval_id, case_id, event_id, action_json, status, requested_by,
+                 decided_by, decision_reason, execution_status, created_at_ms, updated_at_ms)
+                VALUES (?, ?, ?, ?, 'pending', ?, '', '', 'not_executed', ?, ?)
+                """,
+                (
+                    approval["approval_id"],
+                    approval["case_id"],
+                    approval["event_id"],
+                    action_json,
+                    approval["requested_by"],
+                    int(approval["created_at_ms"]),
+                    int(approval["created_at_ms"]),
+                ),
+            )
+            if _commit:
+                self.conn.commit()
+            return cur.rowcount > 0
+
+    def decide_approval(
+        self, approval_id: str, decision: str, actor: str, reason: str, _commit: bool = True
+    ) -> dict[str, Any] | None:
+        if decision not in {"approved", "rejected", "cancelled"}:
+            raise ValueError(f"unsupported approval decision: {decision}")
+        with self._lock:
+            updated_at = now_ms()
+            cur = self.conn.execute(
+                """
+                UPDATE action_approvals
+                SET status = ?, decided_by = ?, decision_reason = ?, updated_at_ms = ?
+                WHERE approval_id = ? AND status = 'pending'
+                """,
+                (decision, actor, reason, updated_at, approval_id),
+            )
+            if cur.rowcount == 0:
+                return None
+            if _commit:
+                self.conn.commit()
+            return self.get_approval(approval_id)
+
+    def get_approval(self, approval_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.conn.execute("SELECT * FROM action_approvals WHERE approval_id = ?", (approval_id,)).fetchone()
+            return self._approval_row(row) if row else None
+
+    def list_approvals(
+        self, case_id: str | None = None, status: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            clauses: list[str] = []
+            params: list[Any] = []
+            if case_id:
+                clauses.append("case_id = ?")
+                params.append(case_id)
+            if status:
+                clauses.append("status = ?")
+                params.append(status)
+            sql = "SELECT * FROM action_approvals"
+            if clauses:
+                sql += " WHERE " + " AND ".join(clauses)
+            sql += " ORDER BY created_at_ms DESC LIMIT ?"
+            params.append(max(1, min(int(limit), 500)))
+            return [self._approval_row(row) for row in self.conn.execute(sql, params).fetchall()]
+
+    @staticmethod
+    def _approval_row(row: sqlite3.Row) -> dict[str, Any]:
+        payload = dict(row)
+        payload["action"] = json.loads(payload.pop("action_json"))
+        return payload
+
+    def get_normalized_event(self, event_id: str) -> NormalizedEvent | None:
+        """Load the immutable event persisted for an alert retry."""
+        with self._lock:
+            row = self.conn.execute(
+                """
+                SELECT event_id, alert_id, source, product, event_type, severity, timestamp,
+                       entities_json, evidence_json, sensitivity_tags_json
+                FROM normalized_events WHERE event_id = ?
+                """,
+                (event_id,),
+            ).fetchone()
+            if not row:
+                return None
+            return NormalizedEvent(
+                event_id=row["event_id"],
+                raw_ref=row["alert_id"],
+                source=row["source"],
+                product=row["product"],
+                event_type=row["event_type"],
+                severity=row["severity"],
+                timestamp=row["timestamp"],
+                entities=json.loads(row["entities_json"]),
+                evidence=json.loads(row["evidence_json"]),
+                sensitivity_tags=json.loads(row["sensitivity_tags_json"]),
+            )
+
+    def get_agent_result_for_event(self, event_id: str) -> dict[str, Any] | None:
+        """Return the completed analysis for one immutable event, if any."""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT result_json FROM agent_runs WHERE event_id = ? ORDER BY created_at_ms DESC LIMIT 1",
+                (event_id,),
+            ).fetchone()
+            return json.loads(row["result_json"]) if row else None
 
     def link_case_alert(self, case_id: str, alert_id: str, event_id: str, _commit: bool = True) -> None:
         with self._lock:
@@ -713,6 +937,12 @@ class Repository:
                 item["result"] = json.loads(item.pop("result_json"))
                 parsed_runs.append(item)
             result["agent_runs"] = parsed_runs
+            validations = self.conn.execute(
+                "SELECT result_json FROM validation_runs WHERE case_id = ? ORDER BY created_at_ms DESC",
+                (case_id,),
+            ).fetchall()
+            result["validation_runs"] = [json.loads(item["result_json"]) for item in validations]
+            result["approvals"] = self.list_approvals(case_id=case_id, limit=100)
             result["linked_alerts"] = self._linked_alerts_locked(case_id)
             return result
 
@@ -816,6 +1046,18 @@ class Repository:
             high_count = self.conn.execute(
                 f"SELECT COUNT(*) c FROM cases WHERE {open_filter} AND severity IN ('high', 'critical')"
             ).fetchone()["c"]
+            validation = {
+                row["status"]: row["count"]
+                for row in self.conn.execute(
+                    "SELECT status, COUNT(*) AS count FROM validation_runs GROUP BY status"
+                ).fetchall()
+            }
+            approvals = {
+                row["status"]: row["count"]
+                for row in self.conn.execute(
+                    "SELECT status, COUNT(*) AS count FROM action_approvals GROUP BY status"
+                ).fetchall()
+            }
             return {
                 "cases": case_count,
                 "open_cases": case_count,
@@ -823,6 +1065,8 @@ class Repository:
                 "total_cases": total_case_count,
                 "alerts": alert_count,
                 "high_or_critical_cases": high_count,
+                "validation": validation,
+                "approvals": approvals,
             }
 
 

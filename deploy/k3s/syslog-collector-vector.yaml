@@ -157,6 +157,9 @@ data:
     uri = "http://defensive-ai-gateway:8080/api/alerts?profile={{ _gateway_profile }}"
     method = "post"
     request.headers.Content-Type = "application/json"
+    # Empty is valid for the trusted-LAN zero-configuration mode. Once the
+    # shared token is configured, the same manifest sends it automatically.
+    request.headers.Authorization = "Bearer ${DEFENSIVE_AI_API_TOKEN}"
     encoding.codec = "json"
 
     # 3b) standard：未配置 profile 的来源，由 collector 归一化为标准告警 JSON 后直送网关。
@@ -221,6 +224,7 @@ data:
     uri = "http://defensive-ai-gateway:8080/api/alerts"
     method = "post"
     request.headers.Content-Type = "application/json"
+    request.headers.Authorization = "Bearer ${DEFENSIVE_AI_API_TOKEN}"
     encoding.codec = "json"
 ---
 apiVersion: apps/v1
@@ -243,6 +247,12 @@ spec:
           image: timberio/vector:0.39.0-alpine
           imagePullPolicy: IfNotPresent
           args: ["--config", "/etc/vector/vector.toml"]
+          env:
+            - name: DEFENSIVE_AI_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: defensive-ai-gateway-secrets
+                  key: DEFENSIVE_AI_API_TOKEN
           ports:
             - name: syslog-udp
               containerPort: 15140

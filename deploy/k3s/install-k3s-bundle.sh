@@ -11,10 +11,10 @@ if [ -f "$ENV_FILE" ]; then
   set +a
 fi
 
-NAMESPACE="${K3S_NAMESPACE:-defensive-ai-gateway}"
+NAMESPACE="defensive-ai-gateway"
 IMAGE_DIR="${K3S_IMAGE_DIR:-$ROOT_DIR/images}"
 WITH_SYSLOG=0
-ALLOW_EMPTY_TOKEN=0
+REQUIRE_TOKEN=0
 
 usage() {
   cat <<'EOF'
@@ -22,16 +22,14 @@ Usage:
   bash deploy/k3s/install-k3s-bundle.sh [options]
 
 Options:
-  --namespace NAME       Kubernetes namespace. Defaults to defensive-ai-gateway.
   --image-dir DIR        Directory containing exported image tar files. Defaults to ./images.
   --with-syslog          Also deploy the Vector syslog collector.
-  --allow-empty-token    Permit an empty DEFENSIVE_AI_API_TOKEN for lab-only use.
+  --require-token        Refuse deployment unless DEFENSIVE_AI_API_TOKEN is set.
+  --allow-empty-token    Deprecated compatibility flag; empty is now the offline default.
   -h, --help             Show this help.
 
-Required environment:
-  DEFENSIVE_AI_API_TOKEN    Shared bearer token for gateway API.
-
 Optional environment:
+  DEFENSIVE_AI_API_TOKEN    When set, require this Bearer token for protected APIs.
   DEFENSIVE_AI_LLM_API_KEY  API key for enterprise LLM Gateway.
   K3S_ENV_FILE              Env file to source. Defaults to bundle-root .env.
 EOF
@@ -82,11 +80,6 @@ import_image() {
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --namespace)
-      [ "$#" -ge 2 ] || die "--namespace requires a value"
-      NAMESPACE="$2"
-      shift 2
-      ;;
     --image-dir)
       [ "$#" -ge 2 ] || die "--image-dir requires a value"
       IMAGE_DIR="$2"
@@ -96,8 +89,11 @@ while [ "$#" -gt 0 ]; do
       WITH_SYSLOG=1
       shift
       ;;
+    --require-token)
+      REQUIRE_TOKEN=1
+      shift
+      ;;
     --allow-empty-token)
-      ALLOW_EMPTY_TOKEN=1
       shift
       ;;
     -h|--help)
@@ -112,8 +108,8 @@ done
 
 command -v kubectl >/dev/null 2>&1 || die "kubectl not found"
 
-if [ -z "${DEFENSIVE_AI_API_TOKEN:-}" ] && [ "$ALLOW_EMPTY_TOKEN" -ne 1 ]; then
-  die "DEFENSIVE_AI_API_TOKEN is required. Copy .env.example to .env and edit it, or pass --allow-empty-token for lab-only use."
+if [ -z "${DEFENSIVE_AI_API_TOKEN:-}" ] && [ "$REQUIRE_TOKEN" -eq 1 ]; then
+  die "DEFENSIVE_AI_API_TOKEN is required by --require-token"
 fi
 
 if [ -d "$IMAGE_DIR" ]; then
@@ -149,4 +145,10 @@ if [ "$WITH_SYSLOG" -eq 1 ]; then
 fi
 
 log "deployment complete"
-log "health check: kubectl -n $NAMESPACE port-forward svc/defensive-ai-gateway 8080:8080"
+NODE_IP="$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || true)"
+if [ -n "$NODE_IP" ]; then
+  log "open: http://$NODE_IP:8080"
+else
+  log "open: http://<k3s-node-ip>:8080"
+fi
+log "health check: curl http://127.0.0.1:8080/api/health"
