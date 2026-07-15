@@ -10,12 +10,22 @@ Restart=always
 RestartSec=3
 User=defensive-ai
 Group=defensive-ai
+Environment=DEFENSIVE_AI_DB=/var/lib/defensive-ai-gateway/gateway.db
+EnvironmentFile=/etc/defensive-ai-gateway/env
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+TasksMax=256
+MemoryMax=2G
 ReadWritePaths=/var/lib/defensive-ai-gateway
 
 [Install]
 WantedBy=multi-user.target
-

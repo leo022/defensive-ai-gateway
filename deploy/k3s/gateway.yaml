@@ -3,18 +3,6 @@ kind: Namespace
 metadata:
   name: defensive-ai-gateway
 ---
-# Empty values provide zero-configuration startup. Supplying
-# DEFENSIVE_AI_API_TOKEN later immediately enables Bearer authentication.
-apiVersion: v1
-kind: Secret
-metadata:
-  name: defensive-ai-gateway-secrets
-  namespace: defensive-ai-gateway
-type: Opaque
-stringData:
-  DEFENSIVE_AI_LLM_API_KEY: ""
-  DEFENSIVE_AI_API_TOKEN: ""
----
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -34,7 +22,8 @@ metadata:
   namespace: defensive-ai-gateway
 spec:
   replicas: 1
-  # hostPort cannot run old and new pods concurrently on a single-node k3s host.
+  # SQLite permits only one gateway writer. A pre-upgrade backup plus Recreate
+  # avoids overlapping writers; the installer restores this revision on failure.
   strategy:
     type: Recreate
   selector:
@@ -57,7 +46,9 @@ spec:
           type: RuntimeDefault
       containers:
         - name: gateway
-          image: defensive-ai-gateway:latest
+          # Packaging replaces this marker with a digest or image-ID-derived tag.
+          # The installer refuses refs that do not carry a sha256 content identity.
+          image: "@@GATEWAY_IMAGE@@"
           # The deployment bundle imports this image into containerd. Never try
           # an external registry in an air-gapped environment.
           imagePullPolicy: Never
@@ -67,25 +58,24 @@ spec:
           ports:
             - name: http
               containerPort: 8080
-              hostPort: 8080
               protocol: TCP
           startupProbe:
             httpGet:
-              path: /api/health
+              path: /api/live
               port: http
             failureThreshold: 30
             periodSeconds: 2
             timeoutSeconds: 2
           readinessProbe:
             httpGet:
-              path: /api/health
+              path: /api/ready
               port: http
             periodSeconds: 10
             timeoutSeconds: 2
             failureThreshold: 3
           livenessProbe:
             httpGet:
-              path: /api/health
+              path: /api/live
               port: http
             periodSeconds: 20
             timeoutSeconds: 2
@@ -95,6 +85,15 @@ spec:
               mountPath: /data
             - name: tmp
               mountPath: /tmp
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+              ephemeral-storage: 64Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+              ephemeral-storage: 256Mi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -112,8 +111,8 @@ spec:
           emptyDir:
             sizeLimit: 64Mi
 ---
-# ClusterIP remains available to in-cluster collectors. hostPort above exposes
-# the same application directly at http://<k3s-node-ip>:8080.
+# ClusterIP is the only base exposure. Production adds a TLS Ingress with source
+# allowlisting; explicit demo mode applies a separate hostPort patch.
 apiVersion: v1
 kind: Service
 metadata:

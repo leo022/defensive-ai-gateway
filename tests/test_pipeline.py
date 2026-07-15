@@ -24,7 +24,7 @@ class PipelineTest(unittest.TestCase):
     def test_mapping_profile_dry_run_normalizes_real_rasp_log(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = GatewayConfig()
-            repo = Repository(str(Path(tmp) / "gateway.db"))
+            Repository(str(Path(tmp) / "gateway.db"))
             policy = PolicyEngine(config.policy)
             adapter = LogAdapter(EventNormalizer(policy))
             profile = demo_rasp_profile()
@@ -237,6 +237,7 @@ class PipelineTest(unittest.TestCase):
                 timestamp=payload["timestamp"],
                 payload=payload["payload"],
                 alert_id=payload["alert_id"],
+                trusted_sample=True,
             )
             result = orchestrator.handle_alert(alert)
             self.assertEqual(result.agent, "waf-agent")
@@ -274,6 +275,7 @@ class PipelineTest(unittest.TestCase):
                 timestamp=payload["timestamp"],
                 payload=payload["payload"],
                 alert_id=payload["alert_id"],
+                trusted_sample=True,
             )
 
             first = orchestrator.handle_alert(alert)
@@ -357,6 +359,7 @@ class PipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             config = GatewayConfig()
             config.database.path = str(Path(tmp) / "gateway.db")
+            config.llm.allowed_hosts = ["llm-gateway.internal"]
             state = GatewayState(config)
             updated = state.update_llm_config(
                 {
@@ -594,6 +597,7 @@ class ModelReconciliationTest(unittest.TestCase):
             timestamp=payload["timestamp"],
             payload=payload["payload"],
             alert_id=payload["alert_id"],
+            trusted_sample=True,
         )
 
     def _weak_malicious_result(self):
@@ -682,8 +686,7 @@ class AlertProductRoutingTest(unittest.TestCase):
             state = self._state(tmp)
             alert = state.alert_from_payload(self._cloudrasp_log())
             self.assertEqual(alert.product, "rasp")  # not "siem"
-            # no auto-rasp-json registered in temp DB -> shallow build, no adapter
-            self.assertNotIn("adapter", alert.payload)
+            self.assertEqual(alert.payload["adapter"]["profile_id"], "auto-rasp-json")
 
     def test_raw_vendor_log_auto_applies_registered_profile(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -740,9 +743,8 @@ class AlertProductRoutingTest(unittest.TestCase):
                     self.assertEqual(routed.product, product)
                     self.assertEqual(alert.product, product)
                     self.assertNotEqual(alert.product, "siem" if product != "siem" else "waf")
-                    if product == "rasp":
-                        self.assertEqual(routed.profile_id, "demo-rasp-json")
-                        self.assertEqual(alert.payload["adapter"]["profile_id"], "demo-rasp-json")
+                    self.assertEqual(routed.profile_id, f"auto-{product}-json")
+                    self.assertEqual(alert.payload["adapter"]["profile_id"], f"auto-{product}-json")
 
     def test_syslog_port_route_wins_over_conflicting_content_product(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -772,12 +774,35 @@ class AlertProductRoutingTest(unittest.TestCase):
             config = GatewayConfig()
             config.database.path = str(Path(tmp) / "gateway.db")
             config.processing.async_enabled = False
+            # Avoid binding the default listener set during construction. The
+            # fake below models the lifecycle contract without weakening the
+            # production check that a listener must actually be alive.
+            config.syslog.embedded_listeners_enabled = False
             state = GatewayState(config)
+            config.syslog.embedded_listeners_enabled = True
             tcp_port = 25140
             udp_port = 25141
 
+            class FakeListener:
+                def __init__(self, spec):
+                    self.spec = spec
+                    self.active = False
+
+                def start(self):
+                    self.active = True
+
+                def stop(self):
+                    self.active = False
+
+                def is_alive(self):
+                    return self.active
+
             try:
-                with patch("defensive_ai_gateway.syslog_receiver._SyslogListener.start", return_value=None):
+                with patch.object(
+                    state.syslog_receiver,
+                    "_new_listener",
+                    side_effect=FakeListener,
+                ):
                     tcp_payload = state.update_syslog_config({"product": "waf", "port": tcp_port, "protocol": "tcp"})
                     waf_config = next(item for item in tcp_payload["configs"] if item["product"] == "waf")
                     self.assertEqual(waf_config["protocol"], "tcp")

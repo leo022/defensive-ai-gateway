@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass
+from functools import wraps
 from typing import Any
 
 from .database import Repository
@@ -65,6 +67,17 @@ class PromotionOutcome:
     memory_id: str
 
 
+def _serialize_lifecycle(method):
+    """Keep each governance gate check and its state transition indivisible."""
+
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._lifecycle_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapped
+
+
 class MemoryManager:
     """Manages the four memory layers plus the read-only evidence store.
 
@@ -77,6 +90,7 @@ class MemoryManager:
     def __init__(self, repo: Repository, policy: Any = None):
         self.repo = repo
         self.policy = policy
+        self._lifecycle_lock = threading.RLock()
         self._seed_org_knowledge()
 
     # ---- namespaces / retrieval keys ---------------------------------
@@ -178,6 +192,10 @@ class MemoryManager:
             limit=limit - len(active),
         )
         return active + pending
+
+    def load_match_candidates(self, product: str, limit: int = 100) -> list[dict[str, Any]]:
+        """Load a broad, governed candidate pool for the independent matcher."""
+        return self.repo.query_matchable_product_memory(product, now_ms(), limit=limit)
 
     def load_evidence(self, case_id: str) -> list[dict[str, Any]]:
         """Read-only immutable evidence store: desensitized refs only, never writable by agents."""
@@ -376,6 +394,7 @@ class MemoryManager:
                 "match_policy": {
                     "must_match_any": ["product", "event_type", "rule_id"],
                     "high_similarity_threshold": 0.78,
+                    "effect_mode": "downgrade_to_benign",
                     "effect": "降低同类型告警置信度；高度相似时优先判定为误报并保留人工复核边界",
                 },
             },
@@ -482,6 +501,7 @@ class MemoryManager:
 
     # ---- promotion rule (five gates) ---------------------------------
 
+    @_serialize_lifecycle
     def promotion_check(
         self, memory_id: str, approved_by: str, scope: str, expires_at_ms: int | None
     ) -> tuple[bool, list[str]]:
@@ -503,6 +523,8 @@ class MemoryManager:
         # 4) expiry set
         if not expires_at_ms:
             reasons.append("expiry_set:missing_expiry")
+        elif expires_at_ms <= now_ms():
+            reasons.append("expiry_set:not_future")
         # 5) no sensitive leakage
         if not self._sensitivity_ok(m):
             reasons.append("no_sensitive_leak:sensitive_content_detected")
@@ -519,6 +541,7 @@ class MemoryManager:
                 return False
         return True
 
+    @_serialize_lifecycle
     def promote(
         self,
         memory_id: str,
@@ -558,6 +581,7 @@ class MemoryManager:
             )
         return PromotionOutcome(True, [], memory_id)
 
+    @_serialize_lifecycle
     def reject(self, memory_id: str, actor: str, reason: str) -> None:
         with self.repo.transaction():
             self.repo.update_memory(memory_id, status=STATUS_REVOKED, _commit=False)
@@ -566,8 +590,71 @@ class MemoryManager:
                 _commit=False,
             )
 
+    @_serialize_lifecycle
+    def restore(
+        self,
+        memory_id: str,
+        actor: str,
+        reason: str,
+        expires_at_ms: int | None = None,
+    ) -> PromotionOutcome:
+        """Restore a governed memory to review; reactivation always needs approval.
+
+        Prior approval is intentionally cleared. Quarantine/revocation/expiry is a
+        trust-boundary transition, so stale metadata can assist review but cannot
+        silently reactivate the memory.
+        """
+        memory = self.repo.get_memory(memory_id)
+        if not memory:
+            raise ValueError("memory not found")
+        if memory["layer"] != LAYER_PRODUCT_LONG_TERM:
+            raise ValueError("only product long-term memory can be restored")
+        if memory["status"] not in {STATUS_EXPIRED, STATUS_QUARANTINED, STATUS_REVOKED}:
+            raise ValueError(f"memory status {memory['status']} cannot be restored")
+
+        effective_expiry = expires_at_ms or memory.get("expires_at_ms")
+        _, reasons = self.promotion_check(
+            memory_id,
+            "",
+            str(memory.get("scope") or ""),
+            effective_expiry,
+        )
+        reasons = [
+            "analyst_approved:reapproval_required_after_restore"
+            if reason == "analyst_approved:missing_approver"
+            else reason
+            for reason in reasons
+        ]
+        target_status = STATUS_PENDING
+        trust_level = TRUST_LOW
+        with self.repo.transaction():
+            fields: dict[str, Any] = {
+                "status": target_status,
+                "trust_level": trust_level,
+                "approved_by": "",
+            }
+            if effective_expiry:
+                fields["expires_at_ms"] = effective_expiry
+            self.repo.update_memory(memory_id, _commit=False, **fields)
+            self.repo.insert_memory_event(
+                new_id("mev"),
+                memory_id,
+                LAYER_PRODUCT_LONG_TERM,
+                "restored_for_review",
+                actor,
+                {
+                    "reason": reason,
+                    "target_status": target_status,
+                    "gate_reasons": reasons,
+                    "previous_approved_by": memory.get("approved_by") or "",
+                },
+                _commit=False,
+            )
+        return PromotionOutcome(False, reasons, memory_id)
+
     # ---- governance: expiry, poisoning, conflicts, archival ----------
 
+    @_serialize_lifecycle
     def expire_due(self, now_ms_value: int | None = None) -> list[str]:
         """Sweep: mark active memories past their expiry as expired (auto-deweight)."""
         now_ms_value = now_ms_value if now_ms_value is not None else now_ms()
@@ -583,30 +670,73 @@ class MemoryManager:
             expired.append(m["memory_id"])
         return expired
 
+    @_serialize_lifecycle
     def quarantine(self, memory_id: str, actor: str, reason: str) -> None:
         """Isolate a low-trust / suspected-poisoned memory (§11 记忆投毒控制)."""
+        memory = self.repo.get_memory(memory_id)
+        if not memory:
+            raise ValueError("memory not found")
         with self.repo.transaction():
             self.repo.update_memory(memory_id, status=STATUS_QUARANTINED, trust_level=TRUST_LOW, _commit=False)
             self.repo.insert_memory_event(
-                new_id("mev"), memory_id, "", "quarantined", actor, {"reason": reason}, _commit=False,
+                new_id("mev"), memory_id, memory["layer"], "quarantined", actor, {"reason": reason}, _commit=False,
             )
 
+    @_serialize_lifecycle
     def detect_conflicts(self, product: str) -> list[dict[str, Any]]:
         """Detect duplicate/conflicting long-term memories for a product and quarantine the dupes."""
         rows = self.repo.query_memory(
             layer=LAYER_PRODUCT_LONG_TERM, namespace=self.product_namespace(product),
             limit=200, include_expired=False,
         )
-        rows = sorted(rows, key=lambda item: (int(item.get("created_at_ms") or 0), str(item.get("memory_id") or "")))
-        seen: dict[str, str] = {}
-        conflicts: list[dict[str, Any]] = []
-        for m in rows:
-            key = m["content"]
-            if key in seen:
-                conflicts.append({"memory_id": m["memory_id"], "conflicts_with": seen[key]})
-                self.quarantine(m["memory_id"], "memory_manager", "duplicate_conflict")
+        trust_rank = {TRUST_LOW: 0, TRUST_MEDIUM: 1, TRUST_HIGH: 2}
+
+        def conflict_key(item: dict[str, Any]) -> tuple[str, str, str]:
+            try:
+                content = json.loads(item.get("content") or "{}")
+            except json.JSONDecodeError:
+                content = item.get("content") or ""
+            if isinstance(content, dict):
+                signature = content.get("features") or content.get("similarity_features") or {
+                    "event_type": content.get("event_type"),
+                    "asset_id": content.get("asset_id"),
+                }
+                signature_text = json.dumps(signature, ensure_ascii=False, sort_keys=True)
             else:
-                seen[key] = m["memory_id"]
+                signature_text = str(content)
+            retrieval = str(item.get("retrieval_key") or "").strip().lower()
+            scope = str(item.get("scope") or "").strip().lower()
+            if retrieval or scope:
+                return retrieval, scope, signature_text
+            return "content", signature_text, ""
+
+        groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+        for memory in rows:
+            groups.setdefault(conflict_key(memory), []).append(memory)
+        conflicts: list[dict[str, Any]] = []
+        for group in groups.values():
+            if len(group) < 2:
+                continue
+            winner = max(
+                group,
+                key=lambda item: (
+                    trust_rank.get(str(item.get("trust_level") or TRUST_LOW), 0),
+                    1 if item.get("approved_by") else 0,
+                    int(item.get("updated_at_ms") or item.get("created_at_ms") or 0),
+                    str(item.get("memory_id") or ""),
+                ),
+            )
+            for memory in group:
+                if memory["memory_id"] == winner["memory_id"]:
+                    continue
+                conflicts.append(
+                    {
+                        "memory_id": memory["memory_id"],
+                        "conflicts_with": winner["memory_id"],
+                        "retained_memory_id": winner["memory_id"],
+                    }
+                )
+                self.quarantine(memory["memory_id"], "memory_manager", "duplicate_conflict")
         for c in conflicts:
             self.repo.insert_memory_event(
                 new_id("mev"), c["memory_id"], LAYER_PRODUCT_LONG_TERM, "conflict_detected",

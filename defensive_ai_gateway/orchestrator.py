@@ -8,6 +8,7 @@ from .agents.registry import build_agent
 from .database import Repository
 from .llm import LLMClient, LocalHeuristicLLM
 from .memory import MemoryManager
+from .memory_matcher import MemoryMatchEvaluation, MemoryMatcher
 from .models import AgentResult, NormalizedEvent, RawAlert, RecommendedAction, new_id
 from .normalizer import EventNormalizer
 from .policy import PolicyEngine
@@ -17,6 +18,8 @@ from .validation import Validator
 
 
 class Orchestrator:
+    CASE_CORRELATION_WINDOW_MS = 60 * 60 * 1000
+    CROSS_PRODUCT_WINDOW_MS = 15 * 60 * 1000
     def __init__(
         self,
         repo: Repository,
@@ -27,6 +30,7 @@ class Orchestrator:
         skills: SkillRegistry | None = None,
         validator: Validator | None = None,
         response_advisor: ResponseAdvisor | None = None,
+        memory_matcher: MemoryMatcher | None = None,
     ):
         self.repo = repo
         self.normalizer = normalizer
@@ -36,6 +40,7 @@ class Orchestrator:
         self.skills = skills or SkillRegistry()
         self.validator = validator or Validator(policy)
         self.response_advisor = response_advisor or ResponseAdvisor(policy)
+        self.memory_matcher = memory_matcher or MemoryMatcher()
         # Keep only active locks: duplicate deliveries of the same alert wait for
         # the original analysis, while unrelated alerts retain full concurrency.
         self._alert_locks: dict[str, tuple[threading.Lock, int]] = {}
@@ -84,10 +89,45 @@ class Orchestrator:
             existing = self.repo.get_agent_result_for_event(event.event_id)
             if existing:
                 return self._agent_result_from_dict(existing)
-        case_id = self._case_id(event)
+        correlation_key = self._case_correlation_key(event)
+        case_id, case_resolution = self.repo.resolve_case_id(
+            correlation_key,
+            event.event_id,
+            event.timestamp,
+            window_ms=self.CASE_CORRELATION_WINDOW_MS,
+        )
+        # alert_received is deliberately persisted before model work, when the
+        # Case is not known yet. Record the explicit relationship as soon as
+        # correlation resolves it so audit retention never relies on trace_id
+        # accidentally being equal to case_id.
+        self.repo.link_audit_trace_to_case(trace_id, case_id)
         agent = build_agent(event.product, self.llm, self.policy)
         asset_id = self.memory.asset_id_for(event)
+        # Keep governance status current even when operators do not manually run
+        # a sweep. Expired memories are therefore never presented as live context.
+        self.memory.expire_due()
         memory_context = self.memory.load_context(event.product, case_id=case_id, asset_id=asset_id)
+        cross_product_context = self.repo.query_correlated_alerts(
+            event,
+            window_ms=self.CROSS_PRODUCT_WINDOW_MS,
+            limit=20,
+        )
+        memory_context["cross_product_context"] = cross_product_context
+        match_candidates = self.memory.load_match_candidates(
+            event.product,
+            limit=self.memory_matcher.config.candidate_limit,
+        )
+        memory_evaluation = self.memory_matcher.match(event, match_candidates)
+        memory_context["product_long_term"] = [
+            candidate.memory
+            for candidate in memory_evaluation.candidates
+            if candidate.overall_score >= memory_evaluation.review_threshold
+        ][: self.memory_matcher.config.top_k]
+        memory_context["memory_association"] = memory_evaluation.context_payload(
+            self.memory_matcher.config.top_k
+        )
+        model_runtime = dict(self.llm.runtime_metadata)
+        fallback_used = False
         try:
             result = agent.analyze(case_id, event, memory_context)
         except Exception as exc:
@@ -99,6 +139,7 @@ class Orchestrator:
                 {"error": str(exc), "fallback": "local_heuristic"},
             )
             try:
+                fallback_used = True
                 fallback_agent = build_agent(event.product, LocalHeuristicLLM(), self.policy)
                 result = fallback_agent.analyze(case_id, event, memory_context)
                 result.summary = f"[LLM 降级为本地启发式] {result.summary}"
@@ -111,6 +152,20 @@ class Orchestrator:
                     {"error": str(exc2), "fallback": "local_heuristic_failed"},
                 )
                 raise
+        result = self.memory_matcher.reconcile(result, memory_evaluation)
+        result.explanation["model_runtime"] = {
+            **model_runtime,
+            "fallback_used": fallback_used,
+            "effective_provider": "local" if fallback_used else model_runtime.get("provider", "unknown"),
+        }
+        result.explanation["cross_product_correlation"] = {
+            "window_ms": self.CROSS_PRODUCT_WINDOW_MS,
+            "match_count": len(cross_product_context),
+            "event_ids": [item["event_id"] for item in cross_product_context],
+        }
+        result.dashboard_cards.append(
+            {"title": "跨产品关联", "body": str(len(cross_product_context))}
+        )
         analysis_skill = self.skills.for_product(event.product)
         validation = self.validator.validate(case_id, event, result, analysis_skill)
         approvals = self.response_advisor.prepare(event.event_id, result, validation)
@@ -124,6 +179,9 @@ class Orchestrator:
         result.dashboard_cards.append({"title": "验证门禁", "body": validation.status})
         if validation.status == "blocked":
             result.missing_evidence.append("Validator 已阻断审批流转，请按验证发现补证或修正策略违规。")
+        result.explanation["memory_write_status"] = (
+            "committed" if validation.status == "passed" else "suppressed_by_validator"
+        )
 
         # Post-analysis writes are atomic: case row, link, agent run, validation,
         # approval requests, case memory and audit all commit together.
@@ -135,16 +193,37 @@ class Orchestrator:
             # Case row must exist before case_alert_links (FK case_id → cases) and
             # before agent_runs (FK case_id → cases). Linking after analysis is
             # safe: analysis and memory loading do not depend on the link row.
-            self.repo.upsert_case(result, event.product, _commit=False)
-            self.repo.link_case_alert(case_id, alert.alert_id, event.event_id, _commit=False)
+            alert_at_ms = self.repo.timestamp_ms(event.timestamp)
+            self.repo.upsert_case(
+                result,
+                event.product,
+                _commit=False,
+                correlation_key=correlation_key,
+                alert_at_ms=alert_at_ms,
+            )
+            self.repo.link_case_alert(
+                case_id,
+                alert.alert_id,
+                event.event_id,
+                _commit=False,
+                alert_at_ms=alert_at_ms,
+            )
             analysis_run_id = run_id()
             self.repo.insert_agent_run(
                 analysis_run_id, result, event.product, agent.prompt_version, event.event_id, _commit=False
             )
+            self._persist_memory_matches(memory_evaluation, case_id, analysis_run_id)
             self.repo.insert_validation(validation.to_dict(), _commit=False)
+            cancelled_approvals = self.repo.cancel_pending_approvals(
+                case_id,
+                actor=self.response_advisor.name,
+                reason=f"Superseded by analysis for event {event.event_id}",
+                _commit=False,
+            )
             for approval in approvals:
                 self.repo.insert_approval(approval.to_dict(), _commit=False)
-            self.memory.record_case_summary(event.product, result, asset_id=asset_id, trace_id=trace_id)
+            if validation.status == "passed":
+                self.memory.record_case_summary(event.product, result, asset_id=asset_id, trace_id=trace_id)
             self.repo.insert_audit(
                 new_id("audit"), trace_id, agent.name, "analysis_completed", result.to_dict(), _commit=False,
             )
@@ -159,6 +238,45 @@ class Orchestrator:
                 },
                 _commit=False,
             )
+            self.repo.insert_audit(
+                new_id("audit"), trace_id, "cross-product-correlator", "cross_product_context_loaded",
+                {
+                    "case_id": case_id,
+                    "event_id": event.event_id,
+                    "window_ms": self.CROSS_PRODUCT_WINDOW_MS,
+                    "matches": [
+                        {
+                            "event_id": item["event_id"],
+                            "product": item["product"],
+                            "matched_entities": item["matched_entities"],
+                            "time_delta_ms": item["time_delta_ms"],
+                        }
+                        for item in cross_product_context
+                    ],
+                },
+                _commit=False,
+            )
+            self.repo.insert_audit(
+                new_id("audit"), trace_id, "case-correlator", "case_resolution",
+                {
+                    "case_id": case_id,
+                    "correlation_key": correlation_key,
+                    "resolution": case_resolution,
+                    "window_ms": self.CASE_CORRELATION_WINDOW_MS,
+                },
+                _commit=False,
+            )
+            if cancelled_approvals:
+                self.repo.insert_audit(
+                    new_id("audit"), trace_id, self.response_advisor.name, "approvals_cancelled",
+                    {
+                        "case_id": case_id,
+                        "event_id": event.event_id,
+                        "count": cancelled_approvals,
+                        "reason": "superseded_by_new_analysis",
+                    },
+                    _commit=False,
+                )
             for approval in approvals:
                 self.repo.insert_audit(
                     new_id("audit"), trace_id, self.response_advisor.name, "approval_requested",
@@ -172,6 +290,25 @@ class Orchestrator:
                     _commit=False,
                 )
         return result
+
+    def _persist_memory_matches(
+        self,
+        evaluation: MemoryMatchEvaluation,
+        case_id: str,
+        analysis_run_id: str,
+    ) -> None:
+        if not evaluation.candidates:
+            return
+        self.repo.insert_memory_matches(
+            event_id=evaluation.event_id,
+            alert_id=evaluation.alert_id,
+            case_id=case_id,
+            analysis_run_id=analysis_run_id,
+            matcher_version=evaluation.matcher_version,
+            final_effect=evaluation.final_effect,
+            candidates=[candidate.to_dict() for candidate in evaluation.candidates],
+            _commit=False,
+        )
 
     @staticmethod
     def _agent_result_from_dict(payload: dict) -> AgentResult:
@@ -196,7 +333,11 @@ class Orchestrator:
             created_at_ms=int(payload.get("created_at_ms", 0)),
         )
 
-    def _case_id(self, event: NormalizedEvent) -> str:
+    def _case_correlation_key(self, event: NormalizedEvent) -> str:
         host = event.entities.get("host") or event.entities.get("src_ip") or "unknown"
         rule = event.entities.get("rule") or event.event_type
         return f"case_{event.product}_{str(host).replace('.', '_')}_{str(rule).replace(' ', '_')}"[:96]
+
+    def _case_id(self, event: NormalizedEvent) -> str:
+        """Backwards-compatible base key helper used by older integrations."""
+        return self._case_correlation_key(event)

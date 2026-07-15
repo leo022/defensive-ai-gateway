@@ -4,6 +4,13 @@ __pycache__/
 *.pyc
 .pytest_cache/
 *.tar.gz
+.env
+.env.*
+!.env.example
+*.env
+!*.env.example
+config/prod.yaml
 dist/k3s-images/*.tar
 dist/k3s-images/*.tar.sha256
+dist/k3s-images/*.tar.ref
 .DS_Store

@@ -1,4 +1,11 @@
 .git
+.env
+.env.*
+*.env
+**/.env
+**/.env.*
+**/*.env
+config/prod.yaml
 data
 dist
 outputs

@@ -1,4 +1,5 @@
-FROM python:3.11-slim
+ARG PYTHON_BASE_IMAGE=python:3.11-slim
+FROM ${PYTHON_BASE_IMAGE}
 
 ARG APP_VERSION=dev
 ARG VCS_REF=unknown
@@ -30,7 +31,7 @@ VOLUME ["/data"]
 EXPOSE 8080
 
 HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=4 \
-  CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=2).read()"]
+  CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/ready', timeout=2).read()"]
 
 ENTRYPOINT ["python", "-m", "defensive_ai_gateway"]
 CMD ["--config", "config/container.yaml"]

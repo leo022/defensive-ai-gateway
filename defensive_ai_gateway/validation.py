@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
 
 from .models import AgentResult, NormalizedEvent, ValidationFinding, ValidationResult, new_id
 from .policy import PolicyEngine, SECRET_PATTERNS

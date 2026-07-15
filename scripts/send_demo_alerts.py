@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# ruff: noqa: E402 -- source checkout scripts add the project root before imports.
+
 import argparse
 import json
 import os
@@ -77,7 +79,10 @@ def coverage_summary(payloads: list[tuple[str, dict]]) -> dict:
 
 def send_alert(payload: dict, url: str, timeout: int, token: str = "") -> dict:
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "X-Defensive-AI-Demo-Sample": "1",
+    }
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")

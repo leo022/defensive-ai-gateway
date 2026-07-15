@@ -335,6 +335,7 @@ audit and replay backbone.
 | `agent_runs` | Full agent output per run, including prompt version and product |
 | `memory_entries` | Governed memory objects across all memory layers |
 | `memory_events` | Memory lifecycle audit events |
+| `memory_matches` | Auditable alert-to-memory candidate scores, ranking, decision, and final effect |
 | `audit_log` | Gateway and agent trace events |
 
 ## LLM and Agent Contract

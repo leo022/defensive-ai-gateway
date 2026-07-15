@@ -2,38 +2,197 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OUT_DIR="${1:-"$ROOT_DIR/dist"}"
+OUT_DIR="$ROOT_DIR/dist"
 BUNDLE_NAME="${BUNDLE_NAME:-defensive-ai-gateway-k3s-deploy}"
-STAGE="$(mktemp -d "${TMPDIR:-/tmp}/${BUNDLE_NAME}.XXXXXX")"
-BUNDLE_DIR="$STAGE/$BUNDLE_NAME"
-ARCHIVE="$OUT_DIR/$BUNDLE_NAME.tar.gz"
-trap 'rm -rf "$STAGE"' EXIT
+PLATFORM="${PLATFORM:-linux/amd64}"
+IMAGE_DIR=""
+INCLUDE_VECTOR=0
+PYTHON_BASE_IMAGE="${PYTHON_BASE_IMAGE:-}"
+VECTOR_IMAGE="${VECTOR_IMAGE:-}"
+ALLOW_DIRTY=0
 
-mkdir -p "$OUT_DIR" "$BUNDLE_DIR"
+usage() {
+  cat <<'EOF'
+Usage:
+  bash scripts/package_k3s_deploy.sh [options]
 
-cd "$ROOT_DIR"
+Build the current source into a fresh container image and atomically replace the
+existing k3s offline deployment bundle.
 
-tar \
-  --exclude="./.git" \
-  --exclude="./data" \
-  --exclude="./dist" \
-  --exclude="./outputs" \
-  --exclude="./__pycache__" \
-  --exclude="./.pytest_cache" \
-  --exclude="./.DS_Store" \
-  --exclude="./*.pyc" \
-  -czf "$BUNDLE_DIR/defensive-ai-gateway-source.tar.gz" \
-  .
+Options:
+  --out-dir DIR        Output directory. Defaults to ./dist.
+  --platform PLATFORM  Target platform. Defaults to linux/amd64.
+  --include-vector     Include the Vector image for the optional syslog collector.
+  --python-base IMAGE  Digest-pinned Python base image for a release build.
+  --vector-image IMAGE Digest-pinned Vector image used with --include-vector.
+  --image-dir DIR      Package prebuilt image tar files instead of running Docker.
+                       Every *.tar needs matching .sha256 and .ref sidecars.
+  --allow-dirty        Explicitly create a non-release artifact from local changes.
+  -h, --help           Show this help.
+EOF
+}
 
-mkdir -p "$BUNDLE_DIR/deploy" "$BUNDLE_DIR/scripts" "$BUNDLE_DIR/images"
-cp -R "$ROOT_DIR/deploy/docker" "$BUNDLE_DIR/deploy/"
-cp -R "$ROOT_DIR/deploy/k3s" "$BUNDLE_DIR/deploy/"
-cp "$ROOT_DIR/scripts/package_offline.sh" "$BUNDLE_DIR/scripts/"
-cp "$ROOT_DIR/scripts/package_k3s_deploy.sh" "$BUNDLE_DIR/scripts/"
-cp "$ROOT_DIR/deploy/k3s/env.example" "$BUNDLE_DIR/.env.example"
-if [ -d "$ROOT_DIR/dist/k3s-images" ]; then
-  find "$ROOT_DIR/dist/k3s-images" -maxdepth 1 -type f \( -name "*.tar" -o -name "*.sha256" \) -exec cp {} "$BUNDLE_DIR/images/" \;
+die() {
+  printf '[k3s-package] ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+is_content_addressed_gateway_ref() {
+  ref="$1"
+  case "$ref" in
+    *@sha256:*) digest="${ref##*@sha256:}" ;;
+    *:sha256-*) digest="${ref##*:sha256-}" ;;
+    *) return 1 ;;
+  esac
+  [ "${#digest}" -eq 64 ] || return 1
+  case "$digest" in *[!0-9a-fA-F]*) return 1 ;; esac
+  return 0
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --out-dir)
+      [ "$#" -ge 2 ] || die "--out-dir requires a value"
+      OUT_DIR="$2"
+      shift 2
+      ;;
+    --platform)
+      [ "$#" -ge 2 ] || die "--platform requires a value"
+      PLATFORM="$2"
+      shift 2
+      ;;
+    --include-vector)
+      INCLUDE_VECTOR=1
+      shift
+      ;;
+    --python-base)
+      [ "$#" -ge 2 ] || die "--python-base requires a value"
+      PYTHON_BASE_IMAGE="$2"
+      shift 2
+      ;;
+    --vector-image)
+      [ "$#" -ge 2 ] || die "--vector-image requires a value"
+      VECTOR_IMAGE="$2"
+      shift 2
+      ;;
+    --image-dir)
+      [ "$#" -ge 2 ] || die "--image-dir requires a value"
+      IMAGE_DIR="$2"
+      shift 2
+      ;;
+    --allow-dirty)
+      ALLOW_DIRTY=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown option: $1"
+      ;;
+  esac
+done
+
+if [ "$ALLOW_DIRTY" -ne 1 ] && [ -n "$(git -C "$ROOT_DIR" status --porcelain 2>/dev/null || true)" ]; then
+  die "refusing to package a dirty worktree; commit/stash changes or pass --allow-dirty"
 fi
+
+umask 077
+mkdir -p "$OUT_DIR"
+WORK_DIR="$(mktemp -d "$OUT_DIR/.${BUNDLE_NAME}.XXXXXX")"
+BUNDLE_DIR="$WORK_DIR/$BUNDLE_NAME"
+BUILT_IMAGE_DIR="$WORK_DIR/built-images"
+ARCHIVE_TMP="$WORK_DIR/$BUNDLE_NAME.tar.gz"
+CHECKSUM_TMP="$ARCHIVE_TMP.sha256"
+ARCHIVE="$OUT_DIR/$BUNDLE_NAME.tar.gz"
+CHECKSUM="$ARCHIVE.sha256"
+trap 'rm -rf "$WORK_DIR"' EXIT
+
+mkdir -p "$BUNDLE_DIR/deploy/k3s" "$BUNDLE_DIR/images"
+
+if [ -z "$IMAGE_DIR" ]; then
+  build_args=(
+    --out-dir "$BUILT_IMAGE_DIR"
+    --platform "$PLATFORM"
+    --python-base "$PYTHON_BASE_IMAGE"
+  )
+  if [ "$INCLUDE_VECTOR" -eq 1 ]; then
+    build_args+=(--include-vector --vector-image "$VECTOR_IMAGE")
+  fi
+  if [ "$ALLOW_DIRTY" -eq 1 ]; then
+    build_args+=(--allow-dirty)
+  fi
+  printf '[k3s-package] rebuilding images from current source\n'
+  bash "$ROOT_DIR/deploy/k3s/build-offline-images.sh" "${build_args[@]}"
+  IMAGE_DIR="$BUILT_IMAGE_DIR"
+else
+  [ -d "$IMAGE_DIR" ] || die "image directory not found: $IMAGE_DIR"
+  printf '[k3s-package] using explicitly supplied images: %s\n' "$IMAGE_DIR"
+fi
+
+shopt -s nullglob
+image_tars=("$IMAGE_DIR"/*.tar)
+[ "${#image_tars[@]}" -gt 0 ] || die "no image tar files found in $IMAGE_DIR"
+
+GATEWAY_IMAGE_REF=""
+VECTOR_IMAGE_REF=""
+for image_tar in "${image_tars[@]}"; do
+  image_name="$(basename "$image_tar")"
+  checksum_file="$image_tar.sha256"
+  ref_file="$image_tar.ref"
+  [ -f "$checksum_file" ] || die "missing checksum: $checksum_file"
+  [ -f "$ref_file" ] || die "missing image reference: $ref_file"
+
+  expected="$(awk '{print $1; exit}' "$checksum_file")"
+  actual="$(sha256_of "$image_tar")"
+  [ -n "$expected" ] || die "empty checksum: $checksum_file"
+  [ "$expected" = "$actual" ] || die "checksum mismatch: $image_tar"
+
+  image_ref="$(sed -n '1p' "$ref_file")"
+  [ -n "$image_ref" ] || die "empty image reference: $ref_file"
+  case "$image_ref" in *[!A-Za-z0-9._/:@-]*) die "unsafe image reference: $image_ref" ;; esac
+  case "$image_ref" in *:latest|*:dev) die "mutable image reference is forbidden: $image_ref" ;; esac
+
+  cp "$image_tar" "$BUNDLE_DIR/images/$image_name"
+  printf '%s  %s\n' "$actual" "$image_name" > "$BUNDLE_DIR/images/$image_name.sha256"
+  printf '%s\n' "$image_ref" > "$BUNDLE_DIR/images/$image_name.ref"
+  case "$image_ref" in
+    defensive-ai-gateway:*|*/defensive-ai-gateway:*|defensive-ai-gateway@*|*/defensive-ai-gateway@*)
+      [ -z "$GATEWAY_IMAGE_REF" ] || die "multiple gateway images supplied"
+      is_content_addressed_gateway_ref "$image_ref" \
+        || die "gateway image reference must contain its sha256 content identity: $image_ref"
+      GATEWAY_IMAGE_REF="$image_ref"
+      ;;
+    timberio/vector:*|*/timberio/vector:*|timberio/vector@*|*/timberio/vector@*)
+      [ -z "$VECTOR_IMAGE_REF" ] || die "multiple Vector images supplied"
+      VECTOR_IMAGE_REF="$image_ref"
+      ;;
+  esac
+done
+[ -n "$GATEWAY_IMAGE_REF" ] || die "required defensive-ai-gateway image reference not found"
+
+sed "s|@@GATEWAY_IMAGE@@|$GATEWAY_IMAGE_REF|g" \
+  "$ROOT_DIR/deploy/k3s/gateway.yaml" > "$BUNDLE_DIR/deploy/k3s/gateway.yaml"
+cp "$ROOT_DIR/deploy/k3s/install-k3s-bundle.sh" "$BUNDLE_DIR/deploy/k3s/"
+if [ -n "$VECTOR_IMAGE_REF" ]; then
+  sed "s|@@VECTOR_IMAGE@@|$VECTOR_IMAGE_REF|g" \
+    "$ROOT_DIR/deploy/k3s/syslog-collector-vector.yaml" > "$BUNDLE_DIR/deploy/k3s/syslog-collector-vector.yaml"
+else
+  cp "$ROOT_DIR/deploy/k3s/syslog-collector-vector.yaml" "$BUNDLE_DIR/deploy/k3s/"
+fi
+cp "$ROOT_DIR/deploy/k3s/production-exposure.yaml" "$BUNDLE_DIR/deploy/k3s/"
+cp "$ROOT_DIR/deploy/k3s/demo-exposure-patch.yaml" "$BUNDLE_DIR/deploy/k3s/"
+cp "$ROOT_DIR/deploy/k3s/env.example" "$BUNDLE_DIR/.env.example"
+chmod 600 "$BUNDLE_DIR/.env.example"
 
 cat > "$BUNDLE_DIR/install.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -42,96 +201,87 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 exec bash "$ROOT_DIR/deploy/k3s/install-k3s-bundle.sh" "$@"
 EOF
-chmod +x "$BUNDLE_DIR/install.sh"
+chmod +x "$BUNDLE_DIR/install.sh" "$BUNDLE_DIR/deploy/k3s/install-k3s-bundle.sh"
+
+SOURCE_REVISION="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || printf 'unknown')"
+if [ -n "$(git -C "$ROOT_DIR" status --porcelain 2>/dev/null || true)" ]; then
+  SOURCE_STATE="dirty"
+else
+  SOURCE_STATE="clean"
+fi
 
 {
   echo "# Defensive AI Gateway k3s bundle manifest"
   echo "Generated: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  echo "Source revision: $SOURCE_REVISION"
+  echo "Source state: $SOURCE_STATE"
+  echo "Target platform: $PLATFORM"
+  echo "Gateway image: $GATEWAY_IMAGE_REF"
+  if [ -n "$VECTOR_IMAGE_REF" ]; then
+    echo "Vector image: $VECTOR_IMAGE_REF"
+  fi
   echo
   echo "Images:"
-  if compgen -G "$BUNDLE_DIR/images/*.tar" >/dev/null; then
-    for image in "$BUNDLE_DIR"/images/*.tar; do
-      [ -f "$image" ] || continue
-      size="$(du -h "$image" | awk '{print $1}')"
-      echo "- $(basename "$image") ($size)"
-    done
-  else
-    echo "- none bundled; build with deploy/k3s/build-offline-images.sh first"
-  fi
+  for image_tar in "$BUNDLE_DIR"/images/*.tar; do
+    image_name="$(basename "$image_tar")"
+    image_size="$(du -h "$image_tar" | awk '{print $1}')"
+    image_sha="$(sha256_of "$image_tar")"
+    image_ref="$(sed -n '1p' "$image_tar.ref")"
+    echo "- $image_name ($image_size, sha256:$image_sha, ref:$image_ref)"
+  done
 } > "$BUNDLE_DIR/MANIFEST.txt"
 
 cat > "$BUNDLE_DIR/README.md" <<'EOF'
-# Defensive AI Gateway k3s 部署包
+# Defensive AI Gateway k3s 离线部署包
 
-此包用于企业内网 k3s 离线部署。目标服务器不需要安装 Python、不需要访问镜像仓库，也不需要预先填写应用配置。导入后默认使用本地确定性分析器和 SQLite，并通过节点 `8080` 端口直接访问。
+本目录只包含企业内网 k3s 运行时所需物料。目标服务器需要 k3s、kubectl
+和 k3s 默认 local-path 存储，不需要 Python、Docker、源码或外网镜像仓库。
 
-## 内容
-
-- `defensive-ai-gateway-source.tar.gz`：完整应用源码，用于在构建机重建镜像。
-- `deploy/docker/Dockerfile`：镜像构建文件。
-- `deploy/k3s/`：k3s 清单、Secret 模板、构建和部署脚本。
-- `images/`：已打包的离线镜像 tar，以及对应 `.sha256`。
-- `.env.example`：可选的鉴权和企业 LLM Secret 模板。
-- `install.sh`：一键导入镜像并部署/覆盖当前 k3s 物料。
-
-## 直接部署或覆盖
-
-在 k3s 服务器解压后：
-
-```bash
-bash install.sh
-```
-
-部署完成后直接访问：
-
-```text
-http://<内网服务器IP>:8080
-```
-
-如需启用 Bearer Token，再创建 `.env` 后重复安装：
+## 部署或升级
 
 ```bash
 cp .env.example .env
+chmod 600 .env
 vi .env
-bash install.sh --require-token
+bash install.sh
 ```
 
-如需同时部署 syslog collector：
+生产必须提供四个不同的强角色 Token、TLS Secret 名、HTTPS 域名和来源 CIDR
+白名单。可先执行 `bash install.sh --preflight-only`；缺少任何安全前提时安装器
+失败关闭，不会自动暴露明文端口。
+
+安装脚本校验 `.tar.sha256` 与不可变 `.tar.ref`、导入镜像，并在升级前创建
+SQLite 一致性备份。失败会恢复旧镜像及对应数据库；成功输出可重复使用的回滚点：
+
+```bash
+bash install.sh --rollback <backup-id>
+```
+
+如果本包的 `images/` 中包含 Vector 镜像，可同时部署 syslog collector：
 
 ```bash
 bash install.sh --with-syslog
 ```
 
-安装脚本会：
-
-- 校验 `images/*.tar.sha256`。
-- 导入 `images/*.tar` 到 k3s/containerd。
-- `kubectl apply` 网关清单，覆盖已有 ConfigMap、Deployment、Service、Ingress 等物料。
-- 更新 Secret 并重启 Deployment。
-
-## 重建镜像
-
-如需在有 Docker 的构建机上重建镜像，默认产出 `linux/amd64` 镜像；ARM 服务器请改用 `--platform linux/arm64`：
+验证：
 
 ```bash
-mkdir -p source
-tar -xzf defensive-ai-gateway-source.tar.gz -C source
-cd source
-bash deploy/k3s/build-offline-images.sh --platform linux/amd64 --include-vector
+kubectl -n defensive-ai-gateway rollout status deployment/defensive-ai-gateway
+curl --fail https://$DEFENSIVE_AI_PUBLIC_HOST/api/ready
 ```
 
-把 `source/dist/k3s-images/*.tar*` 拷贝回本包 `images/` 目录后，再执行：
-
-```bash
-bash install.sh --with-syslog
-```
+只有隔离临时展示可运行 `bash install.sh --demo-mode`；该模式才增加节点 8080
+明文 hostPort，并保持 Demo 单签。
 EOF
 
-tar -czf "$ARCHIVE" -C "$STAGE" "$BUNDLE_NAME"
-if command -v sha256sum >/dev/null 2>&1; then
-  archive_sha="$(sha256sum "$ARCHIVE" | awk '{print $1}')"
-else
-  archive_sha="$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')"
-fi
-printf '%s  %s\n' "$archive_sha" "$(basename "$ARCHIVE")" > "$ARCHIVE.sha256"
-echo "$ARCHIVE"
+tar -czf "$ARCHIVE_TMP" -C "$WORK_DIR" "$BUNDLE_NAME"
+archive_sha="$(sha256_of "$ARCHIVE_TMP")"
+printf '%s  %s\n' "$archive_sha" "$(basename "$ARCHIVE")" > "$CHECKSUM_TMP"
+
+# Both temporary files live under OUT_DIR, so replacing an old archive cannot
+# expose a partially written tarball if a build or packaging step fails.
+mv -f "$ARCHIVE_TMP" "$ARCHIVE"
+mv -f "$CHECKSUM_TMP" "$CHECKSUM"
+
+printf '[k3s-package] wrote %s\n' "$ARCHIVE"
+printf '[k3s-package] wrote %s\n' "$CHECKSUM"

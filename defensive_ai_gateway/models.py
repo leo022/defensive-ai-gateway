@@ -23,6 +23,10 @@ class RawAlert:
     timestamp: str
     payload: dict[str, Any]
     alert_id: str = field(default_factory=lambda: new_id("alert"))
+    # Set only by a trusted server-side demo/harness path. Inbound payloads must
+    # never be allowed to set this flag themselves: it controls whether sample
+    # ground-truth annotations may participate in analysis.
+    trusted_sample: bool = False
 
 
 @dataclass
@@ -82,6 +86,7 @@ class ApprovalRequest:
     mode: str = "approve_required"
     status: str = "pending"
     requested_by: str = "response-advisor"
+    required_approvals: int = 1
     created_at_ms: int = field(default_factory=now_ms)
 
     def to_dict(self) -> dict[str, Any]:

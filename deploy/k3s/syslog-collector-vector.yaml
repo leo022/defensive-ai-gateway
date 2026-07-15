@@ -5,8 +5,11 @@ metadata:
   namespace: defensive-ai-gateway
 data:
   vector.toml: |
+    data_dir = "/var/lib/vector"
+
     [api]
-    enabled = false
+    enabled = true
+    address = "0.0.0.0:8686"
 
     [sources.syslog_waf_udp]
     type = "syslog"
@@ -113,23 +116,30 @@ data:
       product = appname
     }
 
-    # product → 已保存的 profile_id。RASP 默认复用内置 demo-rasp-json（开箱即用）。
-    # 其它产品需先在 Dashboard 保存对应 profile，再取消注释相应分支；
-    # 未取消注释的产品会落入 standard 路径，由 collector 侧归一化，不会被丢弃。
+    # product → 网关内置的五产品自动 profile。未识别 product 时才走
+    # standard 路径，由 collector 侧保守归一化。
     gateway_profile = ""
-    if product == "rasp" {
-      gateway_profile = "demo-rasp-json"
-    }
-    # else if product == "waf" { gateway_profile = "waf-syslog-json" }
-    # else if product == "hips" { gateway_profile = "hips-syslog-json" }
-    # else if product == "ndr" { gateway_profile = "ndr-syslog-json" }
-    # else if product == "siem" { gateway_profile = "siem-syslog-json" }
+    if product == "waf" { gateway_profile = "auto-waf-json" }
+    else if product == "hips" { gateway_profile = "auto-hips-json" }
+    else if product == "ndr" { gateway_profile = "auto-ndr-json" }
+    else if product == "rasp" { gateway_profile = "auto-rasp-json" }
+    else if product == "siem" { gateway_profile = "auto-siem-json" }
 
     .structured = structured
     .raw = raw
     .appname = appname
     .product = product
     .gateway_profile = gateway_profile
+    .route_envelope = {
+      "collector": "vector",
+      "destination_port": .destination_port,
+      "product": product,
+      "hostname": to_string(.hostname) ?? "",
+      "appname": appname,
+      "source_ip": to_string(.source_ip) ?? "",
+      "raw_message": to_string(.message) ?? "",
+      "received_at": to_string(now())
+    }
     '''
 
     # 2) 路由分流：有 profile 的走网关 profile 解析；其余走 collector 侧归一化。
@@ -145,9 +155,14 @@ data:
     type = "remap"
     inputs = ["route_by_profile.profiled"]
     source = '''
+    structured = .structured
+    envelope = .route_envelope
+    envelope.route_reason = "port_profile"
+    structured._syslog_envelope = envelope
     . = {
-      "log": .structured,
-      "_gateway_profile": .gateway_profile
+      "log": structured,
+      "_gateway_profile": .gateway_profile,
+      "syslog_route": envelope
     }
     '''
 
@@ -157,10 +172,20 @@ data:
     uri = "http://defensive-ai-gateway:8080/api/alerts?profile={{ _gateway_profile }}"
     method = "post"
     request.headers.Content-Type = "application/json"
-    # Empty is valid for the trusted-LAN zero-configuration mode. Once the
-    # shared token is configured, the same manifest sends it automatically.
-    request.headers.Authorization = "Bearer ${DEFENSIVE_AI_API_TOKEN}"
+    # Collector is deliberately limited to the ingest role.
+    request.headers.Authorization = "Bearer ${DEFENSIVE_AI_INGEST_TOKEN}"
     encoding.codec = "json"
+    acknowledgements.enabled = true
+
+    # /api/alerts accepts one JSON object per request. Vector's HTTP sink batches
+    # by default, which can emit NDJSON and make a burst retry forever as 400.
+    [sinks.gateway_profiled.batch]
+    max_events = 1
+
+    [sinks.gateway_profiled.buffer]
+    type = "disk"
+    max_size = 536870912
+    when_full = "block"
 
     # 3b) standard：未配置 profile 的来源，由 collector 归一化为标准告警 JSON 后直送网关。
     [transforms.shape_standard]
@@ -206,6 +231,9 @@ data:
     payload.syslog_appname = source_name
     payload.syslog_collector = "vector"
     payload.syslog_received_at = to_string(now())
+    envelope = .route_envelope
+    envelope.route_reason = "port_standard"
+    payload.syslog_route = envelope
 
     . = {
       "alert_id": alert_id,
@@ -224,8 +252,29 @@ data:
     uri = "http://defensive-ai-gateway:8080/api/alerts"
     method = "post"
     request.headers.Content-Type = "application/json"
-    request.headers.Authorization = "Bearer ${DEFENSIVE_AI_API_TOKEN}"
+    request.headers.Authorization = "Bearer ${DEFENSIVE_AI_INGEST_TOKEN}"
     encoding.codec = "json"
+    acknowledgements.enabled = true
+
+    [sinks.gateway_standard.batch]
+    max_events = 1
+
+    [sinks.gateway_standard.buffer]
+    type = "disk"
+    max_size = 536870912
+    when_full = "block"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: syslog-collector-vector-data
+  namespace: defensive-ai-gateway
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -234,6 +283,8 @@ metadata:
   namespace: defensive-ai-gateway
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: syslog-collector-vector
@@ -242,17 +293,27 @@ spec:
       labels:
         app: syslog-collector-vector
     spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: vector
-          image: timberio/vector:0.39.0-alpine
-          imagePullPolicy: IfNotPresent
+          # Replaced by the offline packaging step with a digest-pinned image.
+          image: "@@VECTOR_IMAGE@@"
+          imagePullPolicy: Never
           args: ["--config", "/etc/vector/vector.toml"]
           env:
-            - name: DEFENSIVE_AI_API_TOKEN
+            - name: DEFENSIVE_AI_INGEST_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: defensive-ai-gateway-secrets
-                  key: DEFENSIVE_AI_API_TOKEN
+                  key: DEFENSIVE_AI_INGEST_TOKEN
           ports:
             - name: syslog-udp
               containerPort: 15140
@@ -284,17 +345,56 @@ spec:
             - name: siem-tcp
               containerPort: 15144
               protocol: TCP
+            - name: vector-api
+              containerPort: 8686
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: vector-api
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: vector-api
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
           volumeMounts:
             - name: config
               mountPath: /etc/vector
               readOnly: true
+            - name: data
+              mountPath: /var/lib/vector
+            - name: tmp
+              mountPath: /tmp
           securityContext:
             allowPrivilegeEscalation: false
             runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
       volumes:
         - name: config
           configMap:
             name: syslog-collector-vector-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: syslog-collector-vector-data
+        - name: tmp
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
@@ -303,6 +403,11 @@ metadata:
   namespace: defensive-ai-gateway
 spec:
   type: LoadBalancer
+  # Preserve device addresses so both the Service allowlist and the optional
+  # production NetworkPolicy evaluate the real source rather than a node SNAT.
+  externalTrafficPolicy: Local
+  # Rendered by the installer; empty/global ranges are rejected in production.
+  loadBalancerSourceRanges: "@@SYSLOG_SOURCE_CIDRS_JSON@@"
   selector:
     app: syslog-collector-vector
   ports:
