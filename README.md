@@ -9,7 +9,7 @@
 - Python 标准库优先：第一版不依赖 pip/npm，降低内网迁移和供应链审查成本。
 - SQLite 事实库：PoC 阶段开箱即用，生产可替换为 PostgreSQL。
 - HTTP API + 静态 Dashboard：接收 HIPS/RASP/NDR/WAF/SIEM 告警，实时查看 Case。
-- 异步告警队列：HTTP 入口只做鉴权、映射和入队，后台 worker 分析，避免高 QPS 告警阻塞入口。
+- 持久告警队列：HTTP 入口在返回 `202` 前写入 SQLite inbox；后台 worker 有限重试，终态失败进入可查询 DLQ，进程重启可恢复。
 - Agent/Skill/Harness 分层：产品专属提示词、记忆命名空间、策略检查和离线回放分开演进。
 - LLM 可插拔：开发配置默认使用 deterministic 本地规则分析器 `local-rule-analyst`；需要真实模型验证时，可在 Dashboard 切换到本地 Ollama 或内网 LLM Gateway。
 - 随机样例 + 记忆降噪：样例脚本可随机生成 attack / false_positive 告警；已批准产品长期记忆可辅助同系统重复告警的误报分辨。
@@ -26,6 +26,7 @@ python3 -m defensive_ai_gateway --config config/dev.yaml
 - 健康检查: `GET /api/health`
 - 提交告警: `POST /api/alerts`
 - 查看 Case: `GET /api/cases`
+- 查询接入队列/DLQ: `GET /api/alerts/inbox?status=dead_letter`
 
 ## 提交样例告警
 
@@ -45,7 +46,7 @@ python3 scripts/send_sample.py --random --count 3 --product waf --scenario false
 
 Dashboard 的“适配”页面可配置 Mapping Profile，把内网真实告警日志映射为内部稳定 `RawAlert`，并通过 dry-run 预览 `RawAlert` 与 `NormalizedEvent`。正式接入时可通过 `POST /api/alerts?profile=<profile_id>` 或请求体中的 `profile_id` 提交真实日志；映射失败的日志不会进入 LLM 分析。
 
-不带 `profile` 直接提交厂商原生日志时，网关会按内容指纹识别来源（例如 cloudrasp 的 `data_type=attack_event` 识别为 `rasp`）；若该产品已注册自动 profile（`AUTO_PROFILE`，默认 `rasp → auto-rasp-json`），则自动套用做深度字段映射，否则落到对应 Subagent（浅字段）。既无显式 `product` 字段、又无法识别的日志会被拒绝（400），不再静默降级为 `siem`。
+不带 `profile` 直接提交厂商原生日志时，网关会按内容指纹识别来源（例如 cloudrasp 的 `data_type=attack_event` 识别为 `rasp`）；WAF、HIPS、NDR、RASP 和 SIEM 默认均注册 `auto-<product>-json` 自动 Profile，识别后会自动做深度字段映射。既无显式 `product` 字段、又无法识别的日志会被拒绝（400），不再静默降级为 `siem`。
 
 Harness 也支持用 profile 回放脱敏真实日志：
 
@@ -70,6 +71,10 @@ bash scripts/package_offline.sh ../outputs
 离线包解压后可以先运行安装检查脚本，生成生产配置和数据目录：
 
 ```bash
+export DEFENSIVE_AI_API_TOKEN='<32+ chars>'
+export DEFENSIVE_AI_INGEST_TOKEN='<different 32+ chars>'
+export DEFENSIVE_AI_OPERATOR_TOKEN='<different 32+ chars>'
+export DEFENSIVE_AI_APPROVER_TOKEN='<different 32+ chars>'
 bash install.sh
 python3 -m defensive_ai_gateway --config config/prod.yaml
 ```
@@ -77,8 +82,15 @@ python3 -m defensive_ai_gateway --config config/prod.yaml
 如需安装为 systemd 服务：
 
 ```bash
-sudo bash install.sh --systemd --enable --start
+sudo --preserve-env=DEFENSIVE_AI_API_TOKEN,DEFENSIVE_AI_INGEST_TOKEN,DEFENSIVE_AI_OPERATOR_TOKEN,DEFENSIVE_AI_APPROVER_TOKEN \
+  bash install.sh --systemd --enable --start
 ```
+
+生产安装拒绝空、已知占位或重复角色 Token，默认双签且关闭 loopback 免认证。
+systemd 服务只监听 `127.0.0.1:8080`，应由同机 TLS/mTLS 反向代理提供远程入口，
+避免 Bearer Token 经过节点明文 HTTP。
+`bash install.sh --demo-mode` 仅生成回环、单签配置，不影响 `config/dev.yaml` 的现有
+Demo 启动方式。
 
 ## k3s 与 Syslog 接入
 
@@ -86,10 +98,27 @@ sudo bash install.sh --systemd --enable --start
 
 ```bash
 docker build -t defensive-ai-gateway:latest -f deploy/docker/Dockerfile .
-docker run --rm -p 8080:8080 -v defensive-ai-data:/data defensive-ai-gateway:latest
+docker run --rm -p 127.0.0.1:8080:8080 \
+  -e DEFENSIVE_AI_AUTH_REQUIRE_REMOTE_TOKEN=0 \
+  -e DEFENSIVE_AI_DEMO_MODE=1 \
+  -v defensive-ai-data:/data defensive-ai-gateway:latest
 ```
 
-然后访问 `http://127.0.0.1:8080`。默认空 Token 仅适合受信任、隔离的内网；设置 `DEFENSIVE_AI_API_TOKEN` 后，受保护 API 会立即要求 Bearer Token。
+然后访问 `http://127.0.0.1:8080`。上面的两个环境变量只适用于隔离 Demo；
+生产不要扩展这条 `docker run`，应使用下方 production Compose，把 loopback bypass、
+Demo 标志和单签全部切换为生产值。
+
+Docker 生产参考使用 `deploy/docker/compose.production.yaml`：应用仅绑定宿主回环，
+必须由同机 TLS/mTLS 反向代理对外提供服务；预检脚本会验证不可变镜像 digest、
+四个不同的强 Token 以及 local/Ollama/Gateway 模型参数：
+
+```bash
+set -a
+. /secure/path/defensive-ai.env
+set +a
+bash deploy/docker/validate-production-env.sh
+docker compose -f deploy/docker/compose.production.yaml up -d
+```
 
 生产接入推荐在 k3s 中用独立 collector 接收 syslog，再转发到网关 HTTP 入口：
 
@@ -99,18 +128,22 @@ Security Product -> Syslog UDP/TCP 15140-15144 -> Collector -> POST /api/alerts
 
 参考清单：
 
-- `deploy/k3s/gateway.yaml`：零配置网关 Deployment、Service 和 PVC，通过节点 `8080` 直接访问。
-- `deploy/k3s/syslog-collector-vector.yaml`：Vector syslog collector 参考清单，接收 syslog 并转成标准告警 JSON。
+- `deploy/k3s/gateway.yaml`：默认对远程请求鉴权失败关闭的 Gateway Deployment、Service 和 PVC。
+- `deploy/k3s/syslog-collector-vector.yaml`：Vector syslog collector 参考清单，使用独立 ingest Token 接收 syslog，并按五产品内置 Mapping Profile 转发。
 - `docs/SYSLOG_INGESTION.md`：安全设备配置、Mapping Profile 接入和运维注意事项。
 
 如果目标服务器不安装 Python，可用 k3s 部署物料：
 
 ```bash
-bash deploy/k3s/build-offline-images.sh --include-vector
-bash scripts/package_k3s_deploy.sh
+export PYTHON_BASE_IMAGE='python:3.11-slim@sha256:<approved-digest>'
+export VECTOR_IMAGE='timberio/vector@sha256:<approved-digest>'
+bash scripts/package_k3s_deploy.sh --include-vector
 ```
 
-生成的 `dist/defensive-ai-gateway-k3s-deploy.tar.gz` 包含镜像、校验文件、k3s 清单、导入脚本和源码包。目标服务器解压后执行 `bash install.sh`，无需 `.env` 或应用配置即可启动；完成后访问 `http://<内网服务器IP>:8080`。
+脚本会基于当前源码重建镜像，并在成功后替换
+`dist/defensive-ai-gateway-k3s-deploy.tar.gz` 及其校验文件。部署包只包含内网运行
+所需的镜像、校验文件、k3s 清单和导入脚本，不包含源码与构建工具。目标服务器
+解压后通过权限为 `600` 的 `.env` 设置四个独立角色 Token、TLS Secret、生产域名、来源 CIDR 和模型参数。生产默认只创建 ClusterIP + TLS Ingress，拒绝 `latest`、脏工作区、空/弱凭据、全网段来源和缺失 TLS；升级前自动备份 SQLite，失败恢复旧镜像与数据库。仅隔离、临时展示可显式使用 `bash install.sh --demo-mode` 增加明文 hostPort。详细说明见 `deploy/k3s/README.md`。
 
 本地可以模拟五类设备分别通过不同 TCP 端口发送 syslog，并验证路由不会把安全系统识别错：
 
@@ -135,11 +168,12 @@ defensive_ai_gateway/
   llm.py              默认本地 LLM 适配器与企业网关接口
   policy.py           沙箱策略、脱敏、工具权限控制
   memory.py           多层记忆管理（短期Case/产品长期/资产画像/组织知识 + 证据库）
+  memory_matcher.py   跨模型统一的长期记忆混合评分、阈值决策与安全合并
   agents/             HIPS/RASP/NDR/WAF/SIEM 专属 Agent
   static/             Dashboard 前端
 config/
   dev.yaml            外网开发配置
-  container.yaml      Docker/k3s 零配置离线默认值
+  container.yaml      Docker/k3s 离线、远程鉴权失败关闭默认值
   prod.example.yaml   内网生产配置模板
 deploy/
   docker/             容器部署参考
@@ -161,3 +195,5 @@ docs/
 - 每次 Agent Run、LLM 调用、策略拦截和输出都写审计记录。
 - 高影响动作只生成 `approve_required` 建议。
 - 只有 Validator `passed` 的建议可以进入审批队列；批准不等于执行，网关不提供生产动作执行接口。
+- 生产模板要求两个不同的服务端认证主体投票；本地 Demo 保持单签。
+- Demo 样本真值只在回环请求带 `X-Defensive-AI-Demo-Sample: 1` 时生效，普通告警不能用请求体自证结论。

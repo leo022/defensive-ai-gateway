@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# ruff: noqa: E402 -- source checkout scripts add the project root before imports.
+
 import argparse
 import json
 import sqlite3

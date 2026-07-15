@@ -55,10 +55,12 @@ flowchart TB
     %% 4) 异步处理队列
     %% ═══════════════════════════════════════════════════════════════
 
-    subgraph QUEUE["⚙️ 异步处理队列 (processing.py)"]
+    subgraph QUEUE["⚙️ 持久接入队列 (database.py / processing.py)"]
         direction LR
-        AP["AlertProcessor<br/>bounded queue (max=5000)<br/>worker pool (default=4)<br/>submit() / start() / stop()"]
-        STATS["AlertProcessorStats<br/>submitted / processed<br/>failed / rejected / inflight"]
+        INBOX["durable_alert_inbox<br/>返回 202 前提交<br/>pending · retry · processing<br/>completed · dead_letter"]
+        AP["AlertProcessor<br/>bounded execution queue<br/>worker pool<br/>bounded shutdown"]
+        STATS["Operational Stats<br/>queued / processed / retried<br/>dead_lettered / rejected / inflight"]
+        INBOX --> AP --> STATS
     end
 
     %% ═══════════════════════════════════════════════════════════════
@@ -70,11 +72,11 @@ flowchart TB
         O["Orchestrator.handle_alert(alert)"]
         step1["① EventNormalizer.normalize(alert) → NormalizedEvent"]
         step2["② 原子事务写入: audit_log + raw_alerts + normalized_events"]
-        step3["③ case_id = _case_id(event) 确定性哈希"]
+        step3["③ 按实体 + 1h 时间窗解析 Case<br/>终态 Case 自动滚动新建"]
         step4["④ build_agent(product, llm, policy)→SecurityAgent"]
-        step5["⑤ memory.load_context(product, case_id, asset_id)"]
+        step5["⑤ 加载分层记忆 + 确定性相似度<br/>+ 15m 跨产品实体关联"]
         step6["⑥ agent.analyze(case_id, event, memory_context)→AgentResult"]
-        step7["⑦ 原子事务: upsert_case + link_case_alert + insert_agent_run + record_case_summary + audit"]
+        step7["⑦ Validator 门禁后原子提交<br/>Case + Run + Match + Approval + Audit<br/>非 passed 禁止写可消费记忆"]
         step8["⑧ LLM 失败降级: LocalHeuristicLLM fallback"]
         O --> step1 --> step2 --> step3 --> step4 --> step5 --> step6 --> step7
         O -.-> step8
@@ -112,9 +114,9 @@ flowchart TB
         direction TB
 
         subgraph LLM_BACKENDS["LLMClient 抽象 → 3 个后端"]
-            LOCAL["LocalHeuristicLLM<br/>确定性规则分析器<br/>关键词评分 + 样本 evidence_assessment 解析<br/>+ 误报记忆匹配 _false_positive_memory_match()<br/>is_deterministic = True"]
-            OLLAMA["OllamaLLM<br/>本地 Ollama 模型 (gemma3:4b…)<br/>JSON Schema 约束输出<br/>(OLLAMA_ANALYSIS_SCHEMA)<br/>temperature=0, fixed seed"]
-            GW_LLM["GatewayLLM<br/>企业内网 LLM Gateway<br/>JSON-over-HTTP 适配<br/>_validate_result_shape()<br/>中文分类标签归一化"]
+            LOCAL["LocalHeuristicLLM<br/>确定性规则分析器<br/>仅对当前告警做关键词评分<br/>+ 样本 evidence_assessment 解析<br/>is_deterministic = True"]
+            OLLAMA["OllamaLLM<br/>仅回环地址<br/>JSON Schema 约束输出<br/>响应上限 · 重试 · 熔断<br/>禁止 HTTP 重定向"]
+            GW_LLM["GatewayLLM<br/>HTTPS + host allowlist<br/>JSON-over-HTTP 适配<br/>响应上限 · 重试 · 熔断<br/>模型来源写入每次 Run"]
         end
 
         PE["PolicyEngine<br/>← 上下文必经的单一掐点<br/>┣ redact() — 敏感字段/模式脱敏<br/>┣ sanitize_context() — 大小裁剪 + 脱敏<br/>┣ truncate_prompt_payload() — Prompt 截断<br/>┗ action_mode() — 只读/审批/自动 模式判定"]
@@ -154,6 +156,11 @@ flowchart TB
             T_MEV["memory_events<br/>(审计追踪)"]
             T_AUDIT["audit_log"]
             T_MP["mapping_profiles"]
+            T_MM["memory_matches"]
+            T_VAL["validation_runs"]
+            T_APP["action_approvals<br/>+ approval_votes"]
+            T_INBOX["durable_alert_inbox"]
+            T_OPS["runtime_settings<br/>+ alert_dispositions"]
         end
         TX["_Transaction 上下文管理器<br/>可重入 · 原子提交/回滚<br/>RLock 串行化并发"]
     end
@@ -165,7 +172,7 @@ flowchart TB
     subgraph UI["🖥️ Dashboard & API"]
         direction TB
         DASH["static/index.html<br/>Cases · Alerts · Memory<br/>LLM Config · Syslog Config<br/>Mapping Profiles"]
-        API_ROUTES["REST API<br/>┣ /api/alerts — 告警提交<br/>┣ /api/cases — Case 列表/详情/处置<br/>┣ /api/memory — 记忆查询/晋升/拒绝/隔离/sweep<br/>┣ /api/memory/events — 记忆事件<br/>┣ /api/config/llm — LLM 配置 CRUD + reload + Ollama 模型列表<br/>┣ /api/config/syslog — Syslog 端口协议配置<br/>┣ /api/mapping-profiles — 日志适配配置<br/>┣ /api/mapping-profiles/dry-run — 适配预览<br/>┣ /api/mapping-profiles/infer — 自动字段识别<br/>┣ /api/alerts/{id}/confirm-false-positive — 人工确认误报<br/>┗ /api/health — 健康检查 + 统计"]
+        API_ROUTES["REST API<br/>┣ /api/session — 服务端身份与角色<br/>┣ /api/alerts — 告警提交<br/>┣ /api/alerts/inbox — 队列与 DLQ<br/>┣ /api/cases — Case 列表/详情/处置<br/>┣ /api/approvals — distinct actor 审批<br/>┣ /api/memory — 治理与相似度记录<br/>┣ /api/config/llm — 模型配置/测试/reload<br/>┣ /api/config/syslog — 本地或外部 Vector 状态<br/>┣ /api/mapping-profiles — 五产品日志适配<br/>┣ /api/alerts/{id}/confirm-false-positive<br/>┗ /api/health — 健康检查 + 统计"]
     end
 
     %% ═══════════════════════════════════════════════════════════════
@@ -174,7 +181,7 @@ flowchart TB
 
     subgraph CONFIG["⚙️ 配置 (config.py)"]
         direction LR
-        CFG["GatewayConfig<br/>┣ ServerConfig (host/port)<br/>┣ DatabaseConfig (path)<br/>┣ LLMConfig (provider/endpoint/model/api_key/timeout)<br/>┣ PolicyConfig (mode/max_prompt/max_context/redact_fields)<br/>┣ AuthConfig (api_token/loopback/remote)<br/>┣ ProcessingConfig (async/queue/workers)<br/>┗ SyslogConfig (product_ports/protocols/profiles)"]
+        CFG["GatewayConfig<br/>┣ ServerConfig (连接/超时/限流)<br/>┣ LLMConfig (provider/allowlist/limits)<br/>┣ PolicyConfig (脱敏/双签)<br/>┣ AuthConfig (admin/ingest/operator/approver)<br/>┣ ProcessingConfig (inbox/retry/workers)<br/>┣ OperationsConfig (清理/恢复/到期)<br/>┗ SyslogConfig (embedded/Vector/profiles)"]
         YAML["config/dev.yaml<br/>config/prod.example.yaml<br/>+ parse_simple_yaml()<br/>+ 环境变量覆盖"]
     end
 
@@ -292,6 +299,9 @@ sequenceDiagram
     MEM->>DB: 查询 4 层记忆
     MEM-->>ORCH: memory_context<br/>{case_short_term, product_long_term,<br/> asset_profile, org_knowledge, evidence_refs}
 
+    ORCH->>MEM: load_match_candidates(product, limit)
+    ORCH->>ORCH: MemoryMatcher<br/>硬过滤 + 加权结构化 + 哈希向量余弦 + 检索键<br/>只注入达到复核阈值的 Top-K
+
     ORCH->>AGENT: agent.analyze(case_id, event, memory_context)
 
     rect rgb(240, 248, 255)
@@ -305,7 +315,6 @@ sequenceDiagram
         alt LocalHeuristicLLM
             LLM->>LLM: 关键词评分 (RCE/SQL/XSS/C2...)
             LLM->>LLM: _sample_assessment() 解析 evidence_assessment
-            LLM->>LLM: _false_positive_memory_match() 误报记忆匹配
             LLM-->>AGENT: 确定性分析结果 dict
         else OllamaLLM
             LLM->>LLM: POST /api/generate + JSON Schema 约束
@@ -317,6 +326,9 @@ sequenceDiagram
             LLM->>LLM: _validate_result_shape() → 中文分类归一化
             LLM-->>AGENT: LLM Gateway 响应 dict
         end
+
+        ORCH->>ORCH: 统一 reconcile<br/>高分可支持 suspicious→benign<br/>malicious 攻击证据拥有否决权
+        ORCH->>DB: 写 memory_matches 分项得分与最终影响
 
         alt LLM 调用异常
             AGENT->>LLM: LocalHeuristicLLM 降级

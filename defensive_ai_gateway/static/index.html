@@ -6,22 +6,7 @@
     <meta name="color-scheme" content="light dark" />
     <meta name="theme-color" content="#f4f6f8" />
     <title>安全运营研判中心</title>
-    <script>
-      (() => {
-        const key = "dashboard-theme";
-        try {
-          const stored = localStorage.getItem(key);
-          const theme =
-            stored ||
-            (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-          document.documentElement.dataset.theme = theme;
-          document.documentElement.style.colorScheme = theme;
-        } catch (err) {
-          document.documentElement.dataset.theme = "light";
-          document.documentElement.style.colorScheme = "light";
-        }
-      })();
-    </script>
+    <script src="/theme-init.js"></script>
     <link rel="stylesheet" href="/style.css" />
   </head>
   <body>
@@ -34,13 +19,27 @@
             <p data-i18n="appSubtitle">多源告警处置与证据治理</p>
           </div>
         </div>
-        <nav class="primary-nav" aria-label="Main">
+        <nav id="primary-navigation" class="primary-nav" aria-label="Main">
           <button class="nav-button active" type="button" data-view="monitor" data-i18n="navMonitor">监控大屏</button>
           <button class="nav-button" type="button" data-view="dashboard" data-i18n="navDashboard">处置台</button>
-          <button class="nav-button" type="button" data-view="adapter" data-i18n="navAdapter">日志接入</button>
+          <div id="memory-nav-group" class="nav-group" data-view-group="memory">
+            <button id="memory-nav-parent" class="nav-button nav-parent" type="button" data-view="memory" data-secondary-group="memory" data-default-secondary="inventory"><span data-i18n="navMemory">记忆治理</span></button>
+            <div id="memory-submenu" class="nav-submenu" role="group" data-i18n-aria-label="memorySecondaryNav">
+              <button id="memory-tab-inventory" class="nav-subbutton active" type="button" data-view="memory" data-secondary-group="memory" data-secondary-target="inventory" aria-controls="memory-inventory-panel" data-i18n="memorySubInventory">记忆清单</button>
+              <button id="memory-tab-audit" class="nav-subbutton" type="button" data-view="memory" data-secondary-group="memory" data-secondary-target="audit" aria-controls="memory-audit-panel" data-i18n="memorySubAudit">治理审计</button>
+            </div>
+          </div>
+          <div id="adapter-nav-group" class="nav-group" data-view-group="adapter">
+            <button id="adapter-nav-parent" class="nav-button nav-parent" type="button" data-view="adapter" data-secondary-group="adapter" data-default-secondary="intake"><span data-i18n="navAdapter">日志接入</span></button>
+            <div id="adapter-submenu" class="nav-submenu" role="group" data-i18n-aria-label="adapterSecondaryNav">
+              <button id="adapter-tab-intake" class="nav-subbutton active" type="button" data-view="adapter" data-secondary-group="adapter" data-secondary-target="intake" aria-controls="adapter-intake-panel" data-i18n="adapterSubIntake">告警接入</button>
+              <button id="adapter-tab-config" class="nav-subbutton" type="button" data-view="adapter" data-secondary-group="adapter" data-secondary-target="config" aria-controls="adapter-config-panel" data-i18n="adapterSubConfig">日志配置</button>
+            </div>
+          </div>
           <button class="nav-button" type="button" data-view="settings" data-i18n="navSettings">运行配置</button>
         </nav>
         <div class="sidebar-footer">
+          <button id="auth-session" class="utility-button" type="button" data-i18n="authSession" hidden>API 认证</button>
           <button id="theme-switch" class="utility-button" type="button" aria-label="切换深色或浅色模式" data-i18n-aria-label="themeAria"></button>
           <button id="language-switch" class="utility-button language-switch" type="button" aria-label="Switch language"></button>
         </div>
@@ -183,6 +182,91 @@
               <div id="cases-list" class="case-list"></div>
             </section>
           </section>
+          <section id="memory-view" class="view">
+            <div id="memory-inventory-panel" class="secondary-view active" aria-labelledby="memory-tab-inventory" data-secondary-panel="memory" data-secondary-name="inventory">
+            <section class="stats memory-kpis" aria-label="Memory governance summary">
+              <div><span id="memory-total">0</span><label data-i18n="memoryTotal">记忆总量</label></div>
+              <div><span id="memory-active">0</span><label data-i18n="memoryActive">生效中</label></div>
+              <div><span id="memory-pending">0</span><label data-i18n="memoryPending">待审批</label></div>
+              <div><span id="memory-quarantined">0</span><label data-i18n="memoryQuarantined">已隔离</label></div>
+              <div><span id="memory-overdue">0</span><label data-i18n="memoryOverdue">逾期复核</label></div>
+            </section>
+
+            <section class="memory-workbench">
+              <section class="panel memory-browser-panel">
+                <div class="panel-heading">
+                  <div>
+                    <h2 data-i18n="memoryInventory">记忆清单</h2>
+                    <p data-i18n="memoryInventoryHint">检索全部层级与生命周期状态。</p>
+                  </div>
+                  <button id="memory-sweep" class="memory-sweep-button" type="button" data-i18n="memorySweep">治理扫描</button>
+                </div>
+                <form id="memory-filter-form" class="memory-filter-form">
+                  <label class="memory-filter-query">
+                    <span data-i18n="memorySearch">关键词</span>
+                    <input id="memory-filter-query" type="search" maxlength="200" data-i18n-placeholder="memorySearchPlaceholder" placeholder="ID、命名空间、检索键或内容" />
+                  </label>
+                  <label>
+                    <span data-i18n="memoryLayer">层级</span>
+                    <select id="memory-filter-layer">
+                      <option value="" data-i18n="memoryAllLayers">全部层级</option>
+                      <option value="case_short_term" data-i18n="memoryLayerCase">Case 短期</option>
+                      <option value="product_long_term" data-i18n="memoryLayerProduct">产品长期</option>
+                      <option value="asset_profile" data-i18n="memoryLayerAsset">资产画像</option>
+                      <option value="org_knowledge" data-i18n="memoryLayerOrg">组织知识</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span data-i18n="memoryStatus">状态</span>
+                    <select id="memory-filter-status">
+                      <option value="" data-i18n="memoryAllStatuses">全部状态</option>
+                      <option value="active" data-i18n="memoryStatusActive">生效中</option>
+                      <option value="pending_approval" data-i18n="memoryStatusPending">待审批</option>
+                      <option value="quarantined" data-i18n="memoryStatusQuarantined">已隔离</option>
+                      <option value="revoked" data-i18n="memoryStatusRevoked">已撤销</option>
+                      <option value="expired" data-i18n="memoryStatusExpired">已过期</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span data-i18n="memoryNamespace">命名空间</span>
+                    <input id="memory-filter-namespace" type="text" maxlength="200" placeholder="product/waf" />
+                  </label>
+                  <div class="memory-filter-actions">
+                    <button type="submit" data-i18n="caseSearchSubmit">搜索</button>
+                    <button type="button" id="memory-filter-reset" data-i18n="caseSearchReset">重置</button>
+                  </div>
+                </form>
+                <p id="memory-inventory-status" class="form-status" aria-live="polite"></p>
+                <div id="memory-list" class="memory-list" aria-live="polite"></div>
+              </section>
+
+              <section class="panel memory-detail-panel">
+                <div class="panel-heading">
+                  <div>
+                    <h2 data-i18n="memoryDetail">治理详情</h2>
+                    <p data-i18n="memoryDetailHint">核验证据、适用范围、期限和审计轨迹。</p>
+                  </div>
+                </div>
+                <div id="memory-detail" class="memory-detail">
+                  <p class="empty-state" data-i18n="memorySelectPrompt">从左侧选择一条记忆开始治理。</p>
+                </div>
+              </section>
+            </section>
+            </div>
+
+            <div id="memory-audit-panel" class="secondary-view" aria-labelledby="memory-tab-audit" data-secondary-panel="memory" data-secondary-name="audit" hidden>
+            <section class="panel memory-audit-panel">
+              <div class="panel-heading">
+                <div>
+                  <h2 data-i18n="memoryAudit">治理审计</h2>
+                  <p data-i18n="memoryAuditHint">最近的提议、审批、隔离、恢复、冲突和过期事件。</p>
+                </div>
+                <button id="memory-audit-refresh" type="button" data-i18n="refresh">刷新</button>
+              </div>
+              <div id="memory-audit-list" class="memory-audit-list"></div>
+            </section>
+            </div>
+          </section>
           <section id="settings-view" class="view">
             <section class="panel settings-panel">
               <div class="panel-heading">
@@ -218,7 +302,7 @@
             </label>
             <label>
               <span data-i18n="keyEnv">Key 环境变量</span>
-              <input id="llm-api-key-env" name="api_key_env" type="text" placeholder="DEFENSIVE_AI_LLM_API_KEY" />
+              <input id="llm-api-key-env" name="api_key_env" type="text" placeholder="DEFENSIVE_AI_LLM_API_KEY" readonly />
             </label>
             <label>
               <span data-i18n="timeoutSeconds">超时秒数</span>
@@ -235,6 +319,7 @@
             </section>
           </section>
           <section id="adapter-view" class="view">
+            <div id="adapter-intake-panel" class="secondary-view active" aria-labelledby="adapter-tab-intake" data-secondary-panel="adapter" data-secondary-name="intake">
             <section class="panel intake-plan-panel">
               <div class="panel-heading">
                 <div>
@@ -270,18 +355,22 @@
                     <dt data-i18n="channelProtocol">协议</dt><dd>Syslog TCP/UDP</dd>
                     <dt data-i18n="channelEndpoint">入口</dt><dd><code>syslog-collector:&lt;产品端口&gt;/&lt;协议&gt;</code></dd>
                     <dt data-i18n="channelTarget">转发</dt><dd><code>POST /api/alerts</code></dd>
-                    <dt data-i18n="channelStatus">状态</dt><dd><span class="field-status needs_review" data-i18n="channelPlanned">规划新增</span></dd>
+                    <dt data-i18n="channelStatus">状态</dt><dd><span id="syslog-channel-status" class="field-status needs_review" data-i18n="channelPlanned">规划新增</span></dd>
                   </dl>
                 </article>
               </div>
               <div class="syslog-config-block">
                 <div class="syslog-config-heading">
                   <div>
-                    <h3 data-i18n="syslogConfigTitle">Syslog 产品接收配置</h3>
+                    <div class="syslog-config-title-row">
+                      <h3 data-i18n="syslogConfigTitle">Syslog 产品接收配置</h3>
+                      <span id="syslog-mode-badge" class="syslog-mode-badge"></span>
+                    </div>
                     <p data-i18n="syslogConfigHint">为每类安全系统配置接收端口和协议；syslog 报文非常长时推荐 TCP，已作为默认项。</p>
                   </div>
-                  <button type="button" id="reset-syslog-config" data-i18n="resetSyslogConfig">恢复默认端口</button>
+                  <button type="button" id="reset-syslog-config" data-i18n="resetSyslogConfig">填入默认值</button>
                 </div>
+                <p id="syslog-mode-summary" class="syslog-mode-summary" hidden></p>
                 <div id="syslog-config-table" class="syslog-config-table"></div>
                 <p id="syslog-config-status" class="form-status"></p>
               </div>
@@ -309,6 +398,8 @@
                 </div>
               </div>
             </section>
+            </div>
+            <div id="adapter-config-panel" class="secondary-view" aria-labelledby="adapter-tab-config" data-secondary-panel="adapter" data-secondary-name="config" hidden>
             <section class="adapter-grid">
               <section class="panel">
                 <div class="panel-heading">
@@ -370,6 +461,7 @@
             <pre id="dry-run-result" class="json-block dry-run-result" data-i18n="dryRunHint">等待日志与映射配置。</pre>
               </section>
             </section>
+            </div>
           </section>
         </main>
         <footer class="app-footer">
@@ -377,6 +469,23 @@
         </footer>
       </div>
     </div>
+    <dialog id="auth-dialog" class="auth-dialog">
+      <form id="auth-form" method="dialog">
+        <div class="auth-dialog-heading">
+          <h2 data-i18n="authTitle">API 认证</h2>
+          <button id="auth-close" class="icon-button" type="button" aria-label="关闭" data-i18n-aria-label="authClose">&times;</button>
+        </div>
+        <label>
+          <span data-i18n="authToken">访问 Token</span>
+          <input id="auth-token" type="password" autocomplete="current-password" required />
+        </label>
+        <p id="auth-status" class="form-status"></p>
+        <div class="form-actions">
+          <button type="submit" data-i18n="authConnect">连接</button>
+          <button id="auth-clear" type="button" data-i18n="authClear">清除</button>
+        </div>
+      </form>
+    </dialog>
     <script src="/app.js"></script>
   </body>
 </html>

@@ -19,7 +19,12 @@ class ResponseAdvisor:
         # turned into an authorization request until an analyst resolves it.
         if validation.status != "passed":
             return []
-        actions = list(result.recommended_actions)
+        # Copy actions so approval normalization never mutates the persisted agent
+        # recommendation. The original and the approval request remain auditable.
+        actions = [
+            RecommendedAction(action.action, action.mode, action.rationale, action.rollback)
+            for action in result.recommended_actions
+        ]
         if result.classification == "malicious" and result.severity in {"critical", "high"} and result.confidence >= 0.75:
             product = result.agent.split("-", 1)[0].lower()
             templates = {
@@ -40,11 +45,18 @@ class ResponseAdvisor:
                     )
                 )
         requests: list[ApprovalRequest] = []
+        seen_actions: set[str] = set()
         for action in actions:
             if self.policy.requires_approval(action.action):
                 action.mode = "approve_required"
             if action.mode != "approve_required":
                 continue
+            if result.classification not in {"malicious", "suspicious"}:
+                continue
+            normalized_action = " ".join(action.action.lower().split())
+            if not normalized_action or normalized_action in seen_actions:
+                continue
+            seen_actions.add(normalized_action)
             rollback = action.rollback.strip() or "由执行系统记录变更前状态；出现业务异常时停止动作并恢复变更前配置。"
             digest = hashlib.sha256(f"{result.case_id}\0{event_id}\0{action.action}".encode("utf-8")).hexdigest()[:20]
             requests.append(
@@ -55,6 +67,9 @@ class ResponseAdvisor:
                     action=action.action,
                     rationale=action.rationale,
                     rollback=rollback,
+                    required_approvals=max(
+                        1, min(int(self.policy.config.approval_quorum), 5)
+                    ),
                 )
             )
         return requests

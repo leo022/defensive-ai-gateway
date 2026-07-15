@@ -1,12 +1,14 @@
 const detailCache = new Map();
 const THEME_KEY = "dashboard-theme";
 const LANGUAGE_KEY = "dashboard-language";
+const API_TOKEN_KEY = "defensive-ai-api-token";
 const SYSLOG_CONFIG_KEY = "dashboard-syslog-intake-config";
 const REFRESH_PAUSED_KEY = "dashboard-refresh-paused";
 const LEGACY_OFFLINE_MODE_KEY = "dashboard-offline-mode";
 const COLLAPSIBLE_TEXT_LIMIT = 280;
 const COLLAPSIBLE_TEXT_LINE_LIMIT = 8;
 const DASHBOARD_REFRESH_MS = 15000;
+const REQUEST_TIMEOUT_MS = 30_000;
 const LOG_PRODUCT_OPTIONS = [
   { product: "waf", label: "WAF" },
   { product: "hips", label: "HIPS" },
@@ -15,11 +17,11 @@ const LOG_PRODUCT_OPTIONS = [
   { product: "siem", label: "SIEM" },
 ];
 const DEFAULT_SYSLOG_CONFIGS = [
-  { product: "waf", label: "WAF", port: 15140, protocol: "tcp", profile: "waf-syslog-json", saved: false },
-  { product: "hips", label: "HIPS", port: 15141, protocol: "tcp", profile: "hips-syslog-json", saved: false },
-  { product: "ndr", label: "NDR", port: 15142, protocol: "tcp", profile: "ndr-syslog-json", saved: false },
-  { product: "rasp", label: "RASP", port: 15143, protocol: "tcp", profile: "demo-rasp-json", saved: false },
-  { product: "siem", label: "SIEM", port: 15144, protocol: "tcp", profile: "siem-syslog-json", saved: false },
+  { product: "waf", label: "WAF", port: 15140, protocol: "tcp", profile: "auto-waf-json", saved: false },
+  { product: "hips", label: "HIPS", port: 15141, protocol: "tcp", profile: "auto-hips-json", saved: false },
+  { product: "ndr", label: "NDR", port: 15142, protocol: "tcp", profile: "auto-ndr-json", saved: false },
+  { product: "rasp", label: "RASP", port: 15143, protocol: "tcp", profile: "auto-rasp-json", saved: false },
+  { product: "siem", label: "SIEM", port: 15144, protocol: "tcp", profile: "auto-siem-json", saved: false },
 ];
 const STRINGS = {
   zh: {
@@ -27,12 +29,31 @@ const STRINGS = {
     appSubtitle: "多源告警处置与证据治理",
     navMonitor: "监控大屏",
     navDashboard: "处置台",
+    navMemory: "记忆治理",
     navAdapter: "日志接入",
     navSettings: "运行配置",
+    memorySecondaryNav: "记忆治理二级目录",
+    memorySubInventory: "记忆清单",
+    memorySubAudit: "治理审计",
+    adapterSecondaryNav: "日志接入二级目录",
+    adapterSubIntake: "告警接入",
+    adapterSubConfig: "日志配置",
+    authSession: "API 认证",
+    authTitle: "API 认证",
+    authToken: "访问 Token",
+    authConnect: "连接",
+    authClear: "清除",
+    authClose: "关闭",
+    authRequired: "需要 API 认证",
+    authConnected: "认证成功",
+    authCleared: "会话认证已清除",
+    authIdentity: "当前身份：{actor} · 权限：{roles}",
+    permissionDenied: "当前会话没有执行此操作的权限",
     workspaceEyebrow: "Security Operations",
     workspaceTitle: "实时监控大屏",
     workspaceTitleMonitor: "实时监控大屏",
     workspaceTitleDashboard: "告警处置队列",
+    workspaceTitleMemory: "记忆治理工作台",
     workspaceTitleAdapter: "日志接入",
     workspaceTitleSettings: "运行配置",
     dashboardEyebrow: "Realtime SOC Overview",
@@ -77,6 +98,96 @@ const STRINGS = {
     highCritical: "高危与严重",
     latestCases: "Case 队列",
     latestCasesHint: "按创建时间排序，处置后队列顺序保持不变。",
+    memoryTotal: "记忆总量",
+    memoryActive: "生效中",
+    memoryPending: "待审批",
+    memoryQuarantined: "已隔离",
+    memoryOverdue: "逾期复核",
+    memoryInventory: "记忆清单",
+    memoryInventoryHint: "检索全部层级与生命周期状态。",
+    memorySweep: "治理扫描",
+    memorySearch: "关键词",
+    memorySearchPlaceholder: "ID、命名空间、检索键或内容",
+    memoryLayer: "层级",
+    memoryAllLayers: "全部层级",
+    memoryLayerCase: "Case 短期",
+    memoryLayerProduct: "产品长期",
+    memoryLayerAsset: "资产画像",
+    memoryLayerOrg: "组织知识",
+    memoryLayerEvidence: "证据引用",
+    memoryStatus: "状态",
+    memoryAllStatuses: "全部状态",
+    memoryStatusActive: "生效中",
+    memoryStatusPending: "待审批",
+    memoryStatusQuarantined: "已隔离",
+    memoryStatusRevoked: "已撤销",
+    memoryStatusExpired: "已过期",
+    memoryNamespace: "命名空间",
+    memoryDetail: "治理详情",
+    memoryDetailHint: "核验证据、适用范围、期限和审计轨迹。",
+    memorySelectPrompt: "从左侧选择一条记忆开始治理。",
+    memoryAudit: "治理审计",
+    memoryAuditHint: "最近的提议、审批、隔离、恢复、冲突和过期事件。",
+    memoryLoading: "正在加载记忆治理数据...",
+    memoryNoResults: "当前筛选条件下没有记忆。",
+    memoryCount: "显示 {count} 条",
+    memorySourceCase: "来源 Case",
+    memoryRetrievalKey: "检索键",
+    memoryTrust: "信任等级",
+    memoryScope: "适用范围",
+    memoryCreated: "创建时间",
+    memoryUpdated: "更新时间",
+    memoryExpires: "过期时间",
+    memoryApprover: "批准人",
+    memoryContent: "结构化内容",
+    memoryGovernanceForm: "治理操作",
+    memoryAnalyst: "操作人",
+    memoryReason: "治理理由",
+    memoryReasonPlaceholder: "记录审批依据、投毒风险或恢复原因",
+    memoryPromotionScope: "批准范围",
+    memoryExpiry: "有效期至",
+    memoryPromote: "批准晋升",
+    memoryReject: "撤销",
+    memoryQuarantine: "隔离",
+    memoryRestore: "恢复",
+    memoryGateStatus: "晋升五门禁",
+    memoryGateEvidence: "证据可追溯",
+    memoryGateApprover: "分析师已确认",
+    memoryGateScope: "适用范围清晰",
+    memoryGateExpiry: "有效期明确",
+    memoryGateSensitive: "无敏感信息泄漏",
+    memoryGatePass: "通过",
+    memoryGateFail: "待补充",
+    memoryActionDone: "记忆 {id} 已完成{action}。",
+    memoryActionFailed: "治理操作失败：{message}",
+    memorySweepDone: "扫描完成：过期 {expired} 条，冲突隔离 {conflicts} 条。",
+    memoryAuditEmpty: "暂无治理事件。",
+    memoryAssociations: "关联告警",
+    memoryAssociationsHint: "由统一 matcher 保存的候选评分与最终影响。",
+    memoryAssociationsEmpty: "尚无后续告警与该记忆产生有效候选关联。",
+    memoryMatchOverall: "综合分",
+    memoryMatchStructured: "结构化",
+    memoryMatchSemantic: "语义向量",
+    memoryMatchRetrieval: "检索键",
+    memoryMatchDecision: "决策",
+    memoryMatchDowngraded: "降级为误报",
+    memoryMatchReinforced: "强化误报结论",
+    memoryMatchAttackVeto: "攻击证据否决降级",
+    memoryMatchReview: "仅供复核",
+    memoryMatchEligible: "达到应用阈值",
+    memoryMatchIgnored: "未达到阈值",
+    memoryEventProposed: "提出候选",
+    memoryEventPromoted: "批准晋升",
+    memoryEventRejected: "拒绝或撤销",
+    memoryEventQuarantined: "隔离",
+    memoryEventExpired: "过期",
+    memoryEventConflict: "发现冲突",
+    memoryEventRestored: "恢复生效",
+    memoryEventRestoredReview: "恢复待审",
+    memoryEventHumanConfirmed: "人工确认误报",
+    memoryEventAssetRecorded: "更新资产画像",
+    memoryReasonRequired: "撤销、隔离或恢复必须填写治理理由。",
+    memoryPromotionRequired: "晋升必须填写操作人、适用范围和未来有效期。",
     caseSearchProduct: "系统",
     caseSearchSeverity: "风险等级",
     caseSearchStatus: "处置状态",
@@ -119,7 +230,7 @@ const STRINGS = {
     flowGateway: "网关 HTTP 告警入口",
     syslogConfigTitle: "Syslog 产品接收配置",
     syslogConfigHint: "为每类安全系统配置接收端口和协议；syslog 报文非常长时推荐 TCP，已作为默认项。",
-    resetSyslogConfig: "恢复默认端口",
+    resetSyslogConfig: "填入默认值",
     syslogProduct: "安全系统",
     syslogPort: "端口",
     syslogProtocol: "协议",
@@ -132,9 +243,16 @@ const STRINGS = {
     syslogSavedToast: "{product} 已配置为 {protocol} {port} 日志接收，配置已生效",
     syslogPortInvalid: "端口必须在 1-65535 之间",
     syslogProtocolInvalid: "协议必须选择 TCP 或 UDP",
-    syslogDefaultsRestored: "已恢复默认 TCP 端口配置，请保存需要生效的行",
+    syslogDefaultsRestored: "已填入默认 TCP 端口草稿；后端配置尚未改变，请逐行保存需要生效的配置",
     syslogConfigLoadFailed: "加载 Syslog 配置失败：{message}",
     syslogConfigApiUnavailable: "当前后端尚未加载 Syslog 动态配置接口，已显示本地默认值；请重启网关服务后再保存使端口生效。",
+    syslogModeEmbedded: "内嵌监听",
+    syslogModeExternal: "外部 Vector",
+    syslogEmbeddedReady: "网关内嵌 Syslog 监听已启用",
+    syslogExternalManaged: "接收端口已由外部 Vector collector 托管；网关内嵌监听器按设计关闭。端口与协议由部署配置管理。",
+    syslogExternalStatus: "外部 Collector 托管",
+    syslogManagedStatus: "外部接收：{protocol} {port}",
+    syslogExternalHealth: "外部 Collector 托管 {total} 个入口",
     syslogOpsTitle: "安全系统侧配置",
     syslogOpsText: "目的地址填写服务区暴露的 syslog collector IP，端口和协议使用对应产品配置。",
     syslogMappingTitle: "字段处理策略",
@@ -217,6 +335,8 @@ const STRINGS = {
     approvalReasonPrompt: "请输入审批理由。批准仅表示授权给既有处置流程，本系统不会执行生产动作。",
     approvalDecisionDefault: "Dashboard 分析师已复核证据与回滚条件",
     approvalSaved: "审批状态已更新：{status}（未执行）",
+    approvalProgress: "审批进度 {count}/{required}",
+    approvalVoteSaved: "审批意见已记录：{count}/{required}，当前状态为 {status}（未执行）",
     approvalFailed: "审批失败：{message}",
     noApprovals: "当前 Case 无可流转审批项",
     missingEvidence: "缺失证据",
@@ -291,18 +411,39 @@ const STRINGS = {
     dryRunError: "映射校验失败：{message}",
     fieldRequired: "必填",
     fieldEnhanced: "增强",
+    requestTimedOut: "请求超过 {seconds} 秒未完成，已自动取消。",
+    requestCancelled: "请求已取消。",
   },
   en: {
     appTitle: "Security Operations Triage Center",
     appSubtitle: "Alert response and evidence governance",
     navMonitor: "Monitoring",
     navDashboard: "Queue",
+    navMemory: "Memory Governance",
     navAdapter: "Log Intake",
     navSettings: "Runtime",
+    memorySecondaryNav: "Memory governance sections",
+    memorySubInventory: "Memory Inventory",
+    memorySubAudit: "Governance Audit",
+    adapterSecondaryNav: "Log intake sections",
+    adapterSubIntake: "Alert Intake",
+    adapterSubConfig: "Log Configuration",
+    authSession: "API Access",
+    authTitle: "API Access",
+    authToken: "Access token",
+    authConnect: "Connect",
+    authClear: "Clear",
+    authClose: "Close",
+    authRequired: "API authentication required",
+    authConnected: "Authenticated",
+    authCleared: "Session credential cleared",
+    authIdentity: "Current identity: {actor} · Roles: {roles}",
+    permissionDenied: "The current session cannot perform this operation",
     workspaceEyebrow: "Security Operations",
     workspaceTitle: "Realtime Monitoring",
     workspaceTitleMonitor: "Realtime Monitoring",
     workspaceTitleDashboard: "Alert Triage Queue",
+    workspaceTitleMemory: "Memory Governance",
     workspaceTitleAdapter: "Log Intake",
     workspaceTitleSettings: "Runtime Configuration",
     dashboardEyebrow: "Realtime SOC Overview",
@@ -347,6 +488,96 @@ const STRINGS = {
     highCritical: "High and Critical",
     latestCases: "Case Queue",
     latestCasesHint: "Sorted by creation time; disposition changes keep the queue order stable.",
+    memoryTotal: "Total Memories",
+    memoryActive: "Active",
+    memoryPending: "Pending",
+    memoryQuarantined: "Quarantined",
+    memoryOverdue: "Review Overdue",
+    memoryInventory: "Memory Inventory",
+    memoryInventoryHint: "Search every layer and lifecycle state.",
+    memorySweep: "Run Governance Scan",
+    memorySearch: "Keyword",
+    memorySearchPlaceholder: "ID, namespace, retrieval key, or content",
+    memoryLayer: "Layer",
+    memoryAllLayers: "All layers",
+    memoryLayerCase: "Case short-term",
+    memoryLayerProduct: "Product long-term",
+    memoryLayerAsset: "Asset profile",
+    memoryLayerOrg: "Organization knowledge",
+    memoryLayerEvidence: "Evidence reference",
+    memoryStatus: "Status",
+    memoryAllStatuses: "All statuses",
+    memoryStatusActive: "Active",
+    memoryStatusPending: "Pending approval",
+    memoryStatusQuarantined: "Quarantined",
+    memoryStatusRevoked: "Revoked",
+    memoryStatusExpired: "Expired",
+    memoryNamespace: "Namespace",
+    memoryDetail: "Governance Detail",
+    memoryDetailHint: "Verify evidence, scope, expiry, and audit history.",
+    memorySelectPrompt: "Select a memory from the inventory to begin governance.",
+    memoryAudit: "Governance Audit",
+    memoryAuditHint: "Recent proposal, approval, quarantine, restore, conflict, and expiry events.",
+    memoryLoading: "Loading memory governance data...",
+    memoryNoResults: "No memories match the current filters.",
+    memoryCount: "Showing {count}",
+    memorySourceCase: "Source case",
+    memoryRetrievalKey: "Retrieval key",
+    memoryTrust: "Trust level",
+    memoryScope: "Scope",
+    memoryCreated: "Created",
+    memoryUpdated: "Updated",
+    memoryExpires: "Expires",
+    memoryApprover: "Approved by",
+    memoryContent: "Structured content",
+    memoryGovernanceForm: "Governance Actions",
+    memoryAnalyst: "Operator",
+    memoryReason: "Governance reason",
+    memoryReasonPlaceholder: "Record approval evidence, poisoning risk, or restore rationale",
+    memoryPromotionScope: "Approved scope",
+    memoryExpiry: "Valid until",
+    memoryPromote: "Approve Promotion",
+    memoryReject: "Revoke",
+    memoryQuarantine: "Quarantine",
+    memoryRestore: "Restore",
+    memoryGateStatus: "Five Promotion Gates",
+    memoryGateEvidence: "Evidence traceable",
+    memoryGateApprover: "Analyst approved",
+    memoryGateScope: "Scope is clear",
+    memoryGateExpiry: "Expiry is set",
+    memoryGateSensitive: "No sensitive data leak",
+    memoryGatePass: "Pass",
+    memoryGateFail: "Needs input",
+    memoryActionDone: "Memory {id}: {action} completed.",
+    memoryActionFailed: "Governance action failed: {message}",
+    memorySweepDone: "Scan complete: {expired} expired, {conflicts} conflicts quarantined.",
+    memoryAuditEmpty: "No governance events.",
+    memoryAssociations: "Associated Alerts",
+    memoryAssociationsHint: "Candidate scores and final effects persisted by the unified matcher.",
+    memoryAssociationsEmpty: "No subsequent alert has produced an eligible association with this memory.",
+    memoryMatchOverall: "Overall",
+    memoryMatchStructured: "Structured",
+    memoryMatchSemantic: "Semantic vector",
+    memoryMatchRetrieval: "Retrieval key",
+    memoryMatchDecision: "Decision",
+    memoryMatchDowngraded: "Downgraded to benign",
+    memoryMatchReinforced: "Benign verdict reinforced",
+    memoryMatchAttackVeto: "Attack evidence vetoed downgrade",
+    memoryMatchReview: "Review only",
+    memoryMatchEligible: "Apply threshold met",
+    memoryMatchIgnored: "Below threshold",
+    memoryEventProposed: "Candidate proposed",
+    memoryEventPromoted: "Promotion approved",
+    memoryEventRejected: "Rejected or revoked",
+    memoryEventQuarantined: "Quarantined",
+    memoryEventExpired: "Expired",
+    memoryEventConflict: "Conflict detected",
+    memoryEventRestored: "Restored active",
+    memoryEventRestoredReview: "Restored for review",
+    memoryEventHumanConfirmed: "False positive confirmed",
+    memoryEventAssetRecorded: "Asset profile updated",
+    memoryReasonRequired: "Revoking, quarantining, or restoring requires a governance reason.",
+    memoryPromotionRequired: "Promotion requires an operator, scope, and future expiry.",
     caseSearchProduct: "System",
     caseSearchSeverity: "Risk level",
     caseSearchStatus: "Disposition",
@@ -389,7 +620,7 @@ const STRINGS = {
     flowGateway: "Gateway HTTP alert endpoint",
     syslogConfigTitle: "Syslog Product Receiver Config",
     syslogConfigHint: "Configure a receiver port and protocol for each security system. TCP is the default recommendation for very long syslog messages.",
-    resetSyslogConfig: "Restore default ports",
+    resetSyslogConfig: "Fill default values",
     syslogProduct: "Security system",
     syslogPort: "Port",
     syslogProtocol: "Protocol",
@@ -402,9 +633,16 @@ const STRINGS = {
     syslogSavedToast: "{product} is configured as a {protocol} {port} log receiver and is active",
     syslogPortInvalid: "Port must be between 1 and 65535",
     syslogProtocolInvalid: "Protocol must be TCP or UDP",
-    syslogDefaultsRestored: "Default TCP port configuration restored. Save the rows that should become active.",
+    syslogDefaultsRestored: "Default TCP values were filled in as a draft. The backend is unchanged until each required row is saved.",
     syslogConfigLoadFailed: "Failed to load Syslog config: {message}",
     syslogConfigApiUnavailable: "The backend has not loaded the dynamic Syslog config API yet. Local defaults are shown; restart the gateway before saving ports.",
+    syslogModeEmbedded: "Embedded listeners",
+    syslogModeExternal: "External Vector",
+    syslogEmbeddedReady: "Embedded gateway Syslog listeners are enabled",
+    syslogExternalManaged: "Receiver ports are managed by the external Vector collector. Embedded gateway listeners are intentionally disabled, and deployment config owns ports and protocols.",
+    syslogExternalStatus: "Managed by external collector",
+    syslogManagedStatus: "External receiver: {protocol} {port}",
+    syslogExternalHealth: "External collector manages {total} endpoint(s)",
     syslogOpsTitle: "Security System Setup",
     syslogOpsText: "Use the service-zone syslog collector IP as the target, with the configured product port and protocol.",
     syslogMappingTitle: "Field Handling",
@@ -487,6 +725,8 @@ const STRINGS = {
     approvalReasonPrompt: "Enter a decision reason. Approval only authorizes the existing response workflow; this gateway executes no production action.",
     approvalDecisionDefault: "Dashboard analyst reviewed the evidence and rollback condition",
     approvalSaved: "Approval updated: {status} (not executed)",
+    approvalProgress: "Approval progress {count}/{required}",
+    approvalVoteSaved: "Approval vote recorded: {count}/{required}; current status is {status} (not executed)",
     approvalFailed: "Approval failed: {message}",
     noApprovals: "No approval item can be routed for this case",
     missingEvidence: "Missing evidence",
@@ -561,6 +801,8 @@ const STRINGS = {
     dryRunError: "Mapping validation failed: {message}",
     fieldRequired: "Required",
     fieldEnhanced: "Enhanced",
+    requestTimedOut: "The request exceeded {seconds} seconds and was cancelled.",
+    requestCancelled: "The request was cancelled.",
   },
 };
 let mappingProfiles = [];
@@ -571,8 +813,22 @@ let currentLanguage = "zh";
 let lastFieldMappingResult = null;
 const sampleLogCache = new Map();
 let syslogConfigs = loadSyslogConfigs();
+let syslogRuntime = { mode: "embedded", editable: true, unavailable: false };
 let refreshPaused = false;
 let dashboardRefreshTimer = null;
+let memoryItems = [];
+let memoryAuditEvents = [];
+let selectedMemoryId = "";
+let selectedMemoryDetail = null;
+let memorySelectionRequestId = 0;
+let caseToUsesCurrentTime = true;
+let currentSession = null;
+let apiToken = "";
+try {
+  apiToken = sessionStorage.getItem(API_TOKEN_KEY) || "";
+} catch (err) {
+  apiToken = "";
+}
 async function loadSampleLog(product = selectedLogProduct()) {
   if (sampleLogCache.has(product)) return sampleLogCache.get(product);
   const sample = await json(`/api/samples/${encodeURIComponent(product)}-alert`);
@@ -581,10 +837,158 @@ async function loadSampleLog(product = selectedLogProduct()) {
 }
 
 async function json(url, options) {
-  const res = await fetch(url, options);
-  if (!res.ok) throw new Error(await res.text());
-  return res.json();
+  const request = { ...(options || {}) };
+  const acceptedErrorStatuses = Array.isArray(request.acceptStatuses) ? request.acceptStatuses : [];
+  delete request.acceptStatuses;
+  const timeoutMs = Number.isFinite(request.timeoutMs) && request.timeoutMs > 0
+    ? Number(request.timeoutMs)
+    : REQUEST_TIMEOUT_MS;
+  delete request.timeoutMs;
+  const headers = new Headers(request.headers || {});
+  if (apiToken) headers.set("Authorization", `Bearer ${apiToken}`);
+  request.headers = headers;
+  const upstreamSignal = request.signal;
+  const controller = new AbortController();
+  let timedOut = false;
+  const cancelFromUpstream = () => controller.abort(upstreamSignal?.reason);
+  if (upstreamSignal) {
+    if (upstreamSignal.aborted) cancelFromUpstream();
+    else upstreamSignal.addEventListener("abort", cancelFromUpstream, { once: true });
+  }
+  request.signal = controller.signal;
+  const timeoutId = window.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  try {
+    const res = await fetch(url, request);
+    if (!res.ok && !acceptedErrorStatuses.includes(res.status)) {
+      if (res.status === 401) showAuthDialog(tr("authRequired"));
+      const error = new Error(await res.text());
+      error.status = res.status;
+      throw error;
+    }
+    return await res.json();
+  } catch (err) {
+    if (timedOut) {
+      const timeoutError = new Error(tr("requestTimedOut", { seconds: Math.ceil(timeoutMs / 1000) }));
+      timeoutError.name = "TimeoutError";
+      throw timeoutError;
+    }
+    if (controller.signal.aborted) {
+      const cancelError = new Error(tr("requestCancelled"));
+      cancelError.name = "AbortError";
+      throw cancelError;
+    }
+    throw err;
+  } finally {
+    window.clearTimeout(timeoutId);
+    upstreamSignal?.removeEventListener("abort", cancelFromUpstream);
+  }
 }
+
+function showAuthDialog(message = "") {
+  const dialog = document.querySelector("#auth-dialog");
+  document.querySelector("#auth-session").hidden = false;
+  document.querySelector("#auth-status").textContent = message || sessionIdentityText();
+  document.querySelector("#auth-token").value = apiToken;
+  if (!dialog.open) dialog.showModal();
+  window.setTimeout(() => document.querySelector("#auth-token").focus(), 0);
+}
+
+function storeApiToken(value) {
+  apiToken = value.trim();
+  try {
+    if (apiToken) sessionStorage.setItem(API_TOKEN_KEY, apiToken);
+    else sessionStorage.removeItem(API_TOKEN_KEY);
+  } catch (err) {
+    // In-memory authentication still works when session storage is unavailable.
+  }
+}
+
+function sessionIdentityText() {
+  if (!currentSession?.actor) return "";
+  return tr("authIdentity", {
+    actor: currentSession.actor,
+    roles: currentSession.roles.length ? currentSession.roles.join(", ") : "-",
+  });
+}
+
+function hasAnyRole(...roles) {
+  // Keep controls available during the initial local Demo bootstrap. Once the
+  // session endpoint responds, its server-issued roles become authoritative.
+  if (!currentSession) return true;
+  return roles.some((role) => currentSession.roles.includes(role));
+}
+
+function canReadCases() {
+  return hasAnyRole("read", "analyst", "approver");
+}
+
+function canReadRuntimeConfig() {
+  return hasAnyRole("read", "config");
+}
+
+function canReadMappingProfiles() {
+  return hasAnyRole("read", "config", "analyst");
+}
+
+function currentActor() {
+  return currentSession?.actor || "-";
+}
+
+function applyPermission(selector, roles) {
+  const allowed = hasAnyRole(...roles);
+  document.querySelectorAll(selector).forEach((control) => {
+    control.disabled = !allowed;
+    if (allowed) {
+      if (control.dataset.permissionDenied === "true") control.removeAttribute("title");
+      delete control.dataset.permissionDenied;
+    } else {
+      control.title = tr("permissionDenied");
+      control.dataset.permissionDenied = "true";
+    }
+  });
+}
+
+function applySessionPermissions() {
+  applyPermission('#llm-form button[type="submit"]', ["config"]);
+  applyPermission("#test-llm-connection", ["config"]);
+  applyPermission("#restore-llm-defaults", ["config"]);
+  applyPermission('#profile-form button[type="submit"]', ["config"]);
+  applyPermission("#save-inferred-profile", ["config"]);
+  applyPermission('#infer-form button[type="submit"]', ["analyst", "config"]);
+  applyPermission('#dry-run-form button[type="submit"]', ["analyst", "config"]);
+  applyPermission("#memory-sweep", ["memory"]);
+  applyPermission(".case-disposition-button", ["analyst"]);
+  applyPermission(".review-button", ["analyst", "memory"]);
+  applyPermission(".approval-decision", ["approver"]);
+  applyPermission("[data-memory-action]", ["memory"]);
+  const authButton = document.querySelector("#auth-session");
+  if (authButton) {
+    if (currentSession?.actor) authButton.title = sessionIdentityText();
+    else authButton.removeAttribute("title");
+  }
+  updateSyslogModeUi();
+}
+
+async function loadSession() {
+  try {
+    const result = await json("/api/session");
+    currentSession = {
+      actor: String(result.actor || ""),
+      roles: Array.isArray(result.roles) ? result.roles.map(String) : [],
+    };
+    applySessionPermissions();
+    return currentSession;
+  } catch (err) {
+    currentSession = { actor: "", roles: [] };
+    applySessionPermissions();
+    throw err;
+  }
+}
+
+if (apiToken) document.querySelector("#auth-session").hidden = false;
 
 function isApiNotFoundError(err) {
   const message = err?.message || String(err);
@@ -616,6 +1020,7 @@ function setDefaultCaseDateRange() {
   const from = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
   fromInput.value = formatDatetimeLocal(from);
   toInput.value = formatDatetimeLocal(now);
+  caseToUsesCurrentTime = true;
   fromInput.defaultValue = fromInput.value;
   toInput.defaultValue = toInput.value;
 }
@@ -632,14 +1037,16 @@ function caseSearchQuery() {
   const severity = document.querySelector("#case-filter-severity")?.value || "";
   const status = document.querySelector("#case-filter-status")?.value || "";
   const createdFrom = datetimeLocalMs(document.querySelector("#case-filter-from")?.value || "");
-  const createdTo = datetimeLocalMs(document.querySelector("#case-filter-to")?.value || "");
+  const toInput = document.querySelector("#case-filter-to");
+  if (caseToUsesCurrentTime && toInput) toInput.value = formatDatetimeLocal(new Date());
+  const createdTo = caseToUsesCurrentTime ? Date.now() : datetimeLocalMs(toInput?.value || "");
   if (product) params.set("product", product);
   if (severity) params.set("severity", severity);
   if (status) params.set("status", status);
   if (createdFrom !== null) params.set("created_from_ms", String(createdFrom));
-  // datetime-local has minute precision. Treat the selected end minute as
-  // inclusive so real-time cases created at :SS are not hidden until next minute.
-  if (createdTo !== null) params.set("created_to_ms", String(createdTo + 59_999));
+  // The default range follows the current clock on every refresh. An end time
+  // explicitly edited by the operator remains fixed and includes that minute.
+  if (createdTo !== null) params.set("created_to_ms", String(createdTo + (caseToUsesCurrentTime ? 0 : 59_999)));
   return params.toString();
 }
 
@@ -705,7 +1112,11 @@ function applyLanguage() {
   renderProfileList();
   renderSyslogConfigTable();
   renderLogProductOptions();
+  renderMemoryList();
+  renderMemoryAudit(memoryAuditEvents, "#memory-audit-list");
+  if (selectedMemoryDetail) renderMemoryDetail(selectedMemoryDetail);
   updateRefreshModeUi();
+  applySessionPermissions();
 }
 
 function renderLogProductOptions() {
@@ -777,14 +1188,19 @@ async function loadSyslogConfig() {
     payload = await json("/api/config/syslog");
   } catch (err) {
     if (!isApiNotFoundError(err)) throw err;
+    setSyslogRuntime({ mode: "embedded", editable: true, unavailable: true });
     mergeSyslogConfigs(loadSyslogConfigs());
     renderSyslogConfigTable();
     setSyslogConfigStatus(tr("syslogConfigApiUnavailable"));
     return { configs: syslogConfigs, unavailable: true };
   }
+  setSyslogRuntime(payload);
   mergeSyslogConfigs(payload.configs || []);
   persistSyslogConfigs();
   renderSyslogConfigTable();
+  if (syslogRuntime.mode === "external_vector") {
+    setSyslogConfigStatus(tr("syslogExternalManaged"));
+  }
   return payload;
 }
 
@@ -803,9 +1219,46 @@ function setSyslogConfigStatus(message, isError = false) {
   status.classList.toggle("error", isError);
 }
 
+function setSyslogRuntime(payload = {}) {
+  const mode = payload.mode === "external_vector" ? "external_vector" : "embedded";
+  syslogRuntime = {
+    mode,
+    editable: mode === "embedded" && payload.editable !== false,
+    unavailable: Boolean(payload.unavailable),
+  };
+  updateSyslogModeUi();
+}
+
+function updateSyslogModeUi() {
+  const external = syslogRuntime.mode === "external_vector";
+  const block = document.querySelector(".syslog-config-block");
+  const badge = document.querySelector("#syslog-mode-badge");
+  const summary = document.querySelector("#syslog-mode-summary");
+  const reset = document.querySelector("#reset-syslog-config");
+  const channelStatus = document.querySelector("#syslog-channel-status");
+  if (block) block.dataset.mode = syslogRuntime.mode;
+  if (badge) badge.textContent = tr(external ? "syslogModeExternal" : "syslogModeEmbedded");
+  if (summary) {
+    summary.hidden = !external;
+    summary.textContent = external ? tr("syslogExternalManaged") : "";
+  }
+  if (reset) {
+    reset.hidden = external;
+    reset.disabled = !external && !hasAnyRole("config");
+    if (!external && reset.disabled) reset.title = tr("permissionDenied");
+    else reset.removeAttribute("title");
+  }
+  if (channelStatus) {
+    channelStatus.className = `field-status ${external || syslogRuntime.editable ? "mapped" : "needs_review"}`;
+    channelStatus.textContent = tr(external ? "syslogExternalStatus" : "syslogEmbeddedReady");
+  }
+}
+
 function renderSyslogConfigTable() {
   const container = document.querySelector("#syslog-config-table");
   if (!container) return;
+  const editable = syslogRuntime.editable && hasAnyRole("config");
+  const external = syslogRuntime.mode === "external_vector";
   container.innerHTML = `
     <table>
       <thead>
@@ -833,10 +1286,11 @@ function renderSyslogConfigTable() {
                     step="1"
                     value="${escapeHtml(item.port)}"
                     aria-label="${escapeHtml(`${item.label} ${tr("syslogPort")}`)}"
+                    ${editable ? "" : "disabled"}
                   />
                 </td>
                 <td>
-                  <select class="syslog-protocol-input" aria-label="${escapeHtml(`${item.label} ${tr("syslogProtocol")}`)}">
+                  <select class="syslog-protocol-input" aria-label="${escapeHtml(`${item.label} ${tr("syslogProtocol")}`)}" ${editable ? "" : "disabled"}>
                     <option value="tcp" ${item.protocol === "tcp" ? "selected" : ""}>TCP</option>
                     <option value="udp" ${item.protocol === "udp" ? "selected" : ""}>UDP</option>
                   </select>
@@ -845,16 +1299,20 @@ function renderSyslogConfigTable() {
                 <td>
                   <span class="field-status ${item.saved ? "mapped" : "needs_review"}">
                     ${escapeHtml(
-                      item.saved
+                      external
+                        ? tr("syslogManagedStatus", { port: item.port, protocol: item.protocol.toUpperCase() })
+                        : item.saved
                         ? tr("syslogSavedStatus", { product: item.label, port: item.port, protocol: item.protocol.toUpperCase() })
                         : tr("syslogPendingStatus"),
                     )}
                   </span>
                 </td>
                 <td>
-                  <button type="button" class="save-syslog-row" data-product="${escapeHtml(item.product)}">
-                    ${escapeHtml(tr("saveSyslogConfig"))}
-                  </button>
+                  ${external
+                    ? `<span class="syslog-managed-label">${escapeHtml(tr("syslogExternalStatus"))}</span>`
+                    : `<button type="button" class="save-syslog-row" data-product="${escapeHtml(item.product)}" ${editable ? "" : `disabled title="${escapeHtml(tr("permissionDenied"))}"`}>
+                        ${escapeHtml(tr("saveSyslogConfig"))}
+                      </button>`}
                 </td>
               </tr>
             `,
@@ -872,9 +1330,18 @@ function renderSyslogConfigTable() {
       });
     });
   });
+  updateSyslogModeUi();
 }
 
 async function saveSyslogConfigRow(product) {
+  if (!syslogRuntime.editable) {
+    setSyslogConfigStatus(tr("syslogExternalManaged"));
+    return;
+  }
+  if (!hasAnyRole("config")) {
+    setSyslogConfigStatus(tr("permissionDenied"), true);
+    return;
+  }
   const row = document.querySelector(`#syslog-config-table tr[data-product="${CSS.escape(product)}"]`);
   const config = syslogConfigs.find((item) => item.product === product);
   if (!row || !config) return;
@@ -904,7 +1371,15 @@ async function saveSyslogConfigRow(product) {
   showToast(message);
 }
 
-function resetSyslogConfigs() {
+function fillDefaultSyslogConfigs() {
+  if (!syslogRuntime.editable) {
+    setSyslogConfigStatus(tr("syslogExternalManaged"));
+    return;
+  }
+  if (!hasAnyRole("config")) {
+    setSyslogConfigStatus(tr("permissionDenied"), true);
+    return;
+  }
   syslogConfigs = defaultSyslogConfigs();
   persistSyslogConfigs();
   renderSyslogConfigTable();
@@ -918,6 +1393,7 @@ function updateWorkspaceTitle(name) {
   const key = {
     monitor: "workspaceTitleMonitor",
     dashboard: "workspaceTitleDashboard",
+    memory: "workspaceTitleMemory",
     adapter: "workspaceTitleAdapter",
     settings: "workspaceTitleSettings",
   }[name] || "workspaceTitleMonitor";
@@ -1110,6 +1586,7 @@ function buildHealthItems(health, llmConfig, syslogPayload) {
   const processing = health?.processing || {};
   const llmProvider = llmConfig?.provider || "local";
   const llmConfigured = llmProvider === "local" || Boolean(llmConfig?.endpoint);
+  const externalSyslog = syslogPayload?.mode === "external_vector";
   const listeners = Array.isArray(syslogPayload?.listeners) ? syslogPayload.listeners : [];
   const configs = Array.isArray(syslogPayload?.configs) ? syslogPayload.configs : syslogConfigs;
   const activeListeners = listeners.filter((item) => item.active).length || configs.filter((item) => item.saved).length;
@@ -1128,11 +1605,13 @@ function buildHealthItems(health, llmConfig, syslogPayload) {
       tr("healthModel"),
       llmProvider === "local" ? tr("modelLocal") : tr("modelRemote", { provider: llmProvider, model: llmConfig?.model || "-" }),
     ),
-    healthItem(
-      activeListeners ? "ok" : "warn",
-      tr("healthSyslog"),
-      configs.length ? tr("syslogActive", { active: activeListeners, total: configs.length }) : tr("syslogInactive"),
-    ),
+    externalSyslog
+      ? healthItem("ok", tr("healthSyslog"), tr("syslogExternalHealth", { total: configs.length }))
+      : healthItem(
+        activeListeners ? "ok" : "warn",
+        tr("healthSyslog"),
+        configs.length ? tr("syslogActive", { active: activeListeners, total: configs.length }) : tr("syslogInactive"),
+      ),
   ];
 }
 
@@ -1171,6 +1650,7 @@ function renderHealth(items) {
 function renderIntakeHealth(syslogPayload) {
   const container = document.querySelector("#intake-health");
   if (!container) return;
+  const external = syslogPayload?.mode === "external_vector";
   const configs = Array.isArray(syslogPayload?.configs) ? syslogPayload.configs : syslogConfigs;
   container.innerHTML = `
     <article class="intake-health-row ok">
@@ -1181,9 +1661,9 @@ function renderIntakeHealth(syslogPayload) {
     ${configs
       .map(
         (item) => `
-          <article class="intake-health-row ${item.saved ? "ok" : "warn"}">
+          <article class="intake-health-row ${external || item.saved ? "ok" : "warn"}">
             <strong>${escapeHtml(item.label || text(item.product).toUpperCase())}</strong>
-            <span>${escapeHtml(item.saved ? tr("healthOk") : tr("healthWarn"))}</span>
+            <span>${escapeHtml(external ? tr("syslogExternalStatus") : item.saved ? tr("healthOk") : tr("healthWarn"))}</span>
             <code>${escapeHtml(String(item.port))}/${escapeHtml(String(item.protocol || "tcp").toUpperCase())}</code>
           </article>
         `,
@@ -1194,6 +1674,7 @@ function renderIntakeHealth(syslogPayload) {
 
 function renderDashboard(health, cases, llmConfig, syslogPayload) {
   const processing = health?.processing || {};
+  if (syslogPayload && !syslogPayload.unavailable) setSyslogRuntime(syslogPayload);
   document.querySelector("#alerts").textContent = health?.stats?.alerts ?? 0;
   document.querySelector("#cases").textContent = health?.stats?.open_cases ?? health?.stats?.cases ?? 0;
   document.querySelector("#high").textContent = health?.stats?.high_or_critical_cases ?? 0;
@@ -1308,6 +1789,7 @@ function dispositionActions(status) {
 function caseDispositionControls(detail) {
   const status = detail.status || "open";
   const actions = dispositionActions(status);
+  const allowed = hasAnyRole("analyst");
   return `
     <div class="case-disposition">
       <div class="case-disposition-head">
@@ -1324,6 +1806,7 @@ function caseDispositionControls(detail) {
                 data-case-id="${escapeHtml(detail.case_id)}"
                 data-status="${escapeHtml(item.status)}"
                 data-reason="${escapeHtml(item.reason)}"
+                ${allowed ? "" : `disabled title="${escapeHtml(tr("permissionDenied"))}"`}
               >${escapeHtml(item.label)}</button>
             `,
           )
@@ -1389,9 +1872,10 @@ function evidenceRows(evidence) {
 function reviewTools(raw) {
   const alertId = raw.alert_id || "";
   if (!alertId) return "";
+  const allowed = hasAnyRole("analyst", "memory");
   return `
     <div class="review-tools">
-      <button class="review-button" type="button" data-alert-id="${escapeHtml(alertId)}">
+      <button class="review-button" type="button" data-alert-id="${escapeHtml(alertId)}" ${allowed ? "" : `disabled title="${escapeHtml(tr("permissionDenied"))}"`}>
         ${escapeHtml(tr("confirmFalsePositive"))}
       </button>
       <p class="review-status" data-alert-status="${escapeHtml(alertId)}"></p>
@@ -1425,6 +1909,22 @@ function approvalStatusLabel(status) {
   return tr({ pending: "approvalPending", approved: "approvalApproved", rejected: "approvalRejected", cancelled: "approvalCancelled" }[status] || "approvalPending");
 }
 
+function approvalProgressText(approval) {
+  const count = Number(approval?.vote_count);
+  const required = Number(approval?.required_approvals);
+  if (!Number.isInteger(count) || count < 0 || !Number.isInteger(required) || required < 1) return "";
+  return tr("approvalProgress", { count, required });
+}
+
+function approvalDecisionMessage(approval) {
+  const count = Number(approval?.vote_count);
+  const required = Number(approval?.required_approvals);
+  if (Number.isInteger(count) && count >= 0 && Number.isInteger(required) && required > 0) {
+    return tr("approvalVoteSaved", { count, required, status: approvalStatusLabel(approval.status) });
+  }
+  return tr("approvalSaved", { status: approvalStatusLabel(approval.status) });
+}
+
 function approvalBlock(approvals, caseId) {
   return `
     <div class="approval-queue">
@@ -1438,11 +1938,12 @@ function approvalBlock(approvals, caseId) {
               </div>
               <p>${escapeHtml(item.action?.action || "")}</p>
               <small>${escapeHtml(item.action?.rationale || "")}</small>
+              ${approvalProgressText(item) ? `<small class="approval-progress">${escapeHtml(approvalProgressText(item))}</small>` : ""}
               <dl class="kv"><dt>${escapeHtml(tr("rollbackCondition"))}</dt><dd>${escapeHtml(item.action?.rollback || "-")}</dd></dl>
               ${item.status === "pending" ? `
                 <div class="approval-actions">
-                  <button type="button" class="approval-decision" data-case-id="${escapeHtml(caseId)}" data-approval-id="${escapeHtml(item.approval_id)}" data-decision="approved">${escapeHtml(tr("approveAction"))}</button>
-                  <button type="button" class="approval-decision" data-case-id="${escapeHtml(caseId)}" data-approval-id="${escapeHtml(item.approval_id)}" data-decision="rejected">${escapeHtml(tr("rejectAction"))}</button>
+                  <button type="button" class="approval-decision" data-case-id="${escapeHtml(caseId)}" data-approval-id="${escapeHtml(item.approval_id)}" data-decision="approved" ${hasAnyRole("approver") ? "" : `disabled title="${escapeHtml(tr("permissionDenied"))}"`}>${escapeHtml(tr("approveAction"))}</button>
+                  <button type="button" class="approval-decision" data-case-id="${escapeHtml(caseId)}" data-approval-id="${escapeHtml(item.approval_id)}" data-decision="rejected" ${hasAnyRole("approver") ? "" : `disabled title="${escapeHtml(tr("permissionDenied"))}"`}>${escapeHtml(tr("rejectAction"))}</button>
                 </div>
               ` : ""}
             </article>
@@ -1618,13 +2119,13 @@ async function decideApproval(button, panel, caseId) {
     const result = await json(`/api/approvals/${encodeURIComponent(button.dataset.approvalId)}/decision`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ decision, actor: "dashboard-analyst", reason: reason.trim() || tr("approvalDecisionDefault") }),
+      body: JSON.stringify({ decision, reason: reason.trim() || tr("approvalDecisionDefault") }),
     });
     const detail = detailCache.get(caseId);
     detail.approvals = (detail.approvals || []).map((item) => item.approval_id === result.approval.approval_id ? result.approval : item);
     panel.innerHTML = renderDetail(detail);
     bindDetailActions(panel, caseId);
-    const message = tr("approvalSaved", { status: approvalStatusLabel(result.approval.status) });
+    const message = approvalDecisionMessage(result.approval);
     panel.querySelector(`[data-approval-status="${CSS.escape(caseId)}"]`).textContent = message;
     showToast(message);
   } catch (err) {
@@ -1649,7 +2150,6 @@ async function updateCaseDisposition(button, caseId) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         status,
-        actor: "dashboard-analyst",
         reason: button.dataset.reason || "",
       }),
     });
@@ -1677,7 +2177,6 @@ async function confirmBusinessFalsePositive(button, caseId) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        analyst: "dashboard-analyst",
         reason: tr("falsePositiveReason"),
       }),
     });
@@ -1705,26 +2204,569 @@ function toggleCollapsibleText(button) {
   button.textContent = nextExpanded ? button.dataset.collapseLabel : button.dataset.expandLabel;
 }
 
+function memoryStatusLabel(status) {
+  const key = {
+    active: "memoryStatusActive",
+    pending_approval: "memoryStatusPending",
+    quarantined: "memoryStatusQuarantined",
+    revoked: "memoryStatusRevoked",
+    expired: "memoryStatusExpired",
+  }[status];
+  return key ? tr(key) : text(status);
+}
+
+function memoryLayerLabel(layer) {
+  const key = {
+    case_short_term: "memoryLayerCase",
+    product_long_term: "memoryLayerProduct",
+    asset_profile: "memoryLayerAsset",
+    org_knowledge: "memoryLayerOrg",
+    evidence: "memoryLayerEvidence",
+  }[layer];
+  return key ? tr(key) : text(layer);
+}
+
+function memoryEventLabel(eventType) {
+  const key = {
+    proposed: "memoryEventProposed",
+    promoted: "memoryEventPromoted",
+    rejected: "memoryEventRejected",
+    quarantined: "memoryEventQuarantined",
+    expired: "memoryEventExpired",
+    conflict_detected: "memoryEventConflict",
+    restored: "memoryEventRestored",
+    restored_for_review: "memoryEventRestoredReview",
+    human_confirmed_business_false_positive: "memoryEventHumanConfirmed",
+    asset_profile_recorded: "memoryEventAssetRecorded",
+  }[eventType];
+  return key ? tr(key) : text(eventType).replaceAll("_", " ");
+}
+
+function memoryContentObject(content) {
+  if (typeof content !== "string") return content || {};
+  try {
+    return JSON.parse(content);
+  } catch (err) {
+    return content;
+  }
+}
+
+function memoryContentSummary(memory) {
+  const content = memoryContentObject(memory.content);
+  if (typeof content === "string") return content.slice(0, 140);
+  const value = content.summary || content.verdict || content.confirmation_reason || content.content;
+  if (value) return text(value).slice(0, 140);
+  return text(memory.retrieval_key || memory.scope || memory.memory_id);
+}
+
+function memoryFilterQuery() {
+  const params = new URLSearchParams({ include_expired: "true", limit: "500" });
+  const values = {
+    q: document.querySelector("#memory-filter-query")?.value.trim(),
+    layer: document.querySelector("#memory-filter-layer")?.value,
+    status: document.querySelector("#memory-filter-status")?.value,
+    namespace: document.querySelector("#memory-filter-namespace")?.value.trim(),
+  };
+  for (const [key, value] of Object.entries(values)) {
+    if (value) params.set(key, value);
+  }
+  return params.toString();
+}
+
+function renderMemorySummary(summary = {}) {
+  const status = summary.by_status || {};
+  const values = {
+    "#memory-total": summary.total || 0,
+    "#memory-active": status.active || 0,
+    "#memory-pending": status.pending_approval || 0,
+    "#memory-quarantined": status.quarantined || 0,
+    "#memory-overdue": summary.overdue_review || 0,
+  };
+  for (const [selector, value] of Object.entries(values)) {
+    const node = document.querySelector(selector);
+    if (node) node.textContent = String(value);
+  }
+}
+
+function renderMemoryList() {
+  const list = document.querySelector("#memory-list");
+  if (!list) return;
+  if (!memoryItems.length) {
+    list.innerHTML = `<p class="empty-state">${escapeHtml(tr("memoryNoResults"))}</p>`;
+    return;
+  }
+  list.innerHTML = `
+    <div class="memory-list-count">${escapeHtml(tr("memoryCount", { count: memoryItems.length }))}</div>
+    ${memoryItems.map((memory) => `
+      <button
+        type="button"
+        class="memory-row ${memory.memory_id === selectedMemoryId ? "selected" : ""}"
+        data-memory-id="${escapeHtml(memory.memory_id)}"
+      >
+        <span class="memory-row-top">
+          <strong>${escapeHtml(memoryLayerLabel(memory.layer))}</strong>
+          <span class="memory-status ${escapeHtml(memory.status.replaceAll("_", "-"))}">${escapeHtml(memoryStatusLabel(memory.status))}</span>
+        </span>
+        <span class="memory-row-summary">${escapeHtml(memoryContentSummary(memory))}</span>
+        <span class="memory-row-meta">
+          <code>${escapeHtml(memory.namespace)}</code>
+          <time>${escapeHtml(fmtTime(memory.updated_at_ms))}</time>
+        </span>
+      </button>
+    `).join("")}
+  `;
+  list.querySelectorAll(".memory-row").forEach((button) => {
+    button.addEventListener("click", () => selectMemory(button.dataset.memoryId));
+  });
+}
+
+function memoryGateRows(gates) {
+  const rows = [
+    ["evidence_traceable", "memoryGateEvidence"],
+    ["analyst_approved", "memoryGateApprover"],
+    ["scope_clear", "memoryGateScope"],
+    ["expiry_set", "memoryGateExpiry"],
+    ["no_sensitive_leak", "memoryGateSensitive"],
+  ];
+  return rows.map(([name, label]) => {
+    const passed = Boolean(gates[name]);
+    return `
+      <li class="${passed ? "passed" : "failed"}">
+        <span aria-hidden="true">${passed ? "✓" : "!"}</span>
+        <strong>${escapeHtml(tr(label))}</strong>
+        <small>${escapeHtml(tr(passed ? "memoryGatePass" : "memoryGateFail"))}</small>
+      </li>
+    `;
+  }).join("");
+}
+
+function defaultMemoryExpiry(memory) {
+  const current = Number(memory.expires_at_ms || 0);
+  const minimum = Date.now() + 24 * 3600 * 1000;
+  return formatDatetimeLocal(new Date(Math.max(current, Date.now() + 90 * 24 * 3600 * 1000, minimum)));
+}
+
+function memoryMatchDecisionLabel(decision, finalEffect) {
+  const value = decision || finalEffect || "ignored";
+  const key = {
+    downgraded_to_benign: "memoryMatchDowngraded",
+    classification_reinforced: "memoryMatchReinforced",
+    attack_signal_veto: "memoryMatchAttackVeto",
+    review_only: "memoryMatchReview",
+    review: "memoryMatchReview",
+    apply: "memoryMatchEligible",
+    ignored: "memoryMatchIgnored",
+  }[value];
+  return key ? tr(key) : text(value).replaceAll("_", " ");
+}
+
+function memoryScorePercent(value) {
+  return `${Math.round(Number(value || 0) * 100)}%`;
+}
+
+function renderMemoryAssociations(matches) {
+  if (!matches.length) {
+    return `<p class="empty-state">${escapeHtml(tr("memoryAssociationsEmpty"))}</p>`;
+  }
+  return `
+    <div class="memory-association-list">
+      ${matches.slice(0, 50).map((match) => `
+        <article class="memory-association-row">
+          <div class="memory-association-heading">
+            <span>
+              <strong>${escapeHtml(match.alert_id)}</strong>
+              <code>${escapeHtml(match.case_id)} · ${escapeHtml(match.event_id)}</code>
+            </span>
+            <span class="memory-match-decision ${escapeHtml(match.decision.replaceAll("_", "-"))}">
+              ${escapeHtml(memoryMatchDecisionLabel(match.decision, match.final_effect))}
+            </span>
+          </div>
+          <div class="memory-score-grid">
+            <span><small>${escapeHtml(tr("memoryMatchOverall"))}</small><strong>${escapeHtml(memoryScorePercent(match.overall_score))}</strong></span>
+            <span><small>${escapeHtml(tr("memoryMatchStructured"))}</small><strong>${escapeHtml(memoryScorePercent(match.structured_score))}</strong></span>
+            <span><small>${escapeHtml(tr("memoryMatchSemantic"))}</small><strong>${escapeHtml(memoryScorePercent(match.semantic_score))}</strong></span>
+            <span><small>${escapeHtml(tr("memoryMatchRetrieval"))}</small><strong>${escapeHtml(memoryScorePercent(match.retrieval_score))}</strong></span>
+          </div>
+          <div class="memory-score-bar" aria-hidden="true"><i style="width:${Math.min(100, Math.max(0, Number(match.overall_score || 0) * 100))}%"></i></div>
+          <div class="memory-matched-features">
+            ${(match.matched_features || []).slice(0, 8).map((feature) => `<code>${escapeHtml(feature)}</code>`).join("")}
+          </div>
+          <small class="memory-association-time">${escapeHtml(match.matcher_version)} · ${escapeHtml(fmtTime(match.created_at_ms))}</small>
+        </article>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderMemoryDetail(memory) {
+  const container = document.querySelector("#memory-detail");
+  if (!container) return;
+  const governance = memory.governance || {};
+  const status = memory.status;
+  const canPromote = governance.actionable && status !== "active";
+  const canReject = governance.actionable && status !== "revoked";
+  const canQuarantine = governance.actionable && status !== "quarantined";
+  const canRestore = governance.actionable && ["quarantined", "revoked", "expired"].includes(status);
+  const canGovern = hasAnyRole("memory");
+  const content = memoryContentObject(memory.content);
+  container.innerHTML = `
+    <div class="memory-detail-heading">
+      <div>
+        <code>${escapeHtml(memory.memory_id)}</code>
+        <h3>${escapeHtml(memoryContentSummary(memory))}</h3>
+      </div>
+      <span class="memory-status ${escapeHtml(status.replaceAll("_", "-"))}">${escapeHtml(memoryStatusLabel(status))}</span>
+    </div>
+    <dl class="memory-meta-grid">
+      <div><dt>${escapeHtml(tr("memoryLayer"))}</dt><dd>${escapeHtml(memoryLayerLabel(memory.layer))}</dd></div>
+      <div><dt>${escapeHtml(tr("memoryNamespace"))}</dt><dd>${escapeHtml(memory.namespace)}</dd></div>
+      <div><dt>${escapeHtml(tr("memoryRetrievalKey"))}</dt><dd>${escapeHtml(memory.retrieval_key)}</dd></div>
+      <div><dt>${escapeHtml(tr("memoryTrust"))}</dt><dd>${escapeHtml(memory.trust_level)}</dd></div>
+      <div><dt>${escapeHtml(tr("memorySourceCase"))}</dt><dd>${escapeHtml(memory.source_case_id)}</dd></div>
+      <div><dt>${escapeHtml(tr("memoryScope"))}</dt><dd>${escapeHtml(memory.scope)}</dd></div>
+      <div><dt>${escapeHtml(tr("memoryApprover"))}</dt><dd>${escapeHtml(memory.approved_by)}</dd></div>
+      <div><dt>${escapeHtml(tr("memoryExpires"))}</dt><dd>${escapeHtml(fmtTime(memory.expires_at_ms))}</dd></div>
+      <div><dt>${escapeHtml(tr("memoryCreated"))}</dt><dd>${escapeHtml(fmtTime(memory.created_at_ms))}</dd></div>
+      <div><dt>${escapeHtml(tr("memoryUpdated"))}</dt><dd>${escapeHtml(fmtTime(memory.updated_at_ms))}</dd></div>
+    </dl>
+    ${governance.actionable ? `
+      <section class="memory-gates">
+        <h4>${escapeHtml(tr("memoryGateStatus"))}</h4>
+        <ul>${memoryGateRows(governance.gates || {})}</ul>
+      </section>
+    ` : ""}
+    ${governance.actionable ? `
+      <section class="memory-associations">
+        <h4>${escapeHtml(tr("memoryAssociations"))}</h4>
+        <p>${escapeHtml(tr("memoryAssociationsHint"))}</p>
+        ${renderMemoryAssociations(governance.matches || [])}
+      </section>
+    ` : ""}
+    <section class="memory-content-section">
+      <h4>${escapeHtml(tr("memoryContent"))}</h4>
+      <pre>${escapeHtml(typeof content === "string" ? content : JSON.stringify(content, null, 2))}</pre>
+    </section>
+    ${governance.actionable ? `
+      <form id="memory-action-form" class="memory-action-form">
+        <h4>${escapeHtml(tr("memoryGovernanceForm"))}</h4>
+        <label>
+          <span>${escapeHtml(tr("memoryAnalyst"))}</span>
+          <input id="memory-action-actor" type="text" maxlength="500" value="${escapeHtml(currentActor())}" readonly />
+        </label>
+        <label>
+          <span>${escapeHtml(tr("memoryPromotionScope"))}</span>
+          <input id="memory-action-scope" type="text" maxlength="500" value="${escapeHtml(memory.scope)}" />
+        </label>
+        <label>
+          <span>${escapeHtml(tr("memoryRetrievalKey"))}</span>
+          <input id="memory-action-retrieval-key" type="text" maxlength="500" value="${escapeHtml(memory.retrieval_key)}" />
+        </label>
+        <label>
+          <span>${escapeHtml(tr("memoryExpiry"))}</span>
+          <input id="memory-action-expiry" type="datetime-local" value="${escapeHtml(defaultMemoryExpiry(memory))}" />
+        </label>
+        <label class="memory-reason-field">
+          <span>${escapeHtml(tr("memoryReason"))}</span>
+          <textarea id="memory-action-reason" rows="2" maxlength="500" placeholder="${escapeHtml(tr("memoryReasonPlaceholder"))}"></textarea>
+        </label>
+        <div class="memory-action-buttons">
+          ${canPromote ? `<button type="button" data-memory-action="promote" data-memory-id="${escapeHtml(memory.memory_id)}" ${canGovern ? "" : "disabled"}>${escapeHtml(tr("memoryPromote"))}</button>` : ""}
+          ${canReject ? `<button type="button" data-memory-action="reject" data-memory-id="${escapeHtml(memory.memory_id)}" ${canGovern ? "" : "disabled"}>${escapeHtml(tr("memoryReject"))}</button>` : ""}
+          ${canQuarantine ? `<button type="button" data-memory-action="quarantine" data-memory-id="${escapeHtml(memory.memory_id)}" ${canGovern ? "" : "disabled"}>${escapeHtml(tr("memoryQuarantine"))}</button>` : ""}
+          ${canRestore ? `<button type="button" data-memory-action="restore" data-memory-id="${escapeHtml(memory.memory_id)}" ${canGovern ? "" : "disabled"}>${escapeHtml(tr("memoryRestore"))}</button>` : ""}
+        </div>
+      </form>
+    ` : ""}
+    <section class="memory-detail-audit">
+      <h4>${escapeHtml(tr("memoryAudit"))}</h4>
+      <div id="memory-detail-audit-list" class="memory-audit-list compact"></div>
+    </section>
+  `;
+  container.querySelectorAll("[data-memory-action]").forEach((button) => {
+    button.addEventListener("click", () => governMemory(button.dataset.memoryAction, button));
+  });
+  renderMemoryAudit(governance.events || [], "#memory-detail-audit-list", false);
+}
+
+function renderMemoryAudit(events, selector, interactive = true) {
+  const container = document.querySelector(selector);
+  if (!container) return;
+  if (!events.length) {
+    container.innerHTML = `<p class="empty-state">${escapeHtml(tr("memoryAuditEmpty"))}</p>`;
+    return;
+  }
+  container.innerHTML = events.map((event) => `
+    <${interactive ? "button" : "div"} ${interactive ? "type=\"button\"" : ""} class="memory-audit-row" data-memory-id="${escapeHtml(event.memory_id)}">
+      <span class="memory-audit-marker" aria-hidden="true"></span>
+      <span class="memory-audit-main">
+        <strong>${escapeHtml(memoryEventLabel(event.event_type))}</strong>
+        <small>${escapeHtml(event.actor)} · ${escapeHtml(fmtTime(event.created_at_ms))}</small>
+        <code>${escapeHtml(event.memory_id)}</code>
+      </span>
+      <span class="memory-audit-detail">${escapeHtml(JSON.stringify(event.detail || {}))}</span>
+    </${interactive ? "button" : "div"}>
+  `).join("");
+  if (interactive) {
+    container.querySelectorAll(".memory-audit-row").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const memoryId = button.dataset.memoryId;
+        setSecondaryView("memory", "inventory");
+        document.querySelector("#memory-filter-form")?.reset();
+        const query = document.querySelector("#memory-filter-query");
+        if (query) query.value = memoryId;
+        selectedMemoryId = memoryId;
+        memoryItems = [];
+        try {
+          await loadMemoryInventory({ skipSelection: true });
+          await selectMemory(memoryId);
+        } catch (err) {
+          showToast(tr("memoryActionFailed", { message: err.message || String(err) }), "error");
+        }
+      });
+    });
+  }
+}
+
+async function selectMemory(memoryId) {
+  const requestId = ++memorySelectionRequestId;
+  selectedMemoryId = memoryId;
+  renderMemoryList();
+  const container = document.querySelector("#memory-detail");
+  if (container) container.innerHTML = `<p class="empty-state">${escapeHtml(tr("memoryLoading"))}</p>`;
+  try {
+    const detail = await json(`/api/memory/${encodeURIComponent(memoryId)}`);
+    if (requestId !== memorySelectionRequestId || memoryId !== selectedMemoryId) return;
+    selectedMemoryDetail = detail;
+    renderMemoryDetail(selectedMemoryDetail);
+  } catch (err) {
+    if (requestId !== memorySelectionRequestId || memoryId !== selectedMemoryId) return;
+    if (container) container.innerHTML = `<p class="empty-state">${escapeHtml(err.message || String(err))}</p>`;
+  }
+}
+
+async function loadMemoryInventory(options = {}) {
+  const list = document.querySelector("#memory-list");
+  const status = document.querySelector("#memory-inventory-status");
+  if (list && !options.quiet) list.innerHTML = `<p class="empty-state">${escapeHtml(tr("memoryLoading"))}</p>`;
+  if (status) {
+    status.textContent = "";
+    status.classList.remove("error");
+  }
+  const [summaryResult, inventoryResult] = await Promise.allSettled([
+    json("/api/memory/summary"),
+    json(`/api/memory?${memoryFilterQuery()}`),
+  ]);
+
+  const errors = [];
+  if (summaryResult.status === "fulfilled") {
+    renderMemorySummary(summaryResult.value);
+  } else {
+    errors.push(summaryResult.reason?.message || String(summaryResult.reason));
+  }
+  if (inventoryResult.status === "rejected") {
+    const message = inventoryResult.reason?.message || String(inventoryResult.reason);
+    errors.push(message);
+    if (list) list.innerHTML = `<p class="empty-state">${escapeHtml(message)}</p>`;
+    if (status) {
+      status.textContent = errors.join(" · ");
+      status.classList.add("error");
+    }
+    return { errors };
+  }
+
+  memoryItems = inventoryResult.value.memories || [];
+  if (selectedMemoryId && !memoryItems.some((item) => item.memory_id === selectedMemoryId)) {
+    selectedMemoryId = "";
+    selectedMemoryDetail = null;
+  }
+  renderMemoryList();
+  if (options.skipSelection) {
+    return { errors };
+  }
+  if (selectedMemoryId) {
+    await selectMemory(selectedMemoryId);
+  } else if (memoryItems.length) {
+    await selectMemory(memoryItems[0].memory_id);
+  } else {
+    selectedMemoryDetail = null;
+    const detail = document.querySelector("#memory-detail");
+    if (detail) detail.innerHTML = `<p class="empty-state">${escapeHtml(tr("memorySelectPrompt"))}</p>`;
+  }
+  if (status && errors.length) {
+    status.textContent = errors.join(" · ");
+    status.classList.add("error");
+  }
+  return { errors };
+}
+
+async function loadMemoryAudit(options = {}) {
+  const list = document.querySelector("#memory-audit-list");
+  if (list && !options.quiet) list.innerHTML = `<p class="empty-state">${escapeHtml(tr("memoryLoading"))}</p>`;
+  try {
+    const audit = await json("/api/memory/events?limit=200");
+    memoryAuditEvents = audit.events || [];
+    renderMemoryAudit(memoryAuditEvents, "#memory-audit-list");
+    return { errors: [] };
+  } catch (err) {
+    if (list) list.innerHTML = `<p class="empty-state">${escapeHtml(err.message || String(err))}</p>`;
+    return { errors: [err] };
+  }
+}
+
+async function loadMemoryGovernance(options = {}) {
+  const section = options.section || "all";
+  const tasks = [];
+  if (section === "all" || section === "inventory") tasks.push(loadMemoryInventory(options));
+  if (section === "all" || section === "audit") tasks.push(loadMemoryAudit(options));
+  return Promise.all(tasks);
+}
+
+async function governMemory(action, button) {
+  const memoryId = button.dataset.memoryId;
+  if (!memoryId) return;
+  const reason = document.querySelector("#memory-action-reason")?.value.trim() || "";
+  const expiryValue = document.querySelector("#memory-action-expiry")?.value || "";
+  const expiresAtMs = datetimeLocalMs(expiryValue);
+  let payload;
+  if (action === "promote") {
+    const scope = document.querySelector("#memory-action-scope")?.value.trim() || "";
+    if (!scope || !expiresAtMs || expiresAtMs <= Date.now()) {
+      showToast(tr("memoryPromotionRequired"), "error");
+      return;
+    }
+    payload = {
+      scope,
+      retrieval_key: document.querySelector("#memory-action-retrieval-key")?.value.trim() || "",
+      expires_at_ms: expiresAtMs,
+    };
+  } else {
+    if (!reason) {
+      showToast(tr("memoryReasonRequired"), "error");
+      return;
+    }
+    payload = { reason };
+    if (action === "restore" && expiresAtMs && expiresAtMs > Date.now()) payload.expires_at_ms = expiresAtMs;
+  }
+  button.disabled = true;
+  try {
+    const result = await json(`/api/memory/${encodeURIComponent(memoryId)}/${action}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (action === "promote" && !result.ok) {
+      throw new Error((result.reasons || []).join(", ") || "promotion gates failed");
+    }
+    showToast(tr("memoryActionDone", { id: selectedMemoryId, action: button.textContent.trim() }));
+    if (selectedMemoryId === memoryId) await loadMemoryGovernance({ quiet: true });
+  } catch (err) {
+    showToast(tr("memoryActionFailed", { message: err.message || String(err) }), "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function sweepMemory() {
+  const button = document.querySelector("#memory-sweep");
+  button.disabled = true;
+  try {
+    const result = await json("/api/memory/sweep", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    showToast(tr("memorySweepDone", { expired: result.expired.length, conflicts: result.conflicts.length }));
+    await loadMemoryGovernance({ quiet: true });
+  } catch (err) {
+    showToast(tr("memoryActionFailed", { message: err.message || String(err) }), "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function setView(name) {
   document.querySelectorAll(".view").forEach((view) => view.classList.remove("active"));
   document.querySelector(`#${name}-view`).classList.add("active");
   document.querySelectorAll(".nav-button").forEach((btn) => {
     btn.classList.toggle("active", btn.dataset.view === name);
   });
+  document.querySelectorAll(".nav-group").forEach((group) => {
+    group.classList.toggle("active", group.dataset.viewGroup === name);
+  });
+  document.querySelectorAll(".nav-subbutton").forEach((btn) => {
+    const current = btn.dataset.view === name && btn.classList.contains("active");
+    if (current) btn.setAttribute("aria-current", "page");
+    else btn.removeAttribute("aria-current");
+  });
   updateWorkspaceTitle(name);
 }
 
+function setSecondaryView(group, name) {
+  const tabs = [...document.querySelectorAll(`.nav-subbutton[data-secondary-group="${group}"]`)];
+  const panels = [...document.querySelectorAll(`.secondary-view[data-secondary-panel="${group}"]`)];
+  const selectedTab = tabs.find((tab) => tab.dataset.secondaryTarget === name);
+  if (!selectedTab) return;
+
+  tabs.forEach((tab) => {
+    const selected = tab === selectedTab;
+    tab.classList.toggle("active", selected);
+    const current = selected && document.querySelector(".nav-button.active")?.dataset.view === tab.dataset.view;
+    if (current) tab.setAttribute("aria-current", "page");
+    else tab.removeAttribute("aria-current");
+  });
+  panels.forEach((panel) => {
+    const selected = panel.dataset.secondaryName === name;
+    panel.classList.toggle("active", selected);
+    panel.hidden = !selected;
+  });
+}
+
+function activeSecondaryView(group, fallback = "") {
+  return document.querySelector(`.nav-subbutton.active[data-secondary-group="${group}"]`)?.dataset.secondaryTarget || fallback;
+}
+
+function loadViewData(name) {
+  if (name === "settings") {
+    return loadLlmConfig().catch((err) => setConfigStatus(err.message || String(err), true));
+  }
+  if (name === "memory") {
+    return loadMemoryGovernance({ section: activeSecondaryView("memory", "inventory") }).catch((err) =>
+      showToast(tr("memoryActionFailed", { message: err.message || String(err) }), "error"),
+    );
+  }
+  if (name === "adapter") {
+    const section = activeSecondaryView("adapter", "intake");
+    const tasks = [
+      loadSyslogConfig().catch((err) =>
+        setSyslogConfigStatus(tr("syslogConfigLoadFailed", { message: err.message || String(err) }), true),
+      ),
+    ];
+    if (section === "config") {
+      tasks.push(loadMappingProfiles().catch((err) => setProfileStatus(err.message || String(err), true)));
+    }
+    return Promise.all(tasks);
+  }
+  return loadCases();
+}
+
+function refreshCurrentView() {
+  const active = document.querySelector(".nav-button.active")?.dataset.view || "monitor";
+  return loadViewData(active);
+}
+
 async function loadDashboardRuntime() {
+  const llmFallback = { provider: "unavailable", model: "-", endpoint: "", unavailable: true };
   const syslogFallback = { configs: syslogConfigs, listeners: [], unavailable: true };
   const caseQuery = caseSearchQuery();
   const [health, casesData, llmConfig, syslogPayload] = await Promise.all([
-    json("/api/health"),
-    json(`/api/cases?${caseQuery}`),
-    json("/api/config/llm"),
-    json("/api/config/syslog").catch((err) => {
-      if (isApiNotFoundError(err)) return syslogFallback;
-      throw err;
-    }),
+    json("/api/health", { acceptStatuses: [503] }),
+    canReadCases() ? json(`/api/cases?${caseQuery}`) : Promise.resolve({ cases: [] }),
+    canReadRuntimeConfig()
+      ? json("/api/config/llm").catch(() => llmFallback)
+      : Promise.resolve(llmFallback),
+    canReadRuntimeConfig()
+      ? json("/api/config/syslog").catch(() => syslogFallback)
+      : Promise.resolve(syslogFallback),
   ]);
   return { health, cases: casesData.cases || [], llmConfig, syslogPayload };
 }
@@ -1828,8 +2870,12 @@ function renderProfileList() {
 function selectProfile(profileId) {
   selectedProfileId = profileId;
   const profile = selectedProfile();
-  inferredProfile = profile;
-  setProfileJson(profile);
+  inferredFields = [];
+  lastFieldMappingResult = null;
+  renderFieldMappingTable(null);
+  document.querySelector("#dry-run-result").textContent = tr("dryRunHint");
+  inferredProfile = profile ? JSON.parse(JSON.stringify(profile)) : null;
+  setProfileJson(inferredProfile);
   const sourceLog = document.querySelector("#source-log");
   const selectedProduct = selectedLogProduct();
   if (profile?.profile_id === `demo-${selectedProduct}-json` && !sourceLog.value.trim() && sampleLogCache.has(selectedProduct)) {
@@ -2077,7 +3123,6 @@ async function saveLlmConfig(event) {
     endpoint: document.querySelector("#llm-endpoint").value,
     model: document.querySelector("#llm-model").value,
     api_key: document.querySelector("#llm-api-key").value,
-    api_key_env: document.querySelector("#llm-api-key-env").value,
     timeout_seconds: Number(document.querySelector("#llm-timeout").value || 30),
     keep_existing_key: true,
   };
@@ -2102,13 +3147,13 @@ async function testLlmConnection() {
       endpoint: document.querySelector("#llm-endpoint").value,
       model: document.querySelector("#llm-model").value,
       api_key: document.querySelector("#llm-api-key").value,
-      api_key_env: document.querySelector("#llm-api-key-env").value,
       timeout_seconds: Number(document.querySelector("#llm-timeout").value || 30),
     };
     const result = await json("/api/config/llm/test", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
+      timeoutMs: Math.max(REQUEST_TIMEOUT_MS, payload.timeout_seconds * 1000 + 5_000),
     });
     if (result.ok) {
       setConfigStatus(tr("testConnOk", { message: result.message }));
@@ -2143,7 +3188,9 @@ if (window.matchMedia) {
   });
 }
 
-document.querySelector("#refresh").addEventListener("click", loadCases);
+document.querySelector("#refresh").addEventListener("click", () => {
+  refreshCurrentView().catch((err) => showToast(err.message || String(err), "error"));
+});
 document.querySelector("#test-llm-connection").addEventListener("click", () => {
   testLlmConnection().catch((err) => setConfigStatus(err.message || String(err), true));
 });
@@ -2155,6 +3202,23 @@ document.querySelector("#case-search-reset").addEventListener("click", () => {
   document.querySelector("#case-search-form").reset();
   setDefaultCaseDateRange();
   loadCases().catch((err) => showToast(err.message || String(err), "error"));
+});
+document.querySelector("#case-filter-to").addEventListener("input", () => {
+  caseToUsesCurrentTime = false;
+});
+document.querySelector("#memory-filter-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  loadMemoryGovernance().catch((err) => showToast(tr("memoryActionFailed", { message: err.message || String(err) }), "error"));
+});
+document.querySelector("#memory-filter-reset").addEventListener("click", () => {
+  document.querySelector("#memory-filter-form").reset();
+  loadMemoryGovernance().catch((err) => showToast(tr("memoryActionFailed", { message: err.message || String(err) }), "error"));
+});
+document.querySelector("#memory-sweep").addEventListener("click", sweepMemory);
+document.querySelector("#memory-audit-refresh").addEventListener("click", () => {
+  loadMemoryAudit({ quiet: true }).catch((err) =>
+    showToast(tr("memoryActionFailed", { message: err.message || String(err) }), "error"),
+  );
 });
 document.querySelector("#refresh-mode-toggle").addEventListener("click", () => {
   saveRefreshPreference(!refreshPaused);
@@ -2221,7 +3285,7 @@ document.querySelector("#save-inferred-profile").addEventListener("click", () =>
 document.querySelector("#reload-profiles").addEventListener("click", () => {
   loadMappingProfiles().catch((err) => setProfileStatus(err.message || String(err), true));
 });
-document.querySelector("#reset-syslog-config").addEventListener("click", resetSyslogConfigs);
+document.querySelector("#reset-syslog-config").addEventListener("click", fillDefaultSyslogConfigs);
 document.querySelector("#dry-run-form").addEventListener("submit", (event) => {
   runDryRun(event).catch((err) => {
     document.querySelector("#dry-run-result").textContent = err.message || String(err);
@@ -2231,21 +3295,71 @@ document.querySelector("#dry-run-form").addEventListener("submit", (event) => {
 document.querySelectorAll(".nav-button").forEach((btn) => {
   btn.addEventListener("click", () => {
     setView(btn.dataset.view);
-    if (btn.dataset.view === "settings") {
-      loadLlmConfig().catch((err) => setConfigStatus(err.message || String(err), true));
-    }
-    if (btn.dataset.view === "adapter") {
-      loadMappingProfiles().catch((err) => setProfileStatus(err.message || String(err), true));
-      loadSyslogConfig().catch((err) =>
-        setSyslogConfigStatus(tr("syslogConfigLoadFailed", { message: err.message || String(err) }), true),
+    if (btn.dataset.secondaryGroup) {
+      const activeChild = document.querySelector(
+        `.nav-subbutton.active[data-secondary-group="${btn.dataset.secondaryGroup}"]`,
+      );
+      setSecondaryView(
+        btn.dataset.secondaryGroup,
+        activeChild?.dataset.secondaryTarget || btn.dataset.defaultSecondary,
       );
     }
+    loadViewData(btn.dataset.view);
   });
+});
+document.querySelectorAll(".nav-subbutton").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    setView(btn.dataset.view);
+    setSecondaryView(btn.dataset.secondaryGroup, btn.dataset.secondaryTarget);
+    loadViewData(btn.dataset.view);
+  });
+});
+
+async function loadApplicationData() {
+  await loadSession();
+  const tasks = [
+    loadSampleLog(selectedLogProduct()),
+    loadCases(),
+  ];
+  if (canReadRuntimeConfig()) {
+    tasks.push(loadLlmConfig(), loadSyslogConfig());
+  }
+  if (canReadMappingProfiles()) {
+    tasks.push(loadMappingProfiles());
+  }
+  return Promise.all(tasks);
+}
+
+document.querySelector("#auth-session").addEventListener("click", () => showAuthDialog());
+document.querySelector("#auth-close").addEventListener("click", () => document.querySelector("#auth-dialog").close());
+document.querySelector("#auth-clear").addEventListener("click", async () => {
+  storeApiToken("");
+  currentSession = { actor: "", roles: [] };
+  applySessionPermissions();
+  document.querySelector("#auth-token").value = "";
+  document.querySelector("#auth-status").textContent = tr("authCleared");
+  try {
+    await loadSession();
+    document.querySelector("#auth-status").textContent = sessionIdentityText() || tr("authCleared");
+  } catch (err) {
+    document.querySelector("#auth-status").textContent = err.status === 401 ? tr("authRequired") : err.message || String(err);
+  }
+});
+document.querySelector("#auth-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  storeApiToken(document.querySelector("#auth-token").value);
+  try {
+    await loadApplicationData();
+    document.querySelector("#auth-status").textContent = tr("authConnected");
+    document.querySelector("#auth-dialog").close();
+  } catch (err) {
+    document.querySelector("#auth-status").textContent = err.status === 401 ? tr("authRequired") : err.message || String(err);
+  }
 });
 
 setDefaultCaseDateRange();
 renderLogProductOptions();
-Promise.all([loadSampleLog(selectedLogProduct()), loadCases(), loadLlmConfig(), loadMappingProfiles(), loadSyslogConfig()]).catch((err) =>
+loadApplicationData().catch((err) =>
   showToast(err.message || String(err), "error"),
 );
 scheduleDashboardRefresh();

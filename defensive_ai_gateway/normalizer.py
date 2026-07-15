@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 from typing import Any
 
@@ -21,12 +22,33 @@ ENTITY_KEYS = {
 }
 
 
+# These fields are test/demo annotations, not security telemetry. Accepting them
+# from ordinary HTTP or syslog alerts lets a sender inject a desired verdict or
+# an unsafe whitelist. They are retained only when the server has marked the
+# RawAlert as a trusted sample out of band.
+_SAMPLE_CONTROL_FIELDS = {
+    "trusted_sample",
+    "_trusted_sample",
+    "evidence_assessment",
+    "expected_verdict",
+    "analysis_dimension",
+    "analysis_dimensions",
+    "whitelist_candidate",
+    "tuning_candidate",
+}
+
+
 class EventNormalizer:
     def __init__(self, policy: PolicyEngine):
         self.policy = policy
 
     def normalize(self, alert: RawAlert) -> NormalizedEvent:
-        payload = self.policy.redact(alert.payload)
+        source_payload = (
+            copy.deepcopy(alert.payload)
+            if alert.trusted_sample
+            else self._strip_sample_controls(alert.payload)
+        )
+        payload = self.policy.redact(source_payload)
         flat = self._flatten(payload)
         entities = self._extract_entities(flat)
         evidence = self._build_evidence(alert, payload, flat)
@@ -46,6 +68,18 @@ class EventNormalizer:
             sensitivity_tags=tags,
             raw_ref=alert.alert_id,
         )
+
+    def _strip_sample_controls(self, value: Any) -> Any:
+        """Deep-copy telemetry while removing untrusted analysis directives."""
+        if isinstance(value, dict):
+            return {
+                key: self._strip_sample_controls(item)
+                for key, item in value.items()
+                if str(key).lower() not in _SAMPLE_CONTROL_FIELDS
+            }
+        if isinstance(value, list):
+            return [self._strip_sample_controls(item) for item in value]
+        return copy.deepcopy(value)
 
     @staticmethod
     def _event_id(alert_id: str) -> str:
@@ -136,7 +170,20 @@ class EventNormalizer:
                     break
         for key, value in flat.items():
             leaf = key.lower().split(".")[-1]
-            if leaf in {"payload", "body", "authorization", "cookie", "password", "token"}:
+            if leaf in {
+                "payload",
+                "body",
+                "authorization",
+                "cookie",
+                "password",
+                "token",
+                "access_token",
+                "refresh_token",
+                "client_secret",
+                "api_key",
+                "x-api-key",
+                "x_api_key",
+            }:
                 continue
             if len(evidence) >= 18:
                 break
@@ -207,11 +254,14 @@ class EventNormalizer:
             for idx, item in enumerate(adapter_evidence[:12]):
                 if not isinstance(item, dict):
                     continue
+                item_type = str(item.get("type") or "mapped_field")
+                if not alert.trusted_sample and item_type.lower() in _SAMPLE_CONTROL_FIELDS:
+                    continue
                 evidence.append(
                     {
                         "ref": item.get("ref") or f"{alert.alert_id}:adapter_evidence.{idx}",
                         "source": item.get("source") or product,
-                        "type": item.get("type") or "mapped_field",
+                        "type": item_type,
                         "value": item.get("value"),
                         "why_it_matters": item.get("why_it_matters") or "日志适配配置提取的证据字段。",
                     }
@@ -282,6 +332,12 @@ class EventNormalizer:
         text = str(payload).lower()
         for needle, tag in [
             ("token", "credential"),
+            ("access_token", "credential"),
+            ("refresh_token", "credential"),
+            ("client_secret", "credential"),
+            ("api_key", "credential"),
+            ("x-api-key", "credential"),
+            ("password", "credential"),
             ("cookie", "credential"),
             ("authorization", "credential"),
             ("customer", "customer_data"),

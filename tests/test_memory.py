@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from defensive_ai_gateway.memory import (
     STATUS_EXPIRED,
     STATUS_PENDING,
     STATUS_QUARANTINED,
+    STATUS_REVOKED,
     MemoryManager,
 )
 from defensive_ai_gateway.models import RawAlert, now_ms
@@ -52,7 +54,7 @@ class MultiLayerMemoryTest(unittest.TestCase):
     def test_org_knowledge_seeded_on_init(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Repository(str(Path(tmp) / "g.db"))
-            memory = MemoryManager(repo)
+            MemoryManager(repo)
             org = repo.query_memory(layer=LAYER_ORG_KNOWLEDGE, limit=100)
             self.assertGreaterEqual(len(org), 5)
             self.assertTrue(all(m["status"] == STATUS_ACTIVE for m in org))
@@ -133,7 +135,7 @@ class MultiLayerMemoryTest(unittest.TestCase):
     def test_promotion_requires_all_five_gates(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo, policy, memory, orchestrator = _build(Path(tmp))
-            result = orchestrator.handle_alert(_waf_alert())
+            orchestrator.handle_alert(_waf_alert())
             pending = repo.query_memory(
                 layer=LAYER_PRODUCT_LONG_TERM, namespace=memory.product_namespace("waf"), limit=10
             )
@@ -233,11 +235,77 @@ class MultiLayerMemoryTest(unittest.TestCase):
             repo.save_memory({**base, "memory_id": "mem_b"})  # duplicate content
             conflicts = memory.detect_conflicts("waf")
             self.assertEqual(len(conflicts), 1)
-            self.assertEqual(repo.get_memory("mem_b")["status"], STATUS_QUARANTINED)
-            # direct quarantine
-            memory.quarantine("mem_a", "analyst-b", "suspected_poisoning")
             self.assertEqual(repo.get_memory("mem_a")["status"], STATUS_QUARANTINED)
-            self.assertEqual(repo.get_memory("mem_a")["trust_level"], "low")
+            self.assertEqual(repo.get_memory("mem_b")["status"], STATUS_ACTIVE)
+            # direct quarantine
+            memory.quarantine("mem_b", "analyst-b", "suspected_poisoning")
+            self.assertEqual(repo.get_memory("mem_b")["status"], STATUS_QUARANTINED)
+            self.assertEqual(repo.get_memory("mem_b")["trust_level"], "low")
+
+    def test_promotion_gate_and_lifecycle_transition_are_serialized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, policy, memory, orchestrator = _build(Path(tmp))
+            result = orchestrator.handle_alert(_waf_alert())
+            pending = next(
+                item
+                for item in repo.query_memory(
+                    layer=LAYER_PRODUCT_LONG_TERM,
+                    status=STATUS_PENDING,
+                    limit=20,
+                )
+                if item["source_case_id"] == result.case_id
+            )
+            entered_gate = threading.Event()
+            release_gate = threading.Event()
+            original_sensitivity_check = memory._sensitivity_ok
+
+            def blocking_sensitivity_check(record):
+                entered_gate.set()
+                self.assertTrue(release_gate.wait(timeout=2))
+                return original_sensitivity_check(record)
+
+            memory._sensitivity_ok = blocking_sensitivity_check
+            errors: list[Exception] = []
+
+            def promote():
+                try:
+                    memory.promote(
+                        pending["memory_id"],
+                        "analyst-a",
+                        "waf:serialized-review",
+                        now_ms() + 24 * 3600 * 1000,
+                    )
+                except Exception as exc:  # pragma: no cover - diagnostic capture
+                    errors.append(exc)
+
+            def quarantine():
+                try:
+                    memory.quarantine(
+                        pending["memory_id"], "soc-lead", "concurrent conflict"
+                    )
+                except Exception as exc:  # pragma: no cover - diagnostic capture
+                    errors.append(exc)
+
+            promotion_thread = threading.Thread(target=promote)
+            quarantine_thread = threading.Thread(target=quarantine)
+            promotion_thread.start()
+            self.assertTrue(entered_gate.wait(timeout=2))
+            quarantine_thread.start()
+            quarantine_thread.join(timeout=0.05)
+            self.assertTrue(
+                quarantine_thread.is_alive(),
+                "quarantine must wait for the promotion gate+commit critical section",
+            )
+            release_gate.set()
+            promotion_thread.join(timeout=2)
+            quarantine_thread.join(timeout=2)
+
+            self.assertFalse(errors)
+            self.assertFalse(promotion_thread.is_alive())
+            self.assertFalse(quarantine_thread.is_alive())
+            self.assertEqual(
+                repo.get_memory(pending["memory_id"])["status"], STATUS_QUARANTINED
+            )
 
     def test_archive_case_on_close(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -256,7 +324,7 @@ class MemoryGovernanceAPITest(unittest.TestCase):
             config = GatewayConfig()
             config.database.path = str(Path(tmp) / "gateway.db")
             state = GatewayState(config)
-            result = state.orchestrator.handle_alert(_waf_alert())
+            state.orchestrator.handle_alert(_waf_alert())
 
             # list filters by layer/status
             listed = state.list_memory({"layer": LAYER_PRODUCT_LONG_TERM, "status": STATUS_PENDING})
@@ -275,6 +343,105 @@ class MemoryGovernanceAPITest(unittest.TestCase):
             # events traceable
             events = state.list_memory_events({"memory_id": mem_id})
             self.assertTrue(any(e["event_type"] == "rejected" for e in events))
+
+    def test_memory_governance_summary_search_and_detail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            config.database.path = str(Path(tmp) / "gateway.db")
+            state = GatewayState(config)
+            state.orchestrator.handle_alert(_waf_alert())
+
+            summary = state.memory_summary()
+            self.assertGreaterEqual(summary["total"], 8)
+            self.assertGreaterEqual(summary["by_status"][STATUS_ACTIVE], 1)
+            self.assertGreaterEqual(summary["by_status"][STATUS_PENDING], 1)
+            self.assertIn("product_long_term", summary["by_layer"])
+            self.assertIn("total_events", summary)
+
+            matches = state.list_memory({"q": "waf", "include_expired": "true"})
+            self.assertTrue(matches)
+            self.assertTrue(any("waf" in json.dumps(row, ensure_ascii=False).lower() for row in matches))
+
+            pending = state.list_memory({"layer": LAYER_PRODUCT_LONG_TERM, "status": STATUS_PENDING})[0]
+            detail = state.memory_detail(pending["memory_id"])
+            self.assertIsNotNone(detail)
+            self.assertTrue(detail["governance"]["actionable"])
+            self.assertTrue(detail["governance"]["gates"]["evidence_traceable"])
+            self.assertFalse(detail["governance"]["gates"]["analyst_approved"])
+            self.assertFalse(detail["governance"]["gates"]["scope_clear"])
+            self.assertTrue(detail["governance"]["events"])
+
+    def test_restore_active_memory_and_return_incomplete_memory_to_review(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            config.database.path = str(Path(tmp) / "gateway.db")
+            state = GatewayState(config)
+            state.orchestrator.handle_alert(_waf_alert())
+            pending = state.list_memory({"layer": LAYER_PRODUCT_LONG_TERM, "status": STATUS_PENDING})[0]
+            memory_id = pending["memory_id"]
+            future = now_ms() + 30 * 24 * 3600 * 1000
+
+            promoted = state.promote_memory(
+                memory_id,
+                {
+                    "approved_by": "analyst-lee",
+                    "scope": "waf:reviewed-pattern",
+                    "expires_at_ms": future,
+                },
+            )
+            self.assertTrue(promoted["ok"])
+            state.quarantine_memory(memory_id, {"actor": "soc-lead", "reason": "validate possible poisoning"})
+            self.assertEqual(state.repo.get_memory(memory_id)["status"], STATUS_QUARANTINED)
+            restored = state.restore_memory(memory_id, {"actor": "soc-lead", "reason": "evidence revalidated"})
+            self.assertFalse(restored["ok"])
+            self.assertEqual(restored["status"], STATUS_PENDING)
+            self.assertEqual(state.repo.get_memory(memory_id)["approved_by"], "")
+            self.assertIn("analyst_approved:reapproval_required_after_restore", restored["reasons"])
+
+            second = state.orchestrator.handle_alert(
+                RawAlert(
+                    source="test",
+                    product="waf",
+                    event_type="different-rule",
+                    severity="low",
+                    timestamp="2026-01-02T00:00:00Z",
+                    payload={"rule_id": "WAF-SECOND", "src_ip": "10.0.0.2"},
+                    alert_id="alert-memory-restore-second",
+                )
+            )
+            candidates = state.list_memory({"layer": LAYER_PRODUCT_LONG_TERM, "status": STATUS_PENDING})
+            incomplete = next(row for row in candidates if row["source_case_id"] == second.case_id)
+            state.reject_memory(incomplete["memory_id"], {"actor": "analyst", "reason": "not reusable yet"})
+            self.assertEqual(state.repo.get_memory(incomplete["memory_id"])["status"], STATUS_REVOKED)
+            for_review = state.restore_memory(
+                incomplete["memory_id"],
+                {"actor": "analyst", "reason": "return for metadata repair", "expires_at_ms": future},
+            )
+            self.assertFalse(for_review["ok"])
+            self.assertEqual(for_review["status"], STATUS_PENDING)
+            self.assertTrue(any(reason.startswith("scope_clear") for reason in for_review["reasons"]))
+
+    def test_governance_actions_validate_target_and_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            config.database.path = str(Path(tmp) / "gateway.db")
+            state = GatewayState(config)
+            state.orchestrator.handle_alert(_waf_alert())
+            pending = state.list_memory({"layer": LAYER_PRODUCT_LONG_TERM, "status": STATUS_PENDING})[0]
+
+            with self.assertRaisesRegex(ValueError, "reason is required"):
+                state.quarantine_memory(pending["memory_id"], {"actor": "analyst", "reason": ""})
+            with self.assertRaisesRegex(ValueError, "future"):
+                state.promote_memory(
+                    pending["memory_id"],
+                    {"approved_by": "analyst", "scope": "waf:test", "expires_at_ms": now_ms() - 1},
+                )
+            org = state.list_memory({"layer": LAYER_ORG_KNOWLEDGE})[0]
+            with self.assertRaisesRegex(ValueError, "product long-term"):
+                state.quarantine_memory(org["memory_id"], {"actor": "analyst", "reason": "invalid target"})
+
+            sweep = state.sweep_memory({})
+            self.assertEqual(sweep["products"], ["hips", "ndr", "rasp", "siem", "waf"])
 
     def test_confirm_alert_false_positive_writes_active_product_memory(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -300,6 +467,35 @@ class MemoryGovernanceAPITest(unittest.TestCase):
             self.assertGreaterEqual(len(content["features"]["similarity_features"]), 1)
             self.assertEqual(state.repo.get_case(result.case_id)["status"], "false_positive")
             self.assertEqual(state.repo.stats()["cases"], 0)
+
+    def test_confirm_alert_false_positive_rejects_past_expiry_atomically(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            config.database.path = str(Path(tmp) / "gateway.db")
+            state = GatewayState(config)
+            result = state.orchestrator.handle_alert(_waf_alert())
+            detail = state.repo.get_case(result.case_id)
+            alert_id = detail["linked_alerts"][0]["alert_id"]
+
+            with self.assertRaisesRegex(ValueError, "future"):
+                state.confirm_alert_false_positive(
+                    alert_id,
+                    {
+                        "analyst": "analyst-lee",
+                        "reason": "过期时间无效",
+                        "expires_at_ms": now_ms() - 1,
+                    },
+                )
+
+            active = state.repo.query_memory(
+                layer=LAYER_PRODUCT_LONG_TERM,
+                namespace=state.memory.product_namespace("waf"),
+                status=STATUS_ACTIVE,
+                limit=100,
+            )
+            self.assertEqual(active, [])
+            self.assertIsNone(state.repo.get_alert_disposition(alert_id))
+            self.assertNotEqual(state.repo.get_case(result.case_id)["status"], "false_positive")
 
 
 if __name__ == "__main__":
