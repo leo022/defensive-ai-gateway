@@ -10,6 +10,9 @@ from typing import Any
 class ServerConfig:
     host: str = "127.0.0.1"
     port: int = 8080
+    max_connections: int = 128
+    read_timeout_seconds: int = 15
+    requests_per_minute: int = 6000
 
 
 @dataclass
@@ -25,6 +28,9 @@ class LLMConfig:
     api_key: str = ""
     model: str = "local-rule-analyst"
     timeout_seconds: int = 30
+    allowed_hosts: list[str] = field(default_factory=list)
+    max_response_bytes: int = 2_000_000
+    max_retries: int = 1
 
 
 @dataclass
@@ -32,6 +38,7 @@ class PolicyConfig:
     mode: str = "read_only"
     max_prompt_chars: int = 12000
     max_context_bytes: int = 20000
+    approval_quorum: int = 1
     require_approval_for: list[str] = field(default_factory=lambda: ["block", "isolate", "change_policy", "disable_account"])
     redact_fields: list[str] = field(
         default_factory=lambda: [
@@ -49,6 +56,13 @@ class PolicyConfig:
 
 
 @dataclass
+class AuthPrincipalConfig:
+    actor: str
+    token: str
+    roles: list[str] = field(default_factory=list)
+
+
+@dataclass
 class AuthConfig:
     """HTTP API authentication.
 
@@ -60,12 +74,23 @@ class AuthConfig:
     a reverse proxy (see deploy/k3s).
     """
     api_token: str = ""
+    ingest_token: str = ""
+    operator_token: str = ""
+    approver_token: str = ""
     # When True (default), requests originating from 127.0.0.1/::1 are accepted
     # even without a token — keeps local dev and the test harness working.
     allow_loopback_no_token: bool = True
     # When True, an unauthenticated non-loopback request with no token
     # configured is rejected (fail-closed for network-exposed deployments).
     require_token_when_remote: bool = True
+    # Explicit escape hatch for isolated workshops/container demos. Production
+    # manifests must keep this false; merely disabling remote-token enforcement
+    # is not sufficient to enable an unauthenticated network service.
+    demo_mode: bool = False
+    # Optional named identities allow quorum votes to represent real distinct
+    # operators instead of another shared role token. Tokens should normally be
+    # supplied through each entry's token_env setting.
+    principals: list[AuthPrincipalConfig] = field(default_factory=list)
 
 
 @dataclass
@@ -75,6 +100,36 @@ class ProcessingConfig:
     async_enabled: bool = True
     queue_max_size: int = 5000
     workers: int = 4
+    max_attempts: int = 3
+    retry_base_seconds: float = 1.0
+
+
+@dataclass
+class OperationsConfig:
+    maintenance_interval_seconds: int = 60
+    inbox_retention_days: int = 7
+    stale_claim_seconds: int = 600
+    # Zero keeps local/demo databases untouched. Production overlays should set
+    # finite retention windows so terminal operational history cannot grow
+    # without bound.
+    data_retention_days: int = 0
+    audit_retention_days: int = 0
+    memory_history_retention_days: int = 0
+    retention_batch_size: int = 200
+
+
+@dataclass
+class MemoryMatchingConfig:
+    """Deterministic memory association policy shared by every LLM backend."""
+
+    candidate_limit: int = 100
+    top_k: int = 5
+    review_threshold: float = 0.58
+    apply_threshold: float = 0.78
+    structured_weight: float = 0.68
+    semantic_weight: float = 0.22
+    retrieval_weight: float = 0.10
+    vector_dimensions: int = 256
 
 
 @dataclass
@@ -104,7 +159,18 @@ class SyslogConfig:
             "siem": "tcp",
         }
     )
-    gateway_profiles: dict[str, str] = field(default_factory=lambda: {"rasp": "demo-rasp-json"})
+    gateway_profiles: dict[str, str] = field(
+        default_factory=lambda: {
+            "waf": "auto-waf-json",
+            "hips": "auto-hips-json",
+            "ndr": "auto-ndr-json",
+            "rasp": "auto-rasp-json",
+            "siem": "auto-siem-json",
+        }
+    )
+    embedded_listeners_enabled: bool = False
+    max_frame_bytes: int = 1_000_000
+    max_connections: int = 64
 
 
 @dataclass
@@ -115,6 +181,8 @@ class GatewayConfig:
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     auth: AuthConfig = field(default_factory=AuthConfig)
     processing: ProcessingConfig = field(default_factory=ProcessingConfig)
+    operations: OperationsConfig = field(default_factory=OperationsConfig)
+    memory_matching: MemoryMatchingConfig = field(default_factory=MemoryMatchingConfig)
     syslog: SyslogConfig = field(default_factory=SyslogConfig)
 
 
@@ -178,28 +246,94 @@ def load_config(path: str | None = None) -> GatewayConfig:
     policy = raw.get("policy", {})
     auth = raw.get("auth", {})
     processing = raw.get("processing", {})
+    operations = raw.get("operations", {})
+    memory_matching = raw.get("memory_matching", {})
     syslog = raw.get("syslog", {})
+    provider = str(os.getenv("DEFENSIVE_AI_LLM_PROVIDER", llm.get("provider", "local")))
+    endpoint_env = os.getenv("DEFENSIVE_AI_LLM_ENDPOINT")
+    anthropic_base_url = str(os.getenv("ANTHROPIC_BASE_URL", "")).strip()
+    if endpoint_env is not None:
+        endpoint = endpoint_env
+    elif provider.strip().lower() == "gateway" and anthropic_base_url:
+        base = anthropic_base_url.rstrip("/")
+        if base.endswith("/v1/messages"):
+            endpoint = base
+        elif base.endswith("/v1"):
+            endpoint = f"{base}/messages"
+        else:
+            endpoint = f"{base}/v1/messages"
+    else:
+        endpoint = str(llm.get("endpoint", ""))
     api_key_env = str(llm.get("api_key_env", "DEFENSIVE_AI_LLM_API_KEY"))
+    if (
+        provider.strip().lower() == "gateway"
+        and anthropic_base_url
+        and "api_key_env" not in llm
+        and os.getenv("ANTHROPIC_AUTH_TOKEN")
+        and not os.getenv(api_key_env)
+    ):
+        api_key_env = "ANTHROPIC_AUTH_TOKEN"
     default_syslog = SyslogConfig()
+    named_principals: list[AuthPrincipalConfig] = []
+    for actor, principal in dict(auth.get("principals", {}) or {}).items():
+        if not isinstance(principal, dict):
+            continue
+        token_env = str(principal.get("token_env", "")).strip()
+        token = str(
+            os.getenv(token_env, principal.get("token", ""))
+            if token_env
+            else principal.get("token", "")
+        )
+        roles = [
+            str(role).strip().lower()
+            for role in list(principal.get("roles", []) or [])
+            if str(role).strip()
+        ]
+        named_principals.append(
+            AuthPrincipalConfig(actor=str(actor).strip(), token=token, roles=roles)
+        )
+    allowed_hosts_env = os.getenv("DEFENSIVE_AI_LLM_ALLOWED_HOSTS")
+    allowed_hosts = (
+        [item.strip() for item in allowed_hosts_env.split(",") if item.strip()]
+        if allowed_hosts_env is not None
+        else list(llm.get("allowed_hosts", []) or [])
+    )
 
     config = GatewayConfig(
         server=ServerConfig(
             host=str(os.getenv("DEFENSIVE_AI_HOST", server.get("host", "127.0.0.1"))),
             port=int(os.getenv("DEFENSIVE_AI_PORT", server.get("port", 8080))),
+            max_connections=max(8, min(int(server.get("max_connections", 128)), 2048)),
+            read_timeout_seconds=max(1, min(int(server.get("read_timeout_seconds", 15)), 120)),
+            requests_per_minute=max(60, min(int(server.get("requests_per_minute", 6000)), 1_000_000)),
         ),
         database=DatabaseConfig(path=str(os.getenv("DEFENSIVE_AI_DB", database.get("path", "data/gateway.db")))),
         llm=LLMConfig(
-            provider=str(os.getenv("DEFENSIVE_AI_LLM_PROVIDER", llm.get("provider", "local"))),
-            endpoint=str(os.getenv("DEFENSIVE_AI_LLM_ENDPOINT", llm.get("endpoint", ""))),
+            provider=provider,
+            endpoint=endpoint,
             api_key_env=api_key_env,
             api_key=str(os.getenv(api_key_env, llm.get("api_key", ""))),
-            model=str(llm.get("model", "local-rule-analyst")),
-            timeout_seconds=int(llm.get("timeout_seconds", 30)),
+            model=str(os.getenv("DEFENSIVE_AI_LLM_MODEL", llm.get("model", "local-rule-analyst"))),
+            timeout_seconds=max(1, min(int(llm.get("timeout_seconds", 30)), 300)),
+            allowed_hosts=[
+                str(item).strip().lower()
+                for item in allowed_hosts
+                if str(item).strip()
+            ],
+            max_response_bytes=max(65_536, min(int(llm.get("max_response_bytes", 2_000_000)), 10_000_000)),
+            max_retries=max(0, min(int(llm.get("max_retries", 1)), 3)),
         ),
         policy=PolicyConfig(
             mode=str(policy.get("mode", "read_only")),
             max_prompt_chars=int(policy.get("max_prompt_chars", 12000)),
             max_context_bytes=int(policy.get("max_context_bytes", 20000)),
+            approval_quorum=max(
+                1,
+                min(
+                    int(os.getenv("DEFENSIVE_AI_APPROVAL_QUORUM", policy.get("approval_quorum", 1))),
+                    5,
+                ),
+            ),
             require_approval_for=list(policy.get("require_approval_for", ["block", "isolate", "change_policy", "disable_account"])),
             redact_fields=list(
                 policy.get(
@@ -210,6 +344,9 @@ def load_config(path: str | None = None) -> GatewayConfig:
         ),
         auth=AuthConfig(
             api_token=str(os.getenv("DEFENSIVE_AI_API_TOKEN", auth.get("api_token", ""))),
+            ingest_token=str(os.getenv("DEFENSIVE_AI_INGEST_TOKEN", auth.get("ingest_token", ""))),
+            operator_token=str(os.getenv("DEFENSIVE_AI_OPERATOR_TOKEN", auth.get("operator_token", ""))),
+            approver_token=str(os.getenv("DEFENSIVE_AI_APPROVER_TOKEN", auth.get("approver_token", ""))),
             allow_loopback_no_token=str(
                 os.getenv("DEFENSIVE_AI_AUTH_LOOPBACK", "1" if auth.get("allow_loopback_no_token", True) else "0")
             )
@@ -218,6 +355,11 @@ def load_config(path: str | None = None) -> GatewayConfig:
                 os.getenv("DEFENSIVE_AI_AUTH_REQUIRE_REMOTE_TOKEN", "1" if auth.get("require_token_when_remote", True) else "0")
             )
             in {"1", "true", "True", "yes"},
+            demo_mode=str(
+                os.getenv("DEFENSIVE_AI_DEMO_MODE", "1" if auth.get("demo_mode", False) else "0")
+            )
+            in {"1", "true", "True", "yes"},
+            principals=named_principals,
         ),
         processing=ProcessingConfig(
             async_enabled=str(
@@ -226,6 +368,53 @@ def load_config(path: str | None = None) -> GatewayConfig:
             in {"1", "true", "True", "yes"},
             queue_max_size=int(os.getenv("DEFENSIVE_AI_QUEUE_MAX_SIZE", processing.get("queue_max_size", 5000))),
             workers=int(os.getenv("DEFENSIVE_AI_WORKERS", processing.get("workers", 4))),
+            max_attempts=max(1, min(int(processing.get("max_attempts", 3)), 20)),
+            retry_base_seconds=max(0.1, min(float(processing.get("retry_base_seconds", 1.0)), 300.0)),
+        ),
+        operations=OperationsConfig(
+            maintenance_interval_seconds=max(10, min(int(operations.get("maintenance_interval_seconds", 60)), 3600)),
+            inbox_retention_days=max(1, min(int(operations.get("inbox_retention_days", 7)), 365)),
+            stale_claim_seconds=max(30, min(int(operations.get("stale_claim_seconds", 600)), 86400)),
+            data_retention_days=max(
+                0,
+                min(
+                    int(os.getenv("DEFENSIVE_AI_DATA_RETENTION_DAYS", operations.get("data_retention_days", 0))),
+                    3650,
+                ),
+            ),
+            audit_retention_days=max(
+                0,
+                min(
+                    int(os.getenv("DEFENSIVE_AI_AUDIT_RETENTION_DAYS", operations.get("audit_retention_days", 0))),
+                    3650,
+                ),
+            ),
+            memory_history_retention_days=max(
+                0,
+                min(
+                    int(
+                        os.getenv(
+                            "DEFENSIVE_AI_MEMORY_EVENT_RETENTION_DAYS",
+                            operations.get("memory_history_retention_days", 0),
+                        )
+                    ),
+                    3650,
+                ),
+            ),
+            retention_batch_size=max(
+                10,
+                min(int(operations.get("retention_batch_size", 200)), 1000),
+            ),
+        ),
+        memory_matching=MemoryMatchingConfig(
+            candidate_limit=max(1, min(int(memory_matching.get("candidate_limit", 100)), 500)),
+            top_k=max(1, min(int(memory_matching.get("top_k", 5)), 20)),
+            review_threshold=float(memory_matching.get("review_threshold", 0.58)),
+            apply_threshold=float(memory_matching.get("apply_threshold", 0.78)),
+            structured_weight=float(memory_matching.get("structured_weight", 0.68)),
+            semantic_weight=float(memory_matching.get("semantic_weight", 0.22)),
+            retrieval_weight=float(memory_matching.get("retrieval_weight", 0.10)),
+            vector_dimensions=max(64, min(int(memory_matching.get("vector_dimensions", 256)), 2048)),
         ),
         syslog=SyslogConfig(
             product_ports={
@@ -240,6 +429,15 @@ def load_config(path: str | None = None) -> GatewayConfig:
                 **default_syslog.gateway_profiles,
                 **{str(k): str(v) for k, v in dict(syslog.get("gateway_profiles", {}) or {}).items()},
             },
+            embedded_listeners_enabled=str(
+                os.getenv(
+                    "DEFENSIVE_AI_EMBEDDED_SYSLOG",
+                    "1" if syslog.get("embedded_listeners_enabled", False) else "0",
+                )
+            )
+            in {"1", "true", "True", "yes"},
+            max_frame_bytes=max(1024, min(int(syslog.get("max_frame_bytes", 1_000_000)), 10_000_000)),
+            max_connections=max(1, min(int(syslog.get("max_connections", 64)), 1024)),
         ),
     )
     return config

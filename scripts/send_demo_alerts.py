@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+# ruff: noqa: E402 -- source checkout scripts add the project root before imports.
+
 import argparse
 import json
 import os
 import sys
+import time
 import urllib.request
 from collections import Counter
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -77,7 +81,10 @@ def coverage_summary(payloads: list[tuple[str, dict]]) -> dict:
 
 def send_alert(payload: dict, url: str, timeout: int, token: str = "") -> dict:
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "X-Defensive-AI-Demo-Sample": "1",
+    }
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
@@ -85,11 +92,71 @@ def send_alert(payload: dict, url: str, timeout: int, token: str = "") -> dict:
         return {"status": resp.status, "response": json.loads(resp.read().decode("utf-8"))}
 
 
+def fetch_inbox(url: str, timeout: int, token: str = "") -> dict:
+    parsed = urlsplit(url)
+    path = parsed.path.rstrip("/")
+    inbox_path = f"{path}/inbox" if path.endswith("/api/alerts") else f"{path}/api/alerts/inbox"
+    inbox_url = urlunsplit((parsed.scheme, parsed.netloc, inbox_path, "limit=500", ""))
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(inbox_url, headers=headers, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def wait_for_alerts(
+    alert_ids: list[str],
+    url: str,
+    timeout_seconds: int,
+    request_timeout: int,
+    token: str = "",
+    poll_interval: float = 1.0,
+) -> dict:
+    wanted = set(alert_ids)
+    deadline = time.monotonic() + max(0, timeout_seconds)
+    statuses: dict[str, str] = {}
+    while True:
+        payload = fetch_inbox(url, min(max(1, request_timeout), 10), token)
+        statuses = {
+            str(row.get("alert_id")): str(row.get("status"))
+            for row in payload.get("alerts", [])
+            if str(row.get("alert_id")) in wanted
+        }
+        completed = sorted(alert_id for alert_id in wanted if statuses.get(alert_id) == "completed")
+        dead_letter = sorted(alert_id for alert_id in wanted if statuses.get(alert_id) == "dead_letter")
+        remaining = sorted(wanted - set(completed) - set(dead_letter))
+        if not remaining:
+            return {
+                "ok": not dead_letter,
+                "completed": completed,
+                "dead_letter": dead_letter,
+                "remaining": [],
+                "statuses": statuses,
+            }
+        if time.monotonic() >= deadline:
+            return {
+                "ok": False,
+                "completed": completed,
+                "dead_letter": dead_letter,
+                "remaining": remaining,
+                "statuses": statuses,
+                "error": f"timed out after {timeout_seconds}s waiting for terminal inbox state",
+            }
+        time.sleep(max(0.05, poll_interval))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Send curated demo alerts to the gateway")
     parser.add_argument("--batch", choices=BATCHES, default="demo", help="demo=15 alerts; coverage=10 alerts covering all systems/types/levels")
     parser.add_argument("--url", default="http://127.0.0.1:8080/api/alerts")
     parser.add_argument("--timeout", type=int, default=300)
+    parser.add_argument(
+        "--wait-seconds",
+        type=int,
+        default=300,
+        help="Wait for every submitted alert to complete (0 disables waiting)",
+    )
     parser.add_argument("--print-only", action="store_true", help="Print payloads without sending")
     parser.add_argument(
         "--token",
@@ -127,6 +194,7 @@ def main() -> None:
                 "alert_id": payload.get("alert_id"),
                 "status": result["status"],
                 "queue_status": body.get("status"),
+                "recovered": bool(body.get("recovered")),
                 "queued_product": body.get("product"),
                 "case_id": body.get("case_id"),
                 "classification": body.get("classification"),
@@ -142,6 +210,17 @@ def main() -> None:
     succeeded = [r for r in rows if "error" not in r]
     if rows and not succeeded:
         sys.exit(1)
+    if args.wait_seconds > 0 and succeeded:
+        terminal = wait_for_alerts(
+            [str(row["alert_id"]) for row in succeeded],
+            args.url,
+            args.wait_seconds,
+            args.timeout,
+            args.token,
+        )
+        print(json.dumps({"terminal": terminal}, ensure_ascii=False, indent=2))
+        if not terminal["ok"]:
+            sys.exit(1)
 
 
 if __name__ == "__main__":

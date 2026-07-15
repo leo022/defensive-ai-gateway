@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# ruff: noqa: E402 -- source checkout scripts add the project root before imports.
+
 import argparse
 import json
 import sys
@@ -35,6 +37,7 @@ def load_alert(path: Path, adapter: LogAdapter | None = None) -> RawAlert:
     if adapter and not explicit_product(data) and fingerprint_product(data) == "rasp":
         result = adapter.adapt(demo_rasp_profile(), data)
         if result["ok"]:
+            result["raw_alert"].trusted_sample = True
             return result["raw_alert"]
     return RawAlert(
         source=str(data.get("source", "harness")),
@@ -44,6 +47,7 @@ def load_alert(path: Path, adapter: LogAdapter | None = None) -> RawAlert:
         timestamp=str(data.get("timestamp", "")),
         payload=dict(data.get("payload", data)),
         alert_id=str(data.get("alert_id", data.get("id", ""))),
+        trusted_sample=True,
     )
 
 
@@ -64,6 +68,7 @@ def load_alert_with_profile(path: Path, adapter: LogAdapter, profile: MappingPro
     result = adapter.adapt(profile, data)
     if not result["ok"]:
         raise SystemExit(f"Mapping failed for {path}: {', '.join(result['errors'])}")
+    result["raw_alert"].trusted_sample = True
     return result["raw_alert"]
 
 
@@ -181,6 +186,7 @@ def main():
                 timestamp=str(payload.get("timestamp", "")),
                 payload=dict(payload.get("payload", payload)),
                 alert_id=str(payload.get("alert_id", payload.get("id", ""))),
+                trusted_sample=True,
             )
             result = orchestrator.handle_alert(alert)
             item = {

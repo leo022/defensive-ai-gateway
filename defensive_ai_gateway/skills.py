@@ -36,7 +36,7 @@ def _product_skill(product: str, capability: str, tools: tuple[str, ...]) -> Ski
         product=product,
         capability=capability,
         risk_level="read_only",
-        allowed_inputs=("normalized_event", "case_memory", "evidence_refs"),
+        allowed_inputs=("normalized_event", "case_memory", "evidence_refs", "cross_product_context"),
         allowed_tools=tools,
         blocked_tools=("execute_production_action", "export_raw_evidence", "open_network_scan"),
         output_schema="security-analysis-v2",

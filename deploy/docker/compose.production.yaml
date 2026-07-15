@@ -1,0 +1,47 @@
+services:
+  gateway:
+    # Production requires an immutable digest, for example:
+    # defensive-ai-gateway@sha256:<64 hex characters>
+    image: "${DEFENSIVE_AI_IMAGE:?set an immutable image digest}"
+    command: ["--config", "config/container.yaml"]
+    restart: unless-stopped
+    ports:
+      # Fail closed: only a same-host TLS reverse proxy can reach the app.
+      - "127.0.0.1:${DEFENSIVE_AI_LOCAL_PORT:-8080}:8080"
+    environment:
+      DEFENSIVE_AI_API_TOKEN: "${DEFENSIVE_AI_API_TOKEN:?set a strong admin token}"
+      DEFENSIVE_AI_INGEST_TOKEN: "${DEFENSIVE_AI_INGEST_TOKEN:?set a distinct ingest token}"
+      DEFENSIVE_AI_OPERATOR_TOKEN: "${DEFENSIVE_AI_OPERATOR_TOKEN:?set a distinct operator token}"
+      DEFENSIVE_AI_APPROVER_TOKEN: "${DEFENSIVE_AI_APPROVER_TOKEN:?set a distinct approver token}"
+      DEFENSIVE_AI_AUTH_LOOPBACK: "0"
+      DEFENSIVE_AI_AUTH_REQUIRE_REMOTE_TOKEN: "1"
+      DEFENSIVE_AI_DEMO_MODE: "0"
+      DEFENSIVE_AI_APPROVAL_QUORUM: "2"
+      DEFENSIVE_AI_LLM_PROVIDER: "${DEFENSIVE_AI_LLM_PROVIDER:-local}"
+      DEFENSIVE_AI_LLM_ENDPOINT: "${DEFENSIVE_AI_LLM_ENDPOINT:-}"
+      DEFENSIVE_AI_LLM_MODEL: "${DEFENSIVE_AI_LLM_MODEL:-local-rule-analyst}"
+      DEFENSIVE_AI_LLM_ALLOWED_HOSTS: "${DEFENSIVE_AI_LLM_ALLOWED_HOSTS:-127.0.0.1,localhost,::1}"
+      DEFENSIVE_AI_LLM_API_KEY: "${DEFENSIVE_AI_LLM_API_KEY:-}"
+      DEFENSIVE_AI_DATA_RETENTION_DAYS: "${DEFENSIVE_AI_DATA_RETENTION_DAYS:-90}"
+      DEFENSIVE_AI_AUDIT_RETENTION_DAYS: "${DEFENSIVE_AI_AUDIT_RETENTION_DAYS:-365}"
+      DEFENSIVE_AI_MEMORY_EVENT_RETENTION_DAYS: "${DEFENSIVE_AI_MEMORY_EVENT_RETENTION_DAYS:-365}"
+    volumes:
+      - defensive-ai-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 2g
+    cpus: 2.0
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/ready', timeout=2).read()"]
+      interval: 15s
+      timeout: 3s
+      retries: 4
+      start_period: 10s
+
+volumes:
+  defensive-ai-data:

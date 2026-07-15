@@ -1,6 +1,6 @@
 # 多层记忆管理（Multi-layer Memory）
 
-本模块实现《银行业防御AI代理网关架构设计方案》第 8 章"四层记忆 + 一层证据"（case_short_term / product_long_term / asset_profile / org_knowledge + evidence）设计，并落地第 6 章 Memory Manager 与第 11 章记忆投毒控制。代码见 `defensive_ai_gateway/memory.py` 与 `database.py`。
+本模块实现《银行业防御AI代理网关架构设计方案》第 8 章"四层记忆 + 一层证据"（case_short_term / product_long_term / asset_profile / org_knowledge + evidence）设计，并落地第 6 章 Memory Manager 与第 11 章记忆投毒控制。生命周期治理见 `defensive_ai_gateway/memory.py`，跨模型关联见 `memory_matcher.py`，持久化见 `database.py`。
 
 端到端架构图与 memory 在 alert processing 中的位置见 `docs/DEMO_ARCHITECTURE.md`。
 
@@ -21,7 +21,27 @@
 - 每次 Agent 分析后，`record_case_summary()` 写入一条短期 Case 记忆（24h TTL），并对产品长期记忆提出一条 `pending_approval` 候选——**不自动晋升**。
 - `load_context(product, case_id, asset_id)` 返回结构化多层上下文：`{case_short_term, product_long_term, asset_profile, org_knowledge, evidence_refs}`，由 orchestrator 注入 Agent prompt。
 - `asset_id` 由事件实体（host/app/src_ip）派生，用于检索资产画像。
-- Dashboard 中“确认为业务误报”会调用 `/api/alerts/{alert_id}/confirm-false-positive`，从关联告警中抽取相似特征，写入一条可治理的长期误报记忆，并记录审计。
+- Dashboard 中“确认为业务误报”会调用 `/api/alerts/{alert_id}/confirm-false-positive`，从关联告警中抽取相似特征，写入一条可治理的长期误报记忆，并记录逐告警 disposition。多告警 Case 只有全部关联告警均被确认误报后才关闭。
+
+### 2.1 后续告警关联
+
+`MemoryMatcher` 在调用 Local/Ollama/Gateway 之前统一执行，流程如下：
+
+1. 从同产品 `product/{product}` 中召回最多 `candidate_limit` 条候选；只允许 `active`、`medium/high` 信任、人工批准、未过期且通过敏感性检查的产品长期记忆。
+2. 对规则 ID、事件类型、应用、资产、URI 模板、进程、客户端、网络和账号计算加权结构化包含度。
+3. 使用离线稳定哈希向量计算文本余弦相似度；该接口可替换为企业 Embedding 服务，默认实现不需要网络或第三方依赖。
+4. 检查 `retrieval_key` 精确命中，并对规则/事件类型冲突施加负向惩罚。
+5. 按配置权重合成总分，只把达到 `review_threshold` 的 Top-K 记忆注入模型上下文。
+6. 模型返回后执行确定性合并：高分可支持 `suspicious → benign`；当前告警中可核验的攻击证据拥有否决权，模型仅自报 `malicious` 不能替代证据门禁。
+7. 所有被评分候选写入 `memory_matches`，保留分项分数、排名、命中特征、决策和最终影响。
+
+默认总分公式：
+
+```text
+overall = 0.68 * structured + 0.22 * semantic_vector + 0.10 * retrieval_key
+```
+
+默认 `review_threshold=0.58`、`apply_threshold=0.78`。配置位于 `memory_matching`，在切换 LLM 后端时保持一致。
 
 ## 3. 晋升五门禁（Promotion Rule）
 
@@ -52,21 +72,28 @@
 
 `memory_events` 表：`event_id, memory_id, layer, event_type, actor, detail_json, created_at_ms`。
 
+`memory_matches` 表：持久化 `event_id / alert_id / case_id / analysis_run_id / memory_id`，以及 matcher 版本、排名、结构化/语义/检索/综合分、决策、最终影响、匹配特征和分项得分。当前整体 Schema 为 v8，可从旧库自动向前迁移。
+
 ## 6. HTTP API（Dashboard 记忆治理模块）
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/memory?layer=&status=&namespace=&retrieval_key=&limit=&include_expired=` | 列出记忆（默认只返回 live：active/pending） |
+| GET | `/api/memory?q=&layer=&status=&namespace=&retrieval_key=&limit=&include_expired=` | 关键词与结构化条件检索（默认只返回 live：active/pending） |
+| GET | `/api/memory/summary` | 返回总量、状态/层级/信任级分布、30 天内到期数与逾期复核数 |
 | GET | `/api/memory/events?memory_id=&event_type=&limit=` | 治理审计事件 |
-| GET | `/api/memory/{memory_id}` | 单条记忆详情 |
+| GET | `/api/memory/matches?memory_id=&event_id=&case_id=&decision=&limit=` | 查询告警与长期记忆的评分关联记录 |
+| GET | `/api/memory/{memory_id}` | 单条记忆详情、五门禁结果及该条记忆的审计事件 |
 | POST | `/api/memory/{memory_id}/promote` | `{approved_by, scope, expires_at_ms, retrieval_key?}` → `{ok, reasons, memory_id}` |
 | POST | `/api/memory/{memory_id}/reject` | `{actor, reason}` |
 | POST | `/api/memory/{memory_id}/quarantine` | `{actor, reason}` |
-| POST | `/api/memory/sweep` | `{products?}` → 到期扫描 + 冲突检测 |
+| POST | `/api/memory/{memory_id}/restore` | `{actor, reason, expires_at_ms?}` → 门禁通过则恢复生效，否则回到待审批 |
+| POST | `/api/memory/sweep` | `{products?}` → 到期扫描 + 冲突检测；未指定产品时扫描全部产品 |
 | POST | `/api/alerts/{alert_id}/confirm-false-positive` | Dashboard 人工确认误报，抽取特征并写入长期记忆 |
+
+Dashboard 的“记忆治理”工作台提供治理概览、关键词及层级/状态/命名空间组合筛选、结构化详情、五门禁可视化、晋升/撤销/隔离/恢复操作、全产品治理扫描、关联告警得分拆解，以及单条和全局审计时间线。操作人由 Bearer Token 对应的服务端身份写入，客户端提交的 actor 会被覆盖；撤销、隔离和恢复仍必须填写治理理由。
 
 ## 7. 范围与演进
 
-- 当前检索为 SQLite 基于命名空间/检索键的精确匹配；向量检索（语义相似）与图谱实体关系属技术方案阶段 C（生产增强），此处预留层级与检索键，便于平滑替换。
+- 当前语义分使用进程内哈希向量，适合离线部署和确定性回放；大规模生产环境可替换为企业 Embedding + pgvector/专用向量库，`MemoryMatcher`、阈值合并和 `memory_matches` 审计契约无需改变。
 - 组织知识默认值为内置只读种子；生产环境由安全治理团队通过评审维护，不应由 agent 自动改写。
-- 当前 Dashboard 已能触发误报确认写入；完整治理界面（批量审批、冲突处理、过期复核列表）仍属于后续增强。
+- 当前 Dashboard 已覆盖单条记忆的完整生命周期治理；批量审批、语义聚类冲突合并和外部知识库同步属于后续增强。

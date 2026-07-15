@@ -1,32 +1,65 @@
 server:
-  host: "0.0.0.0"
+  # Safe default: terminate TLS/mTLS at a same-host reverse proxy.
+  host: "127.0.0.1"
   port: 8080
+  max_connections: 256
+  read_timeout_seconds: 15
+  requests_per_minute: 12000
 database:
   path: "/var/lib/defensive-ai-gateway/gateway.db"
 llm:
   provider: "gateway"
-  endpoint: "https://llm-gateway.internal.example/v1/security/analyze"
-  model: "enterprise-sec-analyst"
+  endpoint: "https://kkcoder.com/v1/messages"
+  api_key_env: "ANTHROPIC_AUTH_TOKEN"
+  model: "claude-sonnet-4-6"
   timeout_seconds: 30
+  allowed_hosts: [kkcoder.com]
+  max_response_bytes: 2000000
+  max_retries: 1
 policy:
   mode: "read_only"
   max_prompt_chars: 12000
   max_context_bytes: 20000
   require_approval_for: [block, isolate, change_policy, disable_account]
+  approval_quorum: 2
   redact_fields: [password, token, cookie, authorization, customer_id, id_card, phone, email, session]
 auth:
-  # Production must set DEFENSIVE_AI_API_TOKEN (env or secret) and front the
-  # gateway with mTLS / a reverse proxy. With a token configured, all mutating
-  # endpoints and the LLM config endpoints require Authorization: Bearer <token>.
-  # Loopback clients are still accepted without a token for local ops.
+  # Production should inject distinct admin, ingest, operator and approver tokens
+  # through environment variables or a Secret, and front the gateway with mTLS
+  # or a reverse proxy. Never put token values in this file.
   api_token: ""
-  allow_loopback_no_token: true
+  ingest_token: ""
+  operator_token: ""
+  approver_token: ""
+  allow_loopback_no_token: false
   require_token_when_remote: true
+  demo_mode: false
 processing:
   async_enabled: true
   queue_max_size: 20000
   workers: 8
+  max_attempts: 5
+  retry_base_seconds: 1
+operations:
+  maintenance_interval_seconds: 60
+  inbox_retention_days: 14
+  stale_claim_seconds: 600
+  data_retention_days: 90
+  audit_retention_days: 365
+  memory_history_retention_days: 365
+memory_matching:
+  candidate_limit: 100
+  top_k: 5
+  review_threshold: 0.58
+  apply_threshold: 0.78
+  structured_weight: 0.68
+  semantic_weight: 0.22
+  retrieval_weight: 0.10
+  vector_dimensions: 256
 syslog:
+  embedded_listeners_enabled: false
+  max_frame_bytes: 1000000
+  max_connections: 64
   product_ports:
     waf: 15140
     hips: 15141
@@ -34,4 +67,8 @@ syslog:
     rasp: 15143
     siem: 15144
   gateway_profiles:
-    rasp: "demo-rasp-json"
+    waf: "auto-waf-json"
+    hips: "auto-hips-json"
+    ndr: "auto-ndr-json"
+    rasp: "auto-rasp-json"
+    siem: "auto-siem-json"

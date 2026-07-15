@@ -17,7 +17,9 @@ DEFAULT_REQUIRED_FIELDS = ["alert_id", "product", "event_type", "severity", "tim
 # 指纹识别到的厂商原生日志”生效（显式带 product 的标准告警走快速路径，不会触发）。
 # 新增产品接入并保存对应 profile 后，在此注册。与 deploy/k3s/syslog-collector-vector.yaml
 # 中 classify_source 的 product→gateway_profile 映射保持同源。
-AUTO_PROFILE: dict[str, str] = {"rasp": "auto-rasp-json"}
+AUTO_PROFILE: dict[str, str] = {
+    product: f"auto-{product}-json" for product in SUPPORTED_PRODUCTS
+}
 
 
 def explicit_product(payload: dict[str, Any]) -> str | None:
@@ -38,8 +40,19 @@ def fingerprint_product(payload: dict[str, Any]) -> str | None:
     ``deploy/k3s/syslog-collector-vector.yaml`` so the HTTP path and the syslog
     path agree on vendor-log identification.
     """
-    # cloudrasp 原生 RASP 指纹：data_type=attack_event + items[] 告警条目
-    if str(payload.get("data_type")) == "attack_event" and isinstance(payload.get("items"), list):
+    for path in (("device", "type"), ("source", "product"), ("event", "product")):
+        node: Any = payload
+        for part in path:
+            if not isinstance(node, dict):
+                node = None
+                break
+            node = node.get(part)
+        product = str(node or "").strip().lower()
+        if product in SUPPORTED_PRODUCTS:
+            return product
+    if str(payload.get("data_type")) == "attack_event" and (
+        isinstance(payload.get("items"), list) or isinstance(payload.get("event"), dict)
+    ):
         return "rasp"
     return None
 
@@ -193,6 +206,12 @@ INFER_FIELD_SPECS = [
         "candidates": ["request_id", "event.request_id", "request.id", "http.request_id"],
     },
 ]
+RASP_ONLY_INFER_TARGETS = {
+    "payload.stack_trace",
+    "payload.sink",
+    "payload.hook_data",
+    "payload.taint_source",
+}
 DEFAULT_SEVERITY_MAP = {
     "critical": "critical",
     "严重": "critical",
@@ -323,6 +342,140 @@ def demo_rasp_profile() -> MappingProfile:
     )
 
 
+def builtin_product_profile(product: str) -> MappingProfile:
+    """Return the reserved, multi-path JSON profile for one supported product."""
+    product = str(product).strip().lower()
+    if product not in SUPPORTED_PRODUCTS:
+        raise ValueError(f"unsupported product: {product}")
+    profile_id = f"auto-{product}-json"
+    name = f"Built-in {PRODUCT_LABELS[product]} JSON 日志"
+    description = f"内置 {PRODUCT_LABELS[product]} 多路径映射；覆盖标准字段、常见厂商嵌套字段和 Syslog envelope。"
+
+    if product == "rasp":
+        profile = demo_rasp_profile()
+        profile.profile_id = profile_id
+        profile.name = name
+        profile.version = "v2"
+        profile.description = description
+        profile.mappings["product"] = [
+            "$.product",
+            "$.device.type",
+            "$.source.product",
+            "$.event.product",
+            {"literal": product},
+        ]
+        return profile
+
+    # Non-RASP profiles intentionally start from a product-neutral mapping.
+    # Cloning the RASP template used to leak its ``source=rasp`` fallback,
+    # stacktrace/sink extraction, and RASP aliases into WAF/NDR/HIPS/SIEM data.
+    mappings: dict[str, Any] = {
+        "alert_id": [
+            "$.alert_id",
+            "$.metadata.id",
+            "$.alert.id",
+            "$.event.id",
+            "$.request_id",
+            "$.id",
+            "$.trace.id",
+        ],
+        "source": [
+            "$.device.vendor",
+            "$.source.vendor",
+            "$.vendor",
+            "$.agent.name",
+            "$.source.name",
+            "$._syslog_envelope.hostname",
+            {"literal": product},
+        ],
+        "product": [
+            "$.product",
+            "$.device.type",
+            "$.source.product",
+            "$.event.product",
+            {"literal": product},
+        ],
+        "event_type": [
+            "$.event_type",
+            "$.alert.category",
+            "$.rule.name",
+            "$.event.type",
+            "$.type",
+            "$.name",
+        ],
+        "severity": [
+            "$.risk.level",
+            "$.severity",
+            "$.level",
+            "$.risk.severity",
+            "$.priority",
+        ],
+        "timestamp": [
+            "$.timestamp",
+            "$.time",
+            "$.@timestamp",
+            "$.event.time",
+            "$.event_time",
+            "$.event.created_at",
+            "$._syslog_envelope.received_at",
+        ],
+        "entities.host": [
+            "$.host.name",
+            "$.host.hostname",
+            "$.device.name",
+            "$.hostname",
+            "$._syslog_envelope.hostname",
+        ],
+        "entities.user": ["$.source.user", "$.user.name", "$.username", "$.user"],
+        "entities.src_ip": ["$.source.ip", "$.http.client_ip", "$.request.client_ip", "$.client.ip", "$.src_ip"],
+        "entities.dst_ip": ["$.destination.ip", "$.dst.ip", "$.server.ip", "$.dst_ip"],
+        "entities.url": ["$.http.uri", "$.request.uri", "$.request.url", "$.url", "$.event.path"],
+        "entities.method": ["$.http.method", "$.request.method", "$.method"],
+        "entities.rule": ["$.rule.id", "$.rule.rule_id", "$.signature.id", "$.rule_id"],
+        "entities.app": ["$.application.name", "$.app.name", "$.service.name", "$.app"],
+        "entities.process": ["$.process.name", "$.process.image", "$.process_name"],
+        "entities.action": ["$.action", "$.event.action", "$.disposition"],
+    }
+    product_aliases = {
+        "waf": {"waf": "waf", "web_application_firewall": "waf"},
+        "hips": {"hips": "hips", "host_intrusion_prevention": "hips"},
+        "ndr": {"ndr": "ndr", "network_detection_response": "ndr"},
+        "siem": {"siem": "siem", "security_information_event_management": "siem"},
+    }
+    common_evidence = [
+        {"type": "rule_id", "path": "$.rule.id", "why_it_matters": "规则 ID 用于关联历史处置与误报边界。"},
+        {"type": "action", "path": "$.action", "why_it_matters": "产品动作影响攻击是否已被阻断。"},
+    ]
+    product_evidence = {
+        "waf": [
+            {"type": "matched_parameters", "path": "$.matched_parameters", "why_it_matters": "命中参数用于界定 Web 攻击面和误报范围。"},
+            {"type": "payload_category", "path": "$.payload_category", "why_it_matters": "载荷类别用于确认 Web 攻击特征。"},
+        ],
+        "hips": [
+            {"type": "command_line", "path": "$.process.command_line", "why_it_matters": "命令行用于判断主机行为是否恶意。"},
+            {"type": "behavior", "path": "$.behavior", "why_it_matters": "行为链用于判断主机攻击阶段和影响。"},
+        ],
+        "ndr": [
+            {"type": "sni", "path": "$.destination.sni", "why_it_matters": "目的域名用于关联信誉和基线。"},
+            {"type": "ja3", "path": "$.network.ja3", "why_it_matters": "TLS 指纹用于识别稀有通信行为。"},
+            {"type": "bytes_out", "path": "$.network.bytes_out", "why_it_matters": "出站字节量用于判断外传风险。"},
+        ],
+        "siem": [
+            {"type": "signals", "path": "$.signals", "why_it_matters": "关联信号用于验证跨产品攻击链。"},
+            {"type": "correlation_logic", "path": "$.correlation_logic", "why_it_matters": "关联逻辑用于审计 SIEM Case 的形成依据。"},
+        ],
+    }
+    return MappingProfile(
+        profile_id=profile_id,
+        name=name,
+        version="v3",
+        description=description,
+        mappings=mappings,
+        product_map=product_aliases[product],
+        evidence_fields=[*common_evidence, *product_evidence[product]],
+    )
+
+
 class LogAdapter:
     def __init__(self, normalizer: EventNormalizer | None = None):
         self.normalizer = normalizer
@@ -356,9 +509,9 @@ class LogAdapter:
         mapped["severity"] = self._map_value(mapped.get("severity"), profile.severity_map).lower()
         mapped["event_type"] = self._map_value(mapped.get("event_type"), profile.event_type_map)
 
-        for field in profile.required_fields:
-            if field not in mapped or mapped.get(field) in ("", None):
-                errors.append(f"missing_required_field:{field}")
+        for required_field in profile.required_fields:
+            if required_field not in mapped or mapped.get(required_field) in ("", None):
+                errors.append(f"missing_required_field:{required_field}")
 
         if mapped.get("product") and mapped["product"] not in SUPPORTED_PRODUCTS:
             errors.append(f"unsupported_product:{mapped['product']}")
@@ -440,19 +593,28 @@ class LogAdapter:
     def infer_mapping_profile(self, log: dict[str, Any], profile_id: str = "auto-rasp-json", product: str = "rasp") -> dict[str, Any]:
         flat = self._flatten_paths(log)
         fields: list[dict[str, Any]] = []
-        mappings: dict[str, Any] = {}
         product = product if product in SUPPORTED_PRODUCTS else "rasp"
+        mappings: dict[str, Any] = {"source": {"literal": product}}
         product_label = PRODUCT_LABELS.get(product, product.upper())
 
         product_signal = self._product_signal(log, flat, product)
         for spec in INFER_FIELD_SPECS:
             target = str(spec["target"])
-            match = self._best_path_match(flat, list(spec["candidates"]))
+            if product != "rasp" and target in RASP_ONLY_INFER_TARGETS:
+                continue
+            candidates_for_product = list(spec["candidates"])
+            if product != "rasp":
+                candidates_for_product = [
+                    candidate
+                    for candidate in candidates_for_product
+                    if "items[0]" not in candidate and not candidate.startswith("rasp.")
+                ]
+            match = self._best_path_match(flat, candidates_for_product)
             mapping: Any = match["path"] if match else None
             status = "missing"
             confidence = 0.0
             sample_value = None
-            candidates = self._candidate_options(flat, list(spec["candidates"]))
+            candidates = self._candidate_options(flat, candidates_for_product)
 
             if target == "product" and product_signal and (not match or product_signal["confidence"] >= match["confidence"]):
                 mapping = {"literal": product_signal["product"]}
@@ -510,25 +672,37 @@ class LogAdapter:
             version="v1",
             description=f"由一条 {product_label} JSON 日志自动识别生成；可保存为正式 Mapping Profile。",
             mappings=mappings,
-            product_map={
-                "runtime_app_protection": "rasp",
-                "runtime_application_self_protection": "rasp",
-                **{item: item for item in SUPPORTED_PRODUCTS},
-                product_label.lower(): product,
-            },
+            product_map=(
+                {
+                    "rasp": "rasp",
+                    "runtime_app_protection": "rasp",
+                    "runtime_application_self_protection": "rasp",
+                }
+                if product == "rasp"
+                else {product: product, product_label.lower(): product}
+            ),
             evidence_fields=[
                 {"type": "rule_id", "path": self._first_mapping_path(mappings.get("entities.rule")), "why_it_matters": f"{product_label} 规则 ID 用于关联误报记忆和调优范围。"},
-                {"type": "stack_trace", "path": self._first_mapping_path(mappings.get("payload.stack_trace")), "why_it_matters": "调用栈用于确认用户输入是否触达危险 sink。"},
-                {"type": "sink", "path": mappings.get("payload.sink"), "why_it_matters": "危险 sink 是判断应用侧告警成功性和影响面的核心字段。"},
+                *(
+                    [
+                        {"type": "stack_trace", "path": self._first_mapping_path(mappings.get("payload.stack_trace")), "why_it_matters": "调用栈用于确认用户输入是否触达危险 sink。"},
+                        {"type": "sink", "path": mappings.get("payload.sink"), "why_it_matters": "危险 sink 是判断应用侧告警成功性和影响面的核心字段。"},
+                    ]
+                    if product == "rasp"
+                    else []
+                ),
                 {"type": "action", "path": self._first_mapping_path(mappings.get("entities.action")), "why_it_matters": f"{product_label} 处置动作影响攻击是否已被阻断。"},
             ],
         )
         profile.evidence_fields = [item for item in profile.evidence_fields if item.get("path")]
         required_missing = [field["target"] for field in fields if field["required"] and not field["mapping"]]
+        recommended_keys = {"host", "trace_id", "request_id"}
+        if product == "rasp":
+            recommended_keys.update({"stack_trace", "sink"})
         recommended_missing = [
             field["optional_key"]
             for field in fields
-            if field.get("optional_key") in {"host", "stack_trace", "sink", "trace_id", "request_id"} and not field["mapping"]
+            if field.get("optional_key") in recommended_keys and not field["mapping"]
         ]
         return {
             "ok": not required_missing,

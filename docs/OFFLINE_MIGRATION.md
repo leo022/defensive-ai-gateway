@@ -1,48 +1,68 @@
-# 离线迁移步骤
+# k3s 离线迁移步骤
 
-## 1. 外网环境打包
+## 1. 外网构建机生成部署包
+
+构建机需要 Docker 和基础镜像访问能力。每次项目迭代后从仓库根目录执行：
 
 ```bash
-cd defensive-ai-gateway
-python3 -m pytest
-python3 scripts/run_harness.py --samples samples --fail-on-low-confidence 0.5
-tar --exclude "data" --exclude "__pycache__" -czf defensive-ai-gateway.tar.gz .
+python3 -m unittest discover -s tests
+export PYTHON_BASE_IMAGE='python:3.11-slim@sha256:<approved-digest>'
+bash scripts/package_k3s_deploy.sh --platform linux/amd64
 ```
 
-如需完全固定 Python 版本，建议在外网构建基础镜像并经企业镜像扫描后导入内网镜像仓库。
+需要 syslog collector 时设置 digest 固定的 `VECTOR_IMAGE` 并增加
+`--include-vector`。脚本拒绝脏工作区，并把 Gateway 按实际镜像 ID 重标记为
+`sha256-<64hex>` 内容地址标签；只有构建、校验和压缩全部成功后才替换 `dist` 中的旧部署包。
 
-## 2. 内网验收前检查
+## 2. 传入企业内网
 
-- 代码安全扫描：确认无硬编码密钥、无外联域名、无危险命令执行。
-- 配置审查：`config/prod.example.yaml` 复制为内网配置，确认 LLM Gateway endpoint、数据库路径和监听地址。
-- 数据分级：确认哪些字段允许进入 prompt，哪些字段只能以 evidence_ref 形式引用。
-- 权限审查：服务账号只授予只读查询权限。
-- 架构审查：对照 `docs/DEMO_ARCHITECTURE.md`、`docs/MEMORY.md`、`docs/HARNESS.md` 确认接入点、记忆治理和回放门禁。
-- 日志适配审查：为每类内网真实日志准备 Mapping Profile，使用 Dashboard dry-run 或 `scripts/run_harness.py --mapping-profile-file` 验证字段映射、严重级别、产品路由和必填字段门禁。
+只需传输以下两个文件，不需要传输源码目录、完整 `deploy/` 或中间镜像目录：
 
-## 3. 内网启动
+```text
+dist/defensive-ai-gateway-k3s-deploy.tar.gz
+dist/defensive-ai-gateway-k3s-deploy.tar.gz.sha256
+```
+
+在目标服务器校验压缩包：
 
 ```bash
-tar -xzf defensive-ai-gateway.tar.gz -C /opt/defensive-ai-gateway
-cd /opt/defensive-ai-gateway
+sha256sum -c defensive-ai-gateway-k3s-deploy.tar.gz.sha256
+```
+
+## 3. 解压并覆盖部署
+
+```bash
+tar -xzf defensive-ai-gateway-k3s-deploy.tar.gz
+cd defensive-ai-gateway-k3s-deploy
+cp .env.example .env
+chmod 600 .env
+vi .env
+bash install.sh --preflight-only
 bash install.sh
-python3 -m defensive_ai_gateway --config config/prod.yaml
 ```
 
-Dashboard 默认由同一服务提供静态页面，可通过生产配置中的监听地址访问。当前页面支持 Case 展开、日志适配 Profile 配置与 dry-run、LLM 配置、浅色/深色模式和人工确认业务误报。
+生产默认要求四个不同且不少于 32 字符的角色 Token、已有的 TLS Secret、HTTPS
+域名以及受限来源 CIDR；还会把审批 quorum 固定为 2。缺少任一前提都会失败关闭。
+只有受信任、隔离且临时的展示环境可使用 `bash install.sh --demo-mode`。
 
-如需用 systemd 托管服务，可在解压目录执行：
+部署 syslog collector 前，在 `.env` 中设置独立的 `DEFENSIVE_AI_INGEST_TOKEN`（不可与管理员 Token 相同）。生成包时必须使用 `--include-vector`：
 
 ```bash
-sudo bash install.sh --systemd --enable --start
+bash install.sh --with-syslog
 ```
 
-## 4. 迁移后第一批测试
+重复安装导入内容地址不可变镜像。变更前会把 SQLite 一致性快照写入 PVC，并保存
+Gateway/Vector 的完整 Deployment、Service、Secret 与暴露契约。发布失败自动恢复
+旧工作负载与快照；回滚前会先确认旧镜像仍在离线节点，成功后打印可手工执行的回滚命令。
+PVC 不会被删除。
 
-1. 提交脱敏样例 WAF 告警，确认敏感字段不会出现在 Agent 输出。
-2. 提交 SIEM 聚合样例，确认使用 `siem-fusion-agent`。
-3. 断开 LLM Gateway，确认系统能失败可见，而不是静默成功。
-4. 检查 `audit_log` 表，确认每次事件均有 `alert_received` 和 `analysis_completed`。
-5. 在 Dashboard 展开 Case，确认 raw alert、normalized evidence、agent_runs 和建议动作均可追溯。
-6. 对确认的业务误报执行一次 Dashboard 误报确认，检查 `memory_entries` 与 `memory_events` 是否写入。
-7. 粘贴一条脱敏 RASP 真实日志运行 Mapping Profile dry-run，确认 `RawAlert`、`NormalizedEvent`、Agent 路由、缺失字段提示和适配状态均符合预期。
+## 4. 验证
+
+```bash
+kubectl -n defensive-ai-gateway get pods
+kubectl -n defensive-ai-gateway rollout status deployment/defensive-ai-gateway
+curl --fail https://gateway.internal.example/api/ready
+```
+
+首批业务验收至少包括：脱敏 WAF 告警、SIEM 聚合路由、LLM Gateway 断链、审计
+日志完整性、误报记忆写入，以及真实 RASP 日志 Mapping Profile dry-run。

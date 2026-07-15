@@ -1,6 +1,9 @@
 server:
   host: "127.0.0.1"
   port: 8080
+  max_connections: 128
+  read_timeout_seconds: 15
+  requests_per_minute: 6000
 database:
   path: "data/gateway.db"
 llm:
@@ -8,16 +11,39 @@ llm:
   endpoint: ""
   model: "local-rule-analyst"
   timeout_seconds: 30
+  allowed_hosts: [127.0.0.1, localhost, "::1", kkcoder.com]
+  max_response_bytes: 2000000
+  max_retries: 1
 policy:
   mode: "read_only"
   max_prompt_chars: 12000
+  max_context_bytes: 20000
+  approval_quorum: 1
   require_approval_for: [block, isolate, change_policy, disable_account]
   redact_fields: [password, token, cookie, authorization, customer_id, id_card, phone, email, session]
 processing:
   async_enabled: true
   queue_max_size: 5000
   workers: 4
+  max_attempts: 3
+  retry_base_seconds: 1
+operations:
+  maintenance_interval_seconds: 60
+  inbox_retention_days: 7
+  stale_claim_seconds: 600
+memory_matching:
+  candidate_limit: 100
+  top_k: 5
+  review_threshold: 0.58
+  apply_threshold: 0.78
+  structured_weight: 0.68
+  semantic_weight: 0.22
+  retrieval_weight: 0.10
+  vector_dimensions: 256
 syslog:
+  embedded_listeners_enabled: true
+  max_frame_bytes: 1000000
+  max_connections: 64
   product_ports:
     waf: 15140
     hips: 15141
@@ -25,4 +51,8 @@ syslog:
     rasp: 15143
     siem: 15144
   gateway_profiles:
-    rasp: "demo-rasp-json"
+    waf: "auto-waf-json"
+    hips: "auto-hips-json"
+    ndr: "auto-ndr-json"
+    rasp: "auto-rasp-json"
+    siem: "auto-siem-json"

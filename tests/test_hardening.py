@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import tempfile
 import threading
@@ -8,10 +9,16 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from defensive_ai_gateway.app import build_server
-from defensive_ai_gateway.config import AuthConfig, GatewayConfig, LLMConfig
+from defensive_ai_gateway.app import (
+    GatewayHandler,
+    _trusted_loopback_request_headers,
+    _validate_exposed_server_config,
+    build_server,
+)
+from defensive_ai_gateway.config import AuthConfig, GatewayConfig, LLMConfig, load_config
 from defensive_ai_gateway.database import Repository
 from defensive_ai_gateway.llm import GatewayLLM
 from defensive_ai_gateway.memory import MemoryManager
@@ -59,8 +66,8 @@ class _Server:
         except urllib.error.HTTPError as exc:
             return exc.code, json.loads(exc.read().decode("utf-8"))
 
-    def post(self, path, body, token=""):
-        headers = {"Content-Type": "application/json"}
+    def post(self, path, body, token="", headers=None):
+        headers = {"Content-Type": "application/json", **(headers or {})}
         if token:
             headers["Authorization"] = f"Bearer {token}"
         data = body if isinstance(body, bytes) else json.dumps(body).encode()
@@ -73,6 +80,142 @@ class _Server:
 
 
 class HttpAuthTest(unittest.TestCase):
+    def test_tokenless_loopback_demo_rejects_dns_rebinding_authority(self):
+        config = GatewayConfig()
+        config.auth = AuthConfig(
+            api_token="",
+            allow_loopback_no_token=True,
+            require_token_when_remote=True,
+        )
+        handler = object.__new__(GatewayHandler)
+        handler.state = SimpleNamespace(config=config)
+        handler.client_address = ("127.0.0.1", 51234)
+
+        handler.headers = {
+            "Host": "127.0.0.1:8080",
+            "Origin": "http://127.0.0.1:8080",
+        }
+        self.assertEqual(handler._principal()["actor"], "local-demo-operator")
+
+        handler.headers = {"Host": "localhost:8080"}
+        self.assertEqual(handler._principal()["actor"], "local-demo-operator")
+
+        handler.headers = {
+            "Host": "attacker.example:8080",
+            "Origin": "http://attacker.example:8080",
+        }
+        self.assertIsNone(handler._principal())
+
+        handler.headers = {
+            "Host": "127.0.0.1:8080",
+            "Origin": "http://attacker.example:8080",
+        }
+        self.assertIsNone(handler._principal())
+        self.assertTrue(
+            _trusted_loopback_request_headers(
+                "[::1]:8080", "http://[::1]:8080"
+            )
+        )
+        self.assertFalse(_trusted_loopback_request_headers("localhost:invalid"))
+
+    def test_model_and_retention_environment_overrides_are_loaded(self):
+        with patch.dict(
+            os.environ,
+            {
+                "DEFENSIVE_AI_LLM_MODEL": "qwen3:14b",
+                "DEFENSIVE_AI_LLM_ALLOWED_HOSTS": "ollama.svc, gateway.example",
+                "DEFENSIVE_AI_DATA_RETENTION_DAYS": "90",
+                "DEFENSIVE_AI_AUDIT_RETENTION_DAYS": "730",
+                "DEFENSIVE_AI_MEMORY_EVENT_RETENTION_DAYS": "365",
+            },
+            clear=False,
+        ):
+            config = load_config()
+        self.assertEqual(config.llm.model, "qwen3:14b")
+        self.assertEqual(config.llm.allowed_hosts, ["ollama.svc", "gateway.example"])
+        self.assertEqual(config.operations.data_retention_days, 90)
+        self.assertEqual(config.operations.audit_retention_days, 730)
+        self.assertEqual(config.operations.memory_history_retention_days, 365)
+
+    def test_anthropic_environment_configures_messages_gateway(self):
+        with patch.dict(
+            os.environ,
+            {
+                "DEFENSIVE_AI_LLM_PROVIDER": "gateway",
+                "ANTHROPIC_BASE_URL": "https://kkcoder.com",
+                "ANTHROPIC_AUTH_TOKEN": "test-anthropic-token",
+            },
+            clear=True,
+        ):
+            config = load_config()
+        self.assertEqual(config.llm.endpoint, "https://kkcoder.com/v1/messages")
+        self.assertEqual(config.llm.api_key_env, "ANTHROPIC_AUTH_TOKEN")
+        self.assertEqual(config.llm.api_key, "test-anthropic-token")
+
+    def test_named_approver_principals_can_satisfy_production_quorum(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "named-principals.yaml"
+            path.write_text(
+                """
+server:
+  host: 0.0.0.0
+policy:
+  approval_quorum: 3
+auth:
+  allow_loopback_no_token: false
+  require_token_when_remote: true
+  principals:
+    security-owner:
+      token_env: TEST_SECURITY_OWNER_TOKEN
+      roles: [read, approver]
+    business-owner:
+      token_env: TEST_BUSINESS_OWNER_TOKEN
+      roles: [read, approver]
+""".strip(),
+                encoding="utf-8",
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "DEFENSIVE_AI_API_TOKEN": "admin-production-token-000001",
+                    "TEST_SECURITY_OWNER_TOKEN": "security-owner-token-000001",
+                    "TEST_BUSINESS_OWNER_TOKEN": "business-owner-token-000001",
+                },
+                clear=False,
+            ):
+                config = load_config(str(path))
+            self.assertEqual(
+                {principal.actor for principal in config.auth.principals},
+                {"security-owner", "business-owner"},
+            )
+            _validate_exposed_server_config(config)
+
+    def test_network_bind_rejects_missing_placeholder_and_shared_tokens(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(Path(tmp))
+            config.server.host = "0.0.0.0"
+            config.auth.allow_loopback_no_token = False
+            with self.assertRaisesRegex(ValueError, "API_TOKEN"):
+                _validate_exposed_server_config(config)
+
+            config.auth.api_token = "replace-with-a-strong-token"
+            with self.assertRaisesRegex(ValueError, "placeholder"):
+                _validate_exposed_server_config(config)
+
+            shared = "a-strong-but-shared-production-token"
+            config.auth.api_token = shared
+            config.auth.approver_token = shared
+            config.policy.approval_quorum = 2
+            with self.assertRaisesRegex(ValueError, "distinct"):
+                _validate_exposed_server_config(config)
+
+            config.auth.api_token = ""
+            config.auth.approver_token = ""
+            config.auth.require_token_when_remote = False
+            config.auth.demo_mode = True
+            config.policy.approval_quorum = 1
+            _validate_exposed_server_config(config)
+
     def test_post_without_token_is_401_when_token_configured(self):
         with tempfile.TemporaryDirectory() as tmp:
             srv = _Server(_config(Path(tmp), token="secret"))
@@ -98,6 +241,55 @@ class HttpAuthTest(unittest.TestCase):
             try:
                 status, body = srv.post("/api/config/llm", {"provider": "local"}, token="")
                 self.assertEqual(status, 200)
+            finally:
+                srv.stop()
+
+    def test_browser_simple_text_plain_post_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            srv = _Server(_config(Path(tmp), token=""))
+            try:
+                request = urllib.request.Request(
+                    srv.base + "/api/config/llm",
+                    data=b'{"provider":"local"}',
+                    headers={"Content-Type": "text/plain"},
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(request, timeout=5)
+                self.assertEqual(raised.exception.code, 415)
+            finally:
+                srv.stop()
+
+    def test_browser_simple_empty_post_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            srv = _Server(_config(Path(tmp), token=""))
+            try:
+                request = urllib.request.Request(
+                    srv.base + "/api/memory/sweep",
+                    data=b"",
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(request, timeout=5)
+                self.assertEqual(raised.exception.code, 415)
+            finally:
+                srv.stop()
+
+    def test_trusted_sample_header_is_limited_to_zero_token_loopback_demo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(Path(tmp), token="")
+            config.processing.async_enabled = False
+            srv = _Server(config)
+            try:
+                sample = json.loads(Path("samples/waf_alert.json").read_text(encoding="utf-8"))
+                sample["alert_id"] = "trusted-local-demo-sample"
+                status, body = srv.post(
+                    "/api/alerts",
+                    sample,
+                    headers={"X-Defensive-AI-Demo-Sample": "1"},
+                )
+                self.assertEqual(status, 202)
+                self.assertEqual(body["classification"], "benign")
             finally:
                 srv.stop()
 
@@ -129,6 +321,41 @@ class HttpAuthTest(unittest.TestCase):
             try:
                 status, _ = srv.get("/../../config/dev.yaml")
                 self.assertEqual(status, 404)
+            finally:
+                srv.stop()
+
+    def test_static_responses_have_security_headers_and_support_head(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            srv = _Server(_config(Path(tmp), token=""))
+            try:
+                with urllib.request.urlopen(srv.base + "/", timeout=5) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.headers["X-Frame-Options"], "DENY")
+                    self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
+                    self.assertIn("script-src 'self'", response.headers["Content-Security-Policy"])
+                    self.assertEqual(response.headers["Cache-Control"], "no-cache")
+                request = urllib.request.Request(srv.base + "/app.js", method="HEAD")
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertGreater(int(response.headers["Content-Length"]), 0)
+                    self.assertEqual(response.read(), b"")
+            finally:
+                srv.stop()
+
+    def test_readiness_reports_dependency_failure_but_liveness_stays_up(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            srv = _Server(_config(Path(tmp), token=""))
+            try:
+                status, ready = srv.get("/api/ready")
+                self.assertEqual(status, 200)
+                self.assertTrue(ready["ok"])
+                srv.server.state.repo.readiness_check = lambda: {"ok": False, "error": "simulated"}
+                status, ready = srv.get("/api/ready")
+                self.assertEqual(status, 503)
+                self.assertFalse(ready["ok"])
+                status, live = srv.get("/api/live")
+                self.assertEqual(status, 200)
+                self.assertTrue(live["ok"])
             finally:
                 srv.stop()
 
@@ -305,7 +532,7 @@ class GatewayLLMHardeningTest(unittest.TestCase):
     def test_non_json_gateway_response_raises_runtime_error(self):
         cfg = LLMConfig(provider="gateway", endpoint="http://127.0.0.1:9999/x", model="m", timeout_seconds=2)
         llm = GatewayLLM(cfg)
-        with patch("defensive_ai_gateway.llm.urllib.request.urlopen") as mock:
+        with patch("defensive_ai_gateway.llm._open_no_redirect") as mock:
             class _R:
                 status = 200
                 def read(self): return b"not json"

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# ruff: noqa: E402 -- source checkout scripts add the project root before imports.
+
 import argparse
 import json
 import os
@@ -170,7 +172,10 @@ def main():
         return
 
     responses = []
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "X-Defensive-AI-Demo-Sample": "1",
+    }
     if args.token:
         headers["Authorization"] = f"Bearer {args.token}"
     for payload in payloads:

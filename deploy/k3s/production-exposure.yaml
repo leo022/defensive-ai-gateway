@@ -1,0 +1,60 @@
+# Rendered by install-k3s-bundle.sh. Do not apply this template directly.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: defensive-ai-gateway-source-allowlist
+  namespace: defensive-ai-gateway
+spec:
+  ipAllowList:
+    sourceRange: "@@SOURCE_CIDRS_JSON@@"
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: defensive-ai-gateway
+  namespace: defensive-ai-gateway
+  annotations:
+    traefik.ingress.kubernetes.io/router.middlewares: defensive-ai-gateway-defensive-ai-gateway-source-allowlist@kubernetescrd
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    nginx.ingress.kubernetes.io/whitelist-source-range: "@@SOURCE_CIDRS_CSV@@"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts: ["@@PUBLIC_HOST@@"]
+      secretName: "@@TLS_SECRET@@"
+  rules:
+    - host: "@@PUBLIC_HOST@@"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: defensive-ai-gateway
+                port:
+                  name: http
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: defensive-ai-gateway-ingress
+  namespace: defensive-ai-gateway
+spec:
+  podSelector:
+    matchLabels:
+      app: defensive-ai-gateway
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+        - podSelector:
+            matchLabels:
+              app: syslog-collector-vector
+      ports:
+        - protocol: TCP
+          port: 8080

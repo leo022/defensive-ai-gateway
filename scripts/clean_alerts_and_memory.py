@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# ruff: noqa: E402 -- source checkout scripts add the project root before imports.
+
 import argparse
 import json
 import sqlite3
@@ -22,7 +24,19 @@ from defensive_ai_gateway.memory import (
 # Alert/analysis runtime tables produced by the gateway during analysis.
 # Cleared on every run. mapping_profiles (config) is never touched unless
 # --include-profiles is passed.
-ALERT_TABLES = ["audit_log", "case_alert_links", "agent_runs", "cases", "normalized_events", "raw_alerts"]
+ALERT_TABLES = [
+    "audit_log",
+    "case_alert_links",
+    "agent_runs",
+    "cases",
+    "normalized_events",
+    "raw_alerts",
+    "durable_alert_inbox",
+]
+
+
+class ActiveAlertProcessingError(RuntimeError):
+    pass
 
 
 def _db_path(config_path: str) -> Path:
@@ -67,6 +81,17 @@ def _select_memory_ids(conn: sqlite3.Connection, include_approved: bool, include
 
 def _preview(conn: sqlite3.Connection, include_approved: bool, include_org: bool, include_profiles: bool) -> dict:
     alerts = {t: _count(conn, f"SELECT COUNT(*) FROM {t}") for t in ALERT_TABLES}
+    active_inbox = {
+        row[0]: int(row[1])
+        for row in conn.execute(
+            """
+            SELECT status, COUNT(*)
+            FROM durable_alert_inbox
+            WHERE status IN ('pending', 'retry', 'processing')
+            GROUP BY status
+            """
+        ).fetchall()
+    }
     mem_deleted = _select_memory_ids(conn, include_approved, include_org)
     # memory_events that reference the to-be-deleted memories
     mem_events = _count(
@@ -91,6 +116,7 @@ def _preview(conn: sqlite3.Connection, include_approved: bool, include_org: bool
     profiles = _count(conn, "SELECT COUNT(*) FROM mapping_profiles")
     return {
         "alerts": alerts,
+        "active_inbox": active_inbox,
         "memories_to_delete": len(mem_deleted),
         "memory_events_to_delete": mem_events,
         "memories_kept": kept,
@@ -104,49 +130,62 @@ def _placeholders(n: int) -> str:
 
 
 def _delete(conn: sqlite3.Connection, include_approved: bool, include_org: bool, include_profiles: bool) -> dict:
-    deleted = {}
-    for table in ALERT_TABLES:
-        n = conn.execute(f"DELETE FROM {table}").rowcount
-        deleted[table] = n
-
-    mem_ids = _select_memory_ids(conn, include_approved, include_org)
-    mem_events_deleted = 0
-    if mem_ids:
-        mem_events_deleted = conn.execute(
-            "DELETE FROM memory_events WHERE memory_id IN (%s)" % _placeholders(len(mem_ids)),
-            tuple(mem_ids),
-        ).rowcount
-        # also drop any orphaned events whose memory layer is being fully cleared
-    # clean memory_events for layers we fully own (case_short_term, asset_profile)
-    # in case some events reference already-removed memories
-    conn.execute(
-        "DELETE FROM memory_events WHERE layer IN (?, ?)",
-        (LAYER_CASE_SHORT_TERM, LAYER_ASSET_PROFILE),
-    )
-    mem_deleted = 0
-    if mem_ids:
-        mem_deleted = conn.execute(
-            "DELETE FROM memory_entries WHERE memory_id IN (%s)" % _placeholders(len(mem_ids)),
-            tuple(mem_ids),
-        ).rowcount
-    if include_org:
-        conn.execute("DELETE FROM memory_entries WHERE layer = ?", (LAYER_ORG_KNOWLEDGE,))
-    if include_approved:
-        conn.execute(
-            "DELETE FROM memory_entries WHERE layer = ? AND status = 'active' AND approved_by != ''",
-            (LAYER_PRODUCT_LONG_TERM,),
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        active = _count(
+            conn,
+            """
+            SELECT COUNT(*) FROM durable_alert_inbox
+            WHERE status IN ('pending', 'retry', 'processing')
+            """,
         )
-    if include_profiles:
-        conn.execute("DELETE FROM mapping_profiles")
+        if active:
+            raise ActiveAlertProcessingError(
+                f"refusing to clean while {active} alert(s) are pending, retrying, or processing"
+            )
 
-    profiles_deleted = 0
-    if include_profiles:
-        profiles_deleted = _count(conn, "SELECT COUNT(*) FROM mapping_profiles")
-    deleted["memory_entries"] = mem_deleted
-    deleted["memory_events"] = mem_events_deleted
-    deleted["mapping_profiles_deleted"] = profiles_deleted
-    conn.commit()
-    return deleted
+        deleted = {}
+        for table in ALERT_TABLES:
+            n = conn.execute(f"DELETE FROM {table}").rowcount
+            deleted[table] = n
+
+        mem_ids = _select_memory_ids(conn, include_approved, include_org)
+        mem_events_deleted = 0
+        if mem_ids:
+            mem_events_deleted = conn.execute(
+                "DELETE FROM memory_events WHERE memory_id IN (%s)" % _placeholders(len(mem_ids)),
+                tuple(mem_ids),
+            ).rowcount
+        # Clean events for memory layers fully owned by this script, including
+        # orphaned history left by older versions.
+        conn.execute(
+            "DELETE FROM memory_events WHERE layer IN (?, ?)",
+            (LAYER_CASE_SHORT_TERM, LAYER_ASSET_PROFILE),
+        )
+        mem_deleted = 0
+        if mem_ids:
+            mem_deleted = conn.execute(
+                "DELETE FROM memory_entries WHERE memory_id IN (%s)" % _placeholders(len(mem_ids)),
+                tuple(mem_ids),
+            ).rowcount
+        if include_org:
+            conn.execute("DELETE FROM memory_entries WHERE layer = ?", (LAYER_ORG_KNOWLEDGE,))
+        if include_approved:
+            conn.execute(
+                "DELETE FROM memory_entries WHERE layer = ? AND status = 'active' AND approved_by != ''",
+                (LAYER_PRODUCT_LONG_TERM,),
+            )
+        profiles_deleted = 0
+        if include_profiles:
+            profiles_deleted = conn.execute("DELETE FROM mapping_profiles").rowcount
+        deleted["memory_entries"] = mem_deleted
+        deleted["memory_events"] = mem_events_deleted
+        deleted["mapping_profiles_deleted"] = profiles_deleted
+        conn.commit()
+        return deleted
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def main() -> None:
@@ -187,7 +226,20 @@ def main() -> None:
             if answer not in {"yes", "y"}:
                 print("已取消。")
                 return
-        deleted = _delete(conn, args.include_approved, args.include_org, args.include_profiles)
+        try:
+            deleted = _delete(conn, args.include_approved, args.include_org, args.include_profiles)
+        except ActiveAlertProcessingError as exc:
+            print(
+                json.dumps(
+                    {
+                        "error": str(exc),
+                        "hint": "等待 Dashboard 待处理队列和 inflight 都变为 0 后再清理。",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            sys.exit(2)
         print(json.dumps({"deleted": deleted, "db_path": str(db_path)}, ensure_ascii=False, indent=2))
     finally:
         conn.close()

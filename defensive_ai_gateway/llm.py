@@ -1,14 +1,240 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
+import socket
+import threading
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
 from .config import LLMConfig
 from .agents.evidence_helpers import fact, join_facts, normalize_classification, short_text
+
+
+MAX_LLM_RESPONSE_BYTES = 2_000_000
+MAX_LLM_ERROR_BYTES = 4096
+MAX_LLM_ATTEMPTS = 2
+_RETRYABLE_HTTP_CODES = {429, 502, 503, 504}
+ANTHROPIC_VERSION = "2023-06-01"
+ANTHROPIC_MAX_TOKENS = 4096
+GATEWAY_USER_AGENT = "defensive-ai-gateway/1.0"
+
+
+def _bounded_timeout(value: Any) -> float:
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError):
+        timeout = 30.0
+    return max(1.0, min(timeout, 120.0))
+
+
+def _is_loopback_host(host: str) -> bool:
+    host = host.strip().lower().rstrip(".")
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _validate_http_endpoint(
+    endpoint: str,
+    *,
+    backend: str,
+    loopback_only: bool = False,
+    allowed_hosts: list[str] | None = None,
+) -> None:
+    parsed = urllib.parse.urlsplit(endpoint)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise RuntimeError(f"{backend} endpoint must be an absolute HTTP(S) URL")
+    if parsed.username or parsed.password:
+        raise RuntimeError(f"{backend} endpoint must not contain user information")
+    host = parsed.hostname
+    is_loopback = _is_loopback_host(host)
+    if loopback_only and not is_loopback:
+        raise RuntimeError(f"{backend} endpoint must use a loopback host")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+    if address and not is_loopback and (
+        address.is_link_local or address.is_multicast or address.is_reserved or address.is_unspecified
+    ):
+        raise RuntimeError(f"{backend} endpoint uses a disallowed network address")
+    if backend == "LLM gateway" and parsed.scheme != "https" and not is_loopback:
+        raise RuntimeError("remote LLM gateway endpoints must use HTTPS")
+    if not is_loopback and allowed_hosts is not None:
+        allowed = {
+            str(item).strip().lower().rstrip(".")
+            for item in (allowed_hosts or [])
+            if str(item).strip()
+        }
+        if host.lower().rstrip(".") not in allowed:
+            raise RuntimeError(f"{backend} host '{host}' is not allowlisted")
+    if backend == "Ollama" and not is_loopback:
+        try:
+            resolved = {
+                item[4][0]
+                for item in socket.getaddrinfo(
+                    host,
+                    parsed.port or 11434,
+                    type=socket.SOCK_STREAM,
+                )
+            }
+        except OSError as exc:
+            raise RuntimeError(f"Ollama endpoint cannot be resolved: {exc}") from exc
+        if not resolved:
+            raise RuntimeError("Ollama endpoint did not resolve")
+        for resolved_address in resolved:
+            resolved_ip = ipaddress.ip_address(resolved_address)
+            if (
+                resolved_ip.is_link_local
+                or resolved_ip.is_multicast
+                or resolved_ip.is_reserved
+                or resolved_ip.is_unspecified
+            ):
+                raise RuntimeError("Ollama endpoint resolves to a disallowed network address")
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        raise urllib.error.HTTPError(req.full_url, code, "redirects are not allowed", headers, fp)
+
+
+def _open_no_redirect(req: urllib.request.Request, timeout: float):
+    return urllib.request.build_opener(_NoRedirectHandler()).open(req, timeout=timeout)
+
+
+def _open_with_retry(req: urllib.request.Request, timeout: Any, max_retries: int = 1):
+    bounded_timeout = _bounded_timeout(timeout)
+    attempts = max(1, min(int(max_retries) + 1, 4))
+    for attempt in range(attempts):
+        try:
+            return _open_no_redirect(req, timeout=bounded_timeout)
+        except urllib.error.HTTPError as exc:
+            if exc.code not in _RETRYABLE_HTTP_CODES or attempt + 1 >= attempts:
+                raise
+            exc.close()
+        except (urllib.error.URLError, TimeoutError):
+            if attempt + 1 >= attempts:
+                raise
+        time.sleep(0.05 * (attempt + 1))
+    raise RuntimeError("model request failed after bounded retry")  # pragma: no cover
+
+
+def _read_limited_response(resp: Any, limit: int = MAX_LLM_RESPONSE_BYTES) -> bytes:
+    headers = getattr(resp, "headers", None)
+    if headers:
+        try:
+            content_length = int(headers.get("Content-Length", "0") or 0)
+        except (TypeError, ValueError):
+            content_length = 0
+        if content_length > limit:
+            raise RuntimeError(f"model response exceeds {limit} byte limit")
+    try:
+        data = resp.read(limit + 1)
+    except TypeError:
+        # Small test doubles and a few alternate urllib-compatible transports do
+        # not expose the optional size argument; still verify after reading.
+        data = resp.read()
+    if not isinstance(data, (bytes, bytearray)):
+        raise RuntimeError("model response body is not bytes")
+    if len(data) > limit:
+        raise RuntimeError(f"model response exceeds {limit} byte limit")
+    return bytes(data)
+
+
+def _read_error_body(exc: urllib.error.HTTPError) -> str:
+    try:
+        try:
+            body = exc.read(MAX_LLM_ERROR_BYTES + 1)
+        except TypeError:
+            body = exc.read()
+    finally:
+        exc.close()
+    return bytes(body[:MAX_LLM_ERROR_BYTES]).decode("utf-8", errors="ignore")
+
+
+def is_anthropic_messages_endpoint(endpoint: str) -> bool:
+    path = urllib.parse.urlsplit(endpoint).path.rstrip("/")
+    return path == "/v1/messages"
+
+
+def resolve_gateway_api_key(
+    endpoint: str,
+    configured_key: str = "",
+    api_key_env: str = "",
+) -> str:
+    if configured_key:
+        return configured_key
+    if api_key_env:
+        api_key = str(os.getenv(api_key_env, ""))
+        if api_key:
+            return api_key
+    anthropic_base = str(os.getenv("ANTHROPIC_BASE_URL", "")).strip()
+    if not anthropic_base or not is_anthropic_messages_endpoint(endpoint):
+        return ""
+    endpoint_url = urllib.parse.urlsplit(endpoint)
+    base_url = urllib.parse.urlsplit(anthropic_base)
+    if (
+        endpoint_url.scheme.lower() == base_url.scheme.lower()
+        and endpoint_url.hostname == base_url.hostname
+        and endpoint_url.port == base_url.port
+    ):
+        return str(os.getenv("ANTHROPIC_AUTH_TOKEN", ""))
+    return ""
+
+
+def build_gateway_request(
+    endpoint: str,
+    model: str,
+    prompt: str,
+    context: dict[str, Any],
+    api_key: str = "",
+    *,
+    max_tokens: int = ANTHROPIC_MAX_TOKENS,
+) -> urllib.request.Request:
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": GATEWAY_USER_AGENT,
+    }
+    if is_anthropic_messages_endpoint(endpoint):
+        payload: dict[str, Any] = {
+            "model": model,
+            "max_tokens": max(1, min(int(max_tokens), ANTHROPIC_MAX_TOKENS)),
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        headers["anthropic-version"] = ANTHROPIC_VERSION
+    else:
+        payload = {"model": model, "prompt": prompt, "context": context}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+
+
+def parse_gateway_response(parsed: Any, model: str) -> dict[str, Any]:
+    if isinstance(parsed, dict) and parsed.get("type") == "message" and isinstance(parsed.get("content"), list):
+        text = "\n".join(
+            str(item.get("text", ""))
+            for item in parsed["content"]
+            if isinstance(item, dict) and item.get("type") == "text"
+        ).strip()
+        if not text:
+            raise RuntimeError("Anthropic gateway returned no text content")
+        parsed = _parse_json_object(text)
+    return _validate_result_shape(parsed, model)
 
 
 class LLMClient:
@@ -17,16 +243,51 @@ class LLMClient:
 
     @property
     def is_deterministic(self) -> bool:
-        """True for analyzers whose judgment is already grounded and need no
-        reconciliation against structured sample evidence (e.g. the heuristic
-        analyzer that reads ``evidence_assessment`` and merges memory itself)."""
+        """True for analyzers whose judgment is grounded in structured evidence."""
         return False
+
+    @property
+    def runtime_metadata(self) -> dict[str, Any]:
+        return {"provider": "unknown", "model": "", "endpoint_host": ""}
+
+
+class _CircuitBreaker:
+    def __init__(self, threshold: int = 3, reset_seconds: float = 30.0):
+        self.threshold = threshold
+        self.reset_seconds = reset_seconds
+        self.failures = 0
+        self.opened_until = 0.0
+        self._lock = threading.Lock()
+
+    def before_request(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            if self.opened_until > now:
+                raise RuntimeError("model circuit breaker is open")
+            if self.opened_until:
+                self.opened_until = 0.0
+                self.failures = 0
+
+    def success(self) -> None:
+        with self._lock:
+            self.failures = 0
+            self.opened_until = 0.0
+
+    def failure(self) -> None:
+        with self._lock:
+            self.failures += 1
+            if self.failures >= self.threshold:
+                self.opened_until = time.monotonic() + self.reset_seconds
 
 
 class LocalHeuristicLLM(LLMClient):
     """Deterministic local analyzer for offline MVP and tests."""
 
     is_deterministic = True
+
+    @property
+    def runtime_metadata(self) -> dict[str, Any]:
+        return {"provider": "local", "model": "local-rule-analyst", "endpoint_host": ""}
 
     HIGH_WORDS = [
         "rce",
@@ -48,63 +309,25 @@ class LocalHeuristicLLM(LLMClient):
         "反序列化",
         "命令执行",
     ]
-    FALSE_POSITIVE_WORDS = [
-        "false_positive",
-        "false positive",
-        "benign",
-        "approved",
-        "maintenance",
-        "canary",
-        "synthetic",
-        "误报",
-        "已批准",
-        "巡检",
-        "演练",
-    ]
-
     def analyze(self, prompt: str, context: dict[str, Any]) -> dict[str, Any]:
-        text = json.dumps(context, ensure_ascii=False).lower()
+        # Historical memory may itself mention SQL/RCE/C2. Attack keyword scoring
+        # must only inspect the current alert; governed-memory influence is applied
+        # later by the provider-neutral MemoryMatcher.
+        text = json.dumps(
+            {
+                "product": context.get("product"),
+                "severity": context.get("severity"),
+                "event_type": context.get("event_type"),
+                "entities": context.get("entities"),
+                "evidence": context.get("evidence"),
+            },
+            ensure_ascii=False,
+        ).lower()
         score = sum(1 for word in self.HIGH_WORDS if word in text)
         severity = context.get("severity", "medium").lower()
         sample_assessment = self._sample_assessment(context)
-        memory_match = self._false_positive_memory_match(context)
         if sample_assessment:
-            if memory_match:
-                return self._merge_memory_match(sample_assessment, memory_match)
             return sample_assessment
-        if memory_match:
-            return {
-                "classification": "benign",
-                "confidence": memory_match["confidence"],
-                "verdict": "【误报】- 命中已批准的长期误报记忆",
-                "analysis_dimensions": [
-                    {
-                        "title": "历史误报",
-                        "status": "benign",
-                        "evidence": f"命中记忆 {memory_match['memory_id']}，匹配特征：{', '.join(memory_match['matched_features'])}",
-                    },
-                    {
-                        "title": "复核边界",
-                        "status": "review",
-                        "evidence": "误报记忆只降低优先级，当前告警仍需核对频率、来源和影响面是否偏离历史基线。",
-                    },
-                ],
-                "reason": (
-                    "研判结论：【误报】- 命中已批准的长期误报记忆\n"
-                    "分析报告：\n"
-                    f"- 历史误报：命中记忆 {memory_match['memory_id']}，匹配特征：{', '.join(memory_match['matched_features'])}\n"
-                    "- 复核边界：仍需确认当前告警未偏离已知模式\n"
-                    "本地规则分析器命中已批准的长期误报记忆："
-                    f"{memory_match['memory_id']}；匹配特征：{', '.join(memory_match['matched_features'])}。"
-                    "建议仍保留只读复核，确认当前告警未偏离已知模式。"
-                ),
-                "recommended_next_steps": [
-                    "核对当前告警的规则、应用、路径和来源是否仍符合已批准误报模式",
-                    "若频率、来源或影响面偏离历史基线，升级 SOC 人工复核",
-                ],
-                "missing_evidence": ["误报记忆只降低优先级，不替代对新异常特征的复核"],
-                "business_impact": "符合已批准误报模式时可降低告警噪声，但需防止攻击者伪装成已知模式。",
-            }
         if self._strong_attack_signal(context, score, severity):
             classification = "malicious"
             confidence = min(0.92, 0.72 + score * 0.05)
@@ -124,52 +347,9 @@ class LocalHeuristicLLM(LLMClient):
             "analysis_dimensions": self._fallback_dimensions(context, score, severity),
             "reason": self._fallback_reason(context, classification, score, severity),
             "recommended_next_steps": self._fallback_next_steps(context, classification),
-            "missing_evidence": ["缺少样本 evidence_assessment 或企业 LLM 深度研判结果"],
+            "missing_evidence": ["缺少可交叉验证的产品证据或企业 LLM 深度研判结果"],
             "business_impact": self._fallback_business_impact(context, classification),
         }
-
-    def _merge_memory_match(self, result: dict[str, Any], memory_match: dict[str, Any]) -> dict[str, Any]:
-        merged = dict(result)
-        original_classification = str(merged.get("classification", "insufficient_evidence"))
-        verdict = str(merged.get("verdict") or self._verdict_from_classification(original_classification))
-        if original_classification == "benign":
-            merged["verdict"] = f"{verdict}；命中已批准误报记忆"
-        elif original_classification == "suspicious" and memory_match["confidence"] >= 0.78:
-            merged["classification"] = "benign"
-            merged["verdict"] = f"【误报】- 当前可疑告警与已批准误报记忆高度相似，建议按误报优先复核"
-        elif original_classification == "malicious":
-            merged["verdict"] = f"{verdict}；注意存在相似误报历史但当前仍按真实攻击处理"
-        else:
-            merged["verdict"] = f"{verdict}；命中相似误报记忆，误报可能性上升"
-        dimensions = list(merged.get("analysis_dimensions") or [])
-        dimensions.append(
-            {
-                "title": "历史误报",
-                "status": "benign" if merged.get("classification") == "benign" else "review",
-                "evidence": (
-                    f"命中已批准的长期误报记忆 {memory_match['memory_id']}；"
-                    f"相似度 {memory_match['similarity']:.2f}；"
-                    f"匹配特征：{', '.join(memory_match['matched_features'])}。"
-                ),
-            }
-        )
-        merged["analysis_dimensions"] = dimensions
-        base_confidence = float(merged.get("confidence", 0.0) or 0.0)
-        if merged.get("classification") == "benign":
-            merged["confidence"] = round(min(0.9, max(base_confidence, memory_match["confidence"]) + 0.02), 2)
-        else:
-            merged["confidence"] = round(max(base_confidence, min(0.82, memory_match["confidence"])), 2)
-        merged["reason"] = (
-            str(merged.get("reason") or "")
-            + "\n- 历史误报："
-            + f"命中已批准的长期误报记忆 {memory_match['memory_id']}；相似度 {memory_match['similarity']:.2f}；匹配特征：{', '.join(memory_match['matched_features'])}。"
-        ).strip()
-        steps = list(merged.get("recommended_next_steps") or [])
-        steps.append("核对当前告警的规则、资产、路径、客户端和频率是否仍符合已批准误报记忆")
-        if original_classification == "malicious":
-            steps.append("当前样本仍有攻击证据，不应仅凭相似误报历史自动降级")
-        merged["recommended_next_steps"] = steps
-        return merged
 
     def _sample_assessment(self, context: dict[str, Any]) -> dict[str, Any] | None:
         evidence = context.get("evidence") or []
@@ -483,107 +663,73 @@ class LocalHeuristicLLM(LLMClient):
     def _short(self, value: Any) -> str:
         return short_text(value)
 
-    def _false_positive_memory_match(self, context: dict[str, Any]) -> dict[str, Any] | None:
-        memory_context = context.get("memory") or {}
-        if not isinstance(memory_context, dict):
-            return None
-        memories = memory_context.get("product_long_term", [])
-        if not isinstance(memories, list):
-            return None
-        alert_text = json.dumps(
-            {
-                "product": context.get("product"),
-                "event_type": context.get("event_type"),
-                "entities": context.get("entities"),
-                "evidence": context.get("evidence"),
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        ).lower()
-        alert_features = self._extract_memory_features(alert_text)
-        best: dict[str, Any] | None = None
-        for memory in memories:
-            if not isinstance(memory, dict):
-                continue
-            if memory.get("status") != "active":
-                continue
-            if str(memory.get("trust_level", "low")).lower() == "low":
-                continue
-            memory_text = json.dumps(memory, ensure_ascii=False, sort_keys=True).lower()
-            if not any(word in memory_text for word in self.FALSE_POSITIVE_WORDS):
-                continue
-            features = self._extract_memory_features(memory_text)
-            matched = sorted(feature for feature in features if feature and (feature in alert_text or feature in alert_features))
-            if not matched:
-                retrieval_key = str(memory.get("retrieval_key", "")).strip().lower()
-                if retrieval_key and retrieval_key in alert_text:
-                    matched = [retrieval_key]
-            if not matched:
-                continue
-            similarity = len(set(matched)) / max(3, min(len(features), len(alert_features)) or 3)
-            if len(matched) < 2 and similarity < 0.55:
-                continue
-            confidence = min(0.88, 0.62 + 0.18 * similarity + 0.03 * min(len(matched), 4))
-            candidate = {
-                "memory_id": memory.get("memory_id", "unknown"),
-                "matched_features": matched[:6],
-                "confidence": confidence,
-                "similarity": similarity,
-            }
-            if best is None or candidate["confidence"] > best["confidence"]:
-                best = candidate
-        return best
-
-    def _extract_memory_features(self, memory_text: str) -> set[str]:
-        features: set[str] = set()
-        for pattern in [
-            r"\b(?:waf|hips|rasp|ndr|siem)-[a-z0-9-]+",
-            r"/[a-z0-9_./{}-]+",
-            r"\b[a-z0-9_-]+(?:-api|-web|-gateway|-service|-client)(?:/[0-9.]+)?\b",
-            r"\b[a-z0-9_-]+(?:-srv|-prod|-[0-9]{2})(?:/[0-9.]+)?\b",
-            r"\b[a-z0-9_.-]+\.(?:internal|example)\b",
-            r"\bsynthetic-browser\b",
-            r"\bbank-partner-batch-client/[0-9.]+\b",
-            r"\bbackup-vault\.internal\b",
-            r"\bsynthetic-canary\b",
-            r"\bsvc-patch\b",
-            r"\bsvc-maintenance\b",
-        ]:
-            features.update(re.findall(pattern, memory_text, flags=re.IGNORECASE))
-        normalized = {feature.strip().lower().rstrip(".,;:") for feature in features}
-        return {feature for feature in normalized if len(feature) >= 4}
-
-
 class GatewayLLM(LLMClient):
-    """Generic JSON-over-HTTP adapter for enterprise LLM gateways."""
+    """Enterprise gateway adapter supporting generic JSON and Anthropic Messages."""
 
     def __init__(self, config: LLMConfig):
         self.config = config
+        self._circuit = _CircuitBreaker()
+
+    @property
+    def runtime_metadata(self) -> dict[str, Any]:
+        parsed = urllib.parse.urlsplit(self.config.endpoint)
+        return {
+            "provider": "gateway",
+            "model": self.config.model,
+            "endpoint_host": parsed.hostname or "",
+        }
 
     def analyze(self, prompt: str, context: dict[str, Any]) -> dict[str, Any]:
+        self._circuit.before_request()
+        try:
+            result = self._analyze(prompt, context)
+        except Exception:
+            self._circuit.failure()
+            raise
+        self._circuit.success()
+        return result
+
+    def _analyze(self, prompt: str, context: dict[str, Any]) -> dict[str, Any]:
         if not self.config.endpoint:
             raise RuntimeError("LLM endpoint is not configured")
-        # ``context`` is already redacted + size-bounded by SecurityAgent.analyze
-        # before reaching here, so we forward it verbatim to the gateway.
-        payload = json.dumps({"model": self.config.model, "prompt": prompt, "context": context}, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(self.config.endpoint, data=payload, headers={"Content-Type": "application/json"}, method="POST")
-        api_key = self.config.api_key or os.getenv(self.config.api_key_env)
-        if api_key:
-            req.add_header("Authorization", f"Bearer {api_key}")
+        _validate_http_endpoint(
+            self.config.endpoint,
+            backend="LLM gateway",
+            allowed_hosts=self.config.allowed_hosts,
+        )
+        api_key = resolve_gateway_api_key(
+            self.config.endpoint,
+            self.config.api_key,
+            self.config.api_key_env,
+        )
+        # ``context`` is already redacted + size-bounded by SecurityAgent.analyze.
+        # Anthropic receives it inside ``prompt``; generic gateways retain the
+        # separate context field used by the original enterprise contract.
+        req = build_gateway_request(
+            self.config.endpoint,
+            self.config.model,
+            prompt,
+            context,
+            api_key,
+        )
         try:
-            with urllib.request.urlopen(req, timeout=self.config.timeout_seconds) as resp:
+            with _open_with_retry(req, self.config.timeout_seconds, self.config.max_retries) as resp:
                 if resp.status >= 400:
                     raise RuntimeError(f"LLM gateway returned HTTP {resp.status}")
-                body = resp.read().decode("utf-8")
+                limit = max(65_536, min(int(self.config.max_response_bytes), 10_000_000))
+                body = _read_limited_response(resp, limit).decode("utf-8")
         except urllib.error.HTTPError as exc:
-            raise RuntimeError(f"LLM gateway HTTP {exc.code}: {exc.read().decode('utf-8', errors='ignore')[:200]}") from exc
+            exc.close()
+            raise RuntimeError(f"LLM gateway HTTP {exc.code}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"LLM gateway unreachable: {exc.reason}") from exc
+        except TimeoutError as exc:
+            raise RuntimeError("LLM gateway request timed out") from exc
         try:
             parsed = json.loads(body)
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"LLM gateway returned non-JSON response: {body[:200]}") from exc
-        return _validate_result_shape(parsed, self.config.model)
+        return parse_gateway_response(parsed, self.config.model)
 
 
 def _validate_result_shape(parsed: Any, model: str) -> dict[str, Any]:
@@ -680,25 +826,62 @@ class OllamaLLM(LLMClient):
     def __init__(self, config: LLMConfig):
         self.config = config
         self.endpoint = config.endpoint or "http://127.0.0.1:11434/api/generate"
+        self._circuit = _CircuitBreaker()
+
+    @property
+    def runtime_metadata(self) -> dict[str, Any]:
+        parsed = urllib.parse.urlsplit(self.endpoint)
+        return {
+            "provider": "ollama",
+            "model": self.config.model or "gemma3:4b",
+            "endpoint_host": parsed.hostname or "",
+        }
 
     def analyze(self, prompt: str, context: dict[str, Any]) -> dict[str, Any]:
+        self._circuit.before_request()
+        try:
+            result = self._analyze(prompt, context)
+        except Exception:
+            self._circuit.failure()
+            raise
+        self._circuit.success()
+        return result
+
+    def _analyze(self, prompt: str, context: dict[str, Any]) -> dict[str, Any]:
         model = self.config.model or "gemma3:4b"
         try:
             return self._generate(model, prompt)
         except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="ignore")
+            body = _read_error_body(exc)
             if exc.code == 404 and model == "gemma3:4b":
-                result = self._generate("gemma3:latest", prompt)
+                try:
+                    result = self._generate("gemma3:latest", prompt)
+                except urllib.error.HTTPError as fallback_exc:
+                    detail = _read_error_body(fallback_exc)
+                    raise RuntimeError(f"Ollama HTTP {fallback_exc.code}: {detail[:200]}") from fallback_exc
+                except urllib.error.URLError as fallback_exc:
+                    raise RuntimeError(f"Ollama unreachable: {fallback_exc.reason}") from fallback_exc
+                except TimeoutError as fallback_exc:
+                    raise RuntimeError("Ollama request timed out") from fallback_exc
                 result["model_fallback"] = "gemma3:4b not found; used gemma3:latest"
                 return result
-            raise RuntimeError(f"Ollama HTTP {exc.code}: {body}") from exc
+            raise RuntimeError(f"Ollama HTTP {exc.code}: {body[:200]}") from exc
         except urllib.error.URLError as exc:
             # Connection refused / DNS / timeout — surface as a RuntimeError so the
             # orchestrator can degrade to the deterministic heuristic rather than
             # abort the whole alert.
             raise RuntimeError(f"Ollama unreachable: {exc.reason}") from exc
+        except TimeoutError as exc:
+            raise RuntimeError("Ollama request timed out") from exc
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Ollama returned non-JSON response") from exc
 
     def _generate(self, model: str, prompt: str) -> dict[str, Any]:
+        _validate_http_endpoint(
+            self.endpoint,
+            backend="Ollama",
+            allowed_hosts=self.config.allowed_hosts,
+        )
         payload = {
             "model": model,
             "prompt": prompt,
@@ -722,8 +905,11 @@ class OllamaLLM(LLMClient):
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=self.config.timeout_seconds) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        with _open_with_retry(req, self.config.timeout_seconds, self.config.max_retries) as resp:
+            limit = max(65_536, min(int(self.config.max_response_bytes), 10_000_000))
+            data = json.loads(_read_limited_response(resp, limit).decode("utf-8"))
+        if not isinstance(data, dict):
+            raise RuntimeError("Ollama returned non-object JSON")
         response = str(data.get("response", "")).strip()
         parsed = _parse_json_object(response)
         parsed.setdefault("reason", "Ollama 本地模型完成分析。")
@@ -758,8 +944,24 @@ def _parse_json_object(text: str) -> dict[str, Any]:
 
 
 def build_llm(config: LLMConfig) -> LLMClient:
-    if config.provider == "local":
+    provider = str(config.provider or "").strip().lower()
+    if provider == "local":
         return LocalHeuristicLLM()
-    if config.provider == "ollama":
+    if provider == "ollama":
+        endpoint = config.endpoint or "http://127.0.0.1:11434/api/generate"
+        _validate_http_endpoint(
+            endpoint,
+            backend="Ollama",
+            allowed_hosts=config.allowed_hosts,
+        )
         return OllamaLLM(config)
-    return GatewayLLM(config)
+    if provider == "gateway":
+        if not config.endpoint:
+            raise RuntimeError("LLM endpoint is not configured")
+        _validate_http_endpoint(
+            config.endpoint,
+            backend="LLM gateway",
+            allowed_hosts=config.allowed_hosts,
+        )
+        return GatewayLLM(config)
+    raise RuntimeError(f"unsupported LLM provider: {provider or '<empty>'}")

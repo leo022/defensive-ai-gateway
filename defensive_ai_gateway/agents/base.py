@@ -100,9 +100,11 @@ class SecurityAgent(ABC):
             + "\n\n你正在为银行 SOC 分析安全告警。请全程使用简体中文输出。只基于输入证据分析，不要编造不存在的事实，不要输出攻击利用步骤、payload 或真实凭证。"
             + "\n请以银行安全运营专家口吻回答，重点说明：攻击链判断、业务影响、证据强弱、仍需补充的证据、只读验证步骤。"
             + "\n输入中的 memory 为多层记忆：case_short_term（本 Case 短期记忆）、product_long_term（产品长期经验）、asset_profile（资产画像）、org_knowledge（组织知识/Playbook）、evidence_refs（不可改证据引用）。evidence_refs 只读，仅作引用，不得外泄原始敏感字段。"
+            + "\nmemory.memory_association 由确定性混合匹配器生成，包含结构化、语义向量与检索键分项得分。只可引用其中达到复核阈值的长期记忆；长期误报记忆不得覆盖当前明确攻击证据。"
             + "\n输出契约对 local-rule-analyst、Ollama 和内网 LLM Gateway 完全一致：必须返回同一 JSON 字段集合，不能改字段名、不能把报告写到 JSON 外。"
             + "\nreason 必须是可直接给 SOC 分析师阅读的报告，第一行固定为“研判结论：<verdict>”，第二行固定为“分析报告：”。"
             + "\nanalysis_dimensions 必须按输入 report_outline 的小标题组织；每个维度只写结论化证据，不复写完整 payload。没有证据的维度也要说明缺口，而不是留空。"
+            + "\nbenign/误报结论必须在至少两个维度引用当前告警中的具体可核验观测值（如规则、资产、路径、动作）；不得用模型自行生成的 normal/benign 状态作为结论依据。"
             + "\nverdict 只能使用三类格式：【真实攻击】- 原因、【误报】- 原因、【需人工复核】- 原因。SIEM 真实事件也归入【真实攻击】标签。"
             + "\n必须返回严格 JSON，字段如下："
             + '\n{"classification":"malicious|suspicious|benign|insufficient_evidence",'
@@ -147,7 +149,7 @@ class SecurityAgent(ABC):
         # The heuristic analyzer is deterministic and already reconciles sample
         # evidence + memory itself; only fill missing fields (original behavior).
         # Model-backed LLMs (ollama/gateway) are reconciled for consistency and
-        # grounded against structured sample evidence where available.
+        # grounded against server-marked trusted sample evidence where available.
         if not getattr(self.llm, "is_deterministic", False):
             return self._reconcile_model_result(
                 llm_result, event, explanation, classification, llm_verdict, llm_dims
@@ -188,10 +190,10 @@ class SecurityAgent(ABC):
         """Reconcile unreliable model output into a logically consistent result.
 
         Priority:
-        1. Structured sample ground truth (``evidence_assessment.expected_verdict``)
-           is authoritative — small local models frequently misclassify samples,
-           so the annotated verdict wins and the model may only enrich reason /
-           next steps.
+        1. Server-marked trusted sample ground truth
+           (``evidence_assessment.expected_verdict``) is authoritative — small
+           local models frequently misclassify demo samples, so the annotation
+           wins and the model may only enrich reason / next steps.
         2. Otherwise, trust the model only when its own dimensions carry a status
            consistent with its classification (e.g. malicious ⇒ a risk/blocked
            dimension). This catches the common failure of a high-confidence
@@ -203,7 +205,15 @@ class SecurityAgent(ABC):
         structured = self._fallback_from_evidence(event)
         if structured and structured.get("verdict"):
             return self._merge_with_structured(llm_result, structured, event)
-        if llm_dims and llm_verdict and self._dimensions_support_classification(llm_dims, classification):
+        if (
+            llm_dims
+            and llm_verdict
+            and self._dimensions_support_classification(llm_dims, classification)
+            and (
+                classification != "benign"
+                or self._benign_result_is_grounded(event, llm_dims)
+            )
+        ):
             return self._complete_result_shape(llm_result, event, classification)
         return self._reconcile_ungrounded(llm_result, event, explanation, classification)
 
@@ -259,6 +269,22 @@ class SecurityAgent(ABC):
         dimensions are consistent with it instead of leaving all-``info`` gaps."""
         merged = dict(llm_result)
         llm_dims = explanation.get("dimensions", [])
+        if classification == "benign" and not self._benign_result_is_grounded(event, llm_dims):
+            classification = "insufficient_evidence"
+            merged["classification"] = classification
+            merged["confidence"] = min(self._normalize_confidence(merged.get("confidence", 0.3)), 0.45)
+            merged["verdict"] = "【需人工复核】- 模型误报结论缺少可核验的当前告警依据"
+            merged["whitelist_recommendation"] = {}
+            missing = merged.get("missing_evidence")
+            if not isinstance(missing, list):
+                missing = []
+            missing = [str(item) for item in missing if item]
+            missing.append("误报结论需至少两个当前告警观测值交叉支撑")
+            merged["missing_evidence"] = list(dict.fromkeys(missing))
+            note = "[证据门禁] 模型给出误报结论，但未引用足够的当前告警观测值，已降级为证据不足。"
+            existing = str(merged.get("reason") or "").strip()
+            merged["reason"] = f"{note}\n{existing}" if existing else note
+            llm_dims = []
         if llm_dims and self._dimensions_support_classification(llm_dims, classification):
             merged["analysis_dimensions"] = llm_dims
         else:
@@ -266,6 +292,59 @@ class SecurityAgent(ABC):
         if not str(merged.get("verdict", "")).strip():
             merged["verdict"] = self._verdict_from_classification(classification)
         return self._complete_result_shape(merged, event, classification)
+
+    def _benign_result_is_grounded(
+        self,
+        event: NormalizedEvent,
+        dims: list[dict[str, Any]],
+    ) -> bool:
+        """Require benign dimensions to cite two distinct current observables.
+
+        Status labels are model output and therefore cannot prove their own
+        verdict. Matching concrete normalized values keeps benign decisions tied
+        to the alert while still allowing model-backed providers to enrich them.
+        """
+        if not self._dimensions_support_classification(dims, "benign"):
+            return False
+        observables = self._event_observables(event)
+        matches: set[str] = set()
+        grounded_dimensions = 0
+        for item in dims:
+            if not isinstance(item, dict) or not self._status_supports_classification(
+                item.get("status"), "benign"
+            ):
+                continue
+            dimension_text = str(item.get("evidence") or "").casefold()
+            dimension_matches = {
+                observable for observable in observables if observable in dimension_text
+            }
+            if dimension_matches:
+                grounded_dimensions += 1
+                matches.update(dimension_matches)
+        return grounded_dimensions >= 2 and len(matches) >= 2
+
+    def _event_observables(self, event: NormalizedEvent) -> set[str]:
+        values: set[str] = set()
+
+        def collect(value: Any) -> None:
+            if isinstance(value, dict):
+                for item in value.values():
+                    collect(item)
+            elif isinstance(value, list):
+                for item in value:
+                    collect(item)
+            elif isinstance(value, (str, int, float)) and not isinstance(value, bool):
+                text = str(value).strip().casefold()
+                if len(text) >= 4 and text not in {
+                    "high", "medium", "critical", "true", "false", "info", "normal", "benign"
+                }:
+                    values.add(text)
+
+        collect(event.entities or {})
+        for item in event.evidence or []:
+            if isinstance(item, dict):
+                collect(item.get("value"))
+        return values
 
     def _complete_result_shape(
         self,
