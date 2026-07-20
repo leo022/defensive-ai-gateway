@@ -26,8 +26,15 @@ from defensive_ai_gateway.memory import (
 # --include-profiles is passed.
 ALERT_TABLES = [
     "audit_log",
+    # Alert dispositions are alert-runtime state. They must be removed before
+    # cases/raw alerts so a reused demo alert_id cannot inherit an old verdict.
+    "alert_dispositions",
     "case_alert_links",
     "agent_runs",
+    "approval_votes",
+    "validation_runs",
+    "action_approvals",
+    "memory_matches",
     "cases",
     "normalized_events",
     "raw_alerts",
@@ -130,6 +137,10 @@ def _placeholders(n: int) -> str:
 
 
 def _delete(conn: sqlite3.Connection, include_approved: bool, include_org: bool, include_profiles: bool) -> dict:
+    # The gateway Repository enables foreign keys, but this helper is also used
+    # directly by tests and operators with a plain sqlite3 connection. Enable
+    # them here so future runtime tables cannot silently leave orphan rows.
+    conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("BEGIN IMMEDIATE")
     try:
         active = _count(

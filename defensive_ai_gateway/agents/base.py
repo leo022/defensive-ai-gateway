@@ -141,6 +141,11 @@ class SecurityAgent(ABC):
         )
 
     def _ensure_explainable_result(self, llm_result: dict[str, Any], event: NormalizedEvent) -> dict[str, Any]:
+        # Gateways often satisfy the JSON contract with a placeholder object
+        # whose fields are all empty strings.  Treat that as "no recommendation"
+        # before reconciliation, otherwise it can suppress a structured sample
+        # recommendation and leak a visually non-empty object to the dashboard.
+        llm_result = self._normalize_whitelist_result(llm_result)
         explanation = self._explanation(llm_result)
         llm_verdict = explanation.get("verdict", "")
         llm_dims = explanation.get("dimensions", [])
@@ -354,7 +359,7 @@ class SecurityAgent(ABC):
     ) -> dict[str, Any]:
         """Fill optional-but-operational fields without changing the public
         JSON contract expected from future Gateway responses."""
-        merged = dict(llm_result)
+        merged = self._normalize_whitelist_result(llm_result)
         merged["classification"] = self._normalize_classification(merged.get("classification", classification))
         merged["confidence"] = self._normalize_confidence(merged.get("confidence", 0.3))
         merged["verdict"] = self._format_verdict(str(merged.get("verdict") or ""), merged["classification"])
@@ -657,7 +662,7 @@ class SecurityAgent(ABC):
                     }
                 )
             elif item_type == "whitelist_candidate" and isinstance(value, dict):
-                whitelist = value
+                whitelist = self._normalize_whitelist_recommendation(value)
             elif item_type == "business_impact" and value:
                 impact = str(value)
             elif item_type == "success_assessment" and value:
@@ -785,7 +790,9 @@ class SecurityAgent(ABC):
                 }
             )
         verdict = str(llm_result.get("verdict") or self._parse_verdict(reason) or "").strip()
-        whitelist = llm_result.get("whitelist_recommendation") or self._parse_whitelist(llm_result)
+        whitelist = self._normalize_whitelist_recommendation(
+            llm_result.get("whitelist_recommendation") or self._parse_whitelist(llm_result)
+        )
         explanation = {
             "verdict": verdict,
             "dimensions": normalized_dimensions,
@@ -795,6 +802,37 @@ class SecurityAgent(ABC):
         if llm_result.get("_ground_truth_override"):
             explanation["ground_truth_override"] = llm_result["_ground_truth_override"]
         return explanation
+
+    def _normalize_whitelist_result(self, llm_result: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(llm_result)
+        if "whitelist_recommendation" in normalized:
+            normalized["whitelist_recommendation"] = self._normalize_whitelist_recommendation(
+                normalized.get("whitelist_recommendation")
+            )
+        return normalized
+
+    def _normalize_whitelist_recommendation(self, value: Any) -> dict[str, Any] | str:
+        """Collapse empty recommendation placeholders to an empty object.
+
+        The public field is allowed to be either a structured object or the
+        legacy textual recommendation extracted from ``recommended_next_steps``.
+        Keep meaningful values in either form, but do not treat whitespace,
+        nulls, or empty containers as an actual tuning recommendation.
+        """
+        if isinstance(value, str):
+            return value.strip() or {}
+        if not isinstance(value, dict):
+            return {}
+        cleaned: dict[str, Any] = {}
+        for key, item in value.items():
+            if item is None:
+                continue
+            if isinstance(item, str) and not item.strip():
+                continue
+            if isinstance(item, (dict, list, tuple, set)) and not item:
+                continue
+            cleaned[key] = item
+        return cleaned
 
     def _parse_verdict(self, reason: str) -> str:
         for line in reason.splitlines():

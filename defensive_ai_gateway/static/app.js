@@ -8,6 +8,7 @@ const LEGACY_OFFLINE_MODE_KEY = "dashboard-offline-mode";
 const COLLAPSIBLE_TEXT_LIMIT = 280;
 const COLLAPSIBLE_TEXT_LINE_LIMIT = 8;
 const DASHBOARD_REFRESH_MS = 5000;
+const OLLAMA_MODEL_REFRESH_MS = 15000;
 const REQUEST_TIMEOUT_MS = 30_000;
 const LOG_PRODUCT_OPTIONS = [
   { product: "waf", label: "WAF" },
@@ -29,6 +30,9 @@ const STRINGS = {
     appSubtitle: "多源告警处置与证据治理",
     navMonitor: "监控大屏",
     navDashboard: "处置台",
+    dashboardSecondaryNav: "处置台二级目录",
+    dashboardSubPending: "待处理队列",
+    dashboardSubHistory: "处理记录",
     navMemory: "记忆治理",
     navAdapter: "日志接入",
     navSettings: "运行配置",
@@ -53,6 +57,8 @@ const STRINGS = {
     workspaceTitle: "实时监控大屏",
     workspaceTitleMonitor: "实时监控大屏",
     workspaceTitleDashboard: "告警处置队列",
+    workspaceTitleHistory: "告警处理记录",
+    workspaceTitleTriage: "研判与处置",
     workspaceTitleMemory: "记忆治理工作台",
     workspaceTitleAdapter: "日志接入",
     workspaceTitleSettings: "运行配置",
@@ -98,6 +104,37 @@ const STRINGS = {
     highCritical: "高危与严重",
     latestCases: "Case 队列",
     latestCasesHint: "按创建时间排序，处置后队列顺序保持不变。",
+    triageEyebrow: "Alert triage",
+    triageTitle: "聚焦当前需要决策的告警",
+    triageSubtitle: "从待处理队列中选择一条 Case，进入研判与处置页面。",
+    triageOpen: "待处置",
+    triageReview: "人工复核",
+    triagePriority: "高危/严重",
+    triageAll: "全部",
+    triageConfirmed: "确认攻击",
+    triageCompleted: "已完成",
+    triageFilterToggle: "筛选",
+    triageFilterHide: "收起筛选",
+    triageQueue: "待处理队列",
+    triageQueueHint: "仅显示尚未完成的 Case；点击一条记录进入研判与处置。",
+    processedQueue: "处理记录",
+    processedQueueHint: "保留已完成处置的 Case，支持按条件检索并追溯历史研判。",
+    triageDetail: "研判与处置",
+    triageDetailHint: "完成研判、处置与审批；详细信息按需在独立页面中查看。",
+    triageBack: "返回待处理队列",
+    triageBackHistory: "返回处理记录",
+    triageSelectPrompt: "从待处理队列选择一条 Case，开始研判与处置。",
+    triageResultCount: "显示 {shown} / {total} 条",
+    triageNoResults: "当前没有待处理 Case。",
+    processedNoResults: "当前没有符合条件的处理记录。",
+    viewCase: "进入 Case {id} 的研判与处置",
+    triageAlertVolume: "关联告警",
+    triageDetails: "详细信息",
+    triageDetailsHint: "原始数据、归一化证据和运行记录在独立页面中按需查看。",
+    detailRawAlertsHint: "查看关联告警的完整原始载荷与处置状态。",
+    detailEvidenceHint: "查看结构化实体、证据和敏感标签。",
+    detailRunsHint: "查看分析结果与验证记录。",
+    detailOpen: "打开详情",
     memoryTotal: "记忆总量",
     memoryActive: "生效中",
     memoryPending: "待审批",
@@ -295,7 +332,9 @@ const STRINGS = {
     noEvidence: "暂无归一化证据",
     expandLongText: "展开全文",
     collapseLongText: "收起",
-    confirmFalsePositive: "确认为业务误报",
+    confirmFalsePositive: "确认误报并写入长期记忆",
+    falsePositiveConfirmed: "已确认误报，相关特征已写入产品长期记忆",
+    memoryWriteHint: "确认后会抽取告警特征并写入产品长期记忆，后续同类高相似告警将降低置信度。",
     caseDisposition: "Case 处置",
     caseStatusOpen: "待处置",
     caseStatusUnderReview: "人工复核",
@@ -419,6 +458,9 @@ const STRINGS = {
     appSubtitle: "Alert response and evidence governance",
     navMonitor: "Monitoring",
     navDashboard: "Queue",
+    dashboardSecondaryNav: "Alert triage sections",
+    dashboardSubPending: "Active queue",
+    dashboardSubHistory: "Disposition history",
     navMemory: "Memory Governance",
     navAdapter: "Log Intake",
     navSettings: "Runtime",
@@ -443,6 +485,8 @@ const STRINGS = {
     workspaceTitle: "Realtime Monitoring",
     workspaceTitleMonitor: "Realtime Monitoring",
     workspaceTitleDashboard: "Alert Triage Queue",
+    workspaceTitleHistory: "Disposition History",
+    workspaceTitleTriage: "Triage and Disposition",
     workspaceTitleMemory: "Memory Governance",
     workspaceTitleAdapter: "Log Intake",
     workspaceTitleSettings: "Runtime Configuration",
@@ -488,6 +532,37 @@ const STRINGS = {
     highCritical: "High and Critical",
     latestCases: "Case Queue",
     latestCasesHint: "Sorted by creation time; disposition changes keep the queue order stable.",
+    triageEyebrow: "Alert triage",
+    triageTitle: "Focus on alerts that need a decision now",
+    triageSubtitle: "Select a case from the active queue to enter triage and disposition.",
+    triageOpen: "Open",
+    triageReview: "Under review",
+    triagePriority: "High / critical",
+    triageAll: "All",
+    triageConfirmed: "Confirmed attack",
+    triageCompleted: "Completed",
+    triageFilterToggle: "Filters",
+    triageFilterHide: "Hide filters",
+    triageQueue: "Active queue",
+    triageQueueHint: "Only unfinished cases are shown. Select one to enter triage and disposition.",
+    processedQueue: "Disposition history",
+    processedQueueHint: "Keep completed cases available for filtered lookup and retrospective review.",
+    triageDetail: "Triage and disposition",
+    triageDetailHint: "Complete review, disposition, and approval here; open detailed information only when needed.",
+    triageBack: "Back to active queue",
+    triageBackHistory: "Back to disposition history",
+    triageSelectPrompt: "Select a case from the active queue to begin triage and disposition.",
+    triageResultCount: "Showing {shown} of {total}",
+    triageNoResults: "There are no active cases.",
+    processedNoResults: "There are no disposition records matching the current filters.",
+    viewCase: "Open triage and disposition for case {id}",
+    triageAlertVolume: "Linked alerts",
+    triageDetails: "Detailed information",
+    triageDetailsHint: "Open raw alerts, normalized evidence, and run records on dedicated pages when needed.",
+    detailRawAlertsHint: "View the complete raw payload and disposition for each linked alert.",
+    detailEvidenceHint: "View structured entities, evidence, and sensitivity tags.",
+    detailRunsHint: "View analysis outputs and validation records.",
+    detailOpen: "Open details",
     memoryTotal: "Total Memories",
     memoryActive: "Active",
     memoryPending: "Pending",
@@ -685,7 +760,9 @@ const STRINGS = {
     noEvidence: "No normalized evidence",
     expandLongText: "Expand full text",
     collapseLongText: "Collapse",
-    confirmFalsePositive: "Confirm business false positive",
+    confirmFalsePositive: "Confirm false positive & write long-term memory",
+    falsePositiveConfirmed: "False positive confirmed; features were written to product long-term memory",
+    memoryWriteHint: "Confirmation extracts alert features into product long-term memory so similar future alerts receive lower confidence.",
     caseDisposition: "Case disposition",
     caseStatusOpen: "Open",
     caseStatusUnderReview: "Under review",
@@ -821,8 +898,14 @@ let memoryAuditEvents = [];
 let selectedMemoryId = "";
 let selectedMemoryDetail = null;
 let memorySelectionRequestId = 0;
-let caseToUsesCurrentTime = true;
+let queueCases = [];
+let activeDashboardSection = "pending";
+let selectedCaseId = "";
+let caseSelectionRequestId = 0;
 let currentSession = null;
+let ollamaModelLoadRequestId = 0;
+let ollamaModelRefreshTimer = 0;
+let ollamaModelFocusRefreshTimer = 0;
 let apiToken = "";
 try {
   apiToken = sessionStorage.getItem(API_TOKEN_KEY) || "";
@@ -1012,41 +1095,31 @@ function formatDatetimeLocal(date) {
   ].join("-") + `T${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
-function setDefaultCaseDateRange() {
-  const fromInput = document.querySelector("#case-filter-from");
-  const toInput = document.querySelector("#case-filter-to");
-  if (!fromInput || !toInput) return;
-  const now = new Date();
-  const from = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-  fromInput.value = formatDatetimeLocal(from);
-  toInput.value = formatDatetimeLocal(now);
-  caseToUsesCurrentTime = true;
-  fromInput.defaultValue = fromInput.value;
-  toInput.defaultValue = toInput.value;
-}
-
 function datetimeLocalMs(value) {
   if (!value) return null;
   const ms = new Date(value).getTime();
   return Number.isFinite(ms) ? ms : null;
 }
 
-function caseSearchQuery() {
-  const params = new URLSearchParams({ limit: "50" });
-  const product = document.querySelector("#case-filter-product")?.value || "";
-  const severity = document.querySelector("#case-filter-severity")?.value || "";
-  const status = document.querySelector("#case-filter-status")?.value || "";
-  const createdFrom = datetimeLocalMs(document.querySelector("#case-filter-from")?.value || "");
-  const toInput = document.querySelector("#case-filter-to");
-  if (caseToUsesCurrentTime && toInput) toInput.value = formatDatetimeLocal(new Date());
-  const createdTo = caseToUsesCurrentTime ? Date.now() : datetimeLocalMs(toInput?.value || "");
+function caseSearchQuery(section = activeDashboardSection) {
+  const form = document.querySelector(`form[data-case-search-section="${section}"]`);
+  if (!form) return new URLSearchParams({ limit: "50" }).toString();
+
+  // Keep the active queue compact while allowing the history view to search
+  // farther back for retrospective review.
+  const params = new URLSearchParams({ limit: section === "history" ? "500" : "50" });
+  const value = (name) => String(form.elements.namedItem(name)?.value || "").trim();
+  const product = value("product");
+  const severity = value("severity");
+  const status = value("status");
+  const createdFrom = datetimeLocalMs(value("from"));
+  const createdTo = datetimeLocalMs(value("to"));
   if (product) params.set("product", product);
   if (severity) params.set("severity", severity);
   if (status) params.set("status", status);
   if (createdFrom !== null) params.set("created_from_ms", String(createdFrom));
-  // The default range follows the current clock on every refresh. An end time
-  // explicitly edited by the operator remains fixed and includes that minute.
-  if (createdTo !== null) params.set("created_to_ms", String(createdTo + (caseToUsesCurrentTime ? 0 : 59_999)));
+  // A datetime-local value has minute precision; include the whole end minute.
+  if (createdTo !== null) params.set("created_to_ms", String(createdTo + 59_999));
   return params.toString();
 }
 
@@ -1107,8 +1180,11 @@ function applyLanguage() {
   if (lastFieldMappingResult) {
     renderFieldMappingTable(lastFieldMappingResult);
   }
-  const active = document.querySelector(".nav-button.active")?.dataset.view || "monitor";
+  const active = document.querySelector(".view.active")?.id.replace(/-view$/, "")
+    || document.querySelector(".nav-button.active")?.dataset.view
+    || "monitor";
   updateWorkspaceTitle(active);
+  updateTriageBackLabel();
   renderProfileList();
   renderSyslogConfigTable();
   renderLogProductOptions();
@@ -1116,6 +1192,12 @@ function applyLanguage() {
   renderMemoryAudit(memoryAuditEvents, "#memory-audit-list");
   if (selectedMemoryDetail) renderMemoryDetail(selectedMemoryDetail);
   updateRefreshModeUi();
+  if (queueCases.length || document.querySelector("#cases-list, #processed-cases-list")) {
+    renderActiveDashboardList();
+    if (selectedCaseId && detailCache.has(selectedCaseId)) {
+      renderSelectedCaseDetail(detailCache.get(selectedCaseId), selectedCaseId);
+    }
+  }
   applySessionPermissions();
 }
 
@@ -1392,7 +1474,8 @@ function updateWorkspaceTitle(name) {
   if (!title) return;
   const key = {
     monitor: "workspaceTitleMonitor",
-    dashboard: "workspaceTitleDashboard",
+    dashboard: activeDashboardSection === "history" ? "workspaceTitleHistory" : "workspaceTitleDashboard",
+    triage: "workspaceTitleTriage",
     memory: "workspaceTitleMemory",
     adapter: "workspaceTitleAdapter",
     settings: "workspaceTitleSettings",
@@ -1711,12 +1794,24 @@ function statusLabel(status) {
   return tr("statusInfo");
 }
 
+function hasMeaningfulWhitelistRecommendation(value) {
+  if (typeof value === "string") return value.trim().length > 0;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  return Object.values(value).some((item) => {
+    if (item === null || item === undefined) return false;
+    if (typeof item === "string") return item.trim().length > 0;
+    if (Array.isArray(item)) return item.length > 0;
+    if (typeof item === "object") return Object.keys(item).length > 0;
+    return Boolean(item);
+  });
+}
+
 function explanationBlock(explanation) {
   const data = explanation || {};
   const dimensions = Array.isArray(data.dimensions) ? data.dimensions : [];
   const whitelist = data.whitelist_recommendation;
   const whitelistHtml =
-    whitelist && Object.keys(whitelist).length
+    hasMeaningfulWhitelistRecommendation(whitelist)
       ? `<pre class="mini-json">${pretty(whitelist)}</pre>`
       : `<p class="empty">${escapeHtml(tr("noWhitelist"))}</p>`;
 
@@ -1879,17 +1974,75 @@ function evidenceRows(evidence) {
     .join("");
 }
 
-function reviewTools(raw) {
+function alertDispositionLabel(disposition) {
+  const status = disposition?.status || "open";
+  if (status === "false_positive") return tr("caseStatusFalsePositive");
+  if (status === "closed") return tr("caseStatusClosed");
+  return tr("caseStatusOpen");
+}
+
+function reviewTools(raw, disposition = null) {
   const alertId = raw.alert_id || "";
   if (!alertId) return "";
+  // An alert disposition alone is not proof that the long-term memory write
+  // committed. The API supplies this marker only after finding the matching
+  // active, human-confirmed product memory for the same alert and Case.
+  const confirmed =
+    disposition?.status === "false_positive" &&
+    Boolean(disposition?.memory_confirmation?.memory_id);
   const allowed = hasAnyRole("analyst", "memory");
   return `
     <div class="review-tools">
-      <button class="review-button" type="button" data-alert-id="${escapeHtml(alertId)}" ${allowed ? "" : `disabled title="${escapeHtml(tr("permissionDenied"))}"`}>
-        ${escapeHtml(tr("confirmFalsePositive"))}
-      </button>
-      <p class="review-status" data-alert-status="${escapeHtml(alertId)}"></p>
+      ${confirmed
+        ? `<p class="review-status confirmed" data-alert-status="${escapeHtml(alertId)}">${escapeHtml(tr("falsePositiveConfirmed"))}</p>`
+        : `<button class="review-button" type="button" data-alert-id="${escapeHtml(alertId)}" ${allowed ? "" : `disabled title="${escapeHtml(tr("permissionDenied"))}"`}>
+            ${escapeHtml(tr("confirmFalsePositive"))}
+          </button>
+          <p class="review-status" data-alert-status="${escapeHtml(alertId)}">${escapeHtml(tr("memoryWriteHint"))}</p>`}
     </div>
+  `;
+}
+
+function linkedAlertReviewCard(link) {
+  const raw = link?.raw_alert || {};
+  const alertId = raw.alert_id || link?.alert_id || "";
+  if (!alertId) return "";
+  const adapter = raw.payload?.adapter || {};
+  const disposition = link.disposition || null;
+  return `
+    <article class="linked-alert-item">
+      <div class="section-title">
+        <div class="linked-alert-heading">
+          <strong>${escapeHtml(alertId)}</strong>
+          <span>${escapeHtml([raw.product, raw.event_type, raw.severity].filter(Boolean).join(" · "))}</span>
+        </div>
+        <span class="case-status ${escapeHtml(caseStatusClass(disposition?.status || "open"))}">${escapeHtml(alertDispositionLabel(disposition))}</span>
+      </div>
+      <dl class="kv">
+        <dt>${escapeHtml(tr("source"))}</dt><dd>${escapeHtml(raw.source)}</dd>
+        <dt>${escapeHtml(tr("product"))}</dt><dd>${escapeHtml(raw.product).toUpperCase()}</dd>
+        <dt>${escapeHtml(tr("event"))}</dt><dd>${escapeHtml(raw.event_type)}</dd>
+        <dt>${escapeHtml(tr("severity"))}</dt><dd>${escapeHtml(raw.severity)}</dd>
+        <dt>${escapeHtml(tr("time"))}</dt><dd>${escapeHtml(raw.timestamp)}</dd>
+        <dt>${escapeHtml(tr("adapterProfile"))}</dt><dd>${escapeHtml(adapter.profile_id ? `${adapter.profile_id} / ${adapter.profile_version}` : "direct")}</dd>
+      </dl>
+      ${reviewTools(raw, disposition)}
+    </article>
+  `;
+}
+
+function linkedAlertsBlock(linked) {
+  const cards = (linked || []).map(linkedAlertReviewCard).filter(Boolean);
+  return `
+    <section class="detail-card linked-alerts-card">
+      <div class="section-title">
+        <h3>${escapeHtml(tr("linkedRawAlerts"))}</h3>
+        <span>${escapeHtml(tr("alertCount", { count: linked?.length || 0 }))}</span>
+      </div>
+      ${cards.length
+        ? `<div class="linked-alert-list">${cards.join("")}</div>`
+        : `<p class="empty">${escapeHtml(tr("noEvidence"))}</p>`}
+    </section>
   `;
 }
 
@@ -1967,30 +2120,53 @@ function approvalBlock(approvals, caseId) {
 function renderDetail(detail) {
   const latestRun = detail.agent_runs?.[0]?.result || {};
   const linked = detail.linked_alerts || [];
-  const firstLink = linked[0] || {};
-  const raw = firstLink.raw_alert || {};
-  const normalized = firstLink.normalized_event || {};
-  const adapter = raw.payload?.adapter || {};
   const missing = latestRun.missing_evidence || [];
   const validation = detail.validation_runs?.[0] || latestRun.explanation?.validation;
+  const confidence = Math.round((detail.confidence || 0) * 100);
+  const headline = latestRun.explanation?.verdict || detail.summary || detail.case_id;
 
   return `
-    <div class="detail-grid">
-      <section class="detail-card analysis-card">
-        <div class="section-title">
-          <h3>${escapeHtml(tr("aiAnalysis"))}</h3>
-          <span class="badge ${escapeHtml(detail.severity)}">${escapeHtml(detail.severity)}</span>
+    <div class="detail-stack">
+      <section class="case-detail-overview">
+        <div class="case-detail-heading">
+          <div>
+            <div class="case-detail-kicker">
+              <strong class="case-product">${escapeHtml(detail.product).toUpperCase()}</strong>
+              <span class="badge ${escapeHtml(detail.severity)}">${escapeHtml(detail.severity)}</span>
+              <span class="case-status ${escapeHtml(caseStatusClass(detail.status))}">${escapeHtml(caseStatusLabel(detail.status))}</span>
+            </div>
+            <h3>${escapeHtml(headline)}</h3>
+            <p class="case-detail-id">Case ID · ${escapeHtml(detail.case_id)}</p>
+          </div>
+          <div class="case-detail-confidence">
+            <span>${escapeHtml(tr("confidence"))}</span>
+            <strong>${confidence}%</strong>
+          </div>
         </div>
-        <dl class="kv">
-          <dt>Case ID</dt><dd>${escapeHtml(detail.case_id)}</dd>
-          <dt>${escapeHtml(tr("product"))}</dt><dd>${escapeHtml(detail.product).toUpperCase()}</dd>
-          <dt>${escapeHtml(tr("classification"))}</dt><dd>${escapeHtml(detail.classification)}</dd>
-          <dt>${escapeHtml(tr("confidence"))}</dt><dd>${Math.round((detail.confidence || 0) * 100)}%</dd>
-          <dt>${escapeHtml(tr("updatedAt"))}</dt><dd>${fmtTime(detail.updated_at_ms)}</dd>
-        </dl>
-        <p class="summary">${escapeHtml(detail.summary)}</p>
+        <div class="case-context-grid">
+          <div>
+            <span>${escapeHtml(tr("classification"))}</span>
+            <strong>${escapeHtml(detail.classification)}</strong>
+          </div>
+          <div>
+            <span>${escapeHtml(tr("triageAlertVolume"))}</span>
+            <strong>${escapeHtml(tr("alertCount", { count: linked.length }))}</strong>
+          </div>
+          <div>
+            <span>${escapeHtml(tr("updatedAt"))}</span>
+            <strong>${escapeHtml(fmtTime(detail.updated_at_ms))}</strong>
+          </div>
+        </div>
         ${caseDispositionControls(detail)}
         ${validationBlock(validation)}
+        ${approvalBlock(detail.approvals || [], detail.case_id)}
+      </section>
+
+      <section class="detail-card">
+        <div class="section-title">
+          <h3>${escapeHtml(tr("aiAnalysis"))}</h3>
+          <span>${escapeHtml(tr("recommendedActions"))}</span>
+        </div>
         ${explanationBlock(latestRun.explanation)}
         <h4>${escapeHtml(tr("recommendedActions"))}</h4>
         <ul class="action-list">${actionRows(latestRun.recommended_actions)}</ul>
@@ -2002,60 +2178,80 @@ function renderDetail(detail) {
               : `<li class="empty">${escapeHtml(tr("none"))}</li>`
           }
         </ul>
-        ${approvalBlock(detail.approvals || [], detail.case_id)}
       </section>
 
-      <section class="detail-card">
-        <div class="section-title">
-          <h3>${escapeHtml(tr("linkedRawAlerts"))}</h3>
-          <span>${escapeHtml(tr("alertCount", { count: linked.length }))}</span>
-        </div>
-        <dl class="kv">
-          <dt>Alert ID</dt><dd>${escapeHtml(raw.alert_id || firstLink.alert_id)}</dd>
-          <dt>${escapeHtml(tr("source"))}</dt><dd>${escapeHtml(raw.source)}</dd>
-          <dt>${escapeHtml(tr("product"))}</dt><dd>${escapeHtml(raw.product).toUpperCase()}</dd>
-          <dt>${escapeHtml(tr("event"))}</dt><dd>${escapeHtml(raw.event_type)}</dd>
-          <dt>${escapeHtml(tr("severity"))}</dt><dd>${escapeHtml(raw.severity)}</dd>
-          <dt>${escapeHtml(tr("time"))}</dt><dd>${escapeHtml(raw.timestamp)}</dd>
-          <dt>${escapeHtml(tr("adapterProfile"))}</dt><dd>${escapeHtml(adapter.profile_id ? `${adapter.profile_id} / ${adapter.profile_version}` : "direct")}</dd>
-          <dt>${escapeHtml(tr("adapterStatus"))}</dt><dd>${escapeHtml(adapter.mapping_status || "passed")}</dd>
-        </dl>
-        ${reviewTools(raw)}
-        <details class="json-details">
-          <summary>${escapeHtml(tr("rawPayload"))}</summary>
-          <pre class="json-block">${pretty(raw.payload)}</pre>
-        </details>
-      </section>
+      ${linkedAlertsBlock(linked)}
 
-      <section class="detail-card">
+      <section class="detail-card detailed-information">
         <div class="section-title">
-          <h3>${escapeHtml(tr("normalizedEvidence"))}</h3>
-          <span>${escapeHtml(normalized.event_id || firstLink.event_id)}</span>
+          <div>
+            <h3>${escapeHtml(tr("triageDetails"))}</h3>
+            <p>${escapeHtml(tr("triageDetailsHint"))}</p>
+          </div>
         </div>
-        <dl class="kv">
-          <dt>${escapeHtml(tr("entities"))}</dt><dd>${escapeHtml(JSON.stringify(normalized.entities || {}))}</dd>
-          <dt>${escapeHtml(tr("sensitivityTags"))}</dt><dd>${escapeHtml((normalized.sensitivity_tags || []).join(", ") || "-")}</dd>
-        </dl>
-        <table class="evidence-table">
-          <thead>
-            <tr><th>${escapeHtml(tr("type"))}</th><th>${escapeHtml(tr("value"))}</th><th>${escapeHtml(tr("weightSource"))}</th></tr>
-          </thead>
-          <tbody>${evidenceRows(normalized.evidence)}</tbody>
-        </table>
-      </section>
-
-      <section class="detail-card">
-        <div class="section-title">
-          <h3>${escapeHtml(tr("agentRuns"))}</h3>
-          <span>${escapeHtml(tr("runCount", { count: detail.agent_runs?.length || 0 }))}</span>
+        <div class="detail-link-list">
+          ${detailLink(detail.case_id, "raw-alerts", tr("linkedRawAlerts"), tr("detailRawAlertsHint"), tr("alertCount", { count: linked.length }))}
+          ${detailLink(detail.case_id, "normalized-evidence", tr("normalizedEvidence"), tr("detailEvidenceHint"), tr("alertCount", { count: linked.length }))}
+          ${detailLink(detail.case_id, "analysis-runs", tr("agentRuns"), tr("detailRunsHint"), tr("runCount", { count: detail.agent_runs?.length || 0 }))}
         </div>
-        <details class="json-details">
-          <summary>${escapeHtml(tr("runPayload"))}</summary>
-          <pre class="json-block">${pretty(detail.agent_runs || [])}</pre>
-        </details>
       </section>
     </div>
   `;
+}
+
+function detailLink(caseId, section, title, description, count) {
+  const href = `/case-details.html?${new URLSearchParams({ case_id: caseId, section }).toString()}`;
+  return `
+    <a class="detail-link-card" data-detail-section="${escapeHtml(section)}" href="${escapeHtml(href)}">
+      <span class="detail-link-copy">
+        <strong>${escapeHtml(title)}</strong>
+        <span>${escapeHtml(description)}</span>
+      </span>
+      <span class="detail-link-meta">
+        <small>${escapeHtml(count)}</small>
+        <b>${escapeHtml(tr("detailOpen"))} →</b>
+      </span>
+    </a>
+  `;
+}
+
+function pendingQueueCases(cases = queueCases) {
+  return (cases || []).filter((item) => !["false_positive", "closed"].includes(text(item?.status).toLowerCase()));
+}
+
+function processedQueueCases(cases = queueCases) {
+  return (cases || []).filter((item) => ["false_positive", "closed"].includes(text(item?.status).toLowerCase()));
+}
+
+function dashboardCaseListId(section = activeDashboardSection) {
+  return section === "history" ? "#processed-cases-list" : "#cases-list";
+}
+
+function renderCaseList(cases, section, emptyKey) {
+  const list = document.querySelector(dashboardCaseListId(section));
+  if (!list) return;
+  const visible = cases || [];
+  list.innerHTML = "";
+  if (!visible.length) {
+    list.innerHTML = `<div class="empty-state">${escapeHtml(tr(emptyKey))}</div>`;
+    return;
+  }
+  for (const item of visible) {
+    list.appendChild(renderCase(item));
+  }
+}
+
+function renderQueueList(cases = pendingQueueCases()) {
+  renderCaseList(cases, "pending", "triageNoResults");
+}
+
+function renderProcessedList(cases = processedQueueCases()) {
+  renderCaseList(cases, "history", "processedNoResults");
+}
+
+function renderActiveDashboardList() {
+  if (activeDashboardSection === "history") renderProcessedList(processedQueueCases());
+  else renderQueueList(pendingQueueCases());
 }
 
 function renderCase(item) {
@@ -2063,47 +2259,62 @@ function renderCase(item) {
   wrapper.className = "case-item";
   wrapper.dataset.caseId = item.case_id;
   wrapper.innerHTML = `
-    <button class="case-toggle" type="button" aria-expanded="false" aria-label="${escapeHtml(tr("expandCase", { id: item.case_id }))}">
-      <span class="case-chevron">›</span>
-      <strong class="case-product">${escapeHtml(item.product).toUpperCase()}</strong>
-      <span class="badge ${escapeHtml(item.severity)}">${escapeHtml(item.severity)}</span>
-      <span class="case-status ${escapeHtml(caseStatusClass(item.status))}">${escapeHtml(caseStatusLabel(item.status))}</span>
+    <button class="case-card" type="button" aria-label="${escapeHtml(tr("viewCase", { id: item.case_id }))}">
+      <span class="case-card-top">
+        <span class="case-card-identity">
+          <strong class="case-product">${escapeHtml(item.product).toUpperCase()}</strong>
+          <span class="badge ${escapeHtml(item.severity)}">${escapeHtml(item.severity)}</span>
+        </span>
+        <span class="case-status ${escapeHtml(caseStatusClass(item.status))}">${escapeHtml(caseStatusLabel(item.status))}</span>
+      </span>
       <span class="case-summary">${escapeHtml(item.summary)}</span>
-      <span class="linked-count">${escapeHtml(tr("alertCountLong", { count: item.alert_count || 0 }))}</span>
-      <small class="case-time">${fmtTime(item.created_at_ms)}</small>
+      <span class="case-card-meta">
+        <span class="linked-count">${escapeHtml(tr("alertCountLong", { count: item.alert_count || 0 }))}</span>
+        <small class="case-time">${escapeHtml(fmtTime(item.created_at_ms))}</small>
+      </span>
     </button>
-    <div class="case-collapse" hidden></div>
   `;
-  wrapper.querySelector(".case-toggle").addEventListener("click", () => toggleCase(wrapper, item.case_id));
+  wrapper.querySelector(".case-card").addEventListener("click", () => {
+    openCaseTriage(item.case_id).catch((err) => showToast(tr("detailLoadFailed", { message: err.message || String(err) }), "error"));
+  });
   return wrapper;
 }
 
-async function toggleCase(wrapper, caseId) {
-  const button = wrapper.querySelector(".case-toggle");
-  const panel = wrapper.querySelector(".case-collapse");
-  const expanded = button.getAttribute("aria-expanded") === "true";
-  if (expanded) {
-    button.setAttribute("aria-expanded", "false");
-    panel.hidden = true;
+function renderSelectedCaseDetail(detail, caseId) {
+  const panel = document.querySelector("#case-detail");
+  if (!panel || selectedCaseId !== caseId) return;
+  panel.innerHTML = renderDetail(detail);
+  bindDetailActions(panel, caseId);
+}
+
+async function loadTriageCase(caseId) {
+  selectedCaseId = caseId;
+  const panel = document.querySelector("#case-detail");
+  const requestId = ++caseSelectionRequestId;
+  if (!panel) return;
+  if (detailCache.has(caseId)) {
+    renderSelectedCaseDetail(detailCache.get(caseId), caseId);
     return;
   }
-
-  button.setAttribute("aria-expanded", "true");
-  panel.hidden = false;
-  if (!detailCache.has(caseId)) {
-    panel.innerHTML = `<div class="loading">${escapeHtml(tr("loadingDetail"))}</div>`;
-    try {
-      detailCache.set(caseId, await json(`/api/cases/${encodeURIComponent(caseId)}`));
-    } catch (err) {
-      const message = err.message || String(err);
-      detailCache.delete(caseId);
-      panel.innerHTML = `<div class="empty-state">${escapeHtml(tr("detailLoadFailed", { message }))}</div>`;
-      showToast(tr("detailLoadFailed", { message }), "error");
-      return;
-    }
+  panel.innerHTML = `<div class="loading">${escapeHtml(tr("loadingDetail"))}</div>`;
+  try {
+    const detail = await json(`/api/cases/${encodeURIComponent(caseId)}`);
+    if (requestId !== caseSelectionRequestId || selectedCaseId !== caseId) return;
+    detailCache.set(caseId, detail);
+    renderSelectedCaseDetail(detail, caseId);
+  } catch (err) {
+    if (requestId !== caseSelectionRequestId || selectedCaseId !== caseId) return;
+    const message = err.message || String(err);
+    detailCache.delete(caseId);
+    panel.innerHTML = `<div class="empty-state">${escapeHtml(tr("detailLoadFailed", { message }))}</div>`;
+    throw err;
   }
-  panel.innerHTML = renderDetail(detailCache.get(caseId));
-  bindDetailActions(panel, caseId);
+}
+
+async function openCaseTriage(caseId) {
+  if (!caseId) return;
+  setView("triage");
+  await loadTriageCase(caseId);
 }
 
 function bindDetailActions(panel, caseId) {
@@ -2166,6 +2377,7 @@ async function updateCaseDisposition(button, caseId) {
     detailCache.set(caseId, { ...detailCache.get(caseId), ...result.case });
     if (statusNode) statusNode.textContent = tr("dispositionSaved", { status: caseStatusLabel(result.case.status) });
     await loadCases();
+    await loadTriageCase(caseId);
     showToast(tr("dispositionSaved", { status: caseStatusLabel(result.case.status) }));
   } catch (err) {
     buttons.forEach((item) => {
@@ -2195,6 +2407,7 @@ async function confirmBusinessFalsePositive(button, caseId) {
       status.textContent = tr("memoryWritten", { id: result.memory_id });
     }
     await loadCases();
+    await loadTriageCase(caseId);
     showToast(tr("falsePositiveDone", { id: result.memory_id }));
   } catch (err) {
     button.disabled = false;
@@ -2695,20 +2908,28 @@ async function sweepMemory() {
 }
 
 function setView(name) {
+  const target = document.querySelector(`#${name}-view`);
+  if (!target) return;
+  const navigationView = name === "triage" ? "dashboard" : name;
   document.querySelectorAll(".view").forEach((view) => view.classList.remove("active"));
-  document.querySelector(`#${name}-view`).classList.add("active");
+  target.classList.add("active");
   document.querySelectorAll(".nav-button").forEach((btn) => {
-    btn.classList.toggle("active", btn.dataset.view === name);
+    btn.classList.toggle("active", btn.dataset.view === navigationView);
   });
   document.querySelectorAll(".nav-group").forEach((group) => {
-    group.classList.toggle("active", group.dataset.viewGroup === name);
+    group.classList.toggle("active", group.dataset.viewGroup === navigationView);
   });
   document.querySelectorAll(".nav-subbutton").forEach((btn) => {
-    const current = btn.dataset.view === name && btn.classList.contains("active");
+    const current = btn.dataset.view === navigationView && btn.classList.contains("active");
     if (current) btn.setAttribute("aria-current", "page");
     else btn.removeAttribute("aria-current");
   });
   updateWorkspaceTitle(name);
+}
+
+function updateTriageBackLabel() {
+  const button = document.querySelector("#triage-back");
+  if (button) button.textContent = tr(activeDashboardSection === "history" ? "triageBackHistory" : "triageBack");
 }
 
 function setSecondaryView(group, name) {
@@ -2729,6 +2950,11 @@ function setSecondaryView(group, name) {
     panel.classList.toggle("active", selected);
     panel.hidden = !selected;
   });
+  if (group === "dashboard") {
+    activeDashboardSection = name === "history" ? "history" : "pending";
+    updateWorkspaceTitle("dashboard");
+    updateTriageBackLabel();
+  }
 }
 
 function activeSecondaryView(group, fallback = "") {
@@ -2736,6 +2962,8 @@ function activeSecondaryView(group, fallback = "") {
 }
 
 function loadViewData(name) {
+  if (name === "triage") return Promise.resolve();
+  if (name === "dashboard") return loadCases({ section: activeDashboardSection });
   if (name === "settings") {
     return loadLlmConfig().catch((err) => setConfigStatus(err.message || String(err), true));
   }
@@ -2760,7 +2988,12 @@ function loadViewData(name) {
 }
 
 function refreshCurrentView() {
-  const active = document.querySelector(".nav-button.active")?.dataset.view || "monitor";
+  const active = document.querySelector(".view.active")?.id.replace(/-view$/, "")
+    || document.querySelector(".nav-button.active")?.dataset.view
+    || "monitor";
+  if (active === "triage") {
+    return loadCases({ quiet: true, section: activeDashboardSection }).then(() => selectedCaseId ? loadTriageCase(selectedCaseId) : undefined);
+  }
   return loadViewData(active);
 }
 
@@ -2782,19 +3015,16 @@ async function loadDashboardRuntime() {
 }
 
 async function loadCases(options = {}) {
-  const list = document.querySelector("#cases-list");
+  const section = options.section === "history" ? "history" : options.section === "pending" ? "pending" : activeDashboardSection;
+  activeDashboardSection = section;
+  const list = document.querySelector(dashboardCaseListId(section));
   try {
     const { health, cases, llmConfig, syslogPayload } = await loadDashboardRuntime();
     renderDashboard(health, cases, llmConfig, syslogPayload);
-    list.innerHTML = "";
     detailCache.clear();
-    if (!cases.length) {
-      list.innerHTML = `<div class="empty-state">${escapeHtml(tr("noCases"))}</div>`;
-      return;
-    }
-    for (const item of cases) {
-      list.appendChild(renderCase(item));
-    }
+    queueCases = cases;
+    if (section === "history") renderProcessedList(processedQueueCases(queueCases));
+    else renderQueueList(pendingQueueCases(queueCases));
   } catch (err) {
     if (list) list.innerHTML = `<div class="empty-state">${escapeHtml(err.stack || String(err))}</div>`;
     if (!options.quiet) showToast(tr("refreshFailed", { message: err.message || String(err) }), "error");
@@ -3050,23 +3280,57 @@ async function loadLlmConfig() {
   const cfg = await json("/api/config/llm");
   populateLlmForm(cfg);
   setConfigStatus(cfg.api_key_set ? tr("configLoadedWithKey") : tr("configLoadedNoKey"));
-  if ((cfg.provider || "local") === "ollama") {
-    loadOllamaModels().catch((err) => setConfigStatus(err.message || String(err), true));
-  }
+  if ((cfg.provider || "local") === "ollama") startOllamaModelRefresh();
+  else stopOllamaModelRefresh();
 }
 
 function populateLlmForm(cfg) {
-  document.querySelector("#llm-provider").value = cfg.provider || "local";
+  const provider = cfg.provider || "local";
+  document.querySelector("#llm-provider").value = provider;
   document.querySelector("#llm-endpoint").value = cfg.endpoint || "";
   // local provider ignores the model field; force the canonical value so the
   // form always reflects the real "local" configuration instead of stale
   // model names left over from a previous ollama session.
   document.querySelector("#llm-model").value =
-    (cfg.provider || "local") === "local" ? "local-rule-analyst" : cfg.model || "";
+    provider === "local" ? "local-rule-analyst" : cfg.model || "";
+  setLlmModelPlaceholder(provider);
   document.querySelector("#llm-api-key").value = "";
   document.querySelector("#llm-api-key").placeholder = cfg.api_key_set ? tr("keySetKeep") : tr("keyUnset");
   document.querySelector("#llm-api-key-env").value = cfg.api_key_env || "DEFENSIVE_AI_LLM_API_KEY";
   document.querySelector("#llm-timeout").value = cfg.timeout_seconds || 30;
+}
+
+function setLlmModelPlaceholder(provider) {
+  const placeholders = {
+    local: "local-rule-analyst",
+    ollama: "请选择已同步的 Ollama 模型",
+    gateway: "例如 claude-sonnet-4-6",
+  };
+  document.querySelector("#llm-model").placeholder = placeholders[provider] || placeholders.local;
+}
+
+function stopOllamaModelRefresh() {
+  if (ollamaModelRefreshTimer) {
+    window.clearInterval(ollamaModelRefreshTimer);
+    ollamaModelRefreshTimer = 0;
+  }
+  if (ollamaModelFocusRefreshTimer) {
+    window.clearTimeout(ollamaModelFocusRefreshTimer);
+    ollamaModelFocusRefreshTimer = 0;
+  }
+}
+
+function startOllamaModelRefresh() {
+  stopOllamaModelRefresh();
+  if (document.querySelector("#llm-provider").value !== "ollama") return;
+  loadOllamaModels().catch((err) => setConfigStatus(err.message || String(err), true));
+  ollamaModelRefreshTimer = window.setInterval(() => {
+    if (document.querySelector("#llm-provider").value !== "ollama") {
+      stopOllamaModelRefresh();
+      return;
+    }
+    loadOllamaModels({ quiet: true }).catch((err) => setConfigStatus(err.message || String(err), true));
+  }, OLLAMA_MODEL_REFRESH_MS);
 }
 
 function applyProviderDefaults(provider) {
@@ -3074,18 +3338,24 @@ function applyProviderDefaults(provider) {
   const model = document.querySelector("#llm-model");
   const timeout = document.querySelector("#llm-timeout");
   if (provider === "local") {
+    stopOllamaModelRefresh();
     document.querySelector("#llm-model").value = "local-rule-analyst";
+    setLlmModelPlaceholder(provider);
     timeout.value = 30;
     document.querySelector("#ollama-models").innerHTML = "";
   } else if (provider === "ollama") {
+    if (model.value.trim() === "local-rule-analyst") model.value = "";
+    setLlmModelPlaceholder(provider);
     if (!endpoint.value.trim()) endpoint.value = "http://127.0.0.1:11434/api/generate";
     if (!timeout.value || Number(timeout.value) < 60) timeout.value = 300;
-    loadOllamaModels().catch((err) => setConfigStatus(err.message || String(err), true));
+    startOllamaModelRefresh();
   } else if (provider === "gateway") {
+    stopOllamaModelRefresh();
+    setLlmModelPlaceholder(provider);
     if (!endpoint.value.trim() || endpoint.value.includes("127.0.0.1:11434")) {
       endpoint.value = "https://kkcoder.com/v1/messages";
     }
-    if (!model.value.trim() || ["local-rule-analyst", "gemma3:4b", "gemma3:latest"].includes(model.value.trim())) {
+    if (!model.value.trim() || model.value.trim() === "local-rule-analyst") {
       model.value = "claude-sonnet-4-6";
     }
     if (!timeout.value || Number(timeout.value) < 60) timeout.value = 120;
@@ -3102,30 +3372,39 @@ async function restoreLlmDefaults() {
   populateLlmForm(result.llm);
   document.querySelector("#llm-api-key").placeholder = result.llm.api_key_set ? tr("keySetKeep") : tr("keyUnset");
   setConfigStatus(tr("configRestored"));
-  if ((result.llm.provider || "local") === "ollama") {
-    loadOllamaModels().catch((err) => setConfigStatus(err.message || String(err), true));
-  }
+  if ((result.llm.provider || "local") === "ollama") startOllamaModelRefresh();
+  else stopOllamaModelRefresh();
 }
 
-async function loadOllamaModels() {
+async function loadOllamaModels({ quiet = false } = {}) {
   const datalist = document.querySelector("#ollama-models");
   // Pass the endpoint currently typed in the form so the picker works before
   // the configuration is saved (the backend no longer gates on the saved
   // provider).
   const endpoint = document.querySelector("#llm-endpoint").value.trim();
   const qs = endpoint ? `?endpoint=${encodeURIComponent(endpoint)}` : "";
-  const result = await json(`/api/config/llm/models${qs}`);
+  const requestId = ++ollamaModelLoadRequestId;
+  const result = await json(`/api/config/llm/models${qs}`, { cache: "no-store" });
+  if (
+    requestId !== ollamaModelLoadRequestId
+    || document.querySelector("#llm-provider").value !== "ollama"
+    || document.querySelector("#llm-endpoint").value.trim() !== endpoint
+  ) {
+    return [];
+  }
   const models = Array.isArray(result.models) ? result.models : [];
   const current = document.querySelector("#llm-model").value;
   datalist.innerHTML = models.map((name) => `<option value="${escapeHtml(name)}"></option>`).join("");
   if (!result.ok) {
-    setConfigStatus(tr("modelsLoadFailed", { error: result.error || "unknown" }), true);
+    if (!quiet) setConfigStatus(tr("modelsLoadFailed", { error: result.error || "unknown" }), true);
     return models;
   }
-  if (models.length === 0) {
-    setConfigStatus(tr("modelsEmpty", { endpoint: result.endpoint || "" }));
-  } else {
-    setConfigStatus(tr("modelsLoaded", { count: models.length, endpoint: result.endpoint || "" }));
+  if (!quiet) {
+    if (models.length === 0) {
+      setConfigStatus(tr("modelsEmpty", { endpoint: result.endpoint || "" }));
+    } else {
+      setConfigStatus(tr("modelsLoaded", { count: models.length, endpoint: result.endpoint || "" }));
+    }
   }
   if (current && !models.includes(current)) {
     datalist.innerHTML += `<option value="${escapeHtml(current)}"></option>`;
@@ -3211,17 +3490,27 @@ document.querySelector("#refresh").addEventListener("click", () => {
 document.querySelector("#test-llm-connection").addEventListener("click", () => {
   testLlmConnection().catch((err) => setConfigStatus(err.message || String(err), true));
 });
-document.querySelector("#case-search-form").addEventListener("submit", (event) => {
-  event.preventDefault();
-  loadCases().catch((err) => showToast(err.message || String(err), "error"));
+document.querySelector("#triage-back").addEventListener("click", () => {
+  setView("dashboard");
+  setSecondaryView("dashboard", activeDashboardSection);
+  loadCases({ quiet: true, section: activeDashboardSection }).catch((err) => showToast(err.message || String(err), "error"));
 });
-document.querySelector("#case-search-reset").addEventListener("click", () => {
-  document.querySelector("#case-search-form").reset();
-  setDefaultCaseDateRange();
-  loadCases().catch((err) => showToast(err.message || String(err), "error"));
-});
-document.querySelector("#case-filter-to").addEventListener("input", () => {
-  caseToUsesCurrentTime = false;
+document.querySelectorAll(".case-search-form").forEach((form) => {
+  const section = form.dataset.caseSearchSection === "history" ? "history" : "pending";
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    activeDashboardSection = section;
+    setView("dashboard");
+    setSecondaryView("dashboard", section);
+    loadCases({ section }).catch((err) => showToast(tr("refreshFailed", { message: err.message || String(err) }), "error"));
+  });
+  form.querySelector("button[type=button]")?.addEventListener("click", () => {
+    form.reset();
+    activeDashboardSection = section;
+    setView("dashboard");
+    setSecondaryView("dashboard", section);
+    loadCases({ section }).catch((err) => showToast(tr("refreshFailed", { message: err.message || String(err) }), "error"));
+  });
 });
 document.querySelector("#memory-filter-form").addEventListener("submit", (event) => {
   event.preventDefault();
@@ -3271,6 +3560,13 @@ document.querySelector("#llm-endpoint").addEventListener("change", () => {
   if (document.querySelector("#llm-provider").value === "ollama") {
     loadOllamaModels().catch((err) => setConfigStatus(err.message || String(err), true));
   }
+});
+document.querySelector("#llm-model").addEventListener("focus", () => {
+  if (document.querySelector("#llm-provider").value !== "ollama") return;
+  if (ollamaModelFocusRefreshTimer) window.clearTimeout(ollamaModelFocusRefreshTimer);
+  ollamaModelFocusRefreshTimer = window.setTimeout(() => {
+    loadOllamaModels({ quiet: true }).catch((err) => setConfigStatus(err.message || String(err), true));
+  }, 0);
 });
 document.querySelector("#profile-form").addEventListener("submit", (event) => {
   saveMappingProfile(event).catch((err) => setProfileStatus(err.message || String(err), true));
@@ -3374,7 +3670,6 @@ document.querySelector("#auth-form").addEventListener("submit", async (event) =>
   }
 });
 
-setDefaultCaseDateRange();
 renderLogProductOptions();
 loadApplicationData().catch((err) =>
   showToast(err.message || String(err), "error"),

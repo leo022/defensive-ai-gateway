@@ -10,6 +10,8 @@ HTML = (ROOT / "defensive_ai_gateway" / "static" / "index.html").read_text(encod
 JS = (ROOT / "defensive_ai_gateway" / "static" / "app.js").read_text(encoding="utf-8")
 CSS = (ROOT / "defensive_ai_gateway" / "static" / "style.css").read_text(encoding="utf-8")
 THEME_JS = (ROOT / "defensive_ai_gateway" / "static" / "theme-init.js").read_text(encoding="utf-8")
+DETAIL_HTML = (ROOT / "defensive_ai_gateway" / "static" / "case-details.html").read_text(encoding="utf-8")
+DETAIL_JS = (ROOT / "defensive_ai_gateway" / "static" / "case-details.js").read_text(encoding="utf-8")
 
 
 class _ElementCollector(HTMLParser):
@@ -47,6 +49,25 @@ class DashboardQueueMetricTest(unittest.TestCase):
         self.assertIn("{queued} 等待，{inflight} 分析中", JS)
 
 
+class WhitelistRecommendationRenderingTest(unittest.TestCase):
+    def test_blank_recommendation_object_is_rendered_as_empty_state(self):
+        self.assertIn("function hasMeaningfulWhitelistRecommendation", JS)
+        self.assertIn("Object.values(value).some", JS)
+        self.assertIn("hasMeaningfulWhitelistRecommendation(whitelist)", JS)
+        self.assertNotIn("whitelist && Object.keys(whitelist).length", JS)
+
+
+class FalsePositiveMemoryActionRenderingTest(unittest.TestCase):
+    def test_triage_detail_exposes_alert_level_memory_confirmation(self):
+        self.assertIn("function linkedAlertsBlock", JS)
+        self.assertIn("${linkedAlertsBlock(linked)}", JS)
+        self.assertIn("function linkedAlertReviewCard", JS)
+        self.assertIn("reviewTools(raw, disposition)", JS)
+        self.assertIn("/api/alerts/${encodeURIComponent(alertId)}/confirm-false-positive", JS)
+        self.assertIn("disposition?.memory_confirmation?.memory_id", JS)
+        self.assertIn("确认误报并写入长期记忆", JS)
+
+
 class FrontendSecondaryNavigationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -56,6 +77,8 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
 
     def test_memory_and_adapter_content_are_partitioned_into_requested_sections(self):
         expected_tabs = {
+            "dashboard-tab-pending": ("dashboard", "pending", "dashboard-pending-panel", "dashboard-submenu"),
+            "dashboard-tab-history": ("dashboard", "history", "dashboard-history-panel", "dashboard-submenu"),
             "memory-tab-inventory": ("memory", "inventory", "memory-inventory-panel", "memory-submenu"),
             "memory-tab-audit": ("memory", "audit", "memory-audit-panel", "memory-submenu"),
             "adapter-tab-intake": ("adapter", "intake", "adapter-intake-panel", "adapter-submenu"),
@@ -75,6 +98,8 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
 
         self.assertEqual(self.elements["memory-submenu"]["attrs"]["role"], "group")
         self.assertEqual(self.elements["adapter-submenu"]["attrs"]["role"], "group")
+        self.assertEqual(self.elements["dashboard-submenu"]["attrs"]["role"], "group")
+        self.assertEqual(self.elements["dashboard-nav-parent"]["attrs"]["data-default-secondary"], "pending")
         self.assertEqual(self.elements["memory-nav-parent"]["attrs"]["data-default-secondary"], "inventory")
         self.assertEqual(self.elements["adapter-nav-parent"]["attrs"]["data-default-secondary"], "intake")
         self.assertNotIn("hidden", self.elements["memory-inventory-panel"]["attrs"])
@@ -84,6 +109,8 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertNotIn('class="secondary-nav"', HTML)
 
         containment = {
+            "case-search-form": "dashboard-pending-panel",
+            "case-history-search-form": "dashboard-history-panel",
             "memory-total": "memory-inventory-panel",
             "memory-list": "memory-inventory-panel",
             "memory-detail": "memory-inventory-panel",
@@ -98,6 +125,9 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
 
     def test_navigation_supports_language_active_state_and_responsive_layout(self):
         for key in (
+            "dashboardSecondaryNav",
+            "dashboardSubPending",
+            "dashboardSubHistory",
             "memorySecondaryNav",
             "memorySubInventory",
             "memorySubAudit",
@@ -114,9 +144,9 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertIn("grid-template-columns: repeat(2, minmax(0, 1fr))", CSS)
 
     def test_frontend_operability_guards_are_present(self):
-        self.assertIn("let caseToUsesCurrentTime = true", JS)
-        self.assertIn("caseToUsesCurrentTime = false", JS)
-        self.assertIn("const createdTo = caseToUsesCurrentTime ? Date.now()", JS)
+        self.assertIn('return new URLSearchParams({ limit: "50" }).toString();', JS)
+        self.assertIn("case-filter-from", HTML)
+        self.assertIn("history-case-filter-from", HTML)
         self.assertIn("async function loadMemoryInventory", JS)
         self.assertIn("async function loadMemoryAudit", JS)
         self.assertIn("Promise.allSettled", JS)
@@ -170,6 +200,59 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertNotIn("localStorage.getItem(key)", HTML)
         self.assertIn('localStorage.getItem(key)', THEME_JS)
         self.assertIn('document.documentElement.dataset.theme = theme', THEME_JS)
+
+    def test_alert_triage_drills_from_queue_to_vertical_disposition_page(self):
+        self.assertIn("cases-list", self.elements)
+        self.assertIn("dashboard-view", self.elements["cases-list"]["ancestors"])
+        self.assertIn("dashboard-view", self.elements["processed-cases-list"]["ancestors"])
+        self.assertIn("case-detail", self.elements)
+        self.assertIn("triage-view", self.elements["case-detail"]["ancestors"])
+        self.assertIn("triage-back", self.elements)
+
+        dashboard = HTML.split('<section id="dashboard-view"', 1)[1].split(
+            '<section id="triage-view"', 1
+        )[0]
+        self.assertNotIn('id="case-detail"', dashboard)
+        self.assertNotIn('class="triage-workbench"', HTML)
+        self.assertNotIn('class="queue-filter-tabs"', HTML)
+        self.assertIn('id="case-search-form"', HTML)
+        self.assertIn('id="case-history-search-form"', HTML)
+        self.assertIn('data-case-search-section="pending"', HTML)
+        self.assertIn('data-case-search-section="history"', HTML)
+        self.assertIn("function openCaseTriage", JS)
+        self.assertIn("function loadTriageCase", JS)
+        self.assertIn("function pendingQueueCases", JS)
+        self.assertIn("function processedQueueCases", JS)
+        self.assertIn("function renderProcessedList", JS)
+        self.assertIn("let activeDashboardSection =", JS)
+        self.assertIn('setView("triage")', JS)
+        self.assertIn('data-detail-section="${escapeHtml(section)}"', JS)
+        self.assertNotIn(".triage-workbench", CSS)
+        self.assertNotIn(".triage-detail-panel", CSS)
+        self.assertIn(".detail-stack", CSS)
+        self.assertIn("grid-template-columns: 1fr", CSS)
+
+    def test_detailed_information_uses_dedicated_page_and_scoped_api(self):
+        self.assertIn('src="/case-details.js"', DETAIL_HTML)
+        self.assertIn('id="case-details-content"', DETAIL_HTML)
+        for section in ("raw-alerts", "normalized-evidence", "analysis-runs"):
+            self.assertIn(section, JS)
+            self.assertIn(section, DETAIL_JS)
+        self.assertIn("/api/cases/${encodeURIComponent(caseId)}/details/${encodeURIComponent(section)}", DETAIL_JS)
+        self.assertIn("sessionStorage.getItem(API_TOKEN_KEY)", DETAIL_JS)
+
+    def test_ollama_model_picker_refreshes_current_model_list(self):
+        self.assertNotIn("gemma3", HTML)
+        self.assertNotIn("gemma3", JS)
+        self.assertIn("请选择已同步的 Ollama 模型", HTML)
+        self.assertIn("const OLLAMA_MODEL_REFRESH_MS = 15000;", JS)
+        self.assertIn("function startOllamaModelRefresh()", JS)
+        self.assertIn("function stopOllamaModelRefresh()", JS)
+        self.assertIn('document.querySelector("#llm-model").addEventListener("focus"', JS)
+        self.assertIn('cache: "no-store"', JS)
+        self.assertIn("ollamaModelLoadRequestId", JS)
+        self.assertIn("startOllamaModelRefresh();", JS)
+        self.assertIn("stopOllamaModelRefresh();", JS)
 
 
 if __name__ == "__main__":

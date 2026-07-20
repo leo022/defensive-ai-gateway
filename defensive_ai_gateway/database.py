@@ -2493,6 +2493,7 @@ class Repository:
               ne.evidence_json,
               ne.sensitivity_tags_json,
               ne.created_at_ms AS normalized_created_at_ms,
+              ad.case_id AS disposition_case_id,
               ad.disposition AS alert_disposition,
               ad.actor AS disposition_actor,
               ad.reason AS disposition_reason,
@@ -2500,7 +2501,8 @@ class Repository:
             FROM case_alert_links l
             LEFT JOIN raw_alerts ra ON ra.alert_id = l.alert_id
             LEFT JOIN normalized_events ne ON ne.event_id = l.event_id
-            LEFT JOIN alert_dispositions ad ON ad.alert_id = l.alert_id
+            LEFT JOIN alert_dispositions ad
+              ON ad.alert_id = l.alert_id AND ad.case_id = l.case_id
             WHERE l.case_id = ?
             ORDER BY l.created_at_ms DESC
             """,
@@ -2535,27 +2537,79 @@ class Repository:
                     "sensitivity_tags": json.loads(item["sensitivity_tags_json"]),
                     "created_at_ms": item["normalized_created_at_ms"],
                 }
+            disposition = None
+            if item.get("alert_disposition"):
+                confirmation = (
+                    self._confirmed_false_positive_memory_locked(
+                        str(item["alert_id"]), str(item["case_id"])
+                    )
+                    if item["alert_disposition"] == "false_positive"
+                    else None
+                )
+                disposition = {
+                    "case_id": item["disposition_case_id"],
+                    "status": item["alert_disposition"],
+                    "actor": item["disposition_actor"],
+                    "reason": item["disposition_reason"],
+                    "updated_at_ms": item["disposition_updated_at_ms"],
+                }
+                if confirmation:
+                    disposition["memory_confirmation"] = confirmation
             linked.append(
                 {
                     "case_id": item["case_id"],
                     "alert_id": item["alert_id"],
                     "event_id": item["event_id"],
                     "linked_at_ms": item["linked_at_ms"],
-                    "disposition": (
-                        {
-                            "status": item["alert_disposition"],
-                            "actor": item["disposition_actor"],
-                            "reason": item["disposition_reason"],
-                            "updated_at_ms": item["disposition_updated_at_ms"],
-                        }
-                        if item.get("alert_disposition")
-                        else None
-                    ),
+                    "disposition": disposition,
                     "raw_alert": raw_alert,
                     "normalized_event": normalized_event,
                 }
             )
         return linked
+
+    def _confirmed_false_positive_memory_locked(
+        self, alert_id: str, case_id: str
+    ) -> dict[str, Any] | None:
+        """Find the active human-confirmed memory for this exact alert/Case.
+
+        ``alert_dispositions`` is intentionally not treated as proof that the
+        memory write completed. Older databases can contain an orphaned or
+        reused alert disposition, so the UI needs an independently persisted
+        confirmation memory before it reports a successful memory write.
+        Caller holds ``self._lock``; JSON parsing is kept in Python so legacy
+        non-JSON memory content cannot make the SQL query fail.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT memory_id, content, created_at_ms, updated_at_ms
+            FROM memory_entries
+            WHERE layer = 'product_long_term'
+              AND status = 'active'
+              AND source_case_id = ?
+            ORDER BY created_at_ms DESC, memory_id ASC
+            """,
+            (case_id,),
+        ).fetchall()
+        for row in rows:
+            try:
+                content = json.loads(row["content"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(content, dict):
+                continue
+            if (
+                content.get("human_confirmed") is True
+                and content.get("confirmation_type") == "business_false_positive"
+                and str(content.get("alert_id") or "") == alert_id
+                and str(content.get("case_id") or "") == case_id
+            ):
+                return {
+                    "memory_id": row["memory_id"],
+                    "created_at_ms": row["created_at_ms"],
+                    "updated_at_ms": row["updated_at_ms"],
+                }
+        return None
 
     def stats(self) -> dict[str, Any]:
         with self._lock:

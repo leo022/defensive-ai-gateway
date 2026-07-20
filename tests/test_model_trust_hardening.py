@@ -16,6 +16,7 @@ from defensive_ai_gateway.llm import (
     LLMClient,
     LocalHeuristicLLM,
     OllamaLLM,
+    _open_no_redirect,
     resolve_gateway_api_key,
 )
 from defensive_ai_gateway.models import NormalizedEvent, RawAlert
@@ -58,6 +59,25 @@ class _Model(LLMClient):
 
     def analyze(self, prompt, context):
         return dict(self.result)
+
+
+class OllamaProxyIsolationTest(unittest.TestCase):
+    def test_ollama_opener_disables_environment_proxies(self):
+        opener = _Opener(_Response(b"{}"))
+        request = urllib.request.Request("http://127.0.0.1:11434/api/tags")
+        with patch(
+            "defensive_ai_gateway.llm.urllib.request.build_opener",
+            return_value=opener,
+        ) as build_opener:
+            with _open_no_redirect(request, 1, bypass_proxy=True):
+                pass
+
+        handlers = build_opener.call_args.args
+        proxy_handlers = [
+            handler for handler in handlers if isinstance(handler, urllib.request.ProxyHandler)
+        ]
+        self.assertEqual(len(proxy_handlers), 1)
+        self.assertEqual(proxy_handlers[0].proxies, {})
 
 
 def _policy(max_bytes: int = 20000) -> PolicyEngine:
@@ -230,7 +250,7 @@ class ModelTransportBoundaryTest(unittest.TestCase):
                     with patch(
                         "defensive_ai_gateway.app.urllib.request.build_opener",
                         return_value=_Opener(_Response(body)),
-                    ):
+                    ) as build_opener:
                         listed = state.list_ollama_models()
                         tested = state.test_llm_connection(
                             {
@@ -242,6 +262,14 @@ class ModelTransportBoundaryTest(unittest.TestCase):
                     self.assertTrue(listed["ok"], listed)
                     self.assertEqual(listed["models"], ["qwen3:8b"])
                     self.assertTrue(tested["ok"], tested)
+                    for call in build_opener.call_args_list:
+                        proxy_handlers = [
+                            handler
+                            for handler in call.args
+                            if isinstance(handler, urllib.request.ProxyHandler)
+                        ]
+                        self.assertEqual(len(proxy_handlers), 1)
+                        self.assertEqual(proxy_handlers[0].proxies, {})
                 finally:
                     state.stop()
 
@@ -454,6 +482,116 @@ class BenignGroundingTest(unittest.TestCase):
         agent = build_agent("waf", _Model(result), _policy())
         analyzed = agent.analyze("case-2", self._event(), [])
         self.assertEqual(analyzed.classification, "benign")
+
+
+class WhitelistRecommendationNormalizationTest(unittest.TestCase):
+    def _attack_event(self) -> NormalizedEvent:
+        return NormalizedEvent(
+            event_id="event-whitelist-normalization",
+            source="direct",
+            product="waf",
+            event_type="web_attack_xss_marker",
+            severity="medium",
+            timestamp="2026-07-14T00:00:00Z",
+            entities={
+                "rule": "WAF-941-XSS",
+                "url": "/retail/profile/update",
+                "host": "retail-web-01",
+            },
+            evidence=[
+                {"type": "action", "value": "blocked", "ref": "e1"},
+                {"type": "rule_id", "value": "WAF-941-XSS", "ref": "e2"},
+            ],
+            sensitivity_tags=[],
+            raw_ref="alert-whitelist-normalization",
+        )
+
+    def test_all_blank_gateway_fields_are_normalized_to_no_recommendation(self):
+        result = {
+            "classification": "malicious",
+            "confidence": 0.9,
+            "verdict": "【真实攻击】- XSS marker",
+            "reason": "真实攻击。",
+            "analysis_dimensions": [
+                {"title": "规则匹配", "status": "risk", "evidence": "WAF-941-XSS"},
+            ],
+            "whitelist_recommendation": {
+                "rule_type": "",
+                "detection_content": " ",
+                "match_method": "",
+                "reason": "",
+            },
+        }
+        agent = build_agent("waf", _Model(result), _policy())
+
+        analyzed = agent.analyze("case-attack", self._attack_event(), [])
+
+        self.assertEqual(analyzed.classification, "malicious")
+        self.assertEqual(analyzed.explanation["whitelist_recommendation"], {})
+
+    def test_blank_model_placeholder_does_not_hide_structured_false_positive_candidate(self):
+        event = self._attack_event()
+        event.evidence.extend(
+            [
+                {
+                    "type": "expected_verdict",
+                    "value": "【误报】- 已批准客户端流量",
+                    "ref": "e3",
+                },
+                {
+                    "type": "analysis_dimension",
+                    "value": {
+                        "title": "规则与路径",
+                        "status": "benign",
+                        "evidence": "WAF-941-XSS on /retail/profile/update",
+                    },
+                    "ref": "e4",
+                },
+                {
+                    "type": "analysis_dimension",
+                    "value": {
+                        "title": "客户端",
+                        "status": "normal",
+                        "evidence": "retail-web-01 uses the approved client",
+                    },
+                    "ref": "e5",
+                },
+                {
+                    "type": "whitelist_candidate",
+                    "value": {
+                        "rule_type": "WAF 白名单",
+                        "detection_content": "URI=/retail/profile/update; rule_id=WAF-941-XSS",
+                        "match_method": "相等",
+                        "reason": "已批准客户端固定接口流量。",
+                    },
+                    "ref": "e6",
+                },
+            ]
+        )
+        result = {
+            "classification": "malicious",
+            "confidence": 0.9,
+            "verdict": "【真实攻击】- model placeholder",
+            "reason": "模型输出。",
+            "analysis_dimensions": [
+                {"title": "规则", "status": "risk", "evidence": "WAF-941-XSS"},
+            ],
+            "whitelist_recommendation": {
+                "rule_type": "",
+                "detection_content": "",
+                "match_method": "",
+                "reason": "",
+            },
+        }
+        agent = build_agent("waf", _Model(result), _policy())
+
+        analyzed = agent.analyze("case-false-positive", event, [])
+
+        self.assertEqual(analyzed.classification, "benign")
+        self.assertEqual(
+            analyzed.explanation["whitelist_recommendation"]["rule_type"],
+            "WAF 白名单",
+        )
 
 
 if __name__ == "__main__":

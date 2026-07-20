@@ -7,10 +7,134 @@ from typing import Any
 
 PRODUCTS = ("waf", "hips", "rasp", "ndr", "siem")
 SCENARIOS = ("random", "attack", "suspicious", "false_positive")
+# Feature names are deliberately product-scoped.  A feature is the security
+# behavior represented by the sample, while ``scenario`` controls the
+# expected disposition (attack/review/false-positive).
+FEATURES = {
+    "waf": ("sql_injection", "xss", "path_traversal", "protocol_anomaly"),
+    "hips": ("credential_access", "powershell_execution"),
+    "rasp": ("jndi", "sql_injection", "command_execution"),
+    "ndr": ("sql_injection", "brute_force", "c2_beacon", "data_exfiltration"),
+    "siem": ("lateral_movement", "service_account_abuse"),
+}
+FEATURE_ALIASES = {
+    "sql": "sql_injection",
+    "sqli": "sql_injection",
+    "sql-injection": "sql_injection",
+    "brute": "brute_force",
+    "bruteforce": "brute_force",
+    "brute-force": "brute_force",
+    "password_spraying": "brute_force",
+    "password-spraying": "brute_force",
+    "c2": "c2_beacon",
+    "beacon": "c2_beacon",
+    "exfil": "data_exfiltration",
+    "exfiltration": "data_exfiltration",
+    "xss": "xss",
+    "traversal": "path_traversal",
+    "path-traversal": "path_traversal",
+    "powershell": "powershell_execution",
+    "powershell-execution": "powershell_execution",
+    "credential": "credential_access",
+    "lateral": "lateral_movement",
+    "service-account": "service_account_abuse",
+}
+
+# Some products have fewer meaningful variants for a particular disposition.
+# Keeping this table explicit lets a requested feature select a compatible
+# scenario when scenario=random instead of producing an incoherent payload.
+FEATURES_BY_SCENARIO = {
+    "waf": {
+        "attack": ("sql_injection", "xss", "path_traversal"),
+        "suspicious": ("sql_injection", "xss"),
+        "false_positive": ("sql_injection", "protocol_anomaly"),
+    },
+    "hips": {
+        "attack": ("credential_access", "powershell_execution"),
+        "suspicious": ("credential_access", "powershell_execution"),
+        "false_positive": ("credential_access", "powershell_execution"),
+    },
+    "rasp": {
+        "attack": ("jndi", "sql_injection", "command_execution"),
+        "suspicious": ("jndi", "sql_injection", "command_execution"),
+        "false_positive": ("jndi", "sql_injection", "command_execution"),
+    },
+    "ndr": {
+        "attack": ("sql_injection", "brute_force", "c2_beacon", "data_exfiltration"),
+        "suspicious": ("sql_injection", "brute_force", "c2_beacon", "data_exfiltration"),
+        "false_positive": ("sql_injection", "brute_force", "c2_beacon", "data_exfiltration"),
+    },
+    "siem": {
+        "attack": ("lateral_movement", "service_account_abuse"),
+        "suspicious": ("lateral_movement", "service_account_abuse"),
+        "false_positive": ("lateral_movement", "service_account_abuse"),
+    },
+}
 HK_TZ = timezone(timedelta(hours=8))
 
 
-def generate_alert(product: str | None = None, scenario: str = "random", seed: int | None = None) -> dict[str, Any]:
+def available_features(product: str | None = None, scenario: str | None = None) -> dict[str, tuple[str, ...]] | tuple[str, ...]:
+    """Return supported feature ids for CLI help and API consumers."""
+    if product is None:
+        return {name: tuple(values) for name, values in FEATURES.items()}
+    selected_product = product.lower()
+    if selected_product not in PRODUCTS:
+        raise ValueError(f"Unsupported product: {product}")
+    if scenario in (None, "random"):
+        return tuple(FEATURES[selected_product])
+    selected_scenario = scenario.lower()
+    if selected_scenario not in FEATURES_BY_SCENARIO[selected_product]:
+        raise ValueError(f"Unsupported scenario: {scenario}")
+    return tuple(FEATURES_BY_SCENARIO[selected_product][selected_scenario])
+
+
+def _canonical_feature(product: str, feature: str) -> str:
+    normalized = feature.strip().lower().replace(" ", "_")
+    normalized = FEATURE_ALIASES.get(normalized, normalized)
+    if normalized not in FEATURES[product]:
+        allowed = ", ".join(FEATURES[product])
+        raise ValueError(f"Unsupported feature for {product}: {feature}; choose one of: {allowed}")
+    return normalized
+
+
+def _select_scenario_and_feature(
+    product: str,
+    requested_scenario: str,
+    requested_feature: str | None,
+    rng: random.Random,
+) -> tuple[str, str]:
+    selected_feature = None
+    if requested_feature and requested_feature.lower() != "random":
+        selected_feature = _canonical_feature(product, requested_feature)
+
+    if requested_scenario == "random":
+        if selected_feature:
+            compatible = [
+                candidate
+                for candidate in SCENARIOS[1:]
+                if selected_feature in FEATURES_BY_SCENARIO[product][candidate]
+            ]
+            selected_scenario = rng.choice(compatible)
+        else:
+            selected_scenario = _scenario(rng, requested_scenario)
+    else:
+        selected_scenario = requested_scenario
+
+    options = FEATURES_BY_SCENARIO[product][selected_scenario]
+    if selected_feature and selected_feature not in options:
+        raise ValueError(
+            f"Feature {selected_feature!r} is not available for {product}/{selected_scenario}; "
+            f"choose one of: {', '.join(options)}"
+        )
+    return selected_scenario, selected_feature or rng.choice(options)
+
+
+def generate_alert(
+    product: str | None = None,
+    scenario: str = "random",
+    seed: int | None = None,
+    feature: str | None = None,
+) -> dict[str, Any]:
     rng = random.Random(seed)
     selected_product = (product or rng.choice(PRODUCTS)).lower()
     if selected_product not in PRODUCTS:
@@ -18,7 +142,10 @@ def generate_alert(product: str | None = None, scenario: str = "random", seed: i
     selected_scenario = scenario.lower()
     if selected_scenario not in SCENARIOS:
         raise ValueError(f"Unsupported scenario: {scenario}")
-    return _BUILDERS[selected_product](rng, selected_scenario)
+    selected_scenario, selected_feature = _select_scenario_and_feature(
+        selected_product, selected_scenario, feature, rng
+    )
+    return _BUILDERS[selected_product](rng, selected_scenario, selected_feature)
 
 
 def generate_alerts(
@@ -26,10 +153,16 @@ def generate_alerts(
     product: str | None = None,
     scenario: str = "random",
     seed: int | None = None,
+    feature: str | None = None,
 ) -> list[dict[str, Any]]:
     rng = random.Random(seed)
     return [
-        generate_alert(product=product, scenario=scenario, seed=rng.randrange(1, 10_000_000))
+        generate_alert(
+            product=product,
+            scenario=scenario,
+            seed=rng.randrange(1, 10_000_000),
+            feature=feature,
+        )
         for _ in range(count)
     ]
 
@@ -82,12 +215,12 @@ def _assessment(
     }
 
 
-def _waf(rng: random.Random, requested: str) -> dict[str, Any]:
-    scenario = _scenario(rng, requested)
+def _waf(rng: random.Random, scenario: str, feature: str) -> dict[str, Any]:
     fp = scenario == "false_positive"
     suspicious = scenario == "suspicious"
     attack_variants = [
         {
+            "feature": "sql_injection",
             "rule_id": "WAF-942-SQLI",
             "rule_name": "SQL injection anomaly threshold exceeded",
             "event_type": "web_attack_sqli_anomaly",
@@ -100,6 +233,7 @@ def _waf(rng: random.Random, requested: str) -> dict[str, Any]:
             "attack_marker": "SQL boolean expression markers",
         },
         {
+            "feature": "xss",
             "rule_id": "WAF-941-XSS",
             "rule_name": "XSS marker in customer profile update",
             "event_type": "web_attack_xss_marker",
@@ -112,6 +246,7 @@ def _waf(rng: random.Random, requested: str) -> dict[str, Any]:
             "attack_marker": "encoded script and HTML entity markers",
         },
         {
+            "feature": "path_traversal",
             "rule_id": "WAF-930-LFI",
             "rule_name": "Path traversal attempt against document endpoint",
             "event_type": "web_attack_path_traversal",
@@ -126,6 +261,7 @@ def _waf(rng: random.Random, requested: str) -> dict[str, Any]:
     ]
     fp_variants = [
         {
+            "feature": "sql_injection",
             "rule_id": "WAF-941-APP-ANOMALY",
             "rule_name": "Known synthetic browser search anomaly",
             "event_type": "web_attack_rule_hit_with_account_context",
@@ -141,6 +277,7 @@ def _waf(rng: random.Random, requested: str) -> dict[str, Any]:
             "whitelist_reason": "QA 合成浏览器在支付搜索接口提交编码搜索词，低频且有固定 UA 与会话特征。",
         },
         {
+            "feature": "protocol_anomaly",
             "rule_id": "WAF-920-PROTOCOL",
             "rule_name": "Approved batch partner malformed header pattern",
             "event_type": "waf_protocol_anomaly_known_partner",
@@ -158,6 +295,7 @@ def _waf(rng: random.Random, requested: str) -> dict[str, Any]:
     ]
     suspicious_variants = [
         {
+            "feature": "sql_injection",
             "rule_id": "WAF-942-SQLI",
             "rule_name": "SQL injection anomaly threshold partially matched",
             "event_type": "web_attack_sqli_needs_review",
@@ -170,6 +308,7 @@ def _waf(rng: random.Random, requested: str) -> dict[str, Any]:
             "attack_marker": "single SQL keyword marker",
         },
         {
+            "feature": "xss",
             "rule_id": "WAF-941-XSS",
             "rule_name": "XSS marker with possible rich-text business input",
             "event_type": "web_attack_xss_needs_review",
@@ -182,12 +321,9 @@ def _waf(rng: random.Random, requested: str) -> dict[str, Any]:
             "attack_marker": "encoded HTML entity marker",
         },
     ]
-    if fp:
-        variant = _choice(rng, fp_variants)
-    elif suspicious:
-        variant = _choice(rng, suspicious_variants)
-    else:
-        variant = _choice(rng, attack_variants)
+    variants = fp_variants if fp else (suspicious_variants if suspicious else attack_variants)
+    matching = [item for item in variants if item.get("feature") == feature]
+    variant = _choice(rng, matching or variants)
     same_src_ip = rng.randrange(*variant["rate"])
     user_agent = variant.get("user_agent") or rng.choice(
         ["Mozilla/5.0", "curl/8.4 synthetic-probe", "python-requests/2.x", "mobile-app/2026.06"]
@@ -258,6 +394,7 @@ def _waf(rng: random.Random, requested: str) -> dict[str, Any]:
         "severity": variant["severity"],
         "timestamp": _timestamp(rng),
         "payload": {
+            "feature": feature,
             "rule_id": variant["rule_id"],
             "rule_name": variant["rule_name"],
             "rule_info": f"{variant['rule_name']} on fields {', '.join(variant['matched_parameters'])}",
@@ -306,21 +443,41 @@ def _waf(rng: random.Random, requested: str) -> dict[str, Any]:
     }
 
 
-def _hips(rng: random.Random, requested: str) -> dict[str, Any]:
-    scenario = _scenario(rng, requested)
+def _hips(rng: random.Random, scenario: str, feature: str) -> dict[str, Any]:
     fp = scenario == "false_positive"
     suspicious = scenario == "suspicious"
     host = rng.choice(["ops-jump-04", "ops-jump-07", "patch-srv-02"])
     parent_process = "software_center.exe" if fp else rng.choice(["wmiprvse.exe", "winword.exe", "psexesvc.exe"])
     user = "svc-patch" if fp else rng.choice(["adm.ops.l2", "svc-reporting", "adm.db"])
-    rule_id = "HIPS-WIN-ADMIN-017" if fp else ("HIPS-WIN-PS-REVIEW-021" if suspicious else "HIPS-WIN-CRED-042")
+    powershell_feature = feature == "powershell_execution"
+    rule_id = (
+        "HIPS-WIN-ADMIN-017"
+        if fp
+        else (
+            "HIPS-WIN-PS-EXEC-REVIEW-021"
+            if suspicious and powershell_feature
+            else (
+                "HIPS-WIN-PS-EXEC-038"
+                if powershell_feature
+                else ("HIPS-WIN-PS-REVIEW-021" if suspicious else "HIPS-WIN-CRED-042")
+            )
+        )
+    )
     behavior = (
         ["approved patch inventory collection", "script hash matches change ticket", "signed script launched by software center"]
         if fp
         else (
-            ["encoded script launched", "single suspicious registry query", "no credential store access observed"]
+            (
+                ["encoded PowerShell execution", "suspicious parent process chain", "network discovery command observed"]
+                if powershell_feature
+                else ["encoded script launched", "single suspicious registry query", "no credential store access observed"]
+            )
             if suspicious
-            else ["credential store access attempt", "remote thread creation blocked", "attempted connection to core database segment"]
+            else (
+                ["encoded PowerShell execution", "remote thread creation blocked", "attempted connection to core database segment"]
+                if powershell_feature
+                else ["credential store access attempt", "remote thread creation blocked", "attempted connection to core database segment"]
+            )
         )
     )
     change_ticket = f"CHG-{rng.randrange(30000, 99999)}" if fp else ""
@@ -386,6 +543,7 @@ def _hips(rng: random.Random, requested: str) -> dict[str, Any]:
         "severity": "medium" if fp or suspicious else "high",
         "timestamp": _timestamp(rng),
         "payload": {
+            "feature": feature,
             "rule_id": rule_id,
             "rule_name": "Approved admin script pattern" if fp else ("PowerShell behavior needs analyst review" if suspicious else "PowerShell credential access behavior chain"),
             "host": host,
@@ -416,8 +574,7 @@ def _hips(rng: random.Random, requested: str) -> dict[str, Any]:
     }
 
 
-def _rasp(rng: random.Random, requested: str) -> dict[str, Any]:
-    scenario = _scenario(rng, requested)
+def _rasp(rng: random.Random, scenario: str, feature: str) -> dict[str, Any]:
     fp = scenario == "false_positive"
     suspicious = scenario == "suspicious"
     route = "/openbanking/v2/payments/search" if not fp else "/internal/canary/sql-guard-check"
@@ -540,11 +697,186 @@ def _rasp(rng: random.Random, requested: str) -> dict[str, Any]:
     }
 
 
-def _ndr(rng: random.Random, requested: str) -> dict[str, Any]:
-    scenario = _scenario(rng, requested)
+def _ndr_application_feature(rng: random.Random, scenario: str, feature: str) -> dict[str, Any]:
+    """Generate NDR detections for application/auth traffic.
+
+    NDR products commonly expose more than encrypted beacon/exfiltration
+    detections.  These two variants make the feature selector useful for a
+    demo without changing the static ``samples/ndr_alert.json`` contract.
+    """
     fp = scenario == "false_positive"
     suspicious = scenario == "suspicious"
-    rule_id = "NDR-BACKUP-BASELINE-004" if fp else ("NDR-TLS-REVIEW-014" if suspicious else rng.choice(["NDR-TLS-BEACON-018", "NDR-EXFIL-RATIO-031"]))
+    host = rng.choice(["pay-api-prod-03", "core-db-17", "auth-gw-prod-02"])
+    src_ip = _ip(rng, "10.30.2")
+
+    if feature == "sql_injection":
+        label = "SQL 注入"
+        target = "/openbanking/v2/payments/search"
+        destination = "pay-api-prod-03"
+        rule_id = "NDR-SQL-REVIEW-014" if suspicious else ("NDR-SQL-CANARY-004" if fp else "NDR-SQLI-HTTP-021")
+        event_type = "known_sql_probe_baseline" if fp else ("sql_injection_needs_review" if suspicious else "sql_injection_detected")
+        request_count = rng.randrange(3, 12) if fp else (rng.randrange(8, 30) if suspicious else rng.randrange(40, 180))
+        failed_count = rng.randrange(1, 4) if fp else (rng.randrange(3, 10) if suspicious else rng.randrange(20, 120))
+        protocol = "http"
+        dst_port = 443
+        feature_fields = {
+            "uri": target,
+            "method": "POST",
+            "request_count_5m": request_count,
+            "sqli_marker": "approved canary token" if fp else ("single SQL keyword marker" if suspicious else "boolean expression and union markers"),
+            "response_code": 200 if fp or suspicious else 403,
+        }
+        if fp:
+            assessment = _assessment(
+                "【误报】- 已批准 SQL 防护 canary 流量",
+                [
+                    _dimension("通信主体", f"{src_ip} 访问内部 canary 路由 {target}，目的主机为 {destination}。", "benign"),
+                    _dimension("请求特征", "请求只包含固定 canary token，未发现外部用户会话。", "benign"),
+                    _dimension("规则匹配", f"{rule_id} 命中预期巡检特征。", "benign"),
+                    _dimension("流量基线", f"request_count_5m={request_count}，处于巡检窗口的正常范围。", "normal"),
+                ],
+                "未发现真实 SQL 注入；该流量属于已批准的防护有效性巡检。",
+                "确认误报后可减少 NDR 与应用防护联动噪声，但应限定 canary 来源与路由。",
+            )
+            whitelist = {
+                "rule_type": "NDR 白名单",
+                "attack_type": label,
+                "detection_content": f"src_ip={src_ip}; uri={target}; marker=approved-canary",
+                "match_method": "相等",
+                "scope": f"rule_id={rule_id}; app={destination}",
+                "reason": "内部 canary 用于验证 SQL 防护链路，不代表外部攻击。",
+                "review_cycle": "canary 路由或探针来源变更时复核",
+            }
+        elif suspicious:
+            assessment = _assessment(
+                "【需人工复核】- SQL 注入疑似网络特征",
+                [
+                    _dimension("通信主体", f"{src_ip} 访问 {destination}{target}，网络侧可见请求但缺少应用层闭环。", "review"),
+                    _dimension("请求特征", f"sqli_marker={feature_fields['sqli_marker']}，命中字段证据不完整。", "review"),
+                    _dimension("流量基线", f"request_count_5m={request_count}，高于普通业务但尚未形成大规模扫描。", "review"),
+                    _dimension("关联证据", "缺少 RASP sink、数据库审计和 WAF request_id。", "review"),
+                ],
+                "网络侧观察到疑似 SQL 注入，但无法确认查询是否成功执行。",
+                "可能影响支付查询接口，也可能是业务输入或安全测试流量，需要应用层确认。",
+                ["RASP trace", "数据库审计日志", "WAF request_id", "测试工单"],
+            )
+            whitelist = {}
+        else:
+            assessment = _assessment(
+                "【真实攻击】- NDR 观察到 SQL 注入流量",
+                [
+                    _dimension("通信主体", f"{src_ip} 从外部地址访问 {destination}{target}。", "risk"),
+                    _dimension("请求特征", f"网络载荷包含 {feature_fields['sqli_marker']}，原始载荷已脱敏。", "risk"),
+                    _dimension("流量基线", f"request_count_5m={request_count}、failed_request_count_5m={failed_count}，明显偏离普通查询。", "risk"),
+                    _dimension("处置结果", f"响应码 {feature_fields['response_code']}，边界层已记录或阻断请求。", "blocked"),
+                ],
+                "NDR 观察到并关联 SQL 注入请求；仍需通过 RASP 和数据库审计确认是否有成功查询。",
+                "可能影响支付查询接口及客户数据读取，应优先关联应用层证据。",
+                ["RASP trace", "数据库审计日志", "WAF request_id", "同源 IP 后续请求"],
+            )
+            whitelist = {}
+    else:
+        label = "暴力破解"
+        target = "/oauth/token"
+        destination = "auth-gw-prod-02"
+        rule_id = "NDR-AUTH-REVIEW-019" if suspicious else ("NDR-AUTH-CANARY-005" if fp else "NDR-BRUTE-FORCE-027")
+        event_type = "known_auth_probe_baseline" if fp else ("brute_force_needs_review" if suspicious else "brute_force_detected")
+        failed_count = rng.randrange(2, 8) if fp else (rng.randrange(8, 30) if suspicious else rng.randrange(40, 260))
+        request_count = failed_count + rng.randrange(1, 8)
+        protocol = "https"
+        dst_port = 443
+        feature_fields = {
+            "uri": target,
+            "method": "POST",
+            "request_count_5m": request_count,
+            "failed_login_count_10m": failed_count,
+            "target_accounts": rng.randrange(1, 4) if fp else (rng.randrange(2, 8) if suspicious else rng.randrange(8, 40)),
+            "response_code": 200 if fp or suspicious else 401,
+        }
+        if fp:
+            assessment = _assessment(
+                "【误报】- 已批准身份认证压力测试",
+                [
+                    _dimension("通信主体", f"{src_ip} 访问认证网关 {target}，来源属于安全测试网段。", "benign"),
+                    _dimension("认证行为", f"failed_login_count_10m={failed_count}，命中测试账号集合。", "benign"),
+                    _dimension("规则匹配", f"{rule_id} 命中已登记的认证压力测试基线。", "benign"),
+                    _dimension("关联证据", "测试工单和探针标识与流量时间窗一致。", "normal"),
+                ],
+                "未发现真实账号攻击；流量与已批准的认证压力测试一致。",
+                "确认误报后可降低认证压测期间的 NDR 噪声，但必须绑定测试网段、账号和时间窗。",
+            )
+            whitelist = {
+                "rule_type": "NDR 白名单",
+                "attack_type": label,
+                "detection_content": f"src_ip={src_ip}; uri={target}; test_window=true",
+                "match_method": "相等",
+                "scope": f"rule_id={rule_id}; app={destination}",
+                "reason": "已批准认证压力测试产生固定失败登录模式。",
+                "review_cycle": "测试计划结束后自动复核",
+            }
+        elif suspicious:
+            assessment = _assessment(
+                "【需人工复核】- 暴力破解疑似行为",
+                [
+                    _dimension("通信主体", f"{src_ip} 在 {destination} 上访问 {target}，来源属于受管网段但不在近期基线内。", "review"),
+                    _dimension("认证行为", f"failed_login_count_10m={failed_count}，覆盖 {feature_fields['target_accounts']} 个账号。", "review"),
+                    _dimension("时序与流量", f"request_count_5m={request_count}，存在连续失败但尚未确认密码喷洒或单账号爆破。", "review"),
+                    _dimension("关联证据", "缺少 IAM 登录源、账号风险和成功登录后的行为证据。", "review"),
+                ],
+                "网络侧观察到异常失败登录，但尚未确认攻击者是否获得有效凭证。",
+                "可能是账号攻击早期阶段，也可能是应用重试或自动化客户端配置错误。",
+                ["IAM 登录日志", "账号风险评分", "成功登录后的主机行为", "变更或压测工单"],
+            )
+            whitelist = {}
+        else:
+            assessment = _assessment(
+                "【真实攻击】- NDR 观察到暴力破解流量",
+                [
+                    _dimension("通信主体", f"{src_ip} 从异常来源持续访问 {destination}{target}。", "risk"),
+                    _dimension("认证行为", f"failed_login_count_10m={failed_count}，覆盖 {feature_fields['target_accounts']} 个账号。", "risk"),
+                    _dimension("时序与流量", f"request_count_5m={request_count}，连续失败模式符合账号攻击特征。", "risk"),
+                    _dimension("处置结果", f"认证接口返回 {feature_fields['response_code']}，需确认是否存在成功登录。", "blocked"),
+                ],
+                "NDR 观察到高频失败认证；当前无法仅凭网络侧确认是否有凭证成功使用。",
+                "可能导致账号接管或服务账号滥用，应立即关联 IAM、主机和业务审计。",
+                ["IAM 登录日志", "成功登录后的会话", "账号锁定状态", "源 IP 信誉"],
+            )
+            whitelist = {}
+
+    return {
+        "alert_id": _alert_id("ndr", rng),
+        "source": "direct",
+        "product": "ndr",
+        "event_type": event_type,
+        "severity": "low" if fp else ("medium" if suspicious else "high"),
+        "timestamp": _timestamp(rng),
+        "payload": {
+            "feature": feature,
+            "rule_id": rule_id,
+            "rule_name": f"NDR {label} detection",
+            "attack_type": feature,
+            "src_ip": src_ip,
+            "host": host,
+            "src_host": host,
+            "dst_ip": _ip(rng, "10.80.4"),
+            "dst_port": dst_port,
+            "protocol": protocol,
+            "sni": destination,
+            "network_segment": "payment-api-prod" if "pay" in host else "server-prod",
+            "detection": feature_fields,
+            "related_events": [] if fp or suspicious else ["WAF correlated request anomaly", "SIEM observed related account or application signal"],
+            "evidence_assessment": assessment,
+            "whitelist_candidate": whitelist,
+        },
+    }
+
+
+def _ndr(rng: random.Random, scenario: str, feature: str) -> dict[str, Any]:
+    if feature in {"sql_injection", "brute_force"}:
+        return _ndr_application_feature(rng, scenario, feature)
+    fp = scenario == "false_positive"
+    suspicious = scenario == "suspicious"
+    rule_id = "NDR-BACKUP-BASELINE-004" if fp else ("NDR-TLS-REVIEW-014" if suspicious else ("NDR-TLS-BEACON-018" if feature == "c2_beacon" else "NDR-EXFIL-RATIO-031"))
     host = rng.choice(["pay-api-prod-03", "core-db-17", "reporting-srv-09"])
     dst_ip = "10.80.4.20" if fp else f"198.51.100.{rng.randrange(10, 240)}"
     sni = "backup-vault.internal" if fp else rng.choice(["cdn-update-check.example", "storage-sync.example", "telemetry-edge.example"])
@@ -618,6 +950,7 @@ def _ndr(rng: random.Random, requested: str) -> dict[str, Any]:
         "severity": "low" if fp else ("medium" if suspicious else ("critical" if rule_id == "NDR-EXFIL-RATIO-031" else "high")),
         "timestamp": _timestamp(rng),
         "payload": {
+            "feature": feature,
             "rule_id": rule_id,
             "rule_name": "Approved backup replication baseline" if fp else ("Rare outbound TLS needs review" if suspicious else "Rare outbound TLS beacon or exfiltration pattern"),
             "src_ip": _ip(rng, "10.30.2"),
@@ -655,8 +988,7 @@ def _ndr(rng: random.Random, requested: str) -> dict[str, Any]:
     }
 
 
-def _siem(rng: random.Random, requested: str) -> dict[str, Any]:
-    scenario = _scenario(rng, requested)
+def _siem(rng: random.Random, scenario: str, feature: str) -> dict[str, Any]:
     fp = scenario == "false_positive"
     suspicious = scenario == "suspicious"
     host = rng.choice(["core-db-17", "core-db-22", "ledger-rpt-04"])
@@ -759,6 +1091,7 @@ def _siem(rng: random.Random, requested: str) -> dict[str, Any]:
         "severity": "medium" if fp or suspicious else "critical",
         "timestamp": _timestamp(rng),
         "payload": {
+            "feature": feature,
             "rule_id": rule_id,
             "rule_name": "Approved maintenance behavior matched correlation rule" if fp else ("Service account weak correlation needs review" if suspicious else "High value asset lateral movement with suspicious admin share and PowerShell chain"),
             "case_priority": "P3" if fp else ("P2" if suspicious else "P1"),
@@ -792,8 +1125,7 @@ def _siem(rng: random.Random, requested: str) -> dict[str, Any]:
     }
 
 
-def _rasp_realistic(rng: random.Random, requested: str) -> dict[str, Any]:
-    scenario = _scenario(rng, requested)
+def _rasp_realistic(rng: random.Random, scenario: str, feature: str) -> dict[str, Any]:
     fp = scenario == "false_positive"
     suspicious = scenario == "suspicious"
     variants = [
@@ -940,7 +1272,8 @@ def _rasp_realistic(rng: random.Random, requested: str) -> dict[str, Any]:
             "missing": ["主机进程审计", "容器运行时日志", "应用访问日志", "同源 IP 后续行为"],
         },
     ]
-    variant = _choice(rng, variants)
+    matching = [item for item in variants if item["kind"] == feature or item["attack_type"] == feature]
+    variant = _choice(rng, matching or variants)
     trace_id = f"rasp-trace-{rng.randrange(1000, 9999)}"
     request_id = f"{rng.getrandbits(128):032x}"
     attack_time = _timestamp(rng)
@@ -1080,6 +1413,7 @@ def _rasp_realistic(rng: random.Random, requested: str) -> dict[str, Any]:
         "severity": "low" if fp else ("medium" if suspicious else "high"),
         "timestamp": attack_time,
         "payload": {
+            "feature": feature,
             "rule_id": rule_id,
             "rule_name": rule_name,
             "trace_id": trace_id,

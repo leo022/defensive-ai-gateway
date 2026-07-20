@@ -4,6 +4,7 @@ import json
 import tempfile
 import threading
 import unittest
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -179,6 +180,57 @@ class ApprovalHTTPIntegrationTest(unittest.TestCase):
                     decided = json.loads(response.read())
                 self.assertEqual(decided["approval"]["status"], "rejected")
                 self.assertEqual(decided["approval"]["execution_status"], "not_executed")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+
+class CaseDetailHTTPIntegrationTest(unittest.TestCase):
+    def test_scoped_case_detail_endpoints_return_only_requested_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            config.database.path = str(Path(tmp) / "gateway.db")
+            config.server.host = "127.0.0.1"
+            config.server.port = 0
+            config.processing.async_enabled = False
+            server = build_server(config)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base = f"http://127.0.0.1:{server.server_address[1]}"
+            try:
+                sample = json.loads(Path("samples/waf_alert.json").read_text(encoding="utf-8"))
+                request = urllib.request.Request(
+                    f"{base}/api/alerts",
+                    data=json.dumps(sample).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    analyzed = json.loads(response.read())
+
+                expected_types = {
+                    "raw-alerts": "raw_alert",
+                    "normalized-evidence": "normalized_evidence",
+                    "analysis-runs": "agent_run",
+                }
+                for section, record_type in expected_types.items():
+                    with self.subTest(section=section):
+                        with urllib.request.urlopen(
+                            f"{base}/api/cases/{analyzed['case_id']}/details/{section}", timeout=5
+                        ) as response:
+                            payload = json.loads(response.read())
+                        self.assertEqual(payload["section"], section)
+                        self.assertEqual(payload["case"]["case_id"], analyzed["case_id"])
+                        self.assertNotIn("linked_alerts", payload)
+                        self.assertTrue(payload["items"])
+                        self.assertEqual(payload["items"][0]["record_type"], record_type)
+
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(
+                        f"{base}/api/cases/{analyzed['case_id']}/details/not-a-section", timeout=5
+                    )
+                self.assertEqual(raised.exception.code, 404)
             finally:
                 server.shutdown()
                 server.server_close()

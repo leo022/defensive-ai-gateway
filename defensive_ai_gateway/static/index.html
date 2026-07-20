@@ -21,7 +21,13 @@
         </div>
         <nav id="primary-navigation" class="primary-nav" aria-label="Main">
           <button class="nav-button active" type="button" data-view="monitor" data-i18n="navMonitor">监控大屏</button>
-          <button class="nav-button" type="button" data-view="dashboard" data-i18n="navDashboard">处置台</button>
+          <div id="dashboard-nav-group" class="nav-group" data-view-group="dashboard">
+            <button id="dashboard-nav-parent" class="nav-button nav-parent" type="button" data-view="dashboard" data-secondary-group="dashboard" data-default-secondary="pending"><span data-i18n="navDashboard">处置台</span></button>
+            <div id="dashboard-submenu" class="nav-submenu" role="group" data-i18n-aria-label="dashboardSecondaryNav">
+              <button id="dashboard-tab-pending" class="nav-subbutton active" type="button" data-view="dashboard" data-secondary-group="dashboard" data-secondary-target="pending" aria-controls="dashboard-pending-panel" data-i18n="dashboardSubPending">待处理队列</button>
+              <button id="dashboard-tab-history" class="nav-subbutton" type="button" data-view="dashboard" data-secondary-group="dashboard" data-secondary-target="history" aria-controls="dashboard-history-panel" data-i18n="dashboardSubHistory">处理记录</button>
+            </div>
+          </div>
           <div id="memory-nav-group" class="nav-group" data-view-group="memory">
             <button id="memory-nav-parent" class="nav-button nav-parent" type="button" data-view="memory" data-secondary-group="memory" data-default-secondary="inventory"><span data-i18n="navMemory">记忆治理</span></button>
             <div id="memory-submenu" class="nav-submenu" role="group" data-i18n-aria-label="memorySecondaryNav">
@@ -126,14 +132,15 @@
           </section>
 
           <section id="dashboard-view" class="view">
-            <section class="panel queue-panel">
-              <div class="panel-heading">
+            <div id="dashboard-pending-panel" class="secondary-view active" aria-labelledby="dashboard-tab-pending" data-secondary-panel="dashboard" data-secondary-name="pending">
+            <section class="panel queue-home-panel" aria-labelledby="queue-browser-title">
+              <div class="panel-heading queue-home-heading">
                 <div>
-                  <h2 data-i18n="latestCases">Case 队列</h2>
-                  <p data-i18n="latestCasesHint">按创建时间排序，处置后队列顺序保持不变。</p>
+                  <h2 id="queue-browser-title" data-i18n="triageQueue">待处理队列</h2>
+                  <p data-i18n="triageQueueHint">仅显示尚未完成的 Case；点击一条记录进入研判与处置。</p>
                 </div>
               </div>
-              <form id="case-search-form" class="case-search-form">
+              <form id="case-search-form" class="case-search-form" data-case-search-section="pending">
                 <label>
                   <span data-i18n="caseSearchProduct">系统</span>
                   <select id="case-filter-product" name="product">
@@ -179,7 +186,81 @@
                   <button type="button" id="case-search-reset" data-i18n="caseSearchReset">重置</button>
                 </div>
               </form>
-              <div id="cases-list" class="case-list"></div>
+              <div id="cases-list" class="case-list" aria-live="polite"></div>
+            </section>
+            </div>
+
+            <div id="dashboard-history-panel" class="secondary-view" aria-labelledby="dashboard-tab-history" data-secondary-panel="dashboard" data-secondary-name="history" hidden>
+            <section class="panel queue-home-panel" aria-labelledby="history-browser-title">
+              <div class="panel-heading queue-home-heading">
+                <div>
+                  <h2 id="history-browser-title" data-i18n="processedQueue">处理记录</h2>
+                  <p data-i18n="processedQueueHint">保留已完成处置的 Case，支持按条件检索并追溯历史研判。</p>
+                </div>
+              </div>
+              <form id="case-history-search-form" class="case-search-form" data-case-search-section="history">
+                <label>
+                  <span data-i18n="caseSearchProduct">系统</span>
+                  <select id="history-case-filter-product" name="product">
+                    <option value="" data-i18n="caseSearchAll">全部</option>
+                    <option value="waf">WAF</option>
+                    <option value="hips">HIPS</option>
+                    <option value="ndr">NDR</option>
+                    <option value="rasp">RASP</option>
+                    <option value="siem">SIEM</option>
+                  </select>
+                </label>
+                <label>
+                  <span data-i18n="caseSearchSeverity">风险等级</span>
+                  <select id="history-case-filter-severity" name="severity">
+                    <option value="" data-i18n="caseSearchAll">全部</option>
+                    <option value="critical" data-i18n="severityCritical">严重</option>
+                    <option value="high" data-i18n="severityHigh">高</option>
+                    <option value="medium" data-i18n="severityMedium">中</option>
+                    <option value="low" data-i18n="severityLow">低</option>
+                  </select>
+                </label>
+                <label>
+                  <span data-i18n="caseSearchStatus">处置状态</span>
+                  <select id="history-case-filter-status" name="status">
+                    <option value="" data-i18n="caseSearchAll">全部</option>
+                    <option value="open" data-i18n="caseStatusOpen">待处置</option>
+                    <option value="under_review" data-i18n="caseStatusUnderReview">人工复核</option>
+                    <option value="confirmed_attack" data-i18n="caseStatusConfirmedAttack">确认攻击</option>
+                    <option value="false_positive" data-i18n="caseStatusFalsePositive">业务误报</option>
+                    <option value="closed" data-i18n="caseStatusClosed">已关闭</option>
+                  </select>
+                </label>
+                <label>
+                  <span data-i18n="caseSearchFrom">开始时间</span>
+                  <input id="history-case-filter-from" name="from" type="datetime-local" />
+                </label>
+                <label>
+                  <span data-i18n="caseSearchTo">结束时间</span>
+                  <input id="history-case-filter-to" name="to" type="datetime-local" />
+                </label>
+                <div class="case-search-actions">
+                  <button type="submit" data-i18n="caseSearchSubmit">搜索</button>
+                  <button type="button" id="case-history-search-reset" data-i18n="caseSearchReset">重置</button>
+                </div>
+              </form>
+              <div id="processed-cases-list" class="case-list" aria-live="polite"></div>
+            </section>
+            </div>
+          </section>
+
+          <section id="triage-view" class="view">
+            <header class="triage-page-header">
+              <button id="triage-back" class="triage-back" type="button" data-i18n="triageBack">返回待处理队列</button>
+              <div>
+                <h2 data-i18n="triageDetail">研判与处置</h2>
+                <p data-i18n="triageDetailHint">完成研判、处置与审批；详细信息按需在独立页面中查看。</p>
+              </div>
+            </header>
+            <section class="triage-page-content" aria-label="Triage and disposition">
+              <div id="case-detail" class="case-detail" aria-live="polite">
+                <p class="empty-state" data-i18n="triageSelectPrompt">从待处理队列选择一条 Case，开始研判与处置。</p>
+              </div>
             </section>
           </section>
           <section id="memory-view" class="view">
@@ -291,7 +372,7 @@
             <label>
               <span data-i18n="model">模型</span>
               <div class="model-picker">
-                <input id="llm-model" name="model" type="text" list="ollama-models" placeholder="gemma3:4b" />
+                <input id="llm-model" name="model" type="text" list="ollama-models" placeholder="请选择已同步的 Ollama 模型" />
               <button type="button" id="load-llm-models" data-i18n="loadModels">同步模型</button>
               </div>
               <datalist id="ollama-models"></datalist>

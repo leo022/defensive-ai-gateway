@@ -289,7 +289,7 @@ auth:
                     headers={"X-Defensive-AI-Demo-Sample": "1"},
                 )
                 self.assertEqual(status, 202)
-                self.assertEqual(body["classification"], "benign")
+                self.assertEqual(body["classification"], "malicious")
             finally:
                 srv.stop()
 

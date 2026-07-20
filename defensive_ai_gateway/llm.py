@@ -107,16 +107,38 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         raise urllib.error.HTTPError(req.full_url, code, "redirects are not allowed", headers, fp)
 
 
-def _open_no_redirect(req: urllib.request.Request, timeout: float):
-    return urllib.request.build_opener(_NoRedirectHandler()).open(req, timeout=timeout)
+def _open_no_redirect(
+    req: urllib.request.Request,
+    timeout: float,
+    *,
+    bypass_proxy: bool = False,
+):
+    handlers: list[Any] = [_NoRedirectHandler()]
+    if bypass_proxy:
+        # Ollama is a local or explicitly allowlisted internal service. urllib
+        # otherwise inherits HTTP(S)_PROXY from the process environment, which
+        # can send localhost requests to a corporate proxy and turn a healthy
+        # local Ollama instance into an unexpected HTTP 403.
+        handlers.insert(0, urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener(*handlers).open(req, timeout=timeout)
 
 
-def _open_with_retry(req: urllib.request.Request, timeout: Any, max_retries: int = 1):
+def _open_with_retry(
+    req: urllib.request.Request,
+    timeout: Any,
+    max_retries: int = 1,
+    *,
+    bypass_proxy: bool = False,
+):
     bounded_timeout = _bounded_timeout(timeout)
     attempts = max(1, min(int(max_retries) + 1, 4))
     for attempt in range(attempts):
         try:
-            return _open_no_redirect(req, timeout=bounded_timeout)
+            return _open_no_redirect(
+                req,
+                timeout=bounded_timeout,
+                bypass_proxy=bypass_proxy,
+            )
         except urllib.error.HTTPError as exc:
             if exc.code not in _RETRYABLE_HTTP_CODES or attempt + 1 >= attempts:
                 raise
@@ -905,7 +927,12 @@ class OllamaLLM(LLMClient):
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with _open_with_retry(req, self.config.timeout_seconds, self.config.max_retries) as resp:
+        with _open_with_retry(
+            req,
+            self.config.timeout_seconds,
+            self.config.max_retries,
+            bypass_proxy=True,
+        ) as resp:
             limit = max(65_536, min(int(self.config.max_response_bytes), 10_000_000))
             data = json.loads(_read_limited_response(resp, limit).decode("utf-8"))
         if not isinstance(data, dict):

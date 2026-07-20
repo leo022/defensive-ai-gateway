@@ -37,8 +37,25 @@ python3 scripts/send_sample.py --file samples/siem_case.json
 You can also generate random attack or false-positive alerts:
 
 ```bash
+# --file always sends the JSON sample as-is
+python3 scripts/send_sample.py --file samples/ndr_alert.json
+
+# --random randomizes product, scenario, and the product feature
 python3 scripts/send_sample.py --random --count 5 --product waf --scenario random
 python3 scripts/send_sample.py --random --count 3 --product waf --scenario false_positive --seed 42
+
+# Keep the product feature fixed; for example, generate NDR brute-force alerts
+python3 scripts/send_sample.py --random --count 3 --product ndr --feature brute_force --scenario attack
+python3 scripts/send_sample.py --random --count 3 --product ndr --feature sql_injection --scenario attack
+
+# List supported feature IDs (aliases such as sqli, bruteforce and c2 are accepted)
+python3 scripts/send_sample.py --list-features
+```
+
+`--file` and `--random` are separate sending modes. `--feature` controls the security behavior, while `--scenario` controls whether the generated sample is an attack, review case, or false positive. When omitted, the feature is selected randomly. The offline harness supports the same selector:
+
+```bash
+python3 scripts/run_harness.py --samples samples --random-count 10 --random-product ndr --random-feature brute_force
 ```
 
 ## Real Log Format Adaptation

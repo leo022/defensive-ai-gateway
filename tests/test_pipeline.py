@@ -16,7 +16,7 @@ from defensive_ai_gateway.models import AgentResult, RawAlert, RecommendedAction
 from defensive_ai_gateway.normalizer import EventNormalizer
 from defensive_ai_gateway.orchestrator import Orchestrator
 from defensive_ai_gateway.policy import PolicyEngine
-from defensive_ai_gateway.sample_alerts import generate_alert, generate_alerts
+from defensive_ai_gateway.sample_alerts import available_features, generate_alert, generate_alerts
 from defensive_ai_gateway.syslog_router import SyslogPortRouter
 
 
@@ -444,6 +444,31 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(raw_log["items"][0]["rule_id"], payload["rule_id"])
             self.assertIn("hook_data", raw_log["items"][0])
             self.assertIn("stacktrace", raw_log["items"][0])
+
+    def test_feature_selector_generates_fixed_product_feature(self):
+        ndr_sql = generate_alert(product="ndr", scenario="attack", feature="sqli", seed=11)
+        ndr_brute = generate_alert(product="ndr", scenario="attack", feature="bruteforce", seed=11)
+        rasp_cmd = generate_alert(product="rasp", scenario="attack", feature="command_execution", seed=11)
+
+        self.assertEqual(ndr_sql["payload"]["feature"], "sql_injection")
+        self.assertEqual(ndr_sql["event_type"], "sql_injection_detected")
+        self.assertEqual(ndr_brute["payload"]["feature"], "brute_force")
+        self.assertEqual(ndr_brute["event_type"], "brute_force_detected")
+        self.assertEqual(rasp_cmd["payload"]["feature"], "command_execution")
+        self.assertEqual(rasp_cmd["payload"]["items"][0]["attack_type"], "command_execution")
+
+    def test_random_feature_generation_is_repeatable_and_covers_ndr_features(self):
+        first = generate_alerts(20, product="ndr", scenario="attack", seed=2026)
+        second = generate_alerts(20, product="ndr", scenario="attack", seed=2026)
+
+        self.assertEqual(first, second)
+        self.assertTrue({item["payload"]["feature"] for item in first}.issubset(set(available_features("ndr"))))
+        self.assertGreaterEqual(len({item["payload"]["feature"] for item in first}), 2)
+
+    def test_feature_and_random_scenario_select_a_compatible_scenario(self):
+        payload = generate_alert(product="waf", feature="path-traversal", seed=3)
+        self.assertEqual(payload["payload"]["feature"], "path_traversal")
+        self.assertEqual(payload["payload"]["rule_id"], "WAF-930-LFI")
 
     def test_suspicious_sample_generation_has_review_verdict(self):
         for product in ["waf", "hips", "rasp", "ndr", "siem"]:

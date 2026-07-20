@@ -128,6 +128,49 @@ class WorkflowGovernanceTest(unittest.TestCase):
             )
             self.assertTrue(two["case_can_close_as_false_positive"])
 
+    def test_clean_removes_alert_dispositions_with_runtime_alert_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _, orchestrator = _build(tmp)
+            result = orchestrator.handle_alert(_alert("alert-clean-disposition"))
+            self.assertIsNotNone(
+                repo.set_alert_disposition(
+                    "alert-clean-disposition",
+                    "false_positive",
+                    "analyst",
+                    "known maintenance traffic",
+                )
+            )
+
+            deleted = _delete(repo.conn, False, False, False)
+
+            self.assertEqual(deleted["alert_dispositions"], 1)
+            self.assertIsNone(repo.get_alert_disposition("alert-clean-disposition"))
+            self.assertIsNone(repo.get_case(result.case_id))
+            self.assertEqual(repo.conn.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+
+    def test_alert_disposition_is_scoped_to_the_case_that_owns_the_link(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _, orchestrator = _build(tmp)
+            first = orchestrator.handle_alert(_alert("alert-reused"))
+            first_alert = repo.get_case(first.case_id)["linked_alerts"][0]
+            repo.set_alert_disposition("alert-reused", "false_positive", "analyst", "old case")
+
+            second = orchestrator.handle_alert(
+                _alert(
+                    "alert-current",
+                    timestamp="2026-07-14T04:00:00Z",
+                    host="current-host",
+                )
+            )
+            # A reset/re-ingest can attach the same alert_id to a new Case while
+            # an old disposition row remains. The old verdict must not leak into
+            # the new Case's linked-alert view.
+            repo.link_case_alert(second.case_id, "alert-reused", first_alert["event_id"])
+
+            linked = repo.get_case(second.case_id)["linked_alerts"]
+            reused = next(item for item in linked if item["alert_id"] == "alert-reused")
+            self.assertIsNone(reused["disposition"])
+
     def test_open_case_outside_time_window_gets_new_case(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo, _, orchestrator = _build(tmp)

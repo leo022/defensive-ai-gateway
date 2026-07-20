@@ -80,12 +80,84 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
         raise urllib.error.HTTPError(req.full_url, code, "redirects are not allowed", headers, fp)
 
+
+def _open_ollama(req: urllib.request.Request, timeout: float):
+    """Open an allowlisted Ollama URL without inheriting environment proxies."""
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        _NoRedirectHandler(),
+    ).open(req, timeout=timeout)
+
 _CASE_DISPOSITIONS = {
     "under_review": "escalate_case_review",
     "confirmed_attack": "confirm_case_attack",
     "closed": "close_case",
     "open": "reopen_case",
 }
+
+_CASE_DETAIL_SECTIONS = {"raw-alerts", "normalized-evidence", "analysis-runs"}
+
+
+def _case_detail_summary(case_data: dict) -> dict:
+    """Return the case metadata shared by the scoped detail endpoints."""
+    fields = (
+        "case_id",
+        "product",
+        "status",
+        "severity",
+        "classification",
+        "confidence",
+        "summary",
+        "updated_at_ms",
+    )
+    return {field: case_data.get(field) for field in fields}
+
+
+def _case_detail_section_payload(case_data: dict, section: str) -> dict:
+    """Build a narrowly scoped case-detail response for the dedicated detail page."""
+    linked_alerts = case_data.get("linked_alerts") or []
+    if section == "raw-alerts":
+        items = [
+            {
+                "record_type": "raw_alert",
+                "alert_id": link.get("alert_id"),
+                "event_id": link.get("event_id"),
+                "linked_at_ms": link.get("linked_at_ms"),
+                "disposition": link.get("disposition"),
+                "data": link.get("raw_alert"),
+            }
+            for link in linked_alerts
+            if link.get("raw_alert") is not None
+        ]
+    elif section == "normalized-evidence":
+        items = [
+            {
+                "record_type": "normalized_evidence",
+                "alert_id": link.get("alert_id"),
+                "event_id": link.get("event_id"),
+                "linked_at_ms": link.get("linked_at_ms"),
+                "data": link.get("normalized_event"),
+            }
+            for link in linked_alerts
+            if link.get("normalized_event") is not None
+        ]
+    elif section == "analysis-runs":
+        items = [
+            {"record_type": "agent_run", "data": run}
+            for run in case_data.get("agent_runs") or []
+        ]
+        items.extend(
+            {"record_type": "validation_run", "data": run}
+            for run in case_data.get("validation_runs") or []
+        )
+    else:  # The HTTP handler validates the section before calling this helper.
+        raise ValueError("unsupported case detail section")
+    return {
+        "case": _case_detail_summary(case_data),
+        "section": section,
+        "count": len(items),
+        "items": items,
+    }
 
 _MEMORY_LAYERS = {
     "case_short_term", "product_long_term", "asset_profile", "org_knowledge", "evidence",
@@ -336,7 +408,7 @@ def _validated_llm_endpoint(provider: str, endpoint: str, allowed_hosts: list[st
     if provider == "ollama":
         if host not in _ALLOWED_OLLAMA_HOSTS and host not in allowed:
             raise ValueError(
-                "Ollama endpoint is not in llm.allowed_hosts; explicitly allow the service host"
+                "Ollama endpoint is not in the configured allowlist (llm.allowed_hosts); explicitly allow the service host"
             )
         try:
             resolved = {item[4][0] for item in socket.getaddrinfo(host, parsed.port or 11434, type=socket.SOCK_STREAM)}
@@ -982,7 +1054,7 @@ class GatewayState:
             # retaining the DNS/range SSRF checks for explicit remote services.
             tags_url = _validated_llm_endpoint("ollama", tags_url, llm.allowed_hosts)
             req = urllib.request.Request(tags_url, headers={"Accept": "application/json"}, method="GET")
-            with urllib.request.build_opener(_NoRedirectHandler()).open(req, timeout=10) as resp:
+            with _open_ollama(req, timeout=10) as resp:
                 raw = resp.read(self.config.llm.max_response_bytes + 1)
                 if len(raw) > self.config.llm.max_response_bytes:
                     raise ValueError("Ollama model list response is too large")
@@ -1042,7 +1114,7 @@ class GatewayState:
                     "ollama", tags_url, self.config.llm.allowed_hosts
                 )
                 req = urllib.request.Request(tags_url, headers={"Accept": "application/json"}, method="GET")
-                with urllib.request.build_opener(_NoRedirectHandler()).open(req, timeout=min(timeout, 10)) as resp:
+                with _open_ollama(req, timeout=min(timeout, 10)) as resp:
                     raw = resp.read(self.config.llm.max_response_bytes + 1)
                     if len(raw) > self.config.llm.max_response_bytes:
                         raise ValueError("Ollama response is too large")
@@ -2131,6 +2203,24 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     )
                 },
             )
+            return
+        if parsed.path.startswith("/api/cases/") and "/details/" in parsed.path:
+            if not self._require_roles(_ROLE_READ, _ROLE_ANALYST, _ROLE_APPROVER):
+                return
+            parts = parsed.path.split("/")
+            if len(parts) != 6 or parts[4] != "details":
+                self._json(404, {"error": "case detail endpoint not found"})
+                return
+            case_id = unquote(parts[3])
+            section = unquote(parts[5])
+            if not case_id or section not in _CASE_DETAIL_SECTIONS:
+                self._json(404, {"error": "case detail endpoint not found"})
+                return
+            case_data = self.state.repo.get_case(case_id)
+            if not case_data:
+                self._json(404, {"error": "case not found"})
+                return
+            self._json(200, _case_detail_section_payload(case_data, section))
             return
         if parsed.path.startswith("/api/cases/"):
             if not self._require_roles(_ROLE_READ, _ROLE_ANALYST, _ROLE_APPROVER):

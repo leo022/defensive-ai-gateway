@@ -17,7 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from defensive_ai_gateway.sample_alerts import PRODUCTS, SCENARIOS, generate_alerts
+from defensive_ai_gateway.sample_alerts import PRODUCTS, SCENARIOS, available_features, generate_alerts
 
 HK_TZ = timezone(timedelta(hours=8))
 # Leaf keys whose values identify a single alert instance rather than a scenario.
@@ -143,6 +143,15 @@ def main():
     parser.add_argument("--count", type=int, default=1, help="Number of alerts to send (used with --random or --mutate)")
     parser.add_argument("--product", choices=PRODUCTS, help="Product to randomize; omitted means mixed products")
     parser.add_argument("--scenario", choices=SCENARIOS, default="random", help="Randomized scenario type")
+    parser.add_argument(
+        "--feature",
+        help="Product feature to generate (for example ndr: brute_force); omitted means random feature",
+    )
+    parser.add_argument(
+        "--list-features",
+        action="store_true",
+        help="List supported product features and exit",
+    )
     parser.add_argument("--seed", type=int, help="Seed for repeatable randomized/mutated samples")
     parser.add_argument("--print-only", action="store_true", help="Print payloads without sending them")
     parser.add_argument("--url", default="http://127.0.0.1:8080/api/alerts")
@@ -154,8 +163,26 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.list_features:
+        if args.product:
+            print(json.dumps({args.product: available_features(args.product)}, ensure_ascii=False, indent=2))
+        else:
+            print(json.dumps(available_features(), ensure_ascii=False, indent=2))
+        return
+
+    if args.feature and not args.random:
+        parser.error("--feature can only be used with --random")
+    if args.feature and not args.product:
+        parser.error("--product is required when --feature is specified")
+
     if args.random:
-        payloads = generate_alerts(args.count, product=args.product, scenario=args.scenario, seed=args.seed)
+        payloads = generate_alerts(
+            args.count,
+            product=args.product,
+            scenario=args.scenario,
+            seed=args.seed,
+            feature=args.feature,
+        )
     elif args.mutate:
         if not args.file:
             parser.error("--file is required with --mutate")

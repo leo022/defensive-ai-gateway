@@ -122,6 +122,7 @@ def main():
     parser.add_argument("--random-count", type=int, default=0, help="Append N randomized sample alerts to the replay")
     parser.add_argument("--random-product", choices=PRODUCTS, help="Product for randomized alerts; omitted means mixed products")
     parser.add_argument("--random-scenario", choices=SCENARIOS, default="random", help="Scenario type for randomized alerts")
+    parser.add_argument("--random-feature", help="Feature for randomized alerts; omitted means random feature")
     parser.add_argument("--seed", type=int, help="Seed for repeatable randomized alerts")
     parser.add_argument("--seed-demo-memory", action="store_true", help="Seed approved demo false-positive memory before replay")
     parser.add_argument("--mapping-profile", help="Apply a built-in mapping profile to static sample files before replay")
@@ -175,7 +176,13 @@ def main():
                     f"Validation gate failed for {path}: {item['validation'].get('status', 'missing')}"
                 )
         for idx, payload in enumerate(
-            generate_alerts(args.random_count, product=args.random_product, scenario=args.random_scenario, seed=args.seed),
+            generate_alerts(
+                args.random_count,
+                product=args.random_product,
+                scenario=args.random_scenario,
+                seed=args.seed,
+                feature=args.random_feature,
+            ),
             start=1,
         ):
             alert = RawAlert(

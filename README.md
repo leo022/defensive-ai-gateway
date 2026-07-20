@@ -57,8 +57,25 @@ python3 scripts/send_demo_alerts.py
 也可以随机生成不同特征的攻击或误报告警：
 
 ```bash
+# --file 永远按原 JSON 发送固定样本
+python3 scripts/send_sample.py --file samples/ndr_alert.json
+
+# --random 随机选择产品、场景和该产品支持的攻击特征
 python3 scripts/send_sample.py --random --count 5 --product waf --scenario random
 python3 scripts/send_sample.py --random --count 3 --product waf --scenario false_positive --seed 42
+
+# 固定产品特征，但场景仍可随机；例如 NDR 可生成 SQL 注入或暴力破解
+python3 scripts/send_sample.py --random --count 3 --product ndr --feature brute_force --scenario attack
+python3 scripts/send_sample.py --random --count 3 --product ndr --feature sql_injection --scenario attack
+
+# 查看各产品支持的 feature ID；也接受 sqli、bruteforce、c2 等别名
+python3 scripts/send_sample.py --list-features
+```
+
+`--file` 与 `--random` 是两种互斥的发送模式。`--feature` 只控制攻击特征，`--scenario` 控制真实攻击、人工复核或误报；未指定 `--feature` 时随机选择产品特征。离线 Harness 也支持相同能力：
+
+```bash
+python3 scripts/run_harness.py --samples samples --random-count 10 --random-product ndr --random-feature brute_force
 ```
 
 ## 真实日志格式适配
