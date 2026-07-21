@@ -1009,7 +1009,7 @@ function canReadCases() {
 }
 
 function canReadRuntimeConfig() {
-  return hasAnyRole("read", "config");
+  return hasAnyRole("config");
 }
 
 function canReadMappingProfiles() {
@@ -1035,9 +1035,7 @@ function applyPermission(selector, roles) {
 }
 
 function applySessionPermissions() {
-  applyPermission('#llm-form button[type="submit"]', ["config"]);
-  applyPermission("#test-llm-connection", ["config"]);
-  applyPermission("#restore-llm-defaults", ["config"]);
+  applyPermission("#llm-form input, #llm-form select, #llm-form button", ["config"]);
   applyPermission('#profile-form button[type="submit"]', ["config"]);
   applyPermission("#save-inferred-profile", ["config"]);
   applyPermission('#infer-form button[type="submit"]', ["analyst", "config"]);
@@ -1152,6 +1150,10 @@ function saveLanguagePreference(language) {
   applyLanguage();
 }
 
+function toggleLanguage() {
+  saveLanguagePreference(currentLanguage === "en" ? "zh" : "en");
+}
+
 function applyLanguage() {
   document.documentElement.lang = currentLanguage === "en" ? "en" : "zh-CN";
   document.title = tr("appTitle");
@@ -1172,8 +1174,6 @@ function applyLanguage() {
   applyTheme(document.documentElement.dataset.theme || "light");
   const languageButton = document.querySelector("#language-switch");
   if (languageButton) {
-    const nextLanguage = currentLanguage === "en" ? "zh" : "en";
-    languageButton.dataset.languageValue = nextLanguage;
     languageButton.textContent = tr("languageButton");
     languageButton.setAttribute("aria-label", tr("languageAria"));
   }
@@ -2965,6 +2965,7 @@ function loadViewData(name) {
   if (name === "triage") return Promise.resolve();
   if (name === "dashboard") return loadCases({ section: activeDashboardSection });
   if (name === "settings") {
+    if (!canReadRuntimeConfig()) return Promise.resolve();
     return loadLlmConfig().catch((err) => setConfigStatus(err.message || String(err), true));
   }
   if (name === "memory") {
@@ -2974,11 +2975,14 @@ function loadViewData(name) {
   }
   if (name === "adapter") {
     const section = activeSecondaryView("adapter", "intake");
-    const tasks = [
-      loadSyslogConfig().catch((err) =>
-        setSyslogConfigStatus(tr("syslogConfigLoadFailed", { message: err.message || String(err) }), true),
-      ),
-    ];
+    const tasks = [];
+    if (canReadRuntimeConfig()) {
+      tasks.push(
+        loadSyslogConfig().catch((err) =>
+          setSyslogConfigStatus(tr("syslogConfigLoadFailed", { message: err.message || String(err) }), true),
+        ),
+      );
+    }
     if (section === "config") {
       tasks.push(loadMappingProfiles().catch((err) => setProfileStatus(err.message || String(err), true)));
     }
@@ -3537,8 +3541,8 @@ document.addEventListener("click", (event) => {
 document.querySelector("#theme-switch").addEventListener("click", (event) => {
   saveThemePreference(event.currentTarget.dataset.themeValue);
 });
-document.querySelector("#language-switch").addEventListener("click", (event) => {
-  saveLanguagePreference(event.currentTarget.dataset.languageValue);
+document.querySelector("#language-switch").addEventListener("click", () => {
+  toggleLanguage();
   loadCases().catch((err) => showToast(err.message || String(err), "error"));
 });
 document.querySelector("#llm-form").addEventListener("submit", (event) => {

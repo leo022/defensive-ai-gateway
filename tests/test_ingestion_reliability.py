@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from defensive_ai_gateway.app import GatewayState
 from defensive_ai_gateway.config import GatewayConfig
+from defensive_ai_gateway.json_safety import MAX_JSON_NESTING, MAX_JSON_NODES
 from defensive_ai_gateway.models import RawAlert
 from defensive_ai_gateway.processing import AlertProcessor, DeadLetter
 from defensive_ai_gateway.syslog_receiver import (
@@ -195,6 +196,11 @@ class SyslogFrameDecoderTest(unittest.TestCase):
         decoder.feed(b"5 abc")
         with self.assertRaises(SyslogFrameError):
             decoder.finish()
+
+    def test_json_frame_nesting_is_rejected_while_scanning(self):
+        decoder = SyslogFrameDecoder(max_frame_bytes=4096)
+        with self.assertRaisesRegex(SyslogFrameError, "nesting limit"):
+            decoder.feed(b"{" * (MAX_JSON_NESTING + 1))
 
     def test_tcp_listener_dispatches_each_newline_frame_separately(self):
         received: list[bytes] = []
@@ -387,6 +393,18 @@ class SyslogDemoScriptTest(unittest.TestCase):
 
 
 class SyslogEnvelopeTest(unittest.TestCase):
+    def test_router_rejects_excessive_json_structure(self):
+        router = SyslogPortRouter({"waf": 15140})
+        nested = "{}"
+        for _ in range(MAX_JSON_NESTING + 1):
+            nested = '{"nested":' + nested + "}"
+        with self.assertRaisesRegex(ValueError, "nesting exceeds"):
+            router.route(15140, nested)
+
+        nodes = '{"items":[' + "0," * MAX_JSON_NODES + "0]}"
+        with self.assertRaisesRegex(ValueError, "value count exceeds"):
+            router.route(15140, nodes)
+
     def test_standard_route_preserves_transport_envelope_and_raw_message(self):
         raw = b'<134>1 2026-07-14T10:00:00Z host waf - - - {"alert_id":"waf-1","severity":"high"}'
         router = SyslogPortRouter({"waf": 15140})

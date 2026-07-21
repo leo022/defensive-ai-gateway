@@ -19,6 +19,7 @@ from defensive_ai_gateway.app import (
     build_server,
 )
 from defensive_ai_gateway.config import AuthConfig, GatewayConfig, LLMConfig, load_config
+from defensive_ai_gateway.json_safety import MAX_JSON_NESTING, MAX_JSON_NODES
 from defensive_ai_gateway.database import Repository
 from defensive_ai_gateway.llm import GatewayLLM
 from defensive_ai_gateway.memory import MemoryManager
@@ -216,6 +217,22 @@ auth:
             config.policy.approval_quorum = 1
             _validate_exposed_server_config(config)
 
+    def test_network_bind_rejects_unauthenticated_embedded_syslog(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(Path(tmp))
+            config.server.host = "0.0.0.0"
+            config.auth.allow_loopback_no_token = False
+            config.auth.api_token = "a" * 24
+            config.auth.approver_token = "b" * 24
+            config.policy.approval_quorum = 2
+            config.syslog.embedded_listeners_enabled = True
+            with self.assertRaisesRegex(ValueError, "embedded Syslog"):
+                _validate_exposed_server_config(config)
+
+            config.auth.demo_mode = True
+            with self.assertRaisesRegex(ValueError, "embedded Syslog"):
+                _validate_exposed_server_config(config)
+
     def test_post_without_token_is_401_when_token_configured(self):
         with tempfile.TemporaryDirectory() as tmp:
             srv = _Server(_config(Path(tmp), token="secret"))
@@ -300,6 +317,21 @@ auth:
                 status, _ = srv.get("/api/config/llm", token="")
                 self.assertEqual(status, 401)
                 status, _ = srv.get("/api/config/llm", token="secret")
+                self.assertEqual(status, 200)
+            finally:
+                srv.stop()
+
+    def test_read_role_cannot_view_or_probe_runtime_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(Path(tmp), token="admin-token")
+            config.auth.operator_token = "read-only-operator-token"
+            srv = _Server(config)
+            try:
+                for path in ("/api/config/llm", "/api/config/llm/models", "/api/config/syslog"):
+                    with self.subTest(path=path):
+                        status, _ = srv.get(path, token="read-only-operator-token")
+                        self.assertEqual(status, 403)
+                status, _ = srv.get("/api/config/llm", token="admin-token")
                 self.assertEqual(status, 200)
             finally:
                 srv.stop()
@@ -583,15 +615,92 @@ class OversizedBodyTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             srv = _Server(_config(Path(tmp), token=""))
             try:
-                # Content-Length: -1 must be treated as empty (clamped), not read-until-EOF.
+                # Content-Length: -1 must be rejected, not read-until-EOF.
                 import http.client
                 conn = http.client.HTTPConnection("127.0.0.1", srv.server.server_address[1], timeout=5)
                 conn.request("POST", "/api/alerts", body=b"", headers={"Content-Length": "-1", "Content-Type": "application/json"})
                 resp = conn.getresponse()
-                # An empty body is invalid JSON for /api/alerts → 400 (client error), not a hang/500.
-                self.assertIn(resp.status, (400, 500))
+                self.assertEqual(resp.status, 400)
                 resp.read()
                 conn.close()
+            finally:
+                srv.stop()
+
+    def test_ambiguous_http_framing_and_excessive_json_structure_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            srv = _Server(_config(Path(tmp), token=""))
+            try:
+                nested = "{}"
+                for _ in range(MAX_JSON_NESTING + 1):
+                    nested = '{"nested":' + nested + "}"
+                nested_bytes = nested.encode("utf-8")
+                node_budget_bytes = b'{"items":[' + b"0," * MAX_JSON_NODES + b"0]}"
+
+                def content_length_request(body: bytes) -> bytes:
+                    return (
+                        b"POST /api/memory/sweep HTTP/1.1\r\n"
+                        b"Host: 127.0.0.1\r\n"
+                        b"Content-Type: application/json\r\n"
+                        + b"Content-Length: "
+                        + str(len(body)).encode("ascii")
+                        + b"\r\nConnection: close\r\n\r\n"
+                        + body
+                    )
+
+                requests = {
+                    "chunked": (
+                        b"POST /api/memory/sweep HTTP/1.1\r\n"
+                        b"Host: 127.0.0.1\r\n"
+                        b"Content-Type: application/json\r\n"
+                        b"Transfer-Encoding: chunked\r\n"
+                        b"Connection: close\r\n\r\n"
+                        b"2\r\n{}\r\n0\r\n\r\n",
+                        b"Transfer-Encoding is not supported",
+                    ),
+                    "duplicate_content_length": (
+                        b"POST /api/memory/sweep HTTP/1.1\r\n"
+                        b"Host: 127.0.0.1\r\n"
+                        b"Content-Type: application/json\r\n"
+                        b"Content-Length: 0\r\n"
+                        b"Content-Length: 2\r\n"
+                        b"Connection: close\r\n\r\n{}",
+                        b"duplicate Content-Length",
+                    ),
+                    "signed_content_length": (
+                        b"POST /api/memory/sweep HTTP/1.1\r\n"
+                        b"Host: 127.0.0.1\r\n"
+                        b"Content-Type: application/json\r\n"
+                        b"Content-Length: +2\r\n"
+                        b"Connection: close\r\n\r\n{}",
+                        b"invalid Content-Length",
+                    ),
+                    "excessive_nesting": (
+                        content_length_request(nested_bytes),
+                        b"JSON nesting exceeds",
+                    ),
+                    "excessive_node_count": (
+                        content_length_request(node_budget_bytes),
+                        b"JSON value count exceeds",
+                    ),
+                }
+                for name, (request, error_text) in requests.items():
+                    with self.subTest(name=name):
+                        conn = socket.create_connection(
+                            ("127.0.0.1", srv.server.server_address[1]), timeout=5
+                        )
+                        try:
+                            conn.sendall(request)
+                            chunks = []
+                            while True:
+                                chunk = conn.recv(4096)
+                                if not chunk:
+                                    break
+                                chunks.append(chunk)
+                            response = b"".join(chunks)
+                        finally:
+                            conn.close()
+                        self.assertEqual(response.split(b"\r\n", 1)[0].split()[1], b"400")
+                        self.assertIn(error_text, response)
             finally:
                 srv.stop()
 

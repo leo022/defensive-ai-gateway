@@ -361,16 +361,18 @@ class PipelineTest(unittest.TestCase):
             config.database.path = str(Path(tmp) / "gateway.db")
             config.llm.allowed_hosts = ["llm-gateway.internal"]
             state = GatewayState(config)
-            updated = state.update_llm_config(
-                {
-                    "provider": "gateway",
-                    "endpoint": "https://llm-gateway.internal/analyze",
-                    "api_key": "secret-value",
-                    "api_key_env": "BANK_LLM_KEY",
-                    "model": "bank-sec-analyst",
-                    "timeout_seconds": 45,
-                }
-            )
+            resolution = [(None, None, None, None, ("10.42.0.17", 443))]
+            with patch("defensive_ai_gateway.app.socket.getaddrinfo", return_value=resolution):
+                updated = state.update_llm_config(
+                    {
+                        "provider": "gateway",
+                        "endpoint": "https://llm-gateway.internal/analyze",
+                        "api_key": "secret-value",
+                        "api_key_env": "BANK_LLM_KEY",
+                        "model": "bank-sec-analyst",
+                        "timeout_seconds": 45,
+                    }
+                )
             self.assertEqual(updated["provider"], "gateway")
             self.assertEqual(updated["endpoint"], "https://llm-gateway.internal/analyze")
             self.assertEqual(updated["model"], "bank-sec-analyst")

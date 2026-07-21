@@ -6,6 +6,8 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from .json_safety import MAX_JSON_NESTING
+
 
 @dataclass(frozen=True)
 class SyslogListenerSpec:
@@ -103,6 +105,8 @@ class SyslogFrameDecoder:
                 in_string = True
             elif byte in (ord("{"), ord("[")):
                 stack.append(byte)
+                if len(stack) > MAX_JSON_NESTING:
+                    raise SyslogFrameError("JSON syslog frame exceeds the nesting limit")
             elif byte in (ord("}"), ord("]")):
                 expected = ord("{") if byte == ord("}") else ord("[")
                 if not stack or stack[-1] != expected:

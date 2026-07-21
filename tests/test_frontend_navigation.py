@@ -138,6 +138,10 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
             self.assertEqual(JS.count(f"{key}:"), 2)
         self.assertIn("function setSecondaryView", JS)
         self.assertIn("function loadViewData", JS)
+        self.assertIn("function toggleLanguage()", JS)
+        self.assertIn('saveLanguagePreference(currentLanguage === "en" ? "zh" : "en")', JS)
+        self.assertIn('document.querySelector("#language-switch").addEventListener("click", () => {', JS)
+        self.assertNotIn("event.currentTarget.dataset.languageValue", JS)
         self.assertIn('.nav-subbutton[data-secondary-group=', JS)
         self.assertIn('btn.setAttribute("aria-current", "page")', JS)
         self.assertIn(".nav-group.active .nav-subbutton.active", CSS)
@@ -161,6 +165,7 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertIn('applyPermission(".case-disposition-button", ["analyst"])', JS)
         self.assertIn('applyPermission(".approval-decision", ["approver"])', JS)
         self.assertIn('applyPermission("[data-memory-action]", ["memory"])', JS)
+        self.assertIn('applyPermission("#llm-form input, #llm-form select, #llm-form button", ["config"])', JS)
         self.assertIn("let memorySelectionRequestId = 0", JS)
         self.assertIn("requestId !== memorySelectionRequestId", JS)
         self.assertIn("const memoryId = button.dataset.memoryId", JS)
@@ -172,7 +177,7 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
 
     def test_role_scoped_loading_keeps_dashboard_independent_of_config_access(self):
         self.assertIn('return hasAnyRole("read", "analyst", "approver")', JS)
-        self.assertIn('return hasAnyRole("read", "config")', JS)
+        self.assertIn('return hasAnyRole("config")', JS)
         self.assertIn('return hasAnyRole("read", "config", "analyst")', JS)
 
         dashboard = JS.split("async function loadDashboardRuntime()", 1)[1].split(
@@ -194,6 +199,12 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertIn("if (canReadMappingProfiles())", bootstrap)
         self.assertIn("tasks.push(loadMappingProfiles())", bootstrap)
         self.assertNotIn("return Promise.all([", bootstrap)
+
+        view_loader = JS.split("function loadViewData(name)", 1)[1].split(
+            "function refreshCurrentView", 1
+        )[0]
+        self.assertIn('if (!canReadRuntimeConfig()) return Promise.resolve();', view_loader)
+        self.assertIn('const tasks = [];', view_loader)
 
     def test_theme_bootstrap_is_external_for_strict_csp(self):
         self.assertIn('<script src="/theme-init.js"></script>', HTML)

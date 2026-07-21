@@ -8,8 +8,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from defensive_ai_gateway.agents.registry import build_agent
-from defensive_ai_gateway.app import GatewayState
+from defensive_ai_gateway.app import GatewayState, _validated_llm_endpoint
 from defensive_ai_gateway.config import GatewayConfig, LLMConfig
+from defensive_ai_gateway.json_safety import MAX_JSON_NESTING
 from defensive_ai_gateway.llm import (
     MAX_LLM_RESPONSE_BYTES,
     GatewayLLM,
@@ -72,6 +73,27 @@ class OllamaProxyIsolationTest(unittest.TestCase):
             with _open_no_redirect(request, 1, bypass_proxy=True):
                 pass
 
+        handlers = build_opener.call_args.args
+        proxy_handlers = [
+            handler for handler in handlers if isinstance(handler, urllib.request.ProxyHandler)
+        ]
+        self.assertEqual(len(proxy_handlers), 1)
+        self.assertEqual(proxy_handlers[0].proxies, {})
+
+    def test_gateway_requests_disable_environment_proxies(self):
+        opener = _Opener(
+            _Response(json.dumps({"classification": "suspicious", "confidence": 0.6}).encode())
+        )
+        llm = GatewayLLM(
+            LLMConfig(provider="gateway", endpoint="http://127.0.0.1:9999/analyze", model="test")
+        )
+        with patch(
+            "defensive_ai_gateway.llm.urllib.request.build_opener",
+            return_value=opener,
+        ) as build_opener:
+            result = llm.analyze("prompt", {})
+
+        self.assertEqual(result["classification"], "suspicious")
         handlers = build_opener.call_args.args
         proxy_handlers = [
             handler for handler in handlers if isinstance(handler, urllib.request.ProxyHandler)
@@ -232,6 +254,34 @@ class ModelTransportBoundaryTest(unittest.TestCase):
                     OllamaLLM(config).analyze("prompt", {})
             urlopen.assert_not_called()
 
+        loopback_rebound = [(None, None, None, None, ("127.0.0.1", 11434))]
+        with patch("defensive_ai_gateway.llm.socket.getaddrinfo", return_value=loopback_rebound):
+            with patch("defensive_ai_gateway.llm._open_no_redirect") as urlopen:
+                with self.assertRaisesRegex(RuntimeError, "disallowed"):
+                    OllamaLLM(config).analyze("prompt", {})
+            urlopen.assert_not_called()
+
+    def test_gateway_and_dashboard_validation_reject_dns_rebound_loopback(self):
+        resolution = [(None, None, None, None, ("127.0.0.1", 443))]
+        config = LLMConfig(
+            provider="gateway",
+            endpoint="https://gateway.ai-platform.svc/analyze",
+            allowed_hosts=["gateway.ai-platform.svc"],
+        )
+        with patch("defensive_ai_gateway.llm.socket.getaddrinfo", return_value=resolution):
+            with patch("defensive_ai_gateway.llm._open_no_redirect") as urlopen:
+                with self.assertRaisesRegex(RuntimeError, "disallowed"):
+                    GatewayLLM(config).analyze("prompt", {})
+            urlopen.assert_not_called()
+
+        with patch("defensive_ai_gateway.app.socket.getaddrinfo", return_value=resolution):
+            with self.assertRaisesRegex(ValueError, "prohibited"):
+                _validated_llm_endpoint(
+                    "gateway",
+                    config.endpoint,
+                    config.allowed_hosts,
+                )
+
     def test_remote_allowlisted_ollama_can_list_models_and_test_connection(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = GatewayConfig()
@@ -287,6 +337,26 @@ class ModelTransportBoundaryTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "exceeds"):
                 llm.analyze("prompt", {})
 
+    def test_model_responses_reject_excessive_json_nesting(self):
+        nested = "{}"
+        for _ in range(MAX_JSON_NESTING + 1):
+            nested = '{"nested":' + nested + "}"
+        response = _Response(nested.encode())
+
+        gateway = GatewayLLM(
+            LLMConfig(provider="gateway", endpoint="http://127.0.0.1:9999/analyze")
+        )
+        with patch("defensive_ai_gateway.llm._open_no_redirect", return_value=response):
+            with self.assertRaisesRegex(RuntimeError, "invalid JSON"):
+                gateway.analyze("prompt", {})
+
+        ollama = OllamaLLM(
+            LLMConfig(provider="ollama", endpoint="http://127.0.0.1:11434/api/generate")
+        )
+        with patch("defensive_ai_gateway.llm._open_no_redirect", return_value=response):
+            with self.assertRaisesRegex(RuntimeError, "invalid JSON"):
+                ollama.analyze("prompt", {})
+
     def test_anthropic_messages_request_and_response_are_adapted(self):
         result_json = {
             "classification": "suspicious",
@@ -313,10 +383,12 @@ class ModelTransportBoundaryTest(unittest.TestCase):
                 allowed_hosts=["kkcoder.com"],
             )
         )
-        with patch(
-            "defensive_ai_gateway.llm._open_no_redirect", return_value=response
-        ) as urlopen:
-            result = llm.analyze("security prompt", {"event": "redacted"})
+        resolution = [(None, None, None, None, ("8.8.8.8", 443))]
+        with patch("defensive_ai_gateway.llm.socket.getaddrinfo", return_value=resolution):
+            with patch(
+                "defensive_ai_gateway.llm._open_no_redirect", return_value=response
+            ) as urlopen:
+                result = llm.analyze("security prompt", {"event": "redacted"})
 
         request = urlopen.call_args.args[0]
         headers = {key.lower(): value for key, value in request.header_items()}
@@ -351,17 +423,19 @@ class ModelTransportBoundaryTest(unittest.TestCase):
                     },
                     clear=True,
                 ):
-                    with patch(
-                        "defensive_ai_gateway.app.urllib.request.build_opener",
-                        return_value=opener,
-                    ):
-                        result = state.test_llm_connection(
-                            {
-                                "provider": "gateway",
-                                "endpoint": "https://kkcoder.com/v1/messages",
-                                "model": "claude-sonnet-4-6",
-                            }
-                        )
+                    resolution = [(None, None, None, None, ("8.8.8.8", 443))]
+                    with patch("defensive_ai_gateway.app.socket.getaddrinfo", return_value=resolution):
+                        with patch(
+                            "defensive_ai_gateway.app.urllib.request.build_opener",
+                            return_value=opener,
+                        ):
+                            result = state.test_llm_connection(
+                                {
+                                    "provider": "gateway",
+                                    "endpoint": "https://kkcoder.com/v1/messages",
+                                    "model": "claude-sonnet-4-6",
+                                }
+                            )
             finally:
                 state.stop()
 

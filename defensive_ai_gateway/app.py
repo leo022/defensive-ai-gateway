@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from .config import GatewayConfig, LLMConfig, load_config
 from .database import Repository
+from .json_safety import loads_bounded_json
 from .log_adapter import (
     AUTO_PROFILE,
     DEFAULT_SEVERITY_MAP,
@@ -81,12 +82,17 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         raise urllib.error.HTTPError(req.full_url, code, "redirects are not allowed", headers, fp)
 
 
-def _open_ollama(req: urllib.request.Request, timeout: float):
-    """Open an allowlisted Ollama URL without inheriting environment proxies."""
+def _open_model_endpoint(req: urllib.request.Request, timeout: float):
+    """Open an allowlisted model endpoint without inheriting environment proxies."""
     return urllib.request.build_opener(
         urllib.request.ProxyHandler({}),
         _NoRedirectHandler(),
     ).open(req, timeout=timeout)
+
+
+def _open_ollama(req: urllib.request.Request, timeout: float):
+    """Compatibility wrapper for the local Ollama picker/test paths."""
+    return _open_model_endpoint(req, timeout)
 
 _CASE_DISPOSITIONS = {
     "under_review": "escalate_case_review",
@@ -264,6 +270,11 @@ def _validate_exposed_server_config(config: GatewayConfig) -> None:
     """
     if _is_loopback_bind(config.server.host):
         return
+    if config.syslog.embedded_listeners_enabled:
+        raise ValueError(
+            "network-exposed deployments must disable embedded Syslog listeners; "
+            "use the authenticated external collector"
+        )
     auth = config.auth
     if auth.demo_mode:
         return
@@ -421,7 +432,8 @@ def _validated_llm_endpoint(provider: str, endpoint: str, allowed_hosts: list[st
             if any(not address.is_loopback for address in addresses):
                 raise ValueError("local Ollama endpoint resolved outside loopback")
         elif any(
-            address.is_link_local
+            address.is_loopback
+            or address.is_link_local
             or address.is_multicast
             or address.is_unspecified
             or address.is_reserved
@@ -433,6 +445,32 @@ def _validated_llm_endpoint(provider: str, endpoint: str, allowed_hosts: list[st
         raise ValueError(f"gateway host '{host}' is not in llm.allowed_hosts")
     if parsed.scheme != "https" and host not in _ALLOWED_OLLAMA_HOSTS:
         raise ValueError("non-loopback Gateway endpoints must use HTTPS")
+    try:
+        resolved = {
+            item[4][0]
+            for item in socket.getaddrinfo(
+                host,
+                parsed.port or (443 if parsed.scheme == "https" else 80),
+                type=socket.SOCK_STREAM,
+            )
+        }
+    except OSError as exc:
+        raise ValueError(f"cannot resolve Gateway endpoint: {exc}") from exc
+    addresses = [ipaddress.ip_address(address) for address in resolved]
+    if not addresses:
+        raise ValueError("Gateway endpoint did not resolve")
+    if host in _ALLOWED_OLLAMA_HOSTS:
+        if any(not address.is_loopback for address in addresses):
+            raise ValueError("local Gateway endpoint resolved outside loopback")
+    elif any(
+        address.is_loopback
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_unspecified
+        or address.is_reserved
+        for address in addresses
+    ):
+        raise ValueError("Gateway endpoint resolved to a prohibited address range")
     return endpoint
 
 
@@ -1058,7 +1096,7 @@ class GatewayState:
                 raw = resp.read(self.config.llm.max_response_bytes + 1)
                 if len(raw) > self.config.llm.max_response_bytes:
                     raise ValueError("Ollama model list response is too large")
-                data = json.loads(raw.decode("utf-8"))
+                data = loads_bounded_json(raw.decode("utf-8"))
             models: list[str] = []
             for item in data.get("models", []) or []:
                 name = item.get("name") or item.get("model")
@@ -1118,7 +1156,7 @@ class GatewayState:
                     raw = resp.read(self.config.llm.max_response_bytes + 1)
                     if len(raw) > self.config.llm.max_response_bytes:
                         raise ValueError("Ollama response is too large")
-                    data = json.loads(raw.decode("utf-8"))
+                    data = loads_bounded_json(raw.decode("utf-8"))
                 models = [str(m.get("name") or m.get("model", "")) for m in data.get("models", [])]
                 return {
                     "ok": True,
@@ -1177,7 +1215,7 @@ class GatewayState:
                 resolved_key,
                 max_tokens=32,
             )
-            with urllib.request.build_opener(_NoRedirectHandler()).open(req, timeout=min(timeout, 15)) as resp:
+            with _open_model_endpoint(req, timeout=min(timeout, 15)) as resp:
                 raw = resp.read(self.config.llm.max_response_bytes + 1)
                 if len(raw) > self.config.llm.max_response_bytes:
                     return {
@@ -1197,8 +1235,8 @@ class GatewayState:
                         "detail": body[:200],
                     }
                 try:
-                    json.loads(body)
-                except json.JSONDecodeError:
+                    loads_bounded_json(body)
+                except ValueError:
                     return {
                         "ok": False,
                         "provider": provider,
@@ -2005,17 +2043,35 @@ class GatewayHandler(BaseHTTPRequestHandler):
     # ---- body / errors --------------------------------------------------
 
     def _read_json(self) -> dict:
+        transfer_encoding = self.headers.get_all("Transfer-Encoding") or []
+        if any(value.strip() for value in transfer_encoding):
+            # This server deliberately implements Content-Length framing only.
+            # Accepting a second framing scheme invites proxy/parser disagreement.
+            self.close_connection = True
+            raise ValueError("Transfer-Encoding is not supported")
+        content_lengths = self.headers.get_all("Content-Length") or []
+        if len(content_lengths) > 1:
+            self.close_connection = True
+            raise ValueError("duplicate Content-Length headers are not allowed")
+        raw_length = content_lengths[0] if content_lengths else "0"
+        # RFC framing accepts decimal digits only. ``int`` would also accept
+        # signs and surrounding whitespace, which some upstream proxies reject
+        # or interpret differently.
+        if not raw_length.isascii() or not raw_length.isdecimal():
+            self.close_connection = True
+            raise ValueError("invalid Content-Length")
         try:
-            length = int(self.headers.get("Content-Length", "0"))
+            length = int(raw_length)
         except (TypeError, ValueError) as exc:
             # Do not leave an unframed body on a persistent connection: it could
             # be interpreted as the start of a later HTTP request.
             self.close_connection = True
             raise ValueError("invalid Content-Length") from exc
-        # Clamp negatives: a Content-Length of -1 would otherwise make
-        # rfile.read(-1) read until EOF (unbounded memory). Treat as empty.
+        # A negative Content-Length must not turn into ``read(-1)`` or leave an
+        # unframed body on a persistent connection.
         if length < 0:
-            length = 0
+            self.close_connection = True
+            raise ValueError("Content-Length must not be negative")
         if length > MAX_BODY_BYTES:
             # Drain at most the permitted body size before closing. This lets a
             # normal client finish writing and receive its 413, while the short
@@ -2046,7 +2102,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             raise ValueError("request body timed out") from exc
         if not raw:
             return {}
-        payload = json.loads(raw.decode("utf-8"))
+        payload = loads_bounded_json(raw.decode("utf-8"))
         if not isinstance(payload, dict):
             raise ValueError("JSON body must be an object")
         return payload
@@ -2107,7 +2163,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
         if parsed.path in ("/api/config/llm", "/api/config/llm/models"):
             # Sensitive: exposes provider/endpoint and probes the LLM backend.
-            if not self._require_roles(_ROLE_CONFIG, _ROLE_READ):
+            if not self._require_roles(_ROLE_CONFIG):
                 return
             if parsed.path == "/api/config/llm":
                 self._json(200, self.state.llm_config_payload())
@@ -2116,7 +2172,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._json(200, self.state.list_ollama_models(endpoint))
             return
         if parsed.path == "/api/config/syslog":
-            if not self._require_roles(_ROLE_CONFIG, _ROLE_READ):
+            if not self._require_roles(_ROLE_CONFIG):
                 return
             self._json(200, self.state.syslog_config_payload())
             return

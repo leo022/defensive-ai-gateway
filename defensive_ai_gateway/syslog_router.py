@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .log_adapter import DEFAULT_SEVERITY_MAP, SUPPORTED_PRODUCTS
+from .json_safety import loads_bounded_json
 from .models import new_id
 
 
@@ -44,7 +45,7 @@ def _parse_message(message: bytes | str | dict[str, Any]) -> dict[str, Any]:
     if not text:
         return {}
     try:
-        value = json.loads(text)
+        value = loads_bounded_json(text)
         return value if isinstance(value, dict) else {"message": value}
     except json.JSONDecodeError:
         pass
@@ -52,7 +53,7 @@ def _parse_message(message: bytes | str | dict[str, Any]) -> dict[str, Any]:
     end = text.rfind("}")
     if 0 <= start < end:
         try:
-            value = json.loads(text[start : end + 1])
+            value = loads_bounded_json(text[start : end + 1])
             return value if isinstance(value, dict) else {"message": value}
         except json.JSONDecodeError:
             pass
@@ -72,7 +73,7 @@ def _message_format(message: bytes | str | dict[str, Any], structured: dict[str,
         return "object"
     text = _raw_message(message).strip()
     try:
-        parsed = json.loads(text)
+        parsed = loads_bounded_json(text)
     except json.JSONDecodeError:
         parsed = None
     if isinstance(parsed, dict):

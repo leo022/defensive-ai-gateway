@@ -14,6 +14,7 @@ from typing import Any
 
 from .config import LLMConfig
 from .agents.evidence_helpers import fact, join_facts, normalize_classification, short_text
+from .json_safety import loads_bounded_json
 
 
 MAX_LLM_RESPONSE_BYTES = 2_000_000
@@ -77,7 +78,6 @@ def _validate_http_endpoint(
         }
         if host.lower().rstrip(".") not in allowed:
             raise RuntimeError(f"{backend} host '{host}' is not allowlisted")
-    if backend == "Ollama" and not is_loopback:
         try:
             resolved = {
                 item[4][0]
@@ -94,12 +94,13 @@ def _validate_http_endpoint(
         for resolved_address in resolved:
             resolved_ip = ipaddress.ip_address(resolved_address)
             if (
-                resolved_ip.is_link_local
+                resolved_ip.is_loopback
+                or resolved_ip.is_link_local
                 or resolved_ip.is_multicast
                 or resolved_ip.is_reserved
                 or resolved_ip.is_unspecified
             ):
-                raise RuntimeError("Ollama endpoint resolves to a disallowed network address")
+                raise RuntimeError(f"{backend} endpoint resolves to a disallowed network address")
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -735,7 +736,12 @@ class GatewayLLM(LLMClient):
             api_key,
         )
         try:
-            with _open_with_retry(req, self.config.timeout_seconds, self.config.max_retries) as resp:
+            with _open_with_retry(
+                req,
+                self.config.timeout_seconds,
+                self.config.max_retries,
+                bypass_proxy=True,
+            ) as resp:
                 if resp.status >= 400:
                     raise RuntimeError(f"LLM gateway returned HTTP {resp.status}")
                 limit = max(65_536, min(int(self.config.max_response_bytes), 10_000_000))
@@ -748,9 +754,9 @@ class GatewayLLM(LLMClient):
         except TimeoutError as exc:
             raise RuntimeError("LLM gateway request timed out") from exc
         try:
-            parsed = json.loads(body)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"LLM gateway returned non-JSON response: {body[:200]}") from exc
+            parsed = loads_bounded_json(body)
+        except ValueError as exc:
+            raise RuntimeError(f"LLM gateway returned invalid JSON response: {body[:200]}") from exc
         return parse_gateway_response(parsed, self.config.model)
 
 
@@ -895,8 +901,8 @@ class OllamaLLM(LLMClient):
             raise RuntimeError(f"Ollama unreachable: {exc.reason}") from exc
         except TimeoutError as exc:
             raise RuntimeError("Ollama request timed out") from exc
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("Ollama returned non-JSON response") from exc
+        except ValueError as exc:
+            raise RuntimeError("Ollama returned invalid JSON response") from exc
 
     def _generate(self, model: str, prompt: str) -> dict[str, Any]:
         _validate_http_endpoint(
@@ -934,7 +940,7 @@ class OllamaLLM(LLMClient):
             bypass_proxy=True,
         ) as resp:
             limit = max(65_536, min(int(self.config.max_response_bytes), 10_000_000))
-            data = json.loads(_read_limited_response(resp, limit).decode("utf-8"))
+            data = loads_bounded_json(_read_limited_response(resp, limit).decode("utf-8"))
         if not isinstance(data, dict):
             raise RuntimeError("Ollama returned non-object JSON")
         response = str(data.get("response", "")).strip()
@@ -951,17 +957,17 @@ def _parse_json_object(text: str) -> dict[str, Any]:
     # <think>...</think>; strip it so we parse only the final answer.
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
     try:
-        parsed = json.loads(text)
+        parsed = loads_bounded_json(text)
         if isinstance(parsed, dict):
             return parsed
-    except json.JSONDecodeError:
+    except ValueError:
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if match:
             try:
-                parsed = json.loads(match.group(0))
+                parsed = loads_bounded_json(match.group(0))
                 if isinstance(parsed, dict):
                     return parsed
-            except json.JSONDecodeError:
+            except ValueError:
                 pass
     return {
         "classification": "insufficient_evidence",
