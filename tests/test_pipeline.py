@@ -9,7 +9,7 @@ from unittest.mock import patch
 from defensive_ai_gateway.app import GatewayState
 from defensive_ai_gateway.config import GatewayConfig
 from defensive_ai_gateway.database import Repository
-from defensive_ai_gateway.log_adapter import LogAdapter, demo_rasp_profile, mapping_profile_record
+from defensive_ai_gateway.log_adapter import LogAdapter, MappingProfile, demo_rasp_profile, mapping_profile_record
 from defensive_ai_gateway.llm import GatewayLLM, LLMClient, LocalHeuristicLLM, _parse_json_object
 from defensive_ai_gateway.memory import MemoryManager
 from defensive_ai_gateway.models import AgentResult, RawAlert, RecommendedAction
@@ -64,6 +64,61 @@ class PipelineTest(unittest.TestCase):
             self.assertIn("rule_id", evidence_types)
             self.assertIn("stack_trace", evidence_types)
             self.assertIn("sink", evidence_types)
+
+    def test_dry_run_rejects_the_same_invalid_timestamp_as_production(self):
+        profile = {
+            "profile_id": "invalid-time-check",
+            "name": "Invalid time check",
+            "version": "v1",
+            "mappings": {
+                "alert_id": "$.id",
+                "product": {"literal": "waf"},
+                "event_type": "$.event_type",
+                "severity": {"literal": "high"},
+                "timestamp": "$.timestamp",
+            },
+        }
+        log = {"id": "invalid-time-001", "event_type": "sqli", "timestamp": "not-an-iso-time"}
+        result = LogAdapter().dry_run(MappingProfile.from_dict(profile), log)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("invalid_raw_alert:timestamp must be an ISO-8601 value", result["errors"])
+
+    def test_auto_infer_detects_product_and_decodes_syslog_json_envelope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            config.database.path = str(Path(tmp) / "gateway.db")
+            state = GatewayState(config)
+            vendor_log = {
+                "metadata": {"id": "syslog-rasp-001"},
+                "device": {"type": "runtime_app_protection"},
+                "risk": {"level": "high"},
+                "time": "2026-07-22T10:00:00Z",
+                "rule": {"name": "SQL injection"},
+            }
+            envelope = {"hostname": "rasp-agent-01", "appname": "rasp", "message": json.dumps(vendor_log)}
+
+            inferred = state.infer_mapping_profile({"log": envelope})
+            self.assertTrue(inferred["ok"], inferred)
+            self.assertEqual(inferred["product_detection"]["product"], "rasp")
+            self.assertEqual(inferred["product_detection"]["mode"], "auto")
+            self.assertTrue(inferred["input"]["syslog_envelope_detected"])
+
+            dry_run = state.dry_run_mapping_profile({"profile": inferred["profile"], "log": envelope})
+            self.assertTrue(dry_run["ok"], dry_run["errors"])
+            self.assertEqual(dry_run["raw_alert_preview"]["payload"]["syslog_envelope"]["hostname"], "rasp-agent-01")
+
+    def test_seed_does_not_overwrite_a_saved_auto_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            config.database.path = str(Path(tmp) / "gateway.db")
+            state = GatewayState(config)
+            profile = state.get_mapping_profile("auto-waf-json").to_dict()
+            profile["name"] = "User-maintained WAF mapping"
+            state.save_mapping_profile(profile)
+
+            state._seed_mapping_profiles()
+            self.assertEqual(state.get_mapping_profile("auto-waf-json").name, "User-maintained WAF mapping")
 
     def test_gateway_state_accepts_profile_mapped_alert_and_rejects_bad_log(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -351,8 +406,46 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual([item["case_id"] for item in repo.list_cases(severity="critical")], ["case_b"])
             self.assertEqual([item["case_id"] for item in repo.list_cases(status="confirmed_attack")], ["case_a"])
             self.assertEqual(
+                [item["case_id"] for item in repo.list_cases(active_only=True)],
+                ["case_c", "case_b", "case_a"],
+            )
+            self.assertEqual(
                 [item["case_id"] for item in repo.list_cases(created_from_ms=base + 500, created_to_ms=base + 1500)],
                 ["case_b"],
+            )
+
+    def test_active_case_list_filters_terminal_cases_before_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repository(str(Path(tmp) / "gateway.db"))
+
+            def result(case_id: str, created_at_ms: int) -> AgentResult:
+                return AgentResult(
+                    case_id=case_id,
+                    agent="test-agent",
+                    classification="suspicious",
+                    confidence=0.8,
+                    severity="high",
+                    summary=f"{case_id} summary",
+                    evidence=[],
+                    missing_evidence=[],
+                    recommended_actions=[RecommendedAction(action="review", mode="observe", rationale="test")],
+                    dashboard_cards=[],
+                    created_at_ms=created_at_ms,
+                )
+
+            base = 1_700_000_000_000
+            repo.upsert_case(result("case_active", base), "waf")
+            for index in range(3):
+                case_id = f"case_closed_{index}"
+                repo.upsert_case(result(case_id, base + index + 1), "waf")
+                repo.update_case_status(case_id, "closed")
+
+            # A mixed list limited to three omits the older active Case, which
+            # was the source of the misleading empty active queue.
+            self.assertNotIn("case_active", [item["case_id"] for item in repo.list_cases(limit=3)])
+            self.assertEqual(
+                [item["case_id"] for item in repo.list_cases(limit=3, active_only=True)],
+                ["case_active"],
             )
 
     def test_llm_config_update_hides_key_and_rebuilds_client(self):

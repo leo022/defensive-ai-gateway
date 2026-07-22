@@ -382,6 +382,11 @@ class RetentionPolicyTest(unittest.TestCase):
                     if memory["source_case_id"] == result.case_id
                 )
                 state.repo.update_case_status(result.case_id, "closed")
+                # A source Case cannot leave an actionable long-term candidate
+                # behind. Retention only handles payload cleanup now.
+                self.assertEqual(
+                    state.repo.get_memory(candidate["memory_id"])["status"], "expired"
+                )
                 state.repo.conn.execute(
                     "UPDATE cases SET updated_at_ms = 1, closed_at_ms = 1 WHERE case_id = ?",
                     (result.case_id,),
@@ -393,7 +398,7 @@ class RetentionPolicyTest(unittest.TestCase):
                 self.assertEqual(counts["cases"], 1)
                 self.assertEqual(counts["raw_alerts"], 1)
                 self.assertEqual(counts["normalized_events"], 1)
-                self.assertEqual(counts["memory_entries_expired"], 1)
+                self.assertEqual(counts["memory_entries_expired"], 0)
                 self.assertIsNone(state.repo.get_case(result.case_id))
                 self.assertIsNone(
                     state.repo.conn.execute(
@@ -405,7 +410,7 @@ class RetentionPolicyTest(unittest.TestCase):
                 self.assertEqual(retained["status"], "expired")
                 self.assertTrue(
                     any(
-                        event["detail"].get("reason") == "operational_data_retention"
+                        event["detail"].get("reason") == "source_case_terminal_before_promotion"
                         for event in state.repo.list_memory_events(
                             memory_id=candidate["memory_id"], limit=20
                         )

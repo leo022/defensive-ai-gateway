@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import hmac
 import ipaddress
 import json
@@ -20,7 +19,6 @@ from .database import Repository
 from .json_safety import loads_bounded_json
 from .log_adapter import (
     AUTO_PROFILE,
-    DEFAULT_SEVERITY_MAP,
     LogAdapter,
     MappingProfile,
     SUPPORTED_PRODUCTS,
@@ -30,6 +28,7 @@ from .log_adapter import (
     explicit_product,
     fingerprint_product,
     mapping_profile_record,
+    validate_raw_alert,
 )
 from .llm import (
     build_gateway_request,
@@ -347,40 +346,8 @@ def _build_raw_alert(payload: dict, product: str) -> RawAlert:
 
 
 def _validate_raw_alert(alert: RawAlert) -> RawAlert:
-    """Validate and canonicalize the transport-level alert contract."""
-    alert.product = str(alert.product or "").strip().lower()
-    if alert.product not in SUPPORTED_PRODUCTS:
-        raise ValueError(f"unsupported product: {alert.product or '<empty>'}")
-    alert.source = str(alert.source or "").strip()
-    if not alert.source:
-        raise ValueError("source is required")
-    if len(alert.source) > 256:
-        raise ValueError("source is too long")
-    alert.event_type = str(alert.event_type or "").strip()
-    if not alert.event_type or alert.event_type == "unknown":
-        raise ValueError("event_type is required")
-    if len(alert.event_type) > 256:
-        raise ValueError("event_type is too long")
-    severity = str(alert.severity or "").strip().lower()
-    alert.severity = DEFAULT_SEVERITY_MAP.get(severity, severity)
-    if alert.severity not in {"critical", "high", "medium", "low"}:
-        raise ValueError("severity must be critical, high, medium, or low")
-    alert.alert_id = str(alert.alert_id or "").strip() or new_id("alert")
-    if len(alert.alert_id) > 256:
-        raise ValueError("alert_id is too long")
-    if not isinstance(alert.payload, dict):
-        raise ValueError("payload must be a JSON object")
-    timestamp = str(alert.timestamp or "").strip()
-    if not timestamp:
-        timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    if len(timestamp) > 64:
-        raise ValueError("timestamp is too long")
-    try:
-        datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise ValueError("timestamp must be an ISO-8601 value") from exc
-    alert.timestamp = timestamp
-    return alert
+    """Backward-compatible alias for the shared adapter/production contract."""
+    return validate_raw_alert(alert)
 
 
 def _ollama_tags_url(endpoint: str) -> str:
@@ -972,6 +939,8 @@ class GatewayState:
                 self.repo.save_mapping_profile(mapping_profile_record(profile))
         for product in sorted(SUPPORTED_PRODUCTS):
             profile_id = AUTO_PROFILE.get(product, f"auto-{product}-json")
+            if self.repo.get_mapping_profile(profile_id):
+                continue
             try:
                 profile = builtin_product_profile(product)
                 profile.profile_id = profile_id
@@ -1464,11 +1433,21 @@ class GatewayState:
             log = payload.get("log")
             if not isinstance(log, dict):
                 raise ValueError("log must be a JSON object")
-            product = str(payload.get("product") or "rasp").strip().lower() or "rasp"
+            requested_product = str(payload.get("product") or "").strip().lower()
+            if requested_product and requested_product not in SUPPORTED_PRODUCTS:
+                raise ValueError(f"unsupported product: {requested_product}")
+            detected = self.log_adapter.detect_product(log)
+            product = requested_product or str((detected or {}).get("product") or "")
             if product not in SUPPORTED_PRODUCTS:
-                raise ValueError(f"unsupported product: {product}")
-            profile_id = str(payload.get("profile_id") or f"auto-{product}-json").strip() or f"auto-{product}-json"
-            return self.log_adapter.infer_mapping_profile(log, profile_id, product)
+                raise ValueError("无法自动识别日志产品，请选择 WAF、HIPS、NDR、RASP 或 SIEM 后重试")
+            profile_id = str(payload.get("profile_id") or "").strip() or new_id(f"custom-{product}")
+            result = self.log_adapter.infer_mapping_profile(log, profile_id, product)
+            result["product_detection"] = {
+                "product": product,
+                "confidence": float((detected or {}).get("confidence") or 0),
+                "mode": "manual" if requested_product else "auto",
+            }
+            return result
 
     def rasp_sample_log(self) -> dict:
         """Return the canonical RASP vendor-format sample used by the Dashboard
@@ -2254,6 +2233,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         product=_query_first(query, "product") or None,
                         severity=_query_first(query, "severity") or None,
                         status=_query_first(query, "status") or None,
+                        active_only=_query_first(query, "active_only").lower() in {"1", "true", "yes"},
                         created_from_ms=_query_optional_int(query, "created_from_ms"),
                         created_to_ms=_query_optional_int(query, "created_to_ms"),
                     )

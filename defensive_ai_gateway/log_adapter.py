@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any
 
-from .models import RawAlert, now_ms
+from .models import RawAlert, new_id, now_ms
 from .normalizer import EventNormalizer
 
 
@@ -55,6 +56,47 @@ def fingerprint_product(payload: dict[str, Any]) -> str | None:
     ):
         return "rasp"
     return None
+
+
+def validate_raw_alert(alert: RawAlert) -> RawAlert:
+    """Validate the stable RawAlert contract at every ingestion boundary.
+
+    Keeping this next to the adapter lets dry-run use the *same* contract as
+    production submission, rather than only checking whether mapped keys exist.
+    """
+    alert.product = str(alert.product or "").strip().lower()
+    if alert.product not in SUPPORTED_PRODUCTS:
+        raise ValueError(f"unsupported product: {alert.product or '<empty>'}")
+    alert.source = str(alert.source or "").strip()
+    if not alert.source:
+        raise ValueError("source is required")
+    if len(alert.source) > 256:
+        raise ValueError("source is too long")
+    alert.event_type = str(alert.event_type or "").strip()
+    if not alert.event_type or alert.event_type == "unknown":
+        raise ValueError("event_type is required")
+    if len(alert.event_type) > 256:
+        raise ValueError("event_type is too long")
+    severity = str(alert.severity or "").strip().lower()
+    alert.severity = DEFAULT_SEVERITY_MAP.get(severity, severity)
+    if alert.severity not in {"critical", "high", "medium", "low"}:
+        raise ValueError("severity must be critical, high, medium, or low")
+    alert.alert_id = str(alert.alert_id or "").strip() or new_id("alert")
+    if len(alert.alert_id) > 256:
+        raise ValueError("alert_id is too long")
+    if not isinstance(alert.payload, dict):
+        raise ValueError("payload must be a JSON object")
+    timestamp = str(alert.timestamp or "").strip()
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    if len(timestamp) > 64:
+        raise ValueError("timestamp is too long")
+    try:
+        datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("timestamp must be an ISO-8601 value") from exc
+    alert.timestamp = timestamp
+    return alert
 
 DEFAULT_REQUIRED_FIELD_HINTS = {
     "alert_id": "映射到日志中的唯一告警 ID，例如 $.metadata.id、$.alert.id、$.alert_id 或 $.id。",
@@ -481,8 +523,9 @@ class LogAdapter:
         self.normalizer = normalizer
 
     def adapt(self, profile: MappingProfile, log: dict[str, Any]) -> dict[str, Any]:
+        log, envelope = self.unwrap_syslog_envelope(log)
         errors: list[str] = []
-        warnings: list[str] = []
+        warnings: list[str] = ["已从 Syslog envelope 的 JSON message 中提取原始日志。"] if envelope else []
         mapped: dict[str, Any] = {}
         entities: dict[str, Any] = {}
         payload_fields: dict[str, Any] = {}
@@ -522,6 +565,8 @@ class LogAdapter:
         payload = dict(mapped.get("payload") or {})
         self._merge_dict(payload, payload_fields)
         payload.setdefault("original_log", log)
+        if envelope:
+            payload.setdefault("syslog_envelope", envelope)
         payload["adapter"] = {
             "profile_id": profile.profile_id,
             "profile_name": profile.name,
@@ -540,7 +585,7 @@ class LogAdapter:
 
         raw_alert = None
         if not errors:
-            raw_alert = RawAlert(
+            candidate = RawAlert(
                 source=str(mapped["source"]),
                 product=str(mapped["product"]),
                 event_type=str(mapped["event_type"]),
@@ -549,6 +594,12 @@ class LogAdapter:
                 payload=payload,
                 alert_id=str(mapped["alert_id"]),
             )
+            try:
+                raw_alert = validate_raw_alert(candidate)
+            except ValueError as exc:
+                errors.append(f"invalid_raw_alert:{exc}")
+                payload["adapter"]["mapping_status"] = "failed"
+                payload["adapter"]["contract_validation_error"] = str(exc)
 
         result = {
             "ok": not errors,
@@ -591,6 +642,7 @@ class LogAdapter:
         return result
 
     def infer_mapping_profile(self, log: dict[str, Any], profile_id: str = "auto-rasp-json", product: str = "rasp") -> dict[str, Any]:
+        log, envelope = self.unwrap_syslog_envelope(log)
         flat = self._flatten_paths(log)
         fields: list[dict[str, Any]] = []
         product = product if product in SUPPORTED_PRODUCTS else "rasp"
@@ -616,7 +668,7 @@ class LogAdapter:
             sample_value = None
             candidates = self._candidate_options(flat, candidates_for_product)
 
-            if target == "product" and product_signal and (not match or product_signal["confidence"] >= match["confidence"]):
+            if target == "product" and product_signal and (not match or product_signal["confidence"] > match["confidence"]):
                 mapping = {"literal": product_signal["product"]}
                 status = "needs_review" if product_signal["confidence"] < 0.9 else "mapped"
                 confidence = product_signal["confidence"]
@@ -706,6 +758,7 @@ class LogAdapter:
         ]
         return {
             "ok": not required_missing,
+            "input": {"syslog_envelope_detected": bool(envelope)},
             "profile": profile.to_dict(),
             "fields": fields,
             "required_missing": required_missing,
@@ -717,6 +770,48 @@ class LogAdapter:
                 "message": "必填字段已识别，可运行 dry-run。" if not required_missing else "请补齐必填字段后再运行 dry-run。",
             },
         }
+
+    def unwrap_syslog_envelope(self, log: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """Decode JSON carried by common Syslog/collector envelope fields.
+
+        The returned payload retains a compact envelope under
+        ``_syslog_envelope`` so a mapping can still use transport metadata such
+        as hostname without forcing users to hand-edit the original message.
+        """
+        if not isinstance(log, dict):
+            return log, None
+        nested = log.get("log")
+        if isinstance(nested, dict):
+            decoded = dict(nested)
+        else:
+            text = log.get("message")
+            if not isinstance(text, str):
+                event = log.get("event")
+                text = event.get("original") if isinstance(event, dict) else None
+            if not isinstance(text, str):
+                return log, None
+            try:
+                decoded_value = json.loads(text)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return log, None
+            if not isinstance(decoded_value, dict):
+                return log, None
+            decoded = decoded_value
+        envelope = {
+            key: value
+            for key, value in log.items()
+            if key not in {"log", "message", "event"}
+        }
+        event = log.get("event")
+        if isinstance(event, dict):
+            envelope["event"] = {key: value for key, value in event.items() if key != "original"}
+        decoded.setdefault("_syslog_envelope", envelope)
+        return decoded, envelope
+
+    def detect_product(self, log: dict[str, Any]) -> dict[str, Any] | None:
+        """Return a high-confidence product classification for auto mapping."""
+        decoded, _ = self.unwrap_syslog_envelope(log)
+        return self._product_signal(decoded, self._flatten_paths(decoded), None)
 
     def _resolve_mapping(self, mapping: Any, log: dict[str, Any]) -> Any:
         if isinstance(mapping, list):
@@ -785,11 +880,21 @@ class LogAdapter:
         scored.sort(key=lambda item: (-float(item["confidence"]), len(str(item["path"]))))
         return scored
 
-    def _product_signal(self, log: dict[str, Any], flat: dict[str, Any], fallback_product: str = "rasp") -> dict[str, Any] | None:
+    def _product_signal(self, log: dict[str, Any], flat: dict[str, Any], fallback_product: str | None = "rasp") -> dict[str, Any] | None:
         text = json.dumps(log, ensure_ascii=False).lower()
         product_match = self._best_path_match(flat, ["product", "device.type", "source.product", "event.product"])
         if product_match:
             value = str(product_match["value"]).lower()
+            aliases = {
+                "runtime_app_protection": "rasp",
+                "runtime_application_self_protection": "rasp",
+                "web_application_firewall": "waf",
+                "host_intrusion_prevention": "hips",
+                "network_detection_response": "ndr",
+                "security_information_event_management": "siem",
+            }
+            if value in aliases:
+                return {"product": aliases[value], "confidence": 0.98}
             for product in SUPPORTED_PRODUCTS:
                 if product in value:
                     return {"product": product, "confidence": 0.98}
@@ -808,9 +913,9 @@ class LogAdapter:
         best_product, best_score = max(scores.items(), key=lambda item: item[1])
         if best_score >= 2:
             return {"product": best_product, "confidence": 0.88}
-        if best_score == 1:
-            return {"product": best_product, "confidence": 0.72}
-        return {"product": fallback_product if fallback_product in SUPPORTED_PRODUCTS else "rasp", "confidence": 0.62}
+        if best_score == 1 and fallback_product in SUPPORTED_PRODUCTS:
+            return {"product": fallback_product, "confidence": 0.62}
+        return {"product": fallback_product, "confidence": 0.0} if fallback_product in SUPPORTED_PRODUCTS else None
 
     def _mapping_label(self, mapping: Any) -> str:
         if isinstance(mapping, dict) and "literal" in mapping:

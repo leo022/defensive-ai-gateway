@@ -49,10 +49,21 @@ python3 scripts/send_sample.py --file samples/siem_case.json
 python3 scripts/send_demo_alerts.py
 ```
 
-`send_demo_alerts.py` 默认提交 15 条覆盖五类产品的 Demo 告警，并等待所有目标告警
+`send_demo_alerts.py` 默认提交 16 条覆盖五类产品的 Demo 告警，其中额外包含一条
+WAF XSS 提示注入样本，预期触发 Validator `review` 且不生成审批项；脚本会等待所有目标告警
 进入 `completed` 或 `dead_letter` 后再退出；只需提交、不等待时使用
 `--wait-seconds 0`。`clean_alerts_and_memory.py` 会同步清理 durable inbox，并在仍有
 `pending/retry/processing` 任务时拒绝执行，避免处理中的事实记录被删除。
+
+如需单独演示该门禁负向路径，可使用：
+
+```bash
+python3 scripts/send_demo_alerts.py --batch validation-review
+```
+
+注意：Validator 门禁检查的是分析输出的证据可追溯性、提示注入、敏感输出和动作权限，
+不是 WAF 威胁规则本身。因此 WAF 可以命中 XSS 并被分类为真实攻击，同时门禁显示
+`passed`；这表示分析输出合规且可以进入审批流程，不表示告警是误报或没有风险。
 
 也可以随机生成不同特征的攻击或误报告警：
 

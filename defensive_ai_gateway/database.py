@@ -1727,6 +1727,7 @@ class Repository:
                     _commit=False,
                 )
                 self._archive_case_memory_locked(case_id, updated_at)
+                self._expire_unapproved_long_term_memory_locked(case_id, status, updated_at)
             if _commit:
                 self.conn.commit()
             row = self.conn.execute("SELECT * FROM cases WHERE case_id = ?", (case_id,)).fetchone()
@@ -1785,6 +1786,62 @@ class Repository:
                     memory_id,
                     json.dumps({"reason": "case_closed_archive", "case_id": case_id}, ensure_ascii=False),
                     archived_at_ms,
+                ),
+            )
+        return len(rows)
+
+    def _expire_unapproved_long_term_memory_locked(
+        self, case_id: str, case_status: str, expired_at_ms: int
+    ) -> int:
+        """Retire unapproved long-term candidates when their source Case ends.
+
+        A pending candidate is only an observation awaiting governance review.  It
+        must not remain actionable after its source Case has been closed or
+        classified as a business false positive.  Approved long-term memories
+        deliberately remain active: their lifecycle is independent once all
+        promotion gates have been satisfied.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT memory_id FROM memory_entries
+            WHERE source_case_id = ?
+              AND layer = 'product_long_term'
+              AND status = 'pending_approval'
+            """,
+            (case_id,),
+        ).fetchall()
+        for row in rows:
+            memory_id = str(row["memory_id"])
+            self.conn.execute(
+                """
+                UPDATE memory_entries
+                SET status = 'expired', trust_level = 'low', updated_at_ms = ?
+                WHERE memory_id = ? AND status = 'pending_approval'
+                """,
+                (expired_at_ms, memory_id),
+            )
+            digest = hashlib.sha256(
+                f"{memory_id}\0{case_id}\0{expired_at_ms}\0case-terminal".encode("utf-8")
+            ).hexdigest()[:24]
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO memory_events
+                (event_id, memory_id, layer, event_type, actor, detail_json, created_at_ms)
+                VALUES (?, ?, 'product_long_term', 'expired', 'case-lifecycle', ?, ?)
+                """,
+                (
+                    f"mev_{digest}",
+                    memory_id,
+                    json.dumps(
+                        {
+                            "reason": "source_case_terminal_before_promotion",
+                            "case_id": case_id,
+                            "case_status": case_status,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    expired_at_ms,
                 ),
             )
         return len(rows)
@@ -2380,6 +2437,7 @@ class Repository:
         product: str | None = None,
         severity: str | None = None,
         status: str | None = None,
+        active_only: bool = False,
         created_from_ms: int | None = None,
         created_to_ms: int | None = None,
     ) -> list[dict[str, Any]]:
@@ -2395,6 +2453,11 @@ class Repository:
             if status:
                 clauses.append("c.status = ?")
                 params.append(status.lower())
+            if active_only:
+                # Filter before applying the page limit.  Filtering a mixed,
+                # limited result set in the browser can incorrectly make the
+                # active queue appear empty when recent terminal Cases fill it.
+                clauses.append("c.status NOT IN ('closed', 'false_positive')")
             if created_from_ms is not None:
                 clauses.append("c.created_at_ms >= ?")
                 params.append(created_from_ms)

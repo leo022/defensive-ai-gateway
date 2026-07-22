@@ -147,8 +147,18 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertIn(".nav-group.active .nav-subbutton.active", CSS)
         self.assertIn("grid-template-columns: repeat(2, minmax(0, 1fr))", CSS)
 
+    def test_mapping_confirmation_uses_a_full_width_workspace_row(self):
+        self.assertIn("mapping-result-panel", self.elements["field-mapping-table"]["ancestors"])
+        self.assertIn("adapter-config-panel", self.elements["field-mapping-table"]["ancestors"])
+        self.assertIn('id="mapping-result-panel" class="panel mapping-result-panel"', HTML)
+        self.assertIn(".mapping-result-panel {\n  grid-column: 1 / -1;", CSS)
+        self.assertIn(".field-mapping-table table {\n  width: 100%;\n  min-width: 0;", CSS)
+        self.assertIn("fieldConfirmation:", JS)
+        self.assertEqual(JS.count("fieldConfirmationHint:"), 2)
+
     def test_frontend_operability_guards_are_present(self):
         self.assertIn('return new URLSearchParams({ limit: "50" }).toString();', JS)
+        self.assertIn('if (section === "pending") params.set("active_only", "1");', JS)
         self.assertIn("case-filter-from", HTML)
         self.assertIn("history-case-filter-from", HTML)
         self.assertIn("async function loadMemoryInventory", JS)

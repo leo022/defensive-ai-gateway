@@ -162,6 +162,77 @@ class MultiLayerMemoryTest(unittest.TestCase):
             self.assertEqual(promoted["scope"], "waf:false_positive_pattern")
             events = repo.list_memory_events(memory_id=mem_id)
             self.assertTrue(any(e["event_type"] == "promoted" for e in events))
+            # Promotion is human governance of the observation.  The linked Case
+            # enters review, but is never auto-closed or auto-classified.
+            self.assertEqual(repo.get_case(pending[0]["source_case_id"])["status"], "under_review")
+            audit = repo.conn.execute(
+                "SELECT action, detail_json FROM audit_log WHERE memory_id = ? ORDER BY created_at_ms DESC LIMIT 1",
+                (mem_id,),
+            ).fetchone()
+            self.assertEqual(audit["action"], "memory_promotion_started_case_review")
+            self.assertEqual(json.loads(audit["detail_json"])["case_status"], "under_review")
+
+    def test_terminal_case_expires_unapproved_candidate_but_keeps_active_memory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, policy, memory, orchestrator = _build(Path(tmp))
+            result = orchestrator.handle_alert(_waf_alert())
+            pending = next(
+                item
+                for item in repo.query_memory(
+                    layer=LAYER_PRODUCT_LONG_TERM,
+                    namespace=memory.product_namespace("waf"),
+                    status=STATUS_PENDING,
+                    limit=10,
+                )
+                if item["source_case_id"] == result.case_id
+            )
+
+            repo.update_case_status(result.case_id, "confirmed_attack")
+            self.assertEqual(repo.get_memory(pending["memory_id"])["status"], STATUS_PENDING)
+
+            repo.update_case_status(result.case_id, "closed")
+            expired = repo.get_memory(pending["memory_id"])
+            self.assertEqual(expired["status"], STATUS_EXPIRED)
+            event = next(
+                item
+                for item in repo.list_memory_events(memory_id=pending["memory_id"])
+                if item["event_type"] == "expired"
+                and item["detail"].get("reason") == "source_case_terminal_before_promotion"
+            )
+            self.assertEqual(event["detail"]["case_id"], result.case_id)
+
+            # An approved memory is independent after promotion, even when its
+            # source Case later reaches a terminal disposition.
+            second = orchestrator.handle_alert(
+                RawAlert(
+                    source="test",
+                    product="waf",
+                    event_type="different-rule",
+                    severity="low",
+                    timestamp="2026-01-02T00:00:00Z",
+                    payload={"rule_id": "WAF-SECOND", "src_ip": "10.0.0.2"},
+                    alert_id="alert-memory-lifecycle-second",
+                )
+            )
+            second_candidate = next(
+                item
+                for item in repo.query_memory(
+                    layer=LAYER_PRODUCT_LONG_TERM,
+                    namespace=memory.product_namespace("waf"),
+                    status=STATUS_PENDING,
+                    limit=10,
+                )
+                if item["source_case_id"] == second.case_id
+            )
+            outcome = memory.promote(
+                second_candidate["memory_id"],
+                "analyst-lee",
+                "waf:reviewed-pattern",
+                now_ms() + 90 * 24 * 3600 * 1000,
+            )
+            self.assertTrue(outcome.ok)
+            repo.update_case_status(second.case_id, "closed")
+            self.assertEqual(repo.get_memory(second_candidate["memory_id"])["status"], STATUS_ACTIVE)
 
     def test_promotion_blocked_by_sensitive_leak(self):
         with tempfile.TemporaryDirectory() as tmp:

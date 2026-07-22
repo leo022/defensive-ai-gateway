@@ -372,6 +372,42 @@ h1 {
   align-items: center;
 }
 
+.header-icon-button {
+  display: inline-grid;
+  width: 36px;
+  min-width: 36px;
+  height: 36px;
+  min-height: 36px;
+  padding: 0;
+  place-items: center;
+  border-color: var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--muted);
+}
+
+.header-icon-button:hover {
+  border-color: var(--brand-line);
+  background: var(--brand-bg);
+  color: var(--brand-strong);
+}
+
+.header-icon-button[aria-pressed="true"] {
+  border-color: var(--brand-line);
+  background: var(--brand-bg);
+  color: var(--brand-strong);
+}
+
+.control-icon {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+}
+
 #refresh {
   border-color: var(--brand-line);
   background: var(--brand-bg);
@@ -1967,8 +2003,12 @@ h4 {
 
 .adapter-grid {
   display: grid;
-  grid-template-columns: minmax(380px, 0.9fr) minmax(440px, 1.1fr);
+  grid-template-columns: minmax(360px, 0.9fr) minmax(420px, 1.1fr);
   gap: 16px;
+}
+
+.mapping-result-panel {
+  grid-column: 1 / -1;
 }
 
 .profile-form {
@@ -2015,12 +2055,12 @@ h4 {
   min-width: 0;
   max-width: 100%;
   padding: 0 16px 16px;
-  overflow-x: auto;
+  overflow: visible;
 }
 
 .field-mapping-table table {
   width: 100%;
-  min-width: 760px;
+  min-width: 0;
   border: 1px solid var(--line);
   border-radius: 8px;
   border-collapse: separate;
@@ -2030,15 +2070,15 @@ h4 {
 }
 
 .mapping-field-col {
-  width: 18%;
+  width: 17%;
 }
 
 .mapping-path-col {
-  width: 32%;
+  width: 31%;
 }
 
 .mapping-sample-col {
-  width: 38%;
+  width: 40%;
 }
 
 .mapping-status-col {
@@ -2136,7 +2176,7 @@ h4 {
 }
 
 .dry-run-result {
-  min-height: 360px;
+  min-height: 280px;
   margin: 0 16px 16px;
 }
 
@@ -2999,6 +3039,12 @@ button.memory-audit-row:hover {
     flex-direction: column;
   }
 
+  .header-actions {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) repeat(2, 36px);
+    align-items: center;
+  }
+
   .nav-button,
   .utility-button,
   .header-actions button,
@@ -3007,6 +3053,10 @@ button.memory-audit-row:hover {
   .memory-audit-panel .panel-heading button,
   .syslog-config-heading button {
     width: 100%;
+  }
+
+  .header-actions .header-icon-button {
+    width: 36px;
   }
 
   .nav-group {
@@ -3032,6 +3082,14 @@ button.memory-audit-row:hover {
   .memory-kpis,
   .settings-form {
     grid-template-columns: 1fr;
+  }
+
+  .field-mapping-table {
+    overflow-x: auto;
+  }
+
+  .field-mapping-table table {
+    min-width: 680px;
   }
 
   .runtime-pill,

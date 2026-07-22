@@ -299,6 +299,7 @@ const STRINGS = {
     logAdapterHint: "字段识别、映射确认和接入前校验。",
     raspJsonLog: "RASP JSON 日志",
     logSourceType: "日志类型",
+    autoDetectProduct: "自动识别（推荐）",
     securityAlertLog: "安全设备告警日志",
     autoDetectFields: "识别字段",
     loadSample: "加载示例",
@@ -308,6 +309,8 @@ const STRINGS = {
     saveProfile: "保存 Profile",
     dryRunPreview: "映射校验",
     dryRunPreviewHint: "验证 RawAlert 与归一化事件是否符合接入要求。",
+    fieldConfirmation: "字段确认",
+    fieldConfirmationHint: "识别后在此确认字段映射；完整宽度展示，无需横向拖动。",
     runDryRun: "运行校验",
     dryRunHint: "等待日志与映射配置。",
     themeAria: "切换深色或浅色模式",
@@ -361,7 +364,7 @@ const STRINGS = {
     validationPassed: "通过",
     validationReview: "需复核",
     validationBlocked: "已阻断",
-    noValidationFindings: "未发现证据或策略违规",
+    noValidationFindings: "验证检查未发现证据一致性或策略违规",
     approvalQueue: "处置审批",
     approvalPending: "待审批",
     approvalApproved: "已批准",
@@ -727,6 +730,7 @@ const STRINGS = {
     logAdapterHint: "Field detection, mapping confirmation, and pre-ingestion validation.",
     raspJsonLog: "RASP JSON log",
     logSourceType: "Log type",
+    autoDetectProduct: "Auto-detect (recommended)",
     securityAlertLog: "Security device alert log",
     autoDetectFields: "Detect fields",
     loadSample: "Load sample",
@@ -736,6 +740,8 @@ const STRINGS = {
     saveProfile: "Save profile",
     dryRunPreview: "Mapping Validation",
     dryRunPreviewHint: "Validate RawAlert and normalized event output before ingestion.",
+    fieldConfirmation: "Field confirmation",
+    fieldConfirmationHint: "Review detected field mappings here in a full-width workspace.",
     runDryRun: "Run validation",
     dryRunHint: "Waiting for log and mapping configuration.",
     themeAria: "Toggle dark or light mode",
@@ -789,7 +795,7 @@ const STRINGS = {
     validationPassed: "Passed",
     validationReview: "Review required",
     validationBlocked: "Blocked",
-    noValidationFindings: "No evidence or policy violations found",
+    noValidationFindings: "No validation evidence or policy violations found",
     approvalQueue: "Response approvals",
     approvalPending: "Pending",
     approvalApproved: "Approved",
@@ -886,6 +892,7 @@ let mappingProfiles = [];
 let selectedProfileId = "";
 let inferredProfile = null;
 let inferredFields = [];
+let mappingNeedsValidation = true;
 let currentLanguage = "zh";
 let lastFieldMappingResult = null;
 const sampleLogCache = new Map();
@@ -913,6 +920,7 @@ try {
   apiToken = "";
 }
 async function loadSampleLog(product = selectedLogProduct()) {
+  product = product || "waf";
   if (sampleLogCache.has(product)) return sampleLogCache.get(product);
   const sample = await json(`/api/samples/${encodeURIComponent(product)}-alert`);
   sampleLogCache.set(product, sample);
@@ -1106,6 +1114,9 @@ function caseSearchQuery(section = activeDashboardSection) {
   // Keep the active queue compact while allowing the history view to search
   // farther back for retrospective review.
   const params = new URLSearchParams({ limit: section === "history" ? "500" : "50" });
+  // Let the API remove terminal Cases before it applies the limit.  Client-side
+  // filtering after a mixed-status query can hide older active Cases entirely.
+  if (section === "pending") params.set("active_only", "1");
   const value = (name) => String(form.elements.namedItem(name)?.value || "").trim();
   const product = value("product");
   const severity = value("severity");
@@ -1174,7 +1185,6 @@ function applyLanguage() {
   applyTheme(document.documentElement.dataset.theme || "light");
   const languageButton = document.querySelector("#language-switch");
   if (languageButton) {
-    languageButton.textContent = tr("languageButton");
     languageButton.setAttribute("aria-label", tr("languageAria"));
   }
   if (lastFieldMappingResult) {
@@ -1205,20 +1215,21 @@ function renderLogProductOptions() {
   const select = document.querySelector("#log-product-select");
   if (!select) return;
   const current = selectedLogProduct();
-  select.innerHTML = LOG_PRODUCT_OPTIONS.map((item) => {
+  const auto = `<option value="" ${!current ? "selected" : ""}>${escapeHtml(tr("autoDetectProduct"))}</option>`;
+  select.innerHTML = auto + LOG_PRODUCT_OPTIONS.map((item) => {
     const label = `${item.label} JSON ${currentLanguage === "en" ? "log" : "日志"}`;
     return `<option value="${escapeHtml(item.product)}" ${item.product === current ? "selected" : ""}>${escapeHtml(label)}</option>`;
   }).join("");
 }
 
 function selectedLogProduct() {
-  const value = document.querySelector("#log-product-select")?.value || "waf";
-  return LOG_PRODUCT_OPTIONS.some((item) => item.product === value) ? value : "waf";
+  const value = document.querySelector("#log-product-select")?.value || "";
+  return LOG_PRODUCT_OPTIONS.some((item) => item.product === value) ? value : "";
 }
 
 function selectedLogProductLabel() {
   const product = selectedLogProduct();
-  return LOG_PRODUCT_OPTIONS.find((item) => item.product === product)?.label || product.toUpperCase();
+  return LOG_PRODUCT_OPTIONS.find((item) => item.product === product)?.label || tr("autoDetectProduct");
 }
 
 function defaultSyslogConfigs() {
@@ -1539,9 +1550,10 @@ function applyTheme(theme) {
   if (switchButton) {
     const nextTheme = normalized === "dark" ? "light" : "dark";
     switchButton.dataset.themeValue = nextTheme;
-    switchButton.textContent = normalized === "dark" ? tr("switchLight") : tr("switchDark");
     switchButton.setAttribute("aria-label", tr("themeAria"));
     switchButton.setAttribute("aria-pressed", String(normalized === "dark"));
+    switchButton.querySelector('[data-theme-icon="moon"]').hidden = normalized === "dark";
+    switchButton.querySelector('[data-theme-icon="sun"]').hidden = normalized !== "dark";
   }
   return normalized;
 }
@@ -2882,6 +2894,9 @@ async function governMemory(action, button) {
     }
     showToast(tr("memoryActionDone", { id: selectedMemoryId, action: button.textContent.trim() }));
     if (selectedMemoryId === memoryId) await loadMemoryGovernance({ quiet: true });
+    // Promotion can move the source Case from open to under_review. Refresh the
+    // queue too, so the two workbenches never show contradictory lifecycle state.
+    if (action === "promote") await loadCases();
   } catch (err) {
     showToast(tr("memoryActionFailed", { message: err.message || String(err) }), "error");
   } finally {
@@ -3142,6 +3157,13 @@ async function loadMappingProfiles() {
 async function saveMappingProfile(event) {
   event.preventDefault();
   const profile = JSON.parse(document.querySelector("#profile-json").value || "{}");
+  const sourceText = document.querySelector("#source-log").value.trim();
+  if (sourceText) {
+    const validation = await validateMappingProfile(profile, JSON.parse(sourceText));
+    document.querySelector("#dry-run-result").textContent = JSON.stringify(validation, null, 2);
+    mappingNeedsValidation = !validation.ok;
+    if (!validation.ok) throw new Error(validation.errors?.join(", ") || tr("dryRunFailed", { fields: tr("checkResult") }));
+  }
   const result = await json("/api/mapping-profiles", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -3160,7 +3182,7 @@ function renderFieldMappingTable(result) {
     container.innerHTML = `<p class="empty">${escapeHtml(tr("mappingEmpty"))}</p>`;
     return;
   }
-  const requiredMissing = result.required_missing || [];
+  const requiredMissing = fields.filter((field) => field.required && !field.mapping).map((field) => field.target);
   const recommendedMissing = result.recommended_missing || [];
   const summaryClass = requiredMissing.length ? "error" : recommendedMissing.length ? "warn" : "success";
   const summaryText = requiredMissing.length
@@ -3234,28 +3256,40 @@ function updateInferredMapping(event) {
     delete inferredProfile.mappings[field.target];
   }
   setProfileJson(inferredProfile);
+  mappingNeedsValidation = true;
+  renderFieldMappingTable({ fields: inferredFields });
+  setProfileStatus(tr("dryRunHint"));
 }
 
 async function inferMappingProfile(event) {
   event.preventDefault();
   const log = currentLog();
   const product = selectedLogProduct();
+  const body = { log };
+  if (product) body.product = product;
   const result = await json("/api/mapping-profiles/infer", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ log, product, profile_id: `auto-${product}-json` }),
+    body: JSON.stringify(body),
   });
   inferredProfile = result.profile;
   inferredFields = result.fields || [];
   setProfileJson(inferredProfile);
   renderFieldMappingTable(result);
   document.querySelector("#dry-run-result").textContent = JSON.stringify(result.quality || result, null, 2);
-  setProfileStatus(result.ok ? tr("inferOk") : tr("inferNeedsRequired"), !result.ok);
+  mappingNeedsValidation = true;
+  const detection = result.product_detection;
+  const detectedMessage = detection?.mode === "auto" ? ` ${detection.product.toUpperCase()} (${Math.round((detection.confidence || 0) * 100)}%)` : "";
+  setProfileStatus((result.ok ? tr("inferOk") : tr("inferNeedsRequired")) + detectedMessage, !result.ok);
 }
 
 async function saveCurrentProfile() {
   const profile = currentProfileForDryRun();
   if (!profile.profile_id) throw new Error(tr("selectProfileFirst"));
+  if (mappingNeedsValidation) {
+    const validation = await validateMappingProfile(profile);
+    if (!validation.ok) throw new Error(validation.errors?.join(", ") || tr("dryRunFailed", { fields: tr("checkResult") }));
+  }
   const result = await json("/api/mapping-profiles", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -3270,14 +3304,19 @@ async function runDryRun(event) {
   event.preventDefault();
   const profile = currentProfileForDryRun();
   const log = currentLog();
-  const result = await json("/api/mapping-profiles/dry-run", {
+  const result = await validateMappingProfile(profile, log);
+  document.querySelector("#dry-run-result").textContent = JSON.stringify(result, null, 2);
+  mappingNeedsValidation = !result.ok;
+  const missing = Array.isArray(result.missing_required_fields) ? result.missing_required_fields.join(", ") : "";
+  showToast(result.ok ? tr("dryRunOk") : tr("dryRunFailed", { fields: missing || tr("checkResult") }), result.ok ? "success" : "error");
+}
+
+async function validateMappingProfile(profile, log = currentLog()) {
+  return json("/api/mapping-profiles/dry-run", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ profile, log }),
   });
-  document.querySelector("#dry-run-result").textContent = JSON.stringify(result, null, 2);
-  const missing = Array.isArray(result.missing_required_fields) ? result.missing_required_fields.join(", ") : "";
-  showToast(result.ok ? tr("dryRunOk") : tr("dryRunFailed", { fields: missing || tr("checkResult") }), result.ok ? "success" : "error");
 }
 
 async function loadLlmConfig() {
@@ -3579,7 +3618,7 @@ document.querySelector("#infer-form").addEventListener("submit", (event) => {
   inferMappingProfile(event).catch((err) => setProfileStatus(err.message || String(err), true));
 });
 document.querySelector("#load-sample-log").addEventListener("click", () => {
-  const product = selectedLogProduct();
+  const product = selectedLogProduct() || "waf";
   loadSampleLog(product)
     .then((sample) => {
       document.querySelector("#source-log").value = JSON.stringify(sample, null, 2);
@@ -3591,10 +3630,14 @@ document.querySelector("#log-product-select").addEventListener("change", () => {
   inferredProfile = null;
   inferredFields = [];
   lastFieldMappingResult = null;
+  mappingNeedsValidation = true;
   setProfileJson({});
   renderFieldMappingTable(null);
   document.querySelector("#dry-run-result").textContent = tr("dryRunHint");
   setProfileStatus("");
+});
+document.querySelector("#source-log").addEventListener("input", () => {
+  mappingNeedsValidation = true;
 });
 document.querySelector("#save-inferred-profile").addEventListener("click", () => {
   saveCurrentProfile().catch((err) => setProfileStatus(err.message || String(err), true));

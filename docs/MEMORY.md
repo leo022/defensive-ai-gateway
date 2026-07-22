@@ -64,6 +64,11 @@ overall = 0.68 * structured + 0.22 * semantic_vector + 0.10 * retrieval_key
 - `archive_case(case_id)` —— Case 关闭时压缩归档其短期记忆。
 - 所有操作均写 `memory_events` 审计（proposed/promoted/rejected/expired/quarantined/conflict_detected）。
 
+### Case 与长期记忆的生命周期联动
+
+- 长期候选通过五门晋升为 `active` 后，若来源 Case 仍为 `open`，系统将其推进为 `under_review`，并写入 Case 审计；晋升本身不会自动关闭 Case 或确认攻击。
+- Case 进入终态 `closed` 或 `false_positive` 时，其尚未晋升的产品长期候选会转为 `expired`，并记录 `source_case_terminal_before_promotion`。已晋升的 `active` 长期记忆不受此操作影响，仍按自身有效期和治理流程管理。
+
 ## 5. 数据模型
 
 `memory_entries` 表（在原 schema 基础上扩展，含向前兼容迁移）：`memory_id, layer, namespace, retrieval_key, content, source_case_id, scope, trust_level, status, sensitivity_ok, approved_by, expires_at_ms, created_at_ms, updated_at_ms`。

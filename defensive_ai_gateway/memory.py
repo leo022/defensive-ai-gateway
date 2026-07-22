@@ -558,10 +558,16 @@ class MemoryManager:
                     approved_by or "memory_manager", {"reasons": reasons}, _commit=False,
                 )
             return PromotionOutcome(False, reasons, memory_id)
+        m = self.repo.get_memory(memory_id)
+        if not m:
+            return PromotionOutcome(False, ["memory_not_found"], memory_id)
         # Atomic promotion: status, scope, retrieval_key and the audit event commit
         # together so a failure mid-sequence cannot leave an ``active`` memory with
         # empty scope/retrieval_key (which would violate the very gates just checked).
         with self.repo.transaction():
+            source_case_id = str(m.get("source_case_id") or "")
+            source_case = self.repo.get_case(source_case_id) if source_case_id else None
+            source_case_transitioned = bool(source_case and source_case.get("status") == "open")
             self.repo.update_memory(
                 memory_id,
                 status=STATUS_ACTIVE,
@@ -576,9 +582,33 @@ class MemoryManager:
                 self.repo.update_memory(memory_id, retrieval_key=retrieval_key, _commit=False)
             self.repo.insert_memory_event(
                 new_id("mev"), memory_id, LAYER_PRODUCT_LONG_TERM, "promoted", approved_by,
-                {"scope": scope, "expires_at_ms": expires_at_ms, "retrieval_key": retrieval_key},
+                {
+                    "scope": scope,
+                    "expires_at_ms": expires_at_ms,
+                    "retrieval_key": retrieval_key,
+                    "source_case_id": source_case_id,
+                    "source_case_transitioned_to_under_review": source_case_transitioned,
+                },
                 _commit=False,
             )
+            # A human-approved reusable memory means the originating Case has
+            # received governance attention, but is not evidence to auto-close or
+            # auto-classify an incident.  Move only untouched Cases into review.
+            if source_case_transitioned:
+                self.repo.update_case_status(source_case_id, "under_review", _commit=False)
+                self.repo.insert_audit(
+                    new_id("audit"),
+                    source_case_id,
+                    approved_by,
+                    "memory_promotion_started_case_review",
+                    {
+                        "case_id": source_case_id,
+                        "memory_id": memory_id,
+                        "memory_status": STATUS_ACTIVE,
+                        "case_status": "under_review",
+                    },
+                    _commit=False,
+                )
         return PromotionOutcome(True, [], memory_id)
 
     @_serialize_lifecycle

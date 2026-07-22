@@ -46,8 +46,6 @@
         </nav>
         <div class="sidebar-footer">
           <button id="auth-session" class="utility-button" type="button" data-i18n="authSession" hidden>API 认证</button>
-          <button id="theme-switch" class="utility-button" type="button" aria-label="切换深色或浅色模式" data-i18n-aria-label="themeAria"></button>
-          <button id="language-switch" class="utility-button language-switch" type="button" aria-label="Switch language"></button>
         </div>
       </aside>
       <div class="workspace">
@@ -58,6 +56,23 @@
           </div>
           <div class="header-actions">
             <button id="refresh" type="button" data-i18n="refresh">刷新</button>
+            <button id="theme-switch" class="header-icon-button" type="button" aria-label="切换深色或浅色模式" data-i18n-aria-label="themeAria" aria-pressed="false">
+              <svg class="control-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <g data-theme-icon="moon">
+                  <path d="M20.3 15.6A8.6 8.6 0 0 1 8.4 3.7 8.6 8.6 0 1 0 20.3 15.6Z" />
+                </g>
+                <g data-theme-icon="sun" hidden>
+                  <circle cx="12" cy="12" r="3.4" />
+                  <path d="M12 2.5v2M12 19.5v2M21.5 12h-2M4.5 12h-2M18.7 5.3l-1.4 1.4M6.7 17.3l-1.4 1.4M18.7 18.7l-1.4-1.4M6.7 6.7 5.3 5.3" />
+                </g>
+              </svg>
+            </button>
+            <button id="language-switch" class="header-icon-button" type="button" aria-label="Switch language">
+              <svg class="control-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <circle cx="12" cy="12" r="8.5" />
+                <path d="M3.8 12h16.4M12 3.5c2.1 2.3 3.2 5.2 3.2 8.5s-1.1 6.2-3.2 8.5c-2.1-2.3-3.2-5.2-3.2-8.5S9.9 5.8 12 3.5Z" />
+              </svg>
+            </button>
           </div>
         </header>
         <main>
@@ -493,6 +508,7 @@
               <label>
                 <span data-i18n="logSourceType">日志类型</span>
                 <select id="log-product-select" name="product">
+                  <option value="" data-i18n="autoDetectProduct">自动识别（推荐）</option>
                   <option value="waf">WAF JSON 日志</option>
                   <option value="hips">HIPS JSON 日志</option>
                   <option value="ndr">NDR JSON 日志</option>
@@ -511,21 +527,6 @@
               </div>
               <p id="profile-status" class="form-status"></p>
             </form>
-            <div id="field-mapping-table" class="field-mapping-table"></div>
-            <details class="advanced-profile">
-              <summary data-i18n="advancedConfig">映射模板</summary>
-              <div id="profile-list" class="profile-list"></div>
-              <form id="profile-form" class="settings-form profile-form">
-                <label>
-                  <span data-i18n="profileJson">Profile JSON</span>
-                  <textarea id="profile-json" spellcheck="false"></textarea>
-                </label>
-                <div class="form-actions">
-                  <button type="submit" data-i18n="saveProfile">保存 Profile</button>
-                  <button type="button" id="reload-profiles" data-i18n="reload">重新加载</button>
-                </div>
-              </form>
-            </details>
               </section>
               <section class="panel">
                 <div class="panel-heading">
@@ -540,6 +541,29 @@
               </div>
             </form>
             <pre id="dry-run-result" class="json-block dry-run-result" data-i18n="dryRunHint">等待日志与映射配置。</pre>
+              </section>
+              <section id="mapping-result-panel" class="panel mapping-result-panel" aria-live="polite">
+                <div class="panel-heading">
+                  <div>
+                    <h2 data-i18n="fieldConfirmation">字段确认</h2>
+                    <p data-i18n="fieldConfirmationHint">识别后在此确认字段映射；完整宽度展示，无需横向拖动。</p>
+                  </div>
+                </div>
+                <div id="field-mapping-table" class="field-mapping-table"></div>
+                <details class="advanced-profile">
+                  <summary data-i18n="advancedConfig">映射模板</summary>
+                  <div id="profile-list" class="profile-list"></div>
+                  <form id="profile-form" class="settings-form profile-form">
+                    <label>
+                      <span data-i18n="profileJson">Profile JSON</span>
+                      <textarea id="profile-json" spellcheck="false"></textarea>
+                    </label>
+                    <div class="form-actions">
+                      <button type="submit" data-i18n="saveProfile">保存 Profile</button>
+                      <button type="button" id="reload-profiles" data-i18n="reload">重新加载</button>
+                    </div>
+                  </form>
+                </details>
               </section>
             </section>
             </div>
