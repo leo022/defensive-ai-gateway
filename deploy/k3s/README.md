@@ -144,6 +144,13 @@ DEFENSIVE_AI_SYSLOG_SOURCE_CIDRS=10.20.0.0/16,10.21.0.0/16
 bash install.sh --with-syslog
 ```
 
+如已在控制台「日志接入 > 告警接入 > Syslog 接入部署」下载来源网段文件，可替代
+手工编辑该项：
+
+```bash
+bash install.sh --with-syslog --syslog-console-config defensive-ai-syslog-console.env
+```
+
 LoadBalancer 使用 `loadBalancerSourceRanges`，并在生产安装时生成同源 CIDR 的
 `syslog-collector-ingress` NetworkPolicy，阻止其他外部来源和集群 Pod 绕过 Service
 直接向 Vector 注入日志。Vector 只持有 ingest

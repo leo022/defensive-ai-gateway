@@ -6,6 +6,7 @@ ENV_FILE="${K3S_ENV_FILE:-$ROOT_DIR/.env}"
 NAMESPACE="defensive-ai-gateway"
 IMAGE_DIR=""
 WITH_SYSLOG=0
+SYSLOG_CONSOLE_CONFIG=""
 DEMO_MODE=0
 PREFLIGHT_ONLY=0
 SKIP_BACKUP=0
@@ -30,6 +31,8 @@ allowlisting, two-person approval, immutable images, and a pre-upgrade DB backup
 Options:
   --image-dir DIR        Exported image tar directory. Defaults to ./images.
   --with-syslog          Deploy Vector; requires a distinct ingest token and source CIDRs.
+  --syslog-console-config FILE
+                         Read a console-exported Syslog source-CIDR file.
   --demo-mode            Explicitly use tokenless hostPort HTTP for an isolated demo.
   --require-token        Deprecated no-op; production is already the default.
   --allow-empty-token    Deprecated alias for --demo-mode.
@@ -88,6 +91,33 @@ load_environment() {
   # shellcheck disable=SC1090
   . "$ENV_FILE"
   set +a
+}
+
+load_syslog_console_config() {
+  syslog_console_file="$1"
+  [ -f "$syslog_console_file" ] && [ -r "$syslog_console_file" ] \
+    || die "Syslog console config is not a readable regular file: $syslog_console_file"
+
+  syslog_console_value=""
+  syslog_console_found=0
+  syslog_console_line=""
+  while IFS= read -r syslog_console_line || [ -n "$syslog_console_line" ]; do
+    case "$syslog_console_line" in
+      ""|\#*) ;;
+      DEFENSIVE_AI_SYSLOG_SOURCE_CIDRS=*)
+        [ "$syslog_console_found" -eq 0 ] \
+          || die "Syslog console config must contain DEFENSIVE_AI_SYSLOG_SOURCE_CIDRS once"
+        syslog_console_value="${syslog_console_line#DEFENSIVE_AI_SYSLOG_SOURCE_CIDRS=}"
+        syslog_console_found=1
+        ;;
+      *) die "Syslog console config contains an unsupported line" ;;
+    esac
+  done < "$syslog_console_file"
+  [ "$syslog_console_found" -eq 1 ] \
+    || die "Syslog console config must contain DEFENSIVE_AI_SYSLOG_SOURCE_CIDRS"
+  single_line "$syslog_console_value" \
+    || die "Syslog console CIDRs must be a single line"
+  DEFENSIVE_AI_SYSLOG_SOURCE_CIDRS="$syslog_console_value"
 }
 
 strong_secret() {
@@ -778,6 +808,7 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --image-dir) [ "$#" -ge 2 ] || die "--image-dir requires a value"; IMAGE_DIR="$2"; shift 2 ;;
     --with-syslog) WITH_SYSLOG=1; shift ;;
+    --syslog-console-config) [ "$#" -ge 2 ] || die "--syslog-console-config requires a file"; SYSLOG_CONSOLE_CONFIG="$2"; shift 2 ;;
     --demo-mode|--allow-empty-token) DEMO_MODE=1; shift ;;
     --require-token) shift ;;
     --skip-backup) SKIP_BACKUP=1; shift ;;
@@ -797,6 +828,11 @@ if [ -n "$ROLLBACK_ID" ]; then
 fi
 
 load_environment
+if [ -n "$SYSLOG_CONSOLE_CONFIG" ]; then
+  [ "$WITH_SYSLOG" -eq 1 ] || die "--syslog-console-config requires --with-syslog"
+  [ "$DEMO_MODE" -eq 0 ] || die "--syslog-console-config is not available in demo mode"
+  load_syslog_console_config "$SYSLOG_CONSOLE_CONFIG"
+fi
 if [ -z "$IMAGE_DIR" ]; then
   IMAGE_DIR="${K3S_IMAGE_DIR:-$ROOT_DIR/images}"
 fi

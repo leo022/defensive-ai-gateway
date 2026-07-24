@@ -41,6 +41,53 @@ def _waf_alert() -> RawAlert:
     )
 
 
+def _business_false_positive_alert(alert_id: str, timestamp: str) -> RawAlert:
+    return RawAlert(
+        source="test",
+        product="waf",
+        event_type="approved_partner_client_header",
+        severity="low",
+        timestamp=timestamp,
+        payload={
+            "rule_id": "WAF-PARTNER-DUPLICATE-HEADER",
+            "app": "settlement-api",
+            "host": "settlement-api-01",
+            "src_ip": "10.40.8.12",
+            "uri": "/partner/settlement/upload",
+            "headers": {"user-agent": "bank-partner-batch-client/2.4"},
+            "payload_category": "known partner client sends duplicate header during settlement batch",
+        },
+        alert_id=alert_id,
+    )
+
+
+def _memory_candidate_alert(alert_id: str) -> RawAlert:
+    """Return a complete high-risk event eligible for a governed proposal.
+
+    Long-term memory intentionally ignores ``insufficient_evidence`` results,
+    so lifecycle tests need a normalized alert with enough independent evidence
+    to pass the analysis and validation gates.
+    """
+    return RawAlert(
+        source="test",
+        product="waf",
+        event_type="web_attack_sqli_anomaly",
+        severity="high",
+        timestamp="2026-01-02T00:00:00Z",
+        payload={
+            "rule_id": "WAF-SECOND-SQLI",
+            "rule_name": "SQL injection anomaly threshold exceeded",
+            "action": "blocked",
+            "src_ip": "10.0.0.2",
+            "uri": "/openbanking/v2/payments/search",
+            "method": "POST",
+            "status": 403,
+            "payload_category": "SQL injection boolean expression marker observed",
+        },
+        alert_id=alert_id,
+    )
+
+
 def _build(tmp: Path, with_policy: bool = True):
     config = GatewayConfig()
     repo = Repository(str(tmp / "gateway.db"))
@@ -204,15 +251,7 @@ class MultiLayerMemoryTest(unittest.TestCase):
             # An approved memory is independent after promotion, even when its
             # source Case later reaches a terminal disposition.
             second = orchestrator.handle_alert(
-                RawAlert(
-                    source="test",
-                    product="waf",
-                    event_type="different-rule",
-                    severity="low",
-                    timestamp="2026-01-02T00:00:00Z",
-                    payload={"rule_id": "WAF-SECOND", "src_ip": "10.0.0.2"},
-                    alert_id="alert-memory-lifecycle-second",
-                )
+                _memory_candidate_alert("alert-memory-lifecycle-second")
             )
             second_candidate = next(
                 item
@@ -470,15 +509,7 @@ class MemoryGovernanceAPITest(unittest.TestCase):
             self.assertIn("analyst_approved:reapproval_required_after_restore", restored["reasons"])
 
             second = state.orchestrator.handle_alert(
-                RawAlert(
-                    source="test",
-                    product="waf",
-                    event_type="different-rule",
-                    severity="low",
-                    timestamp="2026-01-02T00:00:00Z",
-                    payload={"rule_id": "WAF-SECOND", "src_ip": "10.0.0.2"},
-                    alert_id="alert-memory-restore-second",
-                )
+                _memory_candidate_alert("alert-memory-restore-second")
             )
             candidates = state.list_memory({"layer": LAYER_PRODUCT_LONG_TERM, "status": STATUS_PENDING})
             incomplete = next(row for row in candidates if row["source_case_id"] == second.case_id)
@@ -543,6 +574,84 @@ class MemoryGovernanceAPITest(unittest.TestCase):
             )
             self.assertEqual(state.repo.get_case(result.case_id)["status"], "false_positive")
             self.assertEqual(state.repo.stats()["cases"], 0)
+
+    def test_confirmed_false_positive_matches_a_new_alert_instance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            config.database.path = str(Path(tmp) / "gateway.db")
+            config.processing.async_enabled = False
+            config.syslog.embedded_listeners_enabled = False
+            state = GatewayState(config)
+            try:
+                first = state.orchestrator.handle_alert(
+                    _business_false_positive_alert(
+                        "waf-partner-fp-001",
+                        "2026-07-24T09:00:00+08:00",
+                    )
+                )
+                memory = state.confirm_alert_false_positive(
+                    "waf-partner-fp-001",
+                    {"analyst": "analyst-lee", "reason": "已批准合作方批处理客户端"},
+                )
+
+                second = state.orchestrator.handle_alert(
+                    _business_false_positive_alert(
+                        "waf-partner-fp-002",
+                        "2026-07-24T09:05:00+08:00",
+                    )
+                )
+
+                self.assertNotEqual(second.case_id, first.case_id)
+                self.assertEqual(
+                    state.repo.conn.execute("SELECT COUNT(*) FROM raw_alerts").fetchone()[0],
+                    2,
+                )
+                association = second.explanation["memory_association"]
+                self.assertEqual(association["best_memory_id"], memory["memory_id"])
+                matches = state.repo.list_memory_matches(case_id=second.case_id)
+                self.assertEqual([match["memory_id"] for match in matches], [memory["memory_id"]])
+                self.assertIn(
+                    matches[0]["final_effect"],
+                    {"downgraded_to_benign", "classification_reinforced", "review_only"},
+                )
+            finally:
+                state.stop()
+
+    def test_confirm_alert_false_positive_is_idempotent_for_retries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            config.database.path = str(Path(tmp) / "gateway.db")
+            state = GatewayState(config)
+            result = state.orchestrator.handle_alert(_waf_alert())
+            alert_id = state.repo.get_case(result.case_id)["linked_alerts"][0]["alert_id"]
+
+            first = state.confirm_alert_false_positive(
+                alert_id,
+                {"analyst": "analyst-lee", "reason": "业务搜索参数误报"},
+            )
+            second = state.confirm_alert_false_positive(
+                alert_id,
+                {"analyst": "analyst-lee", "reason": "业务搜索参数误报"},
+            )
+
+            self.assertEqual(second["memory_id"], first["memory_id"])
+            active = state.repo.query_memory(
+                layer=LAYER_PRODUCT_LONG_TERM,
+                namespace=state.memory.product_namespace("waf"),
+                status=STATUS_ACTIVE,
+                limit=100,
+            )
+            confirmations = [
+                item
+                for item in active
+                if json.loads(item["content"]).get("alert_id") == alert_id
+            ]
+            self.assertEqual([item["memory_id"] for item in confirmations], [first["memory_id"]])
+            audit_count = state.repo.conn.execute(
+                "SELECT COUNT(*) FROM audit_log WHERE case_id = ? AND action = 'confirm_business_false_positive'",
+                (result.case_id,),
+            ).fetchone()[0]
+            self.assertEqual(audit_count, 1)
 
     def test_confirm_alert_false_positive_rejects_past_expiry_atomically(self):
         with tempfile.TemporaryDirectory() as tmp:

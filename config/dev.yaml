@@ -31,6 +31,7 @@ operations:
   maintenance_interval_seconds: 60
   inbox_retention_days: 7
   stale_claim_seconds: 600
+  llm_recovery_batch_size: 100
 memory_matching:
   candidate_limit: 100
   top_k: 5
@@ -42,7 +43,7 @@ memory_matching:
   vector_dimensions: 256
 syslog:
   embedded_listeners_enabled: true
-  max_frame_bytes: 1000000
+  max_frame_bytes: 2000000
   max_connections: 64
   product_ports:
     waf: 15140
@@ -50,6 +51,8 @@ syslog:
     ndr: 15142
     rasp: 15143
     siem: 15144
+  product_protocols:
+    rasp: tcp
   gateway_profiles:
     waf: "auto-waf-json"
     hips: "auto-hips-json"

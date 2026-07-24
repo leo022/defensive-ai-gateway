@@ -31,6 +31,8 @@ class ContainerDefaultsTest(unittest.TestCase):
             config.syslog.gateway_profiles,
             {product: f"auto-{product}-json" for product in ("waf", "hips", "ndr", "rasp", "siem")},
         )
+        self.assertEqual(config.syslog.product_protocols["rasp"], "tcp")
+        self.assertEqual(config.syslog.max_frame_bytes, 2_000_000)
 
     def test_container_environment_can_select_remote_model_and_retention(self):
         with patch.dict(
@@ -72,6 +74,26 @@ class ContainerDefaultsTest(unittest.TestCase):
         self.assertIn("DEFENSIVE_AI_LLM_MODEL", compose)
         self.assertIn("DEFENSIVE_AI_LLM_ALLOWED_HOSTS", compose)
         self.assertIn("no-new-privileges:true", compose)
+
+    def test_single_host_caddy_config_has_an_ip_certificate_fallback(self):
+        caddyfile = (ROOT / "deploy" / "docker" / "Caddyfile.single-host").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(":443", caddyfile)
+        self.assertIn("admin 127.0.0.1:2019", caddyfile)
+        self.assertIn("tls /etc/caddy/defensive-ai-gateway.crt", caddyfile)
+        self.assertIn("@gateway host __PUBLIC_HOST__", caddyfile)
+        self.assertNotIn("tls internal", caddyfile)
+
+    def test_single_host_vector_watches_an_atomic_config_directory(self):
+        compose = (ROOT / "deploy" / "docker" / "compose.single-host.yaml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("context: ../..", compose)
+        self.assertIn("dockerfile: deploy/docker/Dockerfile", compose)
+        self.assertIn('command: ["--config", "/etc/vector/vector.toml", "--watch-config"]', compose)
+        self.assertIn('/vector:/etc/vector:ro', compose)
+        self.assertIn('/vector:/var/lib/vector', compose)
 
     def test_systemd_installer_never_writes_known_tokens_and_keeps_demo_loopback(self):
         installer = (ROOT / "install.sh").read_text(encoding="utf-8")
@@ -210,10 +232,82 @@ class K3sManifestTest(unittest.TestCase):
         self.assertIn("gateway-deployment-spec.json", installer)
         self.assertIn("gateway-service-spec.json", installer)
         self.assertIn("vector-deployment-spec.json", installer)
+        self.assertIn("--syslog-console-config", installer)
+        self.assertIn("load_syslog_console_config", installer)
+        self.assertIn("Syslog console config contains an unsupported line", installer)
+        self.assertNotIn('. "$syslog_console_file"', installer)
         self.assertIn(r'{\"op\":\"replace\",\"path\":\"/spec\"', installer)
         self.assertIn("require_runtime_image", installer)
         self.assertIn('if bash "$0" --rollback "$BACKUP_ID"', installer)
         self.assertNotIn('restore_database "$BACKUP_ID" "$PREVIOUS_IMAGE" ||', installer)
+
+    def test_bundle_installer_accepts_only_the_console_exported_source_cidr_key(self):
+        installer = ROOT / "deploy" / "k3s" / "install-k3s-bundle.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            env_file = tmp_path / "production.env"
+            env_file.write_text(
+                "\n".join(
+                    [
+                        "DEFENSIVE_AI_API_TOKEN=" + "a" * 32,
+                        "DEFENSIVE_AI_INGEST_TOKEN=" + "b" * 32,
+                        "DEFENSIVE_AI_OPERATOR_TOKEN=" + "c" * 32,
+                        "DEFENSIVE_AI_APPROVER_TOKEN=" + "d" * 32,
+                        "DEFENSIVE_AI_PUBLIC_HOST=gateway.internal.example",
+                        "DEFENSIVE_AI_TLS_SECRET=defensive-ai-gateway-tls",
+                        "DEFENSIVE_AI_ALLOWED_SOURCE_CIDRS=10.0.0.0/8",
+                        "DEFENSIVE_AI_LLM_PROVIDER=local",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            env_file.chmod(0o600)
+            console_file = tmp_path / "defensive-ai-syslog-console.env"
+            console_file.write_text(
+                "# Console export; no credential is included.\n"
+                "DEFENSIVE_AI_SYSLOG_SOURCE_CIDRS=10.20.10.15/32,10.20.11.0/24\n",
+                encoding="utf-8",
+            )
+            environment = {"PATH": os.environ.get("PATH", ""), "K3S_ENV_FILE": str(env_file)}
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(installer),
+                    "--with-syslog",
+                    "--syslog-console-config",
+                    str(console_file),
+                    "--preflight-only",
+                ],
+                cwd=ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("preflight passed", result.stdout)
+
+            console_file.write_text(
+                "DEFENSIVE_AI_SYSLOG_SOURCE_CIDRS=10.20.10.15/32\n"
+                "UNEXPECTED_SHELL_ASSIGNMENT=1\n",
+                encoding="utf-8",
+            )
+            rejected = subprocess.run(
+                [
+                    "bash",
+                    str(installer),
+                    "--with-syslog",
+                    "--syslog-console-config",
+                    str(console_file),
+                    "--preflight-only",
+                ],
+                cwd=ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("unsupported line", rejected.stderr)
 
     def test_package_script_builds_minimal_runtime_bundle_from_approved_image(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -395,8 +489,34 @@ class K3sManifestTest(unittest.TestCase):
         self.assertIn("externalTrafficPolicy: Local", collector)
         self.assertIn('image: "@@VECTOR_IMAGE@@"', collector)
         self.assertEqual(collector.count("max_events = 1"), 2)
+        self.assertEqual(collector.count('framing.method = "newline_delimited"'), 2)
+        self.assertEqual(collector.count("request.retry_attempts = 4294967295"), 2)
+        self.assertEqual(collector.count("acknowledgements.enabled = false"), 2)
+        self.assertNotIn("acknowledgements.enabled = true", collector)
+        self.assertIn('"profile_id": .gateway_profile', collector)
+        self.assertNotIn("?profile={{ _gateway_profile }}", collector)
+        self.assertIn('(to_string(structured.data_type) ?? "")', collector)
+        self.assertNotIn('\n    else if product ==', collector)
         self.assertIn("syslog-collector-ingress", installer)
         self.assertIn("render_syslog_network_policy", installer)
+        self.assertIn("{protocol: UDP, port: 15143}", installer)
+
+    def test_single_host_vector_renderer_keeps_profile_id_out_of_the_uri(self):
+        renderer = ROOT / "deploy" / "docker" / "render-single-host-vector-config.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "vector.toml"
+            result = subprocess.run(
+                ["bash", str(renderer), str(output)],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rendered = output.read_text(encoding="utf-8")
+        self.assertIn('"profile_id": .gateway_profile', rendered)
+        self.assertIn('uri = "http://127.0.0.1:8080/api/alerts"', rendered)
+        self.assertNotIn("{{ _gateway_profile }}", rendered)
+        self.assertIn('address = "127.0.0.1:8686"', rendered)
 
     def test_role_tokens_are_wired_through_secret_env_and_installer(self):
         env_example = (ROOT / "deploy" / "k3s" / "env.example").read_text(encoding="utf-8")

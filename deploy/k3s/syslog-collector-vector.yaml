@@ -41,15 +41,24 @@ data:
     address = "0.0.0.0:15142"
     mode = "tcp"
 
+    # Keep the existing UDP sender path during a controlled migration. UDP is
+    # always labeled as legacy/best-effort below; new RASP consoles must use
+    # the TCP source on the same port before this compatibility source is removed.
     [sources.syslog_rasp_udp]
     type = "syslog"
     address = "0.0.0.0:15143"
     mode = "udp"
+    max_length = 2_000_000
 
     [sources.syslog_rasp_tcp]
     type = "syslog"
     address = "0.0.0.0:15143"
     mode = "tcp"
+    # Vector defaults to 100 KiB and truncates a larger syslog message. RASP
+    # stack traces can be substantially larger, so this matches the gateway's
+    # bounded RASP transport contract instead of silently cutting evidence.
+    max_length = 2_000_000
+    connection_limit = 64
 
     [sources.syslog_siem_udp]
     type = "syslog"
@@ -76,10 +85,15 @@ data:
     inputs = ["syslog_ndr_udp", "syslog_ndr_tcp"]
     source = '.port_product = "ndr"; .destination_port = 15142'
 
-    [transforms.tag_rasp_syslog]
+    [transforms.tag_rasp_udp_syslog]
     type = "remap"
-    inputs = ["syslog_rasp_udp", "syslog_rasp_tcp"]
-    source = '.port_product = "rasp"; .destination_port = 15143'
+    inputs = ["syslog_rasp_udp"]
+    source = '.port_product = "rasp"; .destination_port = 15143; .transport_protocol = "udp"; .transport_assurance = "legacy_udp_best_effort"'
+
+    [transforms.tag_rasp_tcp_syslog]
+    type = "remap"
+    inputs = ["syslog_rasp_tcp"]
+    source = '.port_product = "rasp"; .destination_port = 15143; .transport_protocol = "tcp"; .transport_assurance = "collector_received_tcp"'
 
     [transforms.tag_siem_syslog]
     type = "remap"
@@ -92,7 +106,7 @@ data:
     #    gateway_profile 为空表示未配置 profile，走下方 standard 路径（collector 侧归一化）。
     [transforms.classify_source]
     type = "remap"
-    inputs = ["tag_waf_syslog", "tag_hips_syslog", "tag_ndr_syslog", "tag_rasp_syslog", "tag_siem_syslog"]
+    inputs = ["tag_waf_syslog", "tag_hips_syslog", "tag_ndr_syslog", "tag_rasp_udp_syslog", "tag_rasp_tcp_syslog", "tag_siem_syslog"]
     source = '''
     raw = .
     structured = parse_json(.message) ?? {}
@@ -108,7 +122,7 @@ data:
     }
 
     # cloudrasp 原生 RASP 指纹：data_type=attack_event
-    if product == "" && to_string(structured.data_type) == "attack_event" {
+    if product == "" && (to_string(structured.data_type) ?? "") == "attack_event" {
       product = "rasp"
     }
     # appname 标签兜底（运维侧把设备 syslog appname 设为 rasp/waf/hips/ndr/siem）
@@ -119,11 +133,17 @@ data:
     # product → 网关内置的五产品自动 profile。未识别 product 时才走
     # standard 路径，由 collector 侧保守归一化。
     gateway_profile = ""
-    if product == "waf" { gateway_profile = "auto-waf-json" }
-    else if product == "hips" { gateway_profile = "auto-hips-json" }
-    else if product == "ndr" { gateway_profile = "auto-ndr-json" }
-    else if product == "rasp" { gateway_profile = "auto-rasp-json" }
-    else if product == "siem" { gateway_profile = "auto-siem-json" }
+    if product == "waf" {
+      gateway_profile = "auto-waf-json"
+    } else if product == "hips" {
+      gateway_profile = "auto-hips-json"
+    } else if product == "ndr" {
+      gateway_profile = "auto-ndr-json"
+    } else if product == "rasp" {
+      gateway_profile = "auto-rasp-json"
+    } else if product == "siem" {
+      gateway_profile = "auto-siem-json"
+    }
 
     .structured = structured
     .raw = raw
@@ -137,6 +157,8 @@ data:
       "hostname": to_string(.hostname) ?? "",
       "appname": appname,
       "source_ip": to_string(.source_ip) ?? "",
+      "protocol": to_string(.transport_protocol) ?? "",
+      "transport_assurance": to_string(.transport_assurance) ?? "",
       "raw_message": to_string(.message) ?? "",
       "received_at": to_string(now())
     }
@@ -149,8 +171,8 @@ data:
     route.profiled = '.gateway_profile != ""'
     route.standard = '.gateway_profile == ""'
 
-    # 3a) profiled：透传原始结构化日志 {"log": ...}，URI 用 ?profile=<id> 指定网关侧 profile。
-    #     网关 alert_from_payload 检测到 profile_id 后只读取 body 中的 "log" 字段做语义映射。
+    # 3a) profiled：透传原始结构化日志 {"log": ...}，在请求体中携带 profile_id。
+    #     HTTP sink URI 必须保持静态，避免把 Vector template 解析为非法 URI。
     [transforms.shape_profiled]
     type = "remap"
     inputs = ["route_by_profile.profiled"]
@@ -161,7 +183,7 @@ data:
     structured._syslog_envelope = envelope
     . = {
       "log": structured,
-      "_gateway_profile": .gateway_profile,
+      "profile_id": .gateway_profile,
       "syslog_route": envelope
     }
     '''
@@ -169,16 +191,25 @@ data:
     [sinks.gateway_profiled]
     type = "http"
     inputs = ["shape_profiled"]
-    uri = "http://defensive-ai-gateway:8080/api/alerts?profile={{ _gateway_profile }}"
+    uri = "http://defensive-ai-gateway:8080/api/alerts"
     method = "post"
     request.headers.Content-Type = "application/json"
     # Collector is deliberately limited to the ingest role.
     request.headers.Authorization = "Bearer ${DEFENSIVE_AI_INGEST_TOKEN}"
     encoding.codec = "json"
-    acknowledgements.enabled = true
+    framing.method = "newline_delimited"
+    # Keep retryable network/server failures on the disk buffer for the
+    # collector lifetime. Vector 0.46 does not support retry_strategy; token
+    # rotation must therefore stop this collector before changing credentials.
+    request.retry_attempts = 4294967295
+    request.retry_initial_backoff_secs = 1
+    request.retry_max_duration_secs = 30
+    # TCP/UDP Syslog cannot provide end-to-end acknowledgements. Accepted events
+    # remain protected by the disk buffer below while the HTTP sink retries.
+    acknowledgements.enabled = false
 
-    # /api/alerts accepts one JSON object per request. Vector's HTTP sink batches
-    # by default, which can emit NDJSON and make a burst retry forever as 400.
+    # /api/alerts accepts one JSON object per request. An explicit NDJSON frame
+    # plus max_events=1 produces one JSON object (with trailing LF), not an array.
     [sinks.gateway_profiled.batch]
     max_events = 1
 
@@ -254,7 +285,11 @@ data:
     request.headers.Content-Type = "application/json"
     request.headers.Authorization = "Bearer ${DEFENSIVE_AI_INGEST_TOKEN}"
     encoding.codec = "json"
-    acknowledgements.enabled = true
+    framing.method = "newline_delimited"
+    request.retry_attempts = 4294967295
+    request.retry_initial_backoff_secs = 1
+    request.retry_max_duration_secs = 30
+    acknowledgements.enabled = false
 
     [sinks.gateway_standard.batch]
     max_events = 1

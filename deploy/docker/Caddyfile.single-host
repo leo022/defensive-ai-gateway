@@ -1,0 +1,38 @@
+{
+    # Keep Caddy's management API on loopback so systemd reloads work without
+    # making the API reachable from the network.
+    admin 127.0.0.1:2019
+    auto_https off
+}
+
+:80 {
+    @gateway host __PUBLIC_HOST__
+    redir @gateway https://__PUBLIC_HOST__{uri} permanent
+    respond "not found" 404
+}
+
+:443 {
+    # A direct IP URL often omits SNI. Use an explicit certificate with the
+    # public IP in its SAN so Caddy can serve it as the server default.
+    tls /etc/caddy/defensive-ai-gateway.crt /etc/caddy/defensive-ai-gateway.key
+
+    @gateway host __PUBLIC_HOST__
+    handle @gateway {
+        encode zstd gzip
+
+        header {
+            -Server
+            X-Content-Type-Options "nosniff"
+            X-Frame-Options "DENY"
+            Referrer-Policy "no-referrer"
+            Permissions-Policy "geolocation=(), camera=(), microphone=()"
+            Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        }
+
+        reverse_proxy 127.0.0.1:8080 {
+            header_up Host __PUBLIC_HOST__
+        }
+    }
+
+    respond "not found" 404
+}

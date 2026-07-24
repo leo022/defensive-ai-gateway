@@ -32,6 +32,7 @@ ALERT_TABLES = [
     "case_alert_links",
     "agent_runs",
     "approval_votes",
+    "validation_review_resolutions",
     "validation_runs",
     "action_approvals",
     "memory_matches",
@@ -94,7 +95,7 @@ def _preview(conn: sqlite3.Connection, include_approved: bool, include_org: bool
             """
             SELECT status, COUNT(*)
             FROM durable_alert_inbox
-            WHERE status IN ('pending', 'retry', 'processing')
+            WHERE status IN ('pending', 'retry', 'deferred', 'processing')
             GROUP BY status
             """
         ).fetchall()
@@ -147,12 +148,12 @@ def _delete(conn: sqlite3.Connection, include_approved: bool, include_org: bool,
             conn,
             """
             SELECT COUNT(*) FROM durable_alert_inbox
-            WHERE status IN ('pending', 'retry', 'processing')
+            WHERE status IN ('pending', 'retry', 'deferred', 'processing')
             """,
         )
         if active:
             raise ActiveAlertProcessingError(
-                f"refusing to clean while {active} alert(s) are pending, retrying, or processing"
+                f"refusing to clean while {active} alert(s) are pending, retrying, deferred, or processing"
             )
 
         deleted = {}

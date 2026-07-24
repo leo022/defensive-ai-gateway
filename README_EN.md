@@ -34,11 +34,23 @@ python3 scripts/send_sample.py --file samples/waf_alert.json
 python3 scripts/send_sample.py --file samples/siem_case.json
 ```
 
+`alert_id` is the idempotency key for one alert occurrence. The `--file` commands replay the fixed JSON unchanged, so sending the same file again is a retry: it does not create another raw alert or rerun long-term-memory matching. To simulate a new alert of the same type, preserve the detection semantics while generating a new instance ID and timestamp:
+
+```bash
+python3 scripts/send_sample.py --file samples/waf_alert.json --mutate
+```
+
+When one `alert_id` arrives with different timestamps, fields, or evidence, the API returns `409 alert_id_conflict`. Upstream systems must assign a unique ID to a new alert occurrence so the gateway never silently drops or rewrites audit evidence.
+Same-type alerts with different IDs can still be aggregated into one Case during the default one-hour correlation window. That is correlation, not replacement: the Case's linked raw alerts should show the increasing count and each original record.
+
 You can also generate random attack or false-positive alerts:
 
 ```bash
-# --file always sends the JSON sample as-is
+# --file always sends the JSON sample as-is; submitting it again is an idempotent replay
 python3 scripts/send_sample.py --file samples/ndr_alert.json
+
+# --mutate keeps the same detection semantics but creates new instance fields
+python3 scripts/send_sample.py --file samples/ndr_alert.json --mutate --count 2
 
 # --random randomizes product, scenario, and the product feature
 python3 scripts/send_sample.py --random --count 5 --product waf --scenario random

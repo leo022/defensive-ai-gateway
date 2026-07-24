@@ -19,6 +19,32 @@ class ResponseAdvisor:
         # turned into an authorization request until an analyst resolves it.
         if validation.status != "passed":
             return []
+        return self._prepare(event_id, result, validation)
+
+    def prepare_after_manual_review(
+        self,
+        event_id: str,
+        result: AgentResult,
+        validation: ValidationResult,
+        review_resolution_id: str,
+    ) -> list[ApprovalRequest]:
+        """Create approval requests after a separately persisted human review.
+
+        Callers must verify review eligibility and create the immutable review
+        resolution before invoking this method. This method deliberately does
+        not turn the Validator result itself into ``passed``.
+        """
+        if validation.status != "review" or not review_resolution_id:
+            return []
+        return self._prepare(event_id, result, validation, review_resolution_id)
+
+    def _prepare(
+        self,
+        event_id: str,
+        result: AgentResult,
+        validation: ValidationResult,
+        review_resolution_id: str = "",
+    ) -> list[ApprovalRequest]:
         # Copy actions so approval normalization never mutates the persisted agent
         # recommendation. The original and the approval request remain auditable.
         actions = [
@@ -58,7 +84,10 @@ class ResponseAdvisor:
                 continue
             seen_actions.add(normalized_action)
             rollback = action.rollback.strip() or "由执行系统记录变更前状态；出现业务异常时停止动作并恢复变更前配置。"
-            digest = hashlib.sha256(f"{result.case_id}\0{event_id}\0{action.action}".encode("utf-8")).hexdigest()[:20]
+            approval_key = f"{result.case_id}\0{event_id}\0{action.action}"
+            if review_resolution_id:
+                approval_key += f"\0manual-review\0{review_resolution_id}"
+            digest = hashlib.sha256(approval_key.encode("utf-8")).hexdigest()[:20]
             requests.append(
                 ApprovalRequest(
                     approval_id=f"approval_{digest}",
@@ -70,6 +99,8 @@ class ResponseAdvisor:
                     required_approvals=max(
                         1, min(int(self.policy.config.approval_quorum), 5)
                     ),
+                    validation_id=validation.validation_id,
+                    review_resolution_id=review_resolution_id,
                 )
             )
         return requests

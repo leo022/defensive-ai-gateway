@@ -95,6 +95,9 @@ const STRINGS = {
     queueSync: "同步分析模式",
     modelLocal: "本地规则分析器",
     modelRemote: "{provider} / {model}",
+    modelCredentialMissing: "Gateway 未配置部署凭据，告警已保留在待恢复队列。",
+    modelDurableRetry: "模型暂不可用，告警等待恢复调度（约 {seconds} 秒后）。",
+    modelDeferredBacklog: "远程模型待恢复分析：{count} 条告警。",
     syslogActive: "{active}/{total} 个监听在线",
     syslogInactive: "未启用监听",
     httpActive: "HTTP 接入在线",
@@ -290,6 +293,22 @@ const STRINGS = {
     syslogExternalStatus: "外部 Collector 托管",
     syslogManagedStatus: "外部接收：{protocol} {port}",
     syslogExternalHealth: "外部 Collector 托管 {total} 个入口",
+    syslogDeploymentTitle: "Syslog 接入部署",
+    syslogDeploymentHint: "集中维护安全设备的发送目标与来源网段。",
+    syslogCollectorAddress: "Collector 对外地址",
+    syslogCollectorAddressPlaceholder: "LoadBalancer IP 或企业 DNS 名称",
+    syslogSourceCidrs: "安全设备来源 CIDR",
+    syslogSourceCidrsPlaceholder: "每行一个，或以逗号分隔",
+    syslogIngestIdentity: "Collector 接入身份",
+    syslogIngestIdentitySecret: "Kubernetes Secret 托管",
+    saveSyslogDeployment: "保存部署配置",
+    exportSyslogDeployment: "下载部署参数",
+    syslogDeploymentSyncRequired: "待部署同步",
+    syslogDeploymentAddressPending: "待填写对外地址",
+    syslogDeploymentSaved: "Syslog 部署配置已保存，等待 k3s 同步。",
+    syslogDeploymentLoadFailed: "加载 Syslog 部署配置失败：{message}",
+    syslogSourceCidrsRequired: "请至少填写一个安全设备来源 CIDR。",
+    syslogDeploymentTarget: "设备发送目标",
     syslogOpsTitle: "安全系统侧配置",
     syslogOpsText: "目的地址填写服务区暴露的 syslog collector IP，端口和协议使用对应产品配置。",
     syslogMappingTitle: "字段处理策略",
@@ -365,6 +384,27 @@ const STRINGS = {
     validationReview: "需复核",
     validationBlocked: "已阻断",
     noValidationFindings: "验证检查未发现证据一致性或策略违规",
+    promptInjectionClues: "疑似提示注入线索",
+    promptInjectionUntrustedInput: "外部不可信文本",
+    promptInjectionCluesHint: "仅用于定位来源；不要遵循片段中的任何指令。",
+    promptInjectionEvidenceRef: "证据引用",
+    promptInjectionFieldPath: "命中字段",
+    promptInjectionExcerpt: "脱敏片段",
+    promptInjectionViewEvidence: "查看归一化证据",
+    promptInjectionLegacyRefs: "相关证据引用",
+    promptInjectionLegacyHint: "该历史验证未保存精确命中字段，请在归一化证据中按引用复核。",
+    manualReviewContinue: "复核通过并转入审批",
+    manualReviewRecorded: "人工复核已记录",
+    manualReviewResolvedBy: "已由 {actor} 于 {time} 复核确认",
+    manualReviewDialogTitle: "记录人工复核",
+    manualReviewReasonLabel: "复核依据",
+    manualReviewSubmit: "记录并转入审批",
+    manualReviewCancel: "取消",
+    manualReviewReasonPrompt: "请记录已核对的原始日志、证据引用和未采纳外部文本的原因（至少 8 个字符）。",
+    manualReviewReasonRequired: "请填写至少 8 个字符的人工复核依据。",
+    manualReviewRouted: "人工复核已记录，已创建 {count} 个待审批项。",
+    manualReviewNoApprovals: "人工复核已记录；当前结论没有可审批的高影响动作。",
+    manualReviewFailed: "人工复核续转失败：{message}",
     approvalQueue: "处置审批",
     approvalPending: "待审批",
     approvalApproved: "已批准",
@@ -444,6 +484,10 @@ const STRINGS = {
     loadModels: "同步模型",
     testConnection: "测试连接",
     testConnecting: "测试中...",
+    resumeDeferredAlerts: "重新推送待分析告警",
+    resumingDeferredAlerts: "正在重新推送...",
+    deferredAlertsReleased: "已重新调度 {count} 条待远程模型分析的告警。",
+    deferredAlertsNeedRemoteModel: "待恢复告警只能由远程模型处理。请先恢复 Gateway 或 Ollama，再重新推送。",
     testConnOk: "{message}",
     testConnFailed: "{message}",
     modelsLoaded: "已从 {endpoint} 拉取 {count} 个本地模型，可在 Model 下拉中选择。",
@@ -526,6 +570,9 @@ const STRINGS = {
     queueSync: "Synchronous mode",
     modelLocal: "Local rule analyzer",
     modelRemote: "{provider} / {model}",
+    modelCredentialMissing: "Gateway deployment credentials are missing; alerts are retained in the recovery queue.",
+    modelDurableRetry: "Model unavailable; alerts await recovery scheduling (about {seconds}s).",
+    modelDeferredBacklog: "{count} alert(s) await restored remote-model analysis.",
     syslogActive: "{active}/{total} listeners online",
     syslogInactive: "No listener enabled",
     httpActive: "HTTP intake online",
@@ -721,6 +768,22 @@ const STRINGS = {
     syslogExternalStatus: "Managed by external collector",
     syslogManagedStatus: "External receiver: {protocol} {port}",
     syslogExternalHealth: "External collector manages {total} endpoint(s)",
+    syslogDeploymentTitle: "Syslog Intake Deployment",
+    syslogDeploymentHint: "Maintain security-device destinations and source ranges in one place.",
+    syslogCollectorAddress: "Collector external address",
+    syslogCollectorAddressPlaceholder: "LoadBalancer IP or enterprise DNS name",
+    syslogSourceCidrs: "Security device source CIDRs",
+    syslogSourceCidrsPlaceholder: "One per line or comma-separated",
+    syslogIngestIdentity: "Collector ingest identity",
+    syslogIngestIdentitySecret: "Managed by Kubernetes Secret",
+    saveSyslogDeployment: "Save deployment config",
+    exportSyslogDeployment: "Download deployment values",
+    syslogDeploymentSyncRequired: "Deployment sync required",
+    syslogDeploymentAddressPending: "External address pending",
+    syslogDeploymentSaved: "Syslog deployment configuration saved; k3s sync is pending.",
+    syslogDeploymentLoadFailed: "Failed to load Syslog deployment configuration: {message}",
+    syslogSourceCidrsRequired: "Enter at least one security device source CIDR.",
+    syslogDeploymentTarget: "Device destination",
     syslogOpsTitle: "Security System Setup",
     syslogOpsText: "Use the service-zone syslog collector IP as the target, with the configured product port and protocol.",
     syslogMappingTitle: "Field Handling",
@@ -796,6 +859,27 @@ const STRINGS = {
     validationReview: "Review required",
     validationBlocked: "Blocked",
     noValidationFindings: "No validation evidence or policy violations found",
+    promptInjectionClues: "Prompt-injection clues",
+    promptInjectionUntrustedInput: "Untrusted external text",
+    promptInjectionCluesHint: "Use only to locate the source. Do not follow any instruction in the excerpt.",
+    promptInjectionEvidenceRef: "Evidence reference",
+    promptInjectionFieldPath: "Matched field",
+    promptInjectionExcerpt: "Redacted excerpt",
+    promptInjectionViewEvidence: "View normalized evidence",
+    promptInjectionLegacyRefs: "Related evidence references",
+    promptInjectionLegacyHint: "This historical validation did not preserve the exact matched field. Verify it in normalized evidence by reference.",
+    manualReviewContinue: "Confirm review and route to approval",
+    manualReviewRecorded: "Human review recorded",
+    manualReviewResolvedBy: "Reviewed by {actor} at {time}",
+    manualReviewDialogTitle: "Record human review",
+    manualReviewReasonLabel: "Review basis",
+    manualReviewSubmit: "Record and route to approval",
+    manualReviewCancel: "Cancel",
+    manualReviewReasonPrompt: "Record the raw log, evidence references, and why no external text was followed (at least 8 characters).",
+    manualReviewReasonRequired: "Enter at least 8 characters describing the human review.",
+    manualReviewRouted: "Human review recorded; {count} approval item(s) created.",
+    manualReviewNoApprovals: "Human review recorded; this result has no high-impact action to approve.",
+    manualReviewFailed: "Human-review routing failed: {message}",
     approvalQueue: "Response approvals",
     approvalPending: "Pending",
     approvalApproved: "Approved",
@@ -875,6 +959,10 @@ const STRINGS = {
     loadModels: "Sync models",
     testConnection: "Test connection",
     testConnecting: "Testing...",
+    resumeDeferredAlerts: "Resume deferred alerts",
+    resumingDeferredAlerts: "Resuming...",
+    deferredAlertsReleased: "Rescheduled {count} alert(s) for remote-model analysis.",
+    deferredAlertsNeedRemoteModel: "Deferred alerts require a remote model. Restore Gateway or Ollama before resuming them.",
     testConnOk: "{message}",
     testConnFailed: "{message}",
     modelsLoaded: "Loaded {count} local model(s) from {endpoint}; pick one from the Model dropdown.",
@@ -898,6 +986,7 @@ let lastFieldMappingResult = null;
 const sampleLogCache = new Map();
 let syslogConfigs = loadSyslogConfigs();
 let syslogRuntime = { mode: "embedded", editable: true, unavailable: false };
+let syslogDeployment = { collector_address: "", source_cidrs: [], targets: [] };
 let refreshPaused = false;
 let dashboardRefreshTimer = null;
 let memoryItems = [];
@@ -914,6 +1003,7 @@ let ollamaModelLoadRequestId = 0;
 let ollamaModelRefreshTimer = 0;
 let ollamaModelFocusRefreshTimer = 0;
 let apiToken = "";
+let pendingManualReview = null;
 try {
   apiToken = sessionStorage.getItem(API_TOKEN_KEY) || "";
 } catch (err) {
@@ -1044,6 +1134,7 @@ function applyPermission(selector, roles) {
 
 function applySessionPermissions() {
   applyPermission("#llm-form input, #llm-form select, #llm-form button", ["config"]);
+  applyPermission("#resume-llm-deferred", ["analyst"]);
   applyPermission('#profile-form button[type="submit"]', ["config"]);
   applyPermission("#save-inferred-profile", ["config"]);
   applyPermission('#infer-form button[type="submit"]', ["analyst", "config"]);
@@ -1059,6 +1150,7 @@ function applySessionPermissions() {
     else authButton.removeAttribute("title");
   }
   updateSyslogModeUi();
+  renderSyslogDeployment();
 }
 
 async function loadSession() {
@@ -1197,6 +1289,7 @@ function applyLanguage() {
   updateTriageBackLabel();
   renderProfileList();
   renderSyslogConfigTable();
+  renderSyslogDeployment();
   renderLogProductOptions();
   renderMemoryList();
   renderMemoryAudit(memoryAuditEvents, "#memory-audit-list");
@@ -1251,7 +1344,7 @@ function loadSyslogConfigs() {
     return {
       ...item,
       port: Number.isInteger(port) && port >= 1 && port <= 65535 ? port : item.port,
-      protocol: ["tcp", "udp"].includes(protocol) ? protocol : item.protocol,
+      protocol: item.product === "rasp" ? "tcp" : (["tcp", "udp"].includes(protocol) ? protocol : item.protocol),
       profile: String(persisted.profile || item.profile),
       saved: Boolean(persisted.saved),
     };
@@ -1268,7 +1361,7 @@ function mergeSyslogConfigs(items) {
       ...item,
       label: String(updated.label || item.label),
       port: Number.isInteger(port) && port >= 1 && port <= 65535 ? port : item.port,
-      protocol: ["tcp", "udp"].includes(protocol) ? protocol : item.protocol,
+      protocol: item.product === "rasp" ? "tcp" : (["tcp", "udp"].includes(protocol) ? protocol : item.protocol),
       profile: String(updated.profile || item.profile),
       saved: Boolean(updated.saved),
     };
@@ -1385,7 +1478,7 @@ function renderSyslogConfigTable() {
                 <td>
                   <select class="syslog-protocol-input" aria-label="${escapeHtml(`${item.label} ${tr("syslogProtocol")}`)}" ${editable ? "" : "disabled"}>
                     <option value="tcp" ${item.protocol === "tcp" ? "selected" : ""}>TCP</option>
-                    <option value="udp" ${item.protocol === "udp" ? "selected" : ""}>UDP</option>
+                    ${item.product === "rasp" ? "" : `<option value="udp" ${item.protocol === "udp" ? "selected" : ""}>UDP</option>`}
                   </select>
                 </td>
                 <td><code>${escapeHtml(item.profile)}</code></td>
@@ -1478,6 +1571,120 @@ function fillDefaultSyslogConfigs() {
   renderSyslogConfigTable();
   setSyslogConfigStatus(tr("syslogDefaultsRestored"));
   showToast(tr("syslogDefaultsRestored"));
+}
+
+function setSyslogDeploymentStatus(message, isError = false) {
+  const status = document.querySelector("#syslog-deployment-status");
+  if (!status) return;
+  status.textContent = message;
+  status.classList.toggle("error", isError);
+}
+
+function renderSyslogDeployment() {
+  const collectorInput = document.querySelector("#syslog-collector-address");
+  const sourceCidrsInput = document.querySelector("#syslog-source-cidrs");
+  const save = document.querySelector("#save-syslog-deployment");
+  const exportButton = document.querySelector("#export-syslog-deployment");
+  const sync = document.querySelector("#syslog-deployment-sync");
+  const identity = document.querySelector("#syslog-ingest-identity");
+  const targets = document.querySelector("#syslog-deployment-targets");
+  if (!collectorInput || !sourceCidrsInput || !save || !exportButton || !sync || !identity || !targets) return;
+
+  const editable = hasAnyRole("config");
+  const collectorAddress = String(syslogDeployment.collector_address || "");
+  const sourceCidrs = Array.isArray(syslogDeployment.source_cidrs) ? syslogDeployment.source_cidrs : [];
+  collectorInput.value = collectorAddress;
+  sourceCidrsInput.value = sourceCidrs.join(", ");
+  collectorInput.disabled = !editable;
+  sourceCidrsInput.disabled = !editable;
+  save.disabled = !editable;
+  exportButton.disabled = !editable || !sourceCidrs.length;
+  if (!editable) {
+    save.title = tr("permissionDenied");
+    exportButton.title = tr("permissionDenied");
+  } else {
+    save.removeAttribute("title");
+    exportButton.removeAttribute("title");
+  }
+
+  sync.className = `field-status ${sourceCidrs.length ? "needs_review" : "missing"}`;
+  sync.textContent = tr("syslogDeploymentSyncRequired");
+  identity.textContent = tr("syslogIngestIdentitySecret");
+
+  const destination = collectorAddress || tr("syslogDeploymentAddressPending");
+  const configuredTargets = Array.isArray(syslogDeployment.targets) ? syslogDeployment.targets : [];
+  targets.innerHTML = configuredTargets
+    .map(
+      (target) => `
+        <div class="syslog-deployment-target">
+          <strong>${escapeHtml(target.label || target.product || "-")}</strong>
+          <span>${escapeHtml(tr("syslogDeploymentTarget"))}</span>
+          <code>${escapeHtml(`${destination}:${target.port}/${String(target.protocol || "tcp").toUpperCase()}`)}</code>
+        </div>
+      `,
+    )
+    .join("");
+}
+
+async function loadSyslogDeployment() {
+  const payload = await json("/api/config/syslog/deployment");
+  syslogDeployment = {
+    collector_address: String(payload.collector_address || ""),
+    source_cidrs: Array.isArray(payload.source_cidrs) ? payload.source_cidrs : [],
+    targets: Array.isArray(payload.targets) ? payload.targets : [],
+  };
+  renderSyslogDeployment();
+  return payload;
+}
+
+async function saveSyslogDeployment(event) {
+  event.preventDefault();
+  if (!hasAnyRole("config")) {
+    setSyslogDeploymentStatus(tr("permissionDenied"), true);
+    return;
+  }
+  const collectorAddress = document.querySelector("#syslog-collector-address")?.value.trim() || "";
+  const sourceCidrs = document.querySelector("#syslog-source-cidrs")?.value || "";
+  const result = await json("/api/config/syslog/deployment", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ collector_address: collectorAddress, source_cidrs: sourceCidrs }),
+  });
+  syslogDeployment = {
+    collector_address: String(result.deployment?.collector_address || ""),
+    source_cidrs: Array.isArray(result.deployment?.source_cidrs) ? result.deployment.source_cidrs : [],
+    targets: Array.isArray(result.deployment?.targets) ? result.deployment.targets : [],
+  };
+  renderSyslogDeployment();
+  setSyslogDeploymentStatus(tr("syslogDeploymentSaved"));
+  showToast(tr("syslogDeploymentSaved"));
+}
+
+function exportSyslogDeployment() {
+  if (!hasAnyRole("config")) {
+    setSyslogDeploymentStatus(tr("permissionDenied"), true);
+    return;
+  }
+  const sourceCidrs = Array.isArray(syslogDeployment.source_cidrs) ? syslogDeployment.source_cidrs : [];
+  if (!sourceCidrs.length) {
+    setSyslogDeploymentStatus(tr("syslogSourceCidrsRequired"), true);
+    showToast(tr("syslogSourceCidrsRequired"), "error");
+    return;
+  }
+  const content = [
+    "# Defensive AI Gateway Syslog deployment values. No credential is included.",
+    `DEFENSIVE_AI_SYSLOG_SOURCE_CIDRS=${sourceCidrs.join(",")}`,
+    "",
+  ].join("\n");
+  const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = "defensive-ai-syslog-console.env";
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
 function updateWorkspaceTitle(name) {
@@ -1686,7 +1893,14 @@ function unfinishedAlertCount(processing = {}) {
 function buildHealthItems(health, llmConfig, syslogPayload) {
   const processing = health?.processing || {};
   const llmProvider = llmConfig?.provider || "local";
-  const llmConfigured = llmProvider === "local" || Boolean(llmConfig?.endpoint);
+  const llmRuntime = llmConfig?.runtime || {};
+  const llmCircuit = llmRuntime?.circuit || {};
+  const llmCredentialMissing = llmProvider === "gateway" && !Boolean(llmConfig?.api_key_set);
+  const llmConfigured = llmProvider === "local" || (Boolean(llmConfig?.endpoint) && !llmCredentialMissing);
+  const llmCircuitOpen = llmCircuit.state === "open";
+  const llmRetrySeconds = Math.max(1, Math.ceil(Number(llmCircuit.retry_after_seconds || 0)));
+  const llmDeferred = Math.max(0, Number(processing?.llm_deferred?.total || 0));
+  const llmStatus = !llmConfigured ? "bad" : (llmCircuitOpen || llmDeferred ? "warn" : "ok");
   const externalSyslog = syslogPayload?.mode === "external_vector";
   const listeners = Array.isArray(syslogPayload?.listeners) ? syslogPayload.listeners : [];
   const configs = Array.isArray(syslogPayload?.configs) ? syslogPayload.configs : syslogConfigs;
@@ -1706,9 +1920,17 @@ function buildHealthItems(health, llmConfig, syslogPayload) {
         : tr("queueSync"),
     ),
     healthItem(
-      llmConfigured ? "ok" : "bad",
+      llmStatus,
       tr("healthModel"),
-      llmProvider === "local" ? tr("modelLocal") : tr("modelRemote", { provider: llmProvider, model: llmConfig?.model || "-" }),
+      llmCredentialMissing
+        ? tr("modelCredentialMissing")
+        : (llmCircuitOpen
+          ? tr("modelDurableRetry", { seconds: llmRetrySeconds })
+          : (llmDeferred
+            ? tr("modelDeferredBacklog", { count: llmDeferred })
+            : (llmProvider === "local"
+            ? tr("modelLocal")
+            : tr("modelRemote", { provider: llmProvider, model: llmConfig?.model || "-" })))),
     ),
     externalSyslog
       ? healthItem("ok", tr("healthSyslog"), tr("syslogExternalHealth", { total: configs.length }))
@@ -2062,7 +2284,107 @@ function validationStatusLabel(status) {
   return tr({ passed: "validationPassed", review: "validationReview", blocked: "validationBlocked" }[status] || "validationReview");
 }
 
-function validationBlock(validation) {
+function canContinueValidationReview(validation) {
+  const findings = validation?.findings || [];
+  const checks = validation?.checks || {};
+  return (
+    validation?.status === "review" &&
+    findings.length > 0 &&
+    findings.every((item) => item?.code === "prompt_injection_detected") &&
+    checks.prompt_injection === false &&
+    Object.entries(checks).every(([key, value]) => key === "prompt_injection" || value === true)
+  );
+}
+
+function promptInjectionFindings(validation) {
+  return (validation?.findings || []).filter((item) => item?.code === "prompt_injection_detected");
+}
+
+function promptInjectionCluesBlock(validation, caseId) {
+  const findings = promptInjectionFindings(validation);
+  if (!findings.length) return "";
+
+  const seenClues = new Set();
+  const clues = [];
+  for (const finding of findings) {
+    for (const item of Array.isArray(finding?.evidence_clues) ? finding.evidence_clues : []) {
+      if (!item || typeof item !== "object") continue;
+      const evidenceRef = String(item.evidence_ref || "");
+      const fieldPath = String(item.field_path || "");
+      const excerpt = String(item.excerpt || "");
+      const clueKey = `${evidenceRef}\u0000${fieldPath}\u0000${excerpt}`;
+      if (seenClues.has(clueKey)) continue;
+      seenClues.add(clueKey);
+      clues.push({ evidenceRef, fieldPath, excerpt });
+    }
+  }
+
+  const legacyRefs = clues.length
+    ? []
+    : [...new Set(findings.flatMap((finding) => Array.isArray(finding?.evidence_refs) ? finding.evidence_refs : []))]
+      .map((ref) => String(ref || ""))
+      .filter(Boolean);
+  const evidenceHref = `case-details.html?case_id=${encodeURIComponent(caseId || "")}&section=normalized-evidence`;
+  const clueRows = clues.map((clue) => `
+    <div class="prompt-injection-clue" role="listitem">
+      <dl>
+        <div><dt>${escapeHtml(tr("promptInjectionEvidenceRef"))}</dt><dd><code>${escapeHtml(clue.evidenceRef || "-")}</code></dd></div>
+        <div><dt>${escapeHtml(tr("promptInjectionFieldPath"))}</dt><dd><code>${escapeHtml(clue.fieldPath || "-")}</code></dd></div>
+        <div><dt>${escapeHtml(tr("promptInjectionExcerpt"))}</dt><dd><code>${escapeHtml(clue.excerpt || "-")}</code></dd></div>
+      </dl>
+    </div>
+  `).join("");
+  const legacyBlock = legacyRefs.length ? `
+    <div class="prompt-injection-legacy">
+      <strong>${escapeHtml(tr("promptInjectionLegacyRefs"))}</strong>
+      <span>${escapeHtml(tr("promptInjectionLegacyHint"))}</span>
+      <div class="prompt-injection-ref-list">${legacyRefs.map((ref) => `<code>${escapeHtml(ref)}</code>`).join("")}</div>
+    </div>
+  ` : "";
+  return `
+    <section class="prompt-injection-clues">
+      <div class="prompt-injection-clues-head">
+        <div class="prompt-injection-clues-title">
+          <strong>${escapeHtml(tr("promptInjectionClues"))}</strong>
+          <span class="prompt-injection-untrusted">${escapeHtml(tr("promptInjectionUntrustedInput"))}</span>
+        </div>
+        ${caseId ? `<a class="prompt-injection-evidence-link" href="${escapeHtml(evidenceHref)}">${escapeHtml(tr("promptInjectionViewEvidence"))}</a>` : ""}
+      </div>
+      <p>${escapeHtml(tr("promptInjectionCluesHint"))}</p>
+      ${clueRows ? `<div class="prompt-injection-clue-list" role="list">${clueRows}</div>` : ""}
+      ${legacyBlock}
+    </section>
+  `;
+}
+
+function manualReviewContinuation(validation, caseId) {
+  const resolution = validation?.manual_review_resolution;
+  if (resolution) {
+    return `
+      <div class="manual-review-resolution">
+        <strong>${escapeHtml(tr("manualReviewRecorded"))}</strong>
+        <span>${escapeHtml(tr("manualReviewResolvedBy", { actor: resolution.actor || "-", time: fmtTime(resolution.created_at_ms) }))}</span>
+        <p>${escapeHtml(resolution.reason || "-")}</p>
+      </div>
+    `;
+  }
+  if (!canContinueValidationReview(validation)) return "";
+  const allowed = hasAnyRole("analyst");
+  return `
+    <div class="manual-review-continuation">
+      <button
+        class="validation-review-continue"
+        type="button"
+        data-case-id="${escapeHtml(caseId)}"
+        data-validation-id="${escapeHtml(validation.validation_id || "")}"
+        ${allowed ? "" : `disabled title="${escapeHtml(tr("permissionDenied"))}"`}
+      >${escapeHtml(tr("manualReviewContinue"))}</button>
+      <p class="manual-review-status" data-manual-review-status="${escapeHtml(validation.validation_id || "")}"></p>
+    </div>
+  `;
+}
+
+function validationBlock(validation, caseId) {
   if (!validation) return "";
   const findings = validation.findings || [];
   return `
@@ -2076,6 +2398,8 @@ function validationBlock(validation) {
           ? findings.map((item) => `<li><strong>${escapeHtml(item.code)}</strong> ${escapeHtml(item.message)}</li>`).join("")
           : `<li>${escapeHtml(tr("noValidationFindings"))}</li>`}
       </ul>
+      ${promptInjectionCluesBlock(validation, caseId)}
+      ${manualReviewContinuation(validation, caseId)}
     </div>
   `;
 }
@@ -2170,7 +2494,7 @@ function renderDetail(detail) {
           </div>
         </div>
         ${caseDispositionControls(detail)}
-        ${validationBlock(validation)}
+        ${validationBlock(validation, detail.case_id)}
         ${approvalBlock(detail.approvals || [], detail.case_id)}
       </section>
 
@@ -2336,9 +2660,76 @@ function bindDetailActions(panel, caseId) {
   panel.querySelectorAll(".review-button").forEach((button) => {
     button.addEventListener("click", () => confirmBusinessFalsePositive(button, caseId));
   });
+  panel.querySelectorAll(".validation-review-continue").forEach((button) => {
+    button.addEventListener("click", () => continueValidationReview(button, panel, caseId));
+  });
   panel.querySelectorAll(".approval-decision").forEach((button) => {
     button.addEventListener("click", () => decideApproval(button, panel, caseId));
   });
+}
+
+function continueValidationReview(button, panel, caseId) {
+  const validationId = button.dataset.validationId;
+  const dialog = document.querySelector("#manual-review-dialog");
+  const reasonInput = document.querySelector("#manual-review-reason");
+  const status = document.querySelector("#manual-review-form-status");
+  const submitButton = document.querySelector("#manual-review-submit");
+  if (!validationId || !dialog || !reasonInput || !status) return;
+  pendingManualReview = { button, panel, caseId, validationId };
+  reasonInput.value = "";
+  status.textContent = "";
+  if (submitButton) submitButton.disabled = false;
+  if (!dialog.open) dialog.showModal();
+  window.setTimeout(() => reasonInput.focus(), 0);
+}
+
+function closeManualReviewDialog() {
+  const dialog = document.querySelector("#manual-review-dialog");
+  if (dialog?.open) dialog.close();
+}
+
+async function submitManualReviewContinuation() {
+  const pending = pendingManualReview;
+  const reasonInput = document.querySelector("#manual-review-reason");
+  const formStatus = document.querySelector("#manual-review-form-status");
+  const submitButton = document.querySelector("#manual-review-submit");
+  if (!pending || !reasonInput) return;
+  const reason = reasonInput.value.trim();
+  if (reason.length < 8) {
+    const message = tr("manualReviewReasonRequired");
+    if (formStatus) formStatus.textContent = message;
+    showToast(message, "error");
+    return;
+  }
+  const { button, panel, caseId, validationId } = pending;
+  const status = panel.querySelector(`[data-manual-review-status="${CSS.escape(validationId)}"]`);
+  button.disabled = true;
+  if (submitButton) submitButton.disabled = true;
+  if (status) status.textContent = tr("manualReviewRecorded");
+  if (formStatus) formStatus.textContent = tr("manualReviewRecorded");
+  try {
+    const result = await json(
+      `/api/cases/${encodeURIComponent(caseId)}/validation-reviews/${encodeURIComponent(validationId)}/continue`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: reason.trim() }),
+      },
+    );
+    await loadCases();
+    await loadTriageCase(caseId);
+    const count = result.approvals?.length || 0;
+    pendingManualReview = null;
+    closeManualReviewDialog();
+    showToast(count ? tr("manualReviewRouted", { count }) : tr("manualReviewNoApprovals"));
+  } catch (err) {
+    button.disabled = false;
+    if (submitButton) submitButton.disabled = false;
+    const message = tr("manualReviewFailed", { message: err.message || String(err) });
+    if (status) status.textContent = message;
+    if (formStatus) formStatus.textContent = message;
+    showToast(message, "error");
+  }
 }
 
 async function decideApproval(button, panel, caseId) {
@@ -2996,7 +3387,12 @@ function loadViewData(name) {
         loadSyslogConfig().catch((err) =>
           setSyslogConfigStatus(tr("syslogConfigLoadFailed", { message: err.message || String(err) }), true),
         ),
+        loadSyslogDeployment().catch((err) =>
+          setSyslogDeploymentStatus(tr("syslogDeploymentLoadFailed", { message: err.message || String(err) }), true),
+        ),
       );
+    } else {
+      renderSyslogDeployment();
     }
     if (section === "config") {
       tasks.push(loadMappingProfiles().catch((err) => setProfileStatus(err.message || String(err), true)));
@@ -3347,7 +3743,7 @@ function setLlmModelPlaceholder(provider) {
   const placeholders = {
     local: "local-rule-analyst",
     ollama: "请选择已同步的 Ollama 模型",
-    gateway: "例如 claude-sonnet-4-6",
+    gateway: "例如 gpt-5.5",
   };
   document.querySelector("#llm-model").placeholder = placeholders[provider] || placeholders.local;
 }
@@ -3396,10 +3792,10 @@ function applyProviderDefaults(provider) {
     stopOllamaModelRefresh();
     setLlmModelPlaceholder(provider);
     if (!endpoint.value.trim() || endpoint.value.includes("127.0.0.1:11434")) {
-      endpoint.value = "https://kkcoder.com/v1/messages";
+      endpoint.value = "https://kkcoder.com/v1/responses";
     }
     if (!model.value.trim() || model.value.trim() === "local-rule-analyst") {
-      model.value = "claude-sonnet-4-6";
+      model.value = "gpt-5.5";
     }
     if (!timeout.value || Number(timeout.value) < 60) timeout.value = 120;
     document.querySelector("#ollama-models").innerHTML = "";
@@ -3510,6 +3906,31 @@ async function testLlmConnection() {
   }
 }
 
+async function resumeDeferredLlmAlerts() {
+  const button = document.querySelector("#resume-llm-deferred");
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = tr("resumingDeferredAlerts");
+  try {
+    const result = await json("/api/alerts/inbox/release-llm-deferred", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ limit: 100 }),
+    });
+    const message = result.reason === "remote_model_not_configured"
+      ? tr("deferredAlertsNeedRemoteModel")
+      : tr("deferredAlertsReleased", { count: Number(result.released || 0) });
+    setConfigStatus(message);
+    showToast(message);
+    await loadCases({ quiet: true, section: activeDashboardSection });
+  } catch (err) {
+    setConfigStatus(err.message || String(err), true);
+  } finally {
+    button.textContent = originalText;
+    applySessionPermissions();
+  }
+}
+
 loadLanguagePreference();
 loadThemePreference();
 loadRefreshPreference();
@@ -3532,6 +3953,9 @@ document.querySelector("#refresh").addEventListener("click", () => {
 });
 document.querySelector("#test-llm-connection").addEventListener("click", () => {
   testLlmConnection().catch((err) => setConfigStatus(err.message || String(err), true));
+});
+document.querySelector("#resume-llm-deferred").addEventListener("click", () => {
+  resumeDeferredLlmAlerts().catch((err) => setConfigStatus(err.message || String(err), true));
 });
 document.querySelector("#triage-back").addEventListener("click", () => {
   setView("dashboard");
@@ -3646,6 +4070,14 @@ document.querySelector("#reload-profiles").addEventListener("click", () => {
   loadMappingProfiles().catch((err) => setProfileStatus(err.message || String(err), true));
 });
 document.querySelector("#reset-syslog-config").addEventListener("click", fillDefaultSyslogConfigs);
+document.querySelector("#syslog-deployment-form").addEventListener("submit", (event) => {
+  saveSyslogDeployment(event).catch((err) => {
+    const message = err.message || String(err);
+    setSyslogDeploymentStatus(message, true);
+    showToast(message, "error");
+  });
+});
+document.querySelector("#export-syslog-deployment").addEventListener("click", exportSyslogDeployment);
 document.querySelector("#dry-run-form").addEventListener("submit", (event) => {
   runDryRun(event).catch((err) => {
     document.querySelector("#dry-run-result").textContent = err.message || String(err);
@@ -3682,7 +4114,9 @@ async function loadApplicationData() {
     loadCases(),
   ];
   if (canReadRuntimeConfig()) {
-    tasks.push(loadLlmConfig(), loadSyslogConfig());
+    tasks.push(loadLlmConfig(), loadSyslogConfig(), loadSyslogDeployment());
+  } else {
+    renderSyslogDeployment();
   }
   if (canReadMappingProfiles()) {
     tasks.push(loadMappingProfiles());
@@ -3692,6 +4126,17 @@ async function loadApplicationData() {
 
 document.querySelector("#auth-session").addEventListener("click", () => showAuthDialog());
 document.querySelector("#auth-close").addEventListener("click", () => document.querySelector("#auth-dialog").close());
+document.querySelector("#manual-review-close").addEventListener("click", closeManualReviewDialog);
+document.querySelector("#manual-review-cancel").addEventListener("click", closeManualReviewDialog);
+document.querySelector("#manual-review-dialog").addEventListener("close", () => {
+  pendingManualReview = null;
+  document.querySelector("#manual-review-reason").value = "";
+  document.querySelector("#manual-review-form-status").textContent = "";
+});
+document.querySelector("#manual-review-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  submitManualReviewContinuation();
+});
 document.querySelector("#auth-clear").addEventListener("click", async () => {
   storeApiToken("");
   currentSession = { actor: "", roles: [] };

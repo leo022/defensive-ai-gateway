@@ -22,12 +22,16 @@
 - `load_context(product, case_id, asset_id)` 返回结构化多层上下文：`{case_short_term, product_long_term, asset_profile, org_knowledge, evidence_refs}`，由 orchestrator 注入 Agent prompt。
 - `asset_id` 由事件实体（host/app/src_ip）派生，用于检索资产画像。
 - Dashboard 中“确认为业务误报”会调用 `/api/alerts/{alert_id}/confirm-false-positive`，从关联告警中抽取相似特征，写入一条可治理的长期误报记忆，并记录逐告警 disposition。多告警 Case 只有全部关联告警均被确认误报后才关闭。
+- “晋升候选记忆”不会把任意历史结论变成误报规则；只有已激活、可信且具有 `benign` 误报语义的产品长期记忆可参与后续告警降噪。“确认为业务误报”路径会写入这种带结构化特征和匹配策略的记忆。
 
 ### 2.1 后续告警关联
 
 `MemoryMatcher` 在调用 Local/Ollama/Gateway 之前统一执行，流程如下：
 
-1. 从同产品 `product/{product}` 中召回最多 `candidate_limit` 条候选；只允许 `active`、`medium/high` 信任、人工批准、未过期且通过敏感性检查的产品长期记忆。
+`alert_id` 是入站幂等键：完全相同的重投会复用首次归一化事件和分析；新告警实例必须使用新 ID。若同一 ID 携带不同证据，`POST /api/alerts` 返回 `409 alert_id_conflict`，而不是静默覆盖历史。
+不同 ID 的同类事件若落在默认一小时相关窗口内，会归并到同一 Case；应通过该 Case 的关联原始告警数量确认多条事实均被保留。
+
+1. 从同产品 `product/{product}` 中召回最多 `candidate_limit` 条候选；只允许 `active`、`medium/high` 信任、人工批准、未过期、通过敏感性检查且表达受治理误报语义的产品长期记忆。
 2. 对规则 ID、事件类型、应用、资产、URI 模板、进程、客户端、网络和账号计算加权结构化包含度。
 3. 使用离线稳定哈希向量计算文本余弦相似度；该接口可替换为企业 Embedding 服务，默认实现不需要网络或第三方依赖。
 4. 检查 `retrieval_key` 精确命中，并对规则/事件类型冲突施加负向惩罚。

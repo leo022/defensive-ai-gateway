@@ -1,21 +1,25 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import hashlib
 import hmac
 import ipaddress
 import json
 import mimetypes
+import os
 import socket
 import threading
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .config import GatewayConfig, LLMConfig, load_config
-from .database import Repository
+from .database import AlertIdentityConflict, Repository
 from .json_safety import loads_bounded_json
 from .log_adapter import (
     AUTO_PROFILE,
@@ -25,16 +29,21 @@ from .log_adapter import (
     builtin_product_profile,
     default_mapping_profile,
     demo_rasp_profile,
+    ensure_rasp_evidence_coverage,
     explicit_product,
     fingerprint_product,
     mapping_profile_record,
     validate_raw_alert,
 )
 from .llm import (
+    MAX_LLM_ERROR_BYTES,
+    WEBSOCKET_ENDPOINT_GUIDANCE,
     build_gateway_request,
     build_llm,
     is_anthropic_messages_endpoint,
+    is_websocket_upgrade_required,
     resolve_gateway_api_key,
+    validate_gateway_http_endpoint,
 )
 from .memory import (
     LAYER_PRODUCT_LONG_TERM,
@@ -46,21 +55,27 @@ from .memory import (
     MemoryManager,
 )
 from .memory_matcher import MemoryMatcher
-from .models import RawAlert, new_id, now_ms
+from .models import AgentResult, RawAlert, ValidationResult, new_id, now_ms
+from .network_safety import EndpointPin, pinned_endpoint_handlers, resolve_http_endpoint_pin
 from .normalizer import EventNormalizer
 from .orchestrator import Orchestrator
 from .policy import PolicyEngine
-from .processing import AlertProcessor, AlertQueueFull, DeadLetter
+from .processing import AlertProcessor, AlertQueueFull, DeadLetter, DeferredAlert
 from .skills import SkillRegistry
 from .syslog_receiver import SyslogListenerSpec, SyslogReceiverManager
 from .syslog_router import SyslogPortRouter
+from .validation import can_continue_after_manual_review
 
 
 _STANDARD_ALERT_KEYS = ("event_type", "severity", "alert_id", "source", "timestamp")
 
 # Hard cap on inbound request bodies to prevent memory-exhaustion DoS. A security
 # alert payload is small JSON; anything larger is rejected before json.loads.
-MAX_BODY_BYTES = 2_000_000
+# A RASP message is retained both as parsed vendor JSON and as the transport
+# envelope's raw message. Allow the bounded 2 MiB collector frame plus JSON
+# envelope overhead, while still rejecting arbitrary large HTTP bodies.
+MAX_BODY_BYTES = 8_000_000
+_RASP_SYSLOG_PROTOCOL = "tcp"
 
 # Hosts permitted for the Ollama model-picker SSRF surface. The picker is meant
 # to reach a local Ollama instance only; cloud-metadata / internal probes are
@@ -74,6 +89,76 @@ _ROLE_APPROVER = "approver"
 _ROLE_MEMORY = "memory"
 _ROLE_CONFIG = "config"
 _ALL_ROLES = {_ROLE_READ, _ROLE_INGEST, _ROLE_ANALYST, _ROLE_APPROVER, _ROLE_MEMORY, _ROLE_CONFIG}
+_SYSLOG_PRODUCT_ORDER = ("waf", "hips", "ndr", "rasp", "siem")
+_SYSLOG_DEPLOYMENT_MAX_CIDRS = 64
+
+
+def _normalize_syslog_collector_address(value: object) -> str:
+    """Accept only a bare Syslog collector IP address or DNS name.
+
+    This is an operator-facing destination value, not an outbound URL. Keeping
+    it to a host/IP also prevents a saved display value from becoming an
+    ambiguous scheme, port, or path in a later deployment workflow.
+    """
+    address = str(value or "").strip()
+    if not address:
+        return ""
+    if len(address) > 253 or any(char.isspace() for char in address):
+        raise ValueError("collector address must be a bare IP address or DNS name")
+    try:
+        return str(ipaddress.ip_address(address))
+    except ValueError:
+        pass
+
+    normalized = address.rstrip(".").lower()
+    labels = normalized.split(".")
+    if not normalized or any(not label or len(label) > 63 for label in labels):
+        raise ValueError("collector address must be a valid DNS name")
+    for label in labels:
+        if (
+            not label.isascii()
+            or label.startswith("-")
+            or label.endswith("-")
+            or any(not (char.isalnum() or char == "-") for char in label)
+        ):
+            raise ValueError("collector address must be a valid DNS name")
+    if all(char.isdigit() or char == "." for char in normalized):
+        raise ValueError("collector address must be a valid IP address")
+    return normalized
+
+
+def _normalize_syslog_source_cidrs(value: object) -> list[str]:
+    """Normalize the device allowlist shared with the k3s collector Service."""
+    if isinstance(value, str):
+        candidates = value.replace("\n", ",").split(",")
+    elif isinstance(value, list):
+        candidates = value
+    else:
+        raise ValueError("source CIDRs must be a comma-separated string or list")
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            raise ValueError("source CIDRs must contain strings")
+        raw = candidate.strip()
+        if not raw:
+            continue
+        try:
+            network = ipaddress.ip_network(raw, strict=False)
+        except ValueError as exc:
+            raise ValueError(f"invalid source CIDR: {raw}") from exc
+        if network.prefixlen == 0:
+            raise ValueError("source CIDRs must not allow the entire internet")
+        rendered = str(network)
+        if rendered not in seen:
+            seen.add(rendered)
+            normalized.append(rendered)
+    if not normalized:
+        raise ValueError("at least one source CIDR is required")
+    if len(normalized) > _SYSLOG_DEPLOYMENT_MAX_CIDRS:
+        raise ValueError(f"at most {_SYSLOG_DEPLOYMENT_MAX_CIDRS} source CIDRs are allowed")
+    return normalized
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -81,17 +166,58 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         raise urllib.error.HTTPError(req.full_url, code, "redirects are not allowed", headers, fp)
 
 
-def _open_model_endpoint(req: urllib.request.Request, timeout: float):
+def _open_model_endpoint(
+    req: urllib.request.Request,
+    timeout: float,
+    *,
+    endpoint_pin: EndpointPin | None = None,
+):
     """Open an allowlisted model endpoint without inheriting environment proxies."""
-    return urllib.request.build_opener(
+    handlers: list[object] = [
         urllib.request.ProxyHandler({}),
         _NoRedirectHandler(),
-    ).open(req, timeout=timeout)
+    ]
+    if endpoint_pin is not None:
+        handlers.extend(pinned_endpoint_handlers(endpoint_pin))
+    return urllib.request.build_opener(*handlers).open(req, timeout=timeout)
 
 
-def _open_ollama(req: urllib.request.Request, timeout: float):
+def _open_ollama(
+    req: urllib.request.Request,
+    timeout: float,
+    *,
+    endpoint_pin: EndpointPin | None = None,
+):
     """Compatibility wrapper for the local Ollama picker/test paths."""
-    return _open_model_endpoint(req, timeout)
+    return _open_model_endpoint(req, timeout, endpoint_pin=endpoint_pin)
+
+
+def _pin_llm_endpoint(provider: str, endpoint: str, allowed_hosts: list[str]) -> EndpointPin:
+    """Resolve a validated endpoint once and pin the subsequent TCP connection."""
+    backend = "Ollama" if provider == "ollama" else "LLM gateway"
+    try:
+        return resolve_http_endpoint_pin(
+            endpoint,
+            backend=backend,
+            allowed_hosts=allowed_hosts,
+            require_https_for_remote=provider == "gateway",
+            resolver=socket.getaddrinfo,
+        )
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _read_http_error_body(exc: urllib.error.HTTPError) -> str:
+    """Read only a bounded diagnostic body from an untrusted model endpoint."""
+    try:
+        body = exc.read(MAX_LLM_ERROR_BYTES + 1)
+    except (TypeError, OSError):
+        body = b""
+    finally:
+        exc.close()
+    if not isinstance(body, (bytes, bytearray)):
+        return ""
+    return bytes(body[:MAX_LLM_ERROR_BYTES]).decode("utf-8", errors="ignore")
 
 _CASE_DISPOSITIONS = {
     "under_review": "escalate_case_review",
@@ -376,6 +502,8 @@ def _validated_llm_endpoint(provider: str, endpoint: str, allowed_hosts: list[st
             endpoint = "http://127.0.0.1:11434/api/generate"
         else:
             raise ValueError("gateway endpoint is required")
+    if provider == "gateway":
+        validate_gateway_http_endpoint(endpoint)
     parsed = urlparse(endpoint)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ValueError("LLM endpoint must be an absolute HTTP(S) URL")
@@ -473,6 +601,7 @@ class GatewayState:
         self.config_path = config_path
         self.lock = threading.RLock()
         self.repo = Repository(config.database.path)
+        self._syslog_deployment = {"collector_address": "", "source_cidrs": []}
         self._restore_runtime_settings()
         self.policy = PolicyEngine(config.policy)
         self.normalizer = EventNormalizer(self.policy)
@@ -514,6 +643,7 @@ class GatewayState:
                 # one in-memory execution attempt before durable retry/DLQ.
                 max_attempts=1,
                 dead_letter_handler=self._persist_dead_letter,
+                deferred_handler=self._persist_llm_deferred,
             )
             if config.processing.async_enabled
             else None
@@ -546,12 +676,14 @@ class GatewayState:
                     str(saved_llm.get("endpoint", current.endpoint)),
                     current.allowed_hosts,
                 )
-                same_destination = provider == current.provider and endpoint == current.endpoint
                 self.config.llm = LLMConfig(
                     provider=provider,
                     endpoint=endpoint,
                     api_key_env=current.api_key_env,
-                    api_key=current.api_key if same_destination else "",
+                    # Runtime settings intentionally never persist a credential.
+                    # Retain the deployment-managed env secret even when an
+                    # operator previously saved a different allowed endpoint.
+                    api_key=current.api_key,
                     model=str(saved_llm.get("model", current.model)),
                     timeout_seconds=max(
                         1,
@@ -582,13 +714,46 @@ class GatewayState:
                     }
                 )
             if isinstance(protocols, dict):
-                self.config.syslog.product_protocols.update(
-                    {
-                        str(product): str(protocol).lower()
-                        for product, protocol in protocols.items()
-                        if str(product) in SUPPORTED_PRODUCTS
-                        and str(protocol).lower() in {"tcp", "udp"}
-                    }
+                forced_rasp_tcp = False
+                restored_protocols: dict[str, str] = {}
+                for product, protocol in protocols.items():
+                    product = str(product)
+                    protocol = str(protocol).lower()
+                    if product not in SUPPORTED_PRODUCTS or protocol not in {"tcp", "udp"}:
+                        continue
+                    if product == "rasp" and protocol != _RASP_SYSLOG_PROTOCOL:
+                        restored_protocols[product] = _RASP_SYSLOG_PROTOCOL
+                        forced_rasp_tcp = True
+                    else:
+                        restored_protocols[product] = protocol
+                self.config.syslog.product_protocols.update(restored_protocols)
+                if forced_rasp_tcp:
+                    self.repo.insert_audit(
+                        new_id("audit"),
+                        "runtime-config",
+                        "system",
+                        "runtime_syslog_rasp_protocol_forced_tcp",
+                        {"previous_protocol": "udp", "required_protocol": _RASP_SYSLOG_PROTOCOL},
+                    )
+
+        saved_syslog_deployment = self.repo.get_runtime_setting("syslog_deployment")
+        if isinstance(saved_syslog_deployment, dict):
+            try:
+                self._syslog_deployment = {
+                    "collector_address": _normalize_syslog_collector_address(
+                        saved_syslog_deployment.get("collector_address", "")
+                    ),
+                    "source_cidrs": _normalize_syslog_source_cidrs(
+                        saved_syslog_deployment.get("source_cidrs", [])
+                    ),
+                }
+            except (TypeError, ValueError) as exc:
+                self.repo.insert_audit(
+                    new_id("audit"),
+                    "runtime-config",
+                    "system",
+                    "runtime_syslog_deployment_restore_rejected",
+                    {"error": str(exc)},
                 )
 
     def _handle_queued_alert(self, alert: RawAlert):
@@ -636,11 +801,20 @@ class GatewayState:
                 self._dispatcher_wakeup.clear()
 
     def _persist_dead_letter(self, entry: DeadLetter) -> None:
-        delay_ms = int(self.config.processing.retry_base_seconds * 1000)
+        record = self.repo.get_inbox_alert(entry.alert.alert_id) or {}
+        durable_attempt = max(1, int(record.get("attempts") or 1))
+        base_delay = max(0.1, float(self.config.processing.retry_base_seconds))
+        # Durable attempts are authoritative. Exponential scheduling prevents a
+        # short-lived remote outage from immediately exhausting the retry budget.
+        retry_delay_seconds = min(300.0, base_delay * (2 ** min(durable_attempt - 1, 8)))
+        retry_delay_seconds = max(
+            retry_delay_seconds,
+            min(300.0, max(0.0, float(entry.retry_after_seconds))),
+        )
         status = self.repo.fail_inbox_alert(
             entry.alert.alert_id,
             entry.error or entry.reason,
-            retry_delay_ms=delay_ms,
+            retry_delay_ms=int(retry_delay_seconds * 1000),
         )
         if status == "dead_letter":
             self.repo.insert_audit(
@@ -651,12 +825,82 @@ class GatewayState:
                 entry.to_dict(),
             )
 
+    def _persist_llm_deferred(self, entry: DeferredAlert) -> None:
+        """Return a transient remote-model failure to the durable Inbox.
+
+        This deliberately does not consume the alert's processing-attempt
+        budget. Once the configured retry window expires, the dispatcher can
+        send the same immutable alert back to the restored remote model.
+        """
+        delay_ms = int(max(0.0, float(entry.retry_after_seconds)) * 1000)
+        if not self.repo.defer_inbox_alert(
+            entry.alert.alert_id,
+            retry_delay_ms=delay_ms,
+            reason=entry.error or "remote_llm_unavailable",
+        ):
+            raise RuntimeError(f"durable LLM deferral failed for {entry.alert.alert_id}")
+        self.repo.insert_audit(
+            new_id("audit"),
+            entry.alert.alert_id,
+            "durable-alert-processor",
+            "analysis_deferred_inbox",
+            entry.to_dict(),
+        )
+        self._dispatcher_wakeup.set()
+
+    def _llm_recovery_ready(self) -> bool:
+        """Release only through a recoverable remote-model client.
+
+        A temporary gateway outage must not turn into an unannounced local-rule
+        verdict after an operator changes the runtime model configuration.
+        """
+        if not self.llm.defer_on_failure:
+            return False
+        runtime = self.llm.runtime_metadata
+        circuit = runtime.get("circuit") if isinstance(runtime, dict) else None
+        return not (isinstance(circuit, dict) and circuit.get("state") == "open")
+
+    def release_llm_deferred_alerts(
+        self,
+        *,
+        limit: int = 100,
+        actor: str = "runtime-operator",
+        force: bool = True,
+    ) -> dict:
+        """Release deferred remote-LLM alerts without replaying completed work."""
+        if not self.alert_processor:
+            raise ValueError("durable LLM recovery requires async alert processing")
+        if not self.llm.defer_on_failure:
+            return {
+                "released": 0,
+                "retry_released": 0,
+                "deferred_released": 0,
+                "dead_letter_recovered": 0,
+                "reason": "remote_model_not_configured",
+                "queue": self.processing_stats(),
+            }
+        released = self.repo.release_llm_deferred_alerts(limit=limit, force=force)
+        if released["released"]:
+            self.repo.insert_audit(
+                new_id("audit"),
+                "maintenance",
+                str(actor or "runtime-operator"),
+                "llm_deferred_alerts_released",
+                {**released, "force": bool(force)},
+            )
+            self._dispatcher_wakeup.set()
+        return {**released, "queue": self.processing_stats()}
+
     def _activate_configured_syslog_listeners(self) -> None:
         specs = [
             SyslogListenerSpec(
                 product,
                 int(port),
-                str(self.config.syslog.product_protocols.get(product, "tcp")).lower(),
+                (
+                    _RASP_SYSLOG_PROTOCOL
+                    if product == "rasp"
+                    else str(self.config.syslog.product_protocols.get(product, "tcp")).lower()
+                ),
             )
             for product, port in self.config.syslog.product_ports.items()
             if product in SUPPORTED_PRODUCTS
@@ -682,6 +926,18 @@ class GatewayState:
                 recovered = self.repo.recover_stale_inbox(
                     current_ms - self.config.operations.stale_claim_seconds * 1000
                 )
+                llm_recovery = {
+                    "released": 0,
+                    "retry_released": 0,
+                    "deferred_released": 0,
+                    "dead_letter_recovered": 0,
+                }
+                if self.alert_processor and self._llm_recovery_ready():
+                    llm_recovery = self.release_llm_deferred_alerts(
+                        limit=self.config.operations.llm_recovery_batch_size,
+                        actor="governance-maintenance",
+                        force=False,
+                    )
                 purged = self.repo.purge_completed_inbox(
                     current_ms
                     - self.config.operations.inbox_retention_days * 24 * 3600 * 1000
@@ -705,7 +961,14 @@ class GatewayState:
                     ),
                     limit=operations.retention_batch_size,
                 )
-                if expired or conflicts or recovered or purged or any(retention.values()):
+                if (
+                    expired
+                    or conflicts
+                    or recovered
+                    or llm_recovery["released"]
+                    or purged
+                    or any(retention.values())
+                ):
                     self.repo.insert_audit(
                         new_id("audit"),
                         "maintenance",
@@ -715,6 +978,7 @@ class GatewayState:
                             "expired_memories": len(expired),
                             "memory_conflicts": len(conflicts),
                             "recovered_inbox": recovered,
+                            "llm_deferred_released": llm_recovery["released"],
                             "purged_inbox": purged,
                             "retention": retention,
                         },
@@ -775,16 +1039,23 @@ class GatewayState:
 
     def processing_stats(self) -> dict:
         inbox = self.repo.inbox_stats()
+        deferred_stats = getattr(self.repo, "llm_deferred_inbox_stats", None)
+        llm_deferred = (
+            deferred_stats()
+            if callable(deferred_stats)
+            else {"deferred": 0, "retry": 0, "dead_letter": 0, "total": 0}
+        )
         durable_waiting = int(inbox.get("pending", 0)) + int(inbox.get("retry", 0))
+        durable_deferred = int(inbox.get("deferred", 0))
         durable_processing = int(inbox.get("processing", 0))
-        unfinished = durable_waiting + durable_processing
+        unfinished = durable_waiting + durable_deferred + durable_processing
         if not self.alert_processor:
             accepted = sum(int(value) for value in inbox.values())
             return {
                 "enabled": False,
                 "queue_max_size": 0,
                 "workers": 0,
-                "queued": durable_waiting,
+                "queued": durable_waiting + durable_deferred,
                 "inflight": durable_processing,
                 "unfinished": unfinished,
                 "submitted": accepted,
@@ -793,7 +1064,9 @@ class GatewayState:
                 "retried": inbox.get("retry", 0),
                 "dead_lettered": inbox.get("dead_letter", 0),
                 "rejected": 0,
+                "deferred": durable_deferred,
                 "durable_inbox": inbox,
+                "llm_deferred": llm_deferred,
             }
         stats = self.alert_processor.stats().to_dict()
         executor_queued = int(stats.get("queued", 0))
@@ -812,14 +1085,19 @@ class GatewayState:
         stats["executor_inflight"] = executor_inflight
         stats["failed"] = int(inbox.get("dead_letter", 0))
         stats["dead_lettered"] = int(inbox.get("dead_letter", 0))
+        stats["deferred"] = durable_deferred
         stats["durable_inbox"] = inbox
+        stats["llm_deferred"] = llm_deferred
         return stats
 
     def readiness(self) -> dict:
         """Return dependency health used by readiness and operator diagnostics."""
         database = self.repo.readiness_check()
         inbox = self.repo.inbox_stats()
-        backlog = sum(int(inbox.get(status, 0)) for status in ("pending", "retry", "processing"))
+        backlog = sum(
+            int(inbox.get(status, 0))
+            for status in ("pending", "retry", "deferred", "processing")
+        )
         capacity_ok = (
             not self.alert_processor
             or backlog < self.config.processing.queue_max_size
@@ -898,6 +1176,10 @@ class GatewayState:
                     "alert_id": alert.alert_id,
                     "product": alert.product,
                     "duplicate": True,
+                    "idempotency": {
+                        "outcome": "reused_existing_alert",
+                        "message": "The same alert_id was already accepted; existing evidence and analysis were reused.",
+                    },
                     "durable": True,
                     "queue": self.processing_stats(),
                 }
@@ -913,13 +1195,45 @@ class GatewayState:
                 "recovered": enqueue_status == "recovered",
                 "queue": self.processing_stats(),
             }
-        self.repo.enqueue_alert(alert, max_attempts=self.config.processing.max_attempts)
+        inserted = self.repo.enqueue_alert(alert, max_attempts=self.config.processing.max_attempts)
+        existing_inbox = self.repo.get_inbox_alert(alert.alert_id) or {}
+        # In synchronous mode, a retry can still claim a pending/retry row and
+        # finish it. Completed or in-flight rows are true idempotent replays.
+        if not inserted and existing_inbox.get("status") not in {"pending", "retry"}:
+            existing = self.repo.get_agent_result_for_event(
+                self.normalizer.normalize(alert).event_id
+            )
+            return {
+                **(existing or {}),
+                "ok": True,
+                "status": "duplicate",
+                "alert_id": alert.alert_id,
+                "product": alert.product,
+                "duplicate": True,
+                "idempotency": {
+                    "outcome": "reused_existing_alert",
+                    "message": "The same alert_id was already accepted; existing evidence and analysis were reused.",
+                },
+                "durable": True,
+            }
         claimed = self.repo.claim_inbox_alert(alert.alert_id)
         if not claimed:
             existing = self.repo.get_agent_result_for_event(
                 self.normalizer.normalize(alert).event_id
             )
-            return existing or {"ok": True, "status": "duplicate", "alert_id": alert.alert_id}
+            return {
+                **(existing or {}),
+                "ok": True,
+                "status": "duplicate",
+                "alert_id": alert.alert_id,
+                "product": alert.product,
+                "duplicate": True,
+                "idempotency": {
+                    "outcome": "reused_existing_alert",
+                    "message": "The same alert_id was already accepted; existing evidence and analysis were reused.",
+                },
+                "durable": True,
+            }
         try:
             result = self.orchestrator.handle_alert(self._raw_alert_from_inbox(claimed))
             self.repo.complete_inbox_alert(alert.alert_id)
@@ -935,11 +1249,17 @@ class GatewayState:
     def _seed_mapping_profiles(self) -> None:
         self.repo.delete_mapping_profile("demo-waf-json")
         for profile in [default_mapping_profile(), demo_rasp_profile()]:
-            if not self.repo.get_mapping_profile(profile.profile_id):
+            existing = self.repo.get_mapping_profile(profile.profile_id)
+            if not existing:
                 self.repo.save_mapping_profile(mapping_profile_record(profile))
+            elif profile.profile_id == "demo-rasp-json":
+                self._backfill_rasp_evidence_profile(existing, profile)
         for product in sorted(SUPPORTED_PRODUCTS):
             profile_id = AUTO_PROFILE.get(product, f"auto-{product}-json")
-            if self.repo.get_mapping_profile(profile_id):
+            existing = self.repo.get_mapping_profile(profile_id)
+            if existing:
+                if product == "rasp":
+                    self._backfill_rasp_evidence_profile(existing, builtin_product_profile("rasp"))
                 continue
             try:
                 profile = builtin_product_profile(product)
@@ -954,20 +1274,77 @@ class GatewayState:
                     {"product": product, "profile_id": profile_id, "error": str(exc)},
                 )
 
+    def _backfill_rasp_evidence_profile(self, record: dict, expected: MappingProfile) -> None:
+        profile = MappingProfile.from_dict(record["profile"])
+        added_mappings, added_evidence = ensure_rasp_evidence_coverage(profile)
+        previous_version = profile.version
+        upgraded_fields: list[str] = []
+        # Reserved built-in profiles used to pass raw hook_data to the model
+        # context. Preserve it under payload.original_log, but replace only the
+        # system-owned projection with the current semantic summary. Custom
+        # profile fields/mappings remain untouched.
+        is_legacy_builtin = profile.name == expected.name and profile.version in {"v1", "v2", "v3", "v4", "v5"}
+        if is_legacy_builtin:
+            hook_mapping = expected.mappings.get("payload.hook_data")
+            if hook_mapping is not None and profile.mappings.get("payload.hook_data") != hook_mapping:
+                profile.mappings["payload.hook_data"] = copy.deepcopy(hook_mapping)
+                upgraded_fields.append("payload.hook_data")
+            expected_hook_evidence = next(
+                (
+                    field
+                    for field in expected.evidence_fields
+                    if str(field.get("type") or "").strip().lower() == "hook_data"
+                ),
+                None,
+            )
+            if expected_hook_evidence:
+                for field in profile.evidence_fields:
+                    if str(field.get("type") or "").strip().lower() == "hook_data" and field != expected_hook_evidence:
+                        field.clear()
+                        field.update(copy.deepcopy(expected_hook_evidence))
+                        upgraded_fields.append("evidence:hook_data")
+            profile.version = expected.version
+            profile.description = expected.description
+        if not added_mappings and not added_evidence and not upgraded_fields:
+            return
+        self.repo.save_mapping_profile(mapping_profile_record(profile))
+        self.repo.insert_audit(
+            new_id("audit"),
+            "mapping-profile-seed",
+            "gateway",
+            "mapping_profile_rasp_evidence_backfilled",
+            {
+                "profile_id": profile.profile_id,
+                "added_mappings": added_mappings,
+                "added_evidence_types": added_evidence,
+                "upgraded_fields": upgraded_fields,
+                "previous_version": previous_version,
+                "version": profile.version,
+            },
+        )
+
     def llm_config_payload(self) -> dict:
         with self.lock:
             llm = self.config.llm
+            resolved_key = (
+                resolve_gateway_api_key(llm.endpoint, llm.api_key, llm.api_key_env)
+                if llm.provider == "gateway"
+                else llm.api_key
+            )
+            runtime = dict(self.llm.runtime_metadata)
             return {
                 "provider": llm.provider,
                 "endpoint": llm.endpoint,
                 "api_key_env": llm.api_key_env,
-                "api_key_set": bool(
-                    resolve_gateway_api_key(llm.endpoint, llm.api_key, llm.api_key_env)
-                    if llm.provider == "gateway"
-                    else llm.api_key
+                "api_key_set": bool(resolved_key),
+                "credential_source": (
+                    "deployment_env"
+                    if bool(os.getenv(llm.api_key_env, ""))
+                    else ("runtime_session" if bool(llm.api_key) else "not_configured")
                 ),
                 "model": llm.model,
                 "timeout_seconds": llm.timeout_seconds,
+                "runtime": runtime,
             }
 
     def update_llm_config(self, payload: dict) -> dict:
@@ -1015,7 +1392,15 @@ class GatewayState:
                     "provider": updated.provider,
                     "model": updated.model,
                     "endpoint_host": urlparse(updated.endpoint).hostname or "",
-                    "api_key_set": bool(updated.api_key),
+                    "api_key_set": bool(
+                        resolve_gateway_api_key(
+                            updated.endpoint,
+                            updated.api_key,
+                            updated.api_key_env,
+                        )
+                        if updated.provider == "gateway"
+                        else updated.api_key
+                    ),
                     "timeout_seconds": updated.timeout_seconds,
                 },
             )
@@ -1058,10 +1443,12 @@ class GatewayState:
         try:
             # Validate the derived URL too, immediately before opening it. This
             # keeps list/test behavior aligned with the analysis client while
-            # retaining the DNS/range SSRF checks for explicit remote services.
+            # retaining the DNS/range SSRF checks and connection pinning for
+            # explicit remote services.
             tags_url = _validated_llm_endpoint("ollama", tags_url, llm.allowed_hosts)
+            endpoint_pin = _pin_llm_endpoint("ollama", tags_url, llm.allowed_hosts)
             req = urllib.request.Request(tags_url, headers={"Accept": "application/json"}, method="GET")
-            with _open_ollama(req, timeout=10) as resp:
+            with _open_ollama(req, timeout=10, endpoint_pin=endpoint_pin) as resp:
                 raw = resp.read(self.config.llm.max_response_bytes + 1)
                 if len(raw) > self.config.llm.max_response_bytes:
                     raise ValueError("Ollama model list response is too large")
@@ -1120,8 +1507,13 @@ class GatewayState:
                 tags_url = _validated_llm_endpoint(
                     "ollama", tags_url, self.config.llm.allowed_hosts
                 )
+                endpoint_pin = _pin_llm_endpoint(
+                    "ollama", tags_url, self.config.llm.allowed_hosts
+                )
                 req = urllib.request.Request(tags_url, headers={"Accept": "application/json"}, method="GET")
-                with _open_ollama(req, timeout=min(timeout, 10)) as resp:
+                with _open_ollama(
+                    req, timeout=min(timeout, 10), endpoint_pin=endpoint_pin
+                ) as resp:
                     raw = resp.read(self.config.llm.max_response_bytes + 1)
                     if len(raw) > self.config.llm.max_response_bytes:
                         raise ValueError("Ollama response is too large")
@@ -1140,7 +1532,7 @@ class GatewayState:
                     "provider": "ollama",
                     "endpoint": tags_url,
                     "message": f"Ollama 返回 HTTP {exc.code}，请确认服务已启动。",
-                    "detail": exc.read().decode("utf-8", errors="ignore")[:200],
+                    "detail": _read_http_error_body(exc)[:200],
                 }
             except urllib.error.URLError as exc:
                 return {
@@ -1162,6 +1554,7 @@ class GatewayState:
         # gateway (and any future provider) — send a lightweight authenticated POST
         # and verify the endpoint returns valid JSON.
         endpoint = _validated_llm_endpoint("gateway", endpoint, self.config.llm.allowed_hosts)
+        endpoint_pin = _pin_llm_endpoint("gateway", endpoint, self.config.llm.allowed_hosts)
 
         # A saved credential may only be reused for its exact saved destination.
         # The caller can provide a one-off key, but can never select an env name.
@@ -1184,7 +1577,9 @@ class GatewayState:
                 resolved_key,
                 max_tokens=32,
             )
-            with _open_model_endpoint(req, timeout=min(timeout, 15)) as resp:
+            with _open_model_endpoint(
+                req, timeout=min(timeout, 15), endpoint_pin=endpoint_pin
+            ) as resp:
                 raw = resp.read(self.config.llm.max_response_bytes + 1)
                 if len(raw) > self.config.llm.max_response_bytes:
                     return {
@@ -1225,7 +1620,15 @@ class GatewayState:
                     "detail": f"HTTP {resp.status}",
                 }
         except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="ignore")
+            body = _read_http_error_body(exc)
+            if is_websocket_upgrade_required(exc.code, body):
+                return {
+                    "ok": False,
+                    "provider": provider,
+                    "endpoint": endpoint,
+                    "message": "Gateway 端点要求 WebSocket 升级；当前服务只支持 HTTP JSON 接口。",
+                    "detail": WEBSOCKET_ENDPOINT_GUIDANCE,
+                }
             return {
                 "ok": False,
                 "provider": provider,
@@ -1315,7 +1718,11 @@ class GatewayState:
             configs = []
             for product in sorted(SUPPORTED_PRODUCTS):
                 port = int(self.config.syslog.product_ports.get(product, 0))
-                protocol = str(self.config.syslog.product_protocols.get(product, "tcp")).lower()
+                protocol = (
+                    _RASP_SYSLOG_PROTOCOL
+                    if product == "rasp"
+                    else str(self.config.syslog.product_protocols.get(product, "tcp")).lower()
+                )
                 configs.append(
                     {
                         "product": product,
@@ -1330,7 +1737,8 @@ class GatewayState:
                 "mode": "embedded" if self.config.syslog.embedded_listeners_enabled else "external_vector",
                 "editable": self.config.syslog.embedded_listeners_enabled,
                 "recommended_protocol": "tcp",
-                "recommendation_reason": "syslog 报文较长时推荐 TCP；UDP 无传输确认，长报文分片后更容易截断或丢包。",
+                "required_protocols": {"rasp": _RASP_SYSLOG_PROTOCOL},
+                "recommendation_reason": "RASP 使用 TCP；UDP 无传输确认且长报文分片后可能截断或丢包。",
                 "configs": configs,
                 "listeners": self.syslog_receiver.status(),
             }
@@ -1347,6 +1755,8 @@ class GatewayState:
         protocol = str(payload.get("protocol") or "tcp").strip().lower()
         if protocol not in {"tcp", "udp"}:
             raise ValueError("protocol must be tcp or udp")
+        if product == "rasp" and protocol != _RASP_SYSLOG_PROTOCOL:
+            raise ValueError("RASP Syslog requires TCP; UDP cannot provide the required loss protection")
 
         with self.lock:
             old_product_ports = dict(self.config.syslog.product_ports)
@@ -1387,6 +1797,78 @@ class GatewayState:
                 {"product": product, "port": port, "protocol": protocol},
             )
             return self.syslog_config_payload()
+
+    def _syslog_deployment_targets(self) -> list[dict]:
+        labels = {"waf": "WAF", "hips": "HIPS", "ndr": "NDR", "rasp": "RASP", "siem": "SIEM"}
+        targets = []
+        for product in _SYSLOG_PRODUCT_ORDER:
+            port = int(self.config.syslog.product_ports.get(product, 0))
+            protocol = (
+                _RASP_SYSLOG_PROTOCOL
+                if product == "rasp"
+                else str(self.config.syslog.product_protocols.get(product, "tcp")).lower()
+            )
+            targets.append(
+                {
+                    "product": product,
+                    "label": labels[product],
+                    "port": port,
+                    "protocol": protocol if protocol in {"tcp", "udp"} else "tcp",
+                }
+            )
+        return targets
+
+    def syslog_deployment_payload(self) -> dict:
+        """Return only operator-safe values needed to configure Syslog senders.
+
+        The collector's ingest credential deliberately remains in the Kubernetes
+        Secret. The web application never reads or returns that credential.
+        """
+        with self.lock:
+            deployment = dict(self._syslog_deployment)
+            source_cidrs = list(deployment.get("source_cidrs") or [])
+            collector_address = str(deployment.get("collector_address") or "")
+            return {
+                "collector_address": collector_address,
+                "source_cidrs": source_cidrs,
+                "targets": self._syslog_deployment_targets(),
+                "sync_required": True,
+                "collector_address_pending": not bool(collector_address),
+                "ingest_auth": {"managed_by": "kubernetes_secret", "exposed": False},
+            }
+
+    def update_syslog_deployment_config(self, payload: dict) -> dict:
+        collector_address = _normalize_syslog_collector_address(
+            payload.get("collector_address", "")
+        )
+        source_cidrs = _normalize_syslog_source_cidrs(payload.get("source_cidrs", []))
+        actor = str(payload.get("_actor") or "runtime-operator")
+        deployment = {
+            "collector_address": collector_address,
+            "source_cidrs": source_cidrs,
+        }
+        with self.lock:
+            with self.repo.transaction():
+                self.repo.set_runtime_setting(
+                    "syslog_deployment",
+                    deployment,
+                    updated_by=actor,
+                    _commit=False,
+                )
+                self.repo.insert_audit(
+                    new_id("audit"),
+                    "runtime-config",
+                    actor,
+                    "syslog_deployment_config_updated",
+                    {
+                        "collector_address": collector_address,
+                        "source_cidrs": source_cidrs,
+                        "k3s_sync_required": True,
+                    },
+                    _commit=False,
+                )
+            self._syslog_deployment = deployment
+            return self.syslog_deployment_payload()
 
     # ---- log mapping profiles ----------------------------------------------
 
@@ -1479,6 +1961,9 @@ class GatewayState:
             profile = self.get_mapping_profile(selected_profile)
             result = self.log_adapter.adapt(profile, log)
             if not result["ok"]:
+                route = self._collector_profile_route(payload)
+                if route is not None:
+                    return self._collector_mapping_fallback(profile, log, route, result)
                 raise ValueError("log mapping failed: " + ", ".join(result["errors"]))
             return result["raw_alert"]
 
@@ -1531,6 +2016,171 @@ class GatewayState:
             "无法识别日志来源 product。厂商原生日志请用 ?profile=<id> 提交，"
             "或补全顶层 product 字段（hips/rasp/ndr/waf/siem）。"
         )
+
+    @staticmethod
+    def _collector_profile_route(payload: dict) -> dict | None:
+        """Recognize the trusted Vector profiled-envelope shape.
+
+        Direct API submissions keep their strict mapping errors. Only Vector's
+        port-profiled envelopes are allowed to take the durable fallback path,
+        so malformed third-party API input does not silently become an alert.
+        """
+        route = payload.get("syslog_route")
+        if not isinstance(route, dict):
+            return None
+        if str(route.get("route_reason") or "").strip().lower() != "port_profile":
+            return None
+        return dict(route)
+
+    @staticmethod
+    def _collector_fallback_product(profile: MappingProfile, route: dict, mapped: dict) -> str:
+        for value in (
+            mapped.get("product"),
+            route.get("product"),
+            route.get("port_product"),
+        ):
+            product = str(value or "").strip().lower()
+            if product in SUPPORTED_PRODUCTS:
+                return product
+        profile_id = str(profile.profile_id or "").strip().lower()
+        for product in SUPPORTED_PRODUCTS:
+            if profile_id in {f"auto-{product}-json", f"demo-{product}-json"}:
+                return product
+        return "siem"
+
+    @staticmethod
+    def _collector_fallback_text(*values: object, default: str, limit: int = 256) -> str:
+        for value in values:
+            text = str(value or "").strip()
+            if text and text.lower() != "unknown":
+                return text[:limit]
+        return default[:limit]
+
+    @staticmethod
+    def _collector_fallback_timestamp(*values: object) -> str:
+        for value in values:
+            timestamp = str(value or "").strip()
+            if not timestamp or len(timestamp) > 64:
+                continue
+            try:
+                datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            return timestamp
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def _collector_mapping_fallback(
+        self,
+        profile: MappingProfile,
+        log: dict,
+        route: dict,
+        result: dict,
+    ) -> RawAlert:
+        """Persist a profiled Syslog event even when its mapping is incomplete.
+
+        Vector treats a Gateway 400 as non-retriable. Converting this narrow
+        collector-only failure into a valid RawAlert preserves the original log,
+        leaves a visible mapping-status evidence item, and prevents silent loss.
+        """
+        mapped = dict(result.get("mapped_fields") or {})
+        preview = result.get("raw_alert_preview") or {}
+        fallback_payload = preview.get("payload") if isinstance(preview, dict) else None
+        fallback_payload = dict(fallback_payload) if isinstance(fallback_payload, dict) else {}
+        product = self._collector_fallback_product(profile, route, mapped)
+        items = log.get("items") if isinstance(log.get("items"), list) else []
+        first_item = items[0] if items and isinstance(items[0], dict) else {}
+        event = log.get("event") if isinstance(log.get("event"), dict) else {}
+        event_type = self._collector_fallback_text(
+            mapped.get("event_type"),
+            log.get("event_type"),
+            first_item.get("rule_name"),
+            first_item.get("attack_type"),
+            event.get("type"),
+            log.get("type"),
+            default="syslog_mapping_unresolved",
+        )
+        source = self._collector_fallback_text(
+            mapped.get("source"),
+            route.get("appname"),
+            route.get("hostname"),
+            profile.name,
+            default=f"syslog-{product}",
+        )
+        severity = str(mapped.get("severity") or log.get("severity") or log.get("level") or "medium").strip().lower()
+        severity = {
+            "emerg": "critical",
+            "alert": "critical",
+            "crit": "critical",
+            "error": "high",
+            "err": "high",
+            "warn": "high",
+            "warning": "high",
+            "notice": "low",
+            "info": "low",
+            "debug": "low",
+        }.get(severity, severity)
+        if severity not in {"critical", "high", "medium", "low"}:
+            severity = "medium"
+        timestamp = self._collector_fallback_timestamp(
+            mapped.get("timestamp"),
+            event.get("attack_time"),
+            event.get("time"),
+            log.get("timestamp"),
+            route.get("received_at"),
+        )
+        alert_id = str(mapped.get("alert_id") or "").strip()
+        if not alert_id or len(alert_id) > 256:
+            identity = json.dumps(
+                {"profile_id": profile.profile_id, "route": route, "log": log},
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+            alert_id = f"syslog_fallback_{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:32]}"
+        errors = [str(item)[:256] for item in result.get("errors", [])[:8]]
+        adapter = fallback_payload.get("adapter")
+        adapter = dict(adapter) if isinstance(adapter, dict) else {}
+        adapter.update(
+            {
+                "profile_id": profile.profile_id,
+                "profile_name": profile.name,
+                "profile_version": profile.version,
+                "mapping_status": "collector_fallback",
+                "mapping_errors": errors,
+            }
+        )
+        fallback_payload.setdefault("original_log", log)
+        fallback_payload["adapter"] = adapter
+        fallback_payload["syslog_route"] = route
+        fallback_payload["collector_mapping_fallback"] = {
+            "status": "accepted_with_mapping_error",
+            "profile_id": profile.profile_id,
+            "errors": errors,
+        }
+        alert = validate_raw_alert(
+            RawAlert(
+                source=source,
+                product=product,
+                event_type=event_type,
+                severity=severity,
+                timestamp=timestamp,
+                payload=fallback_payload,
+                alert_id=alert_id,
+            )
+        )
+        self.repo.insert_audit(
+            new_id("audit"),
+            alert.alert_id,
+            "syslog-collector",
+            "collector_mapping_fallback",
+            {
+                "alert_id": alert.alert_id,
+                "profile_id": profile.profile_id,
+                "product": product,
+                "error_count": len(errors),
+            },
+        )
+        return alert
 
     # ---- memory governance (Dashboard 记忆治理 module, architecture §8/§11) ----
 
@@ -1755,6 +2405,242 @@ class GatewayState:
                 )
                 return {"ok": True, "case": updated}
 
+    def replay_case_alert_analysis(self, case_id: str, alert_id: str, actor: str) -> dict:
+        """Re-map retained RASP evidence and replace the live Case assessment.
+
+        The source alert and its prior analysis remain immutable audit history.
+        The replay appends a new normalized-event version and Agent Run for the
+        same raw alert, then refreshes the Case's current summary atomically.
+        """
+        with self.lock:
+            case = self.repo.get_case(case_id)
+            if not case:
+                raise KeyError("case not found")
+            raw_alert = self.repo.get_raw_alert(alert_id)
+            if not raw_alert:
+                raise KeyError("raw alert not found")
+            if raw_alert.product.lower() != "rasp":
+                raise ValueError("analysis replay currently supports RASP alerts only")
+
+            source_links = [
+                link
+                for link in case.get("linked_alerts", [])
+                if link.get("alert_id") == alert_id
+                and "__replay_" not in str(link.get("event_id") or "")
+            ]
+            if not source_links:
+                raise ValueError("raw alert is not linked to this Case")
+            source_event_id = str(source_links[0].get("event_id") or "")
+            if not source_event_id:
+                raise ValueError("source normalized event is missing")
+
+            original_log = raw_alert.payload.get("original_log")
+            if not isinstance(original_log, dict):
+                raise ValueError("retained original RASP log is unavailable for replay")
+            replay_log = copy.deepcopy(original_log)
+            if "_syslog_envelope" not in replay_log:
+                for envelope_key in ("_syslog_envelope", "syslog_envelope"):
+                    envelope = raw_alert.payload.get(envelope_key)
+                    if isinstance(envelope, dict):
+                        replay_log["_syslog_envelope"] = copy.deepcopy(envelope)
+                        break
+
+            adapter = raw_alert.payload.get("adapter") or {}
+            profile_id = str(adapter.get("profile_id") or AUTO_PROFILE["rasp"])
+            profile = self.get_mapping_profile(profile_id)
+            remapped = self.log_adapter.adapt(profile, replay_log)
+            if not remapped.get("ok") or not remapped.get("raw_alert"):
+                raise ValueError(
+                    "retained RASP log could not be remapped: "
+                    + ", ".join(str(item) for item in remapped.get("errors", []))
+                )
+            replay_alert = remapped["raw_alert"]
+            if replay_alert.product.lower() != raw_alert.product.lower():
+                raise ValueError("replay mapping product does not match retained raw alert")
+            fallback_identity_preserved = False
+            if replay_alert.alert_id != raw_alert.alert_id:
+                mapping_status = str(adapter.get("mapping_status") or "").strip().lower()
+                collector_fallback = raw_alert.payload.get("collector_mapping_fallback")
+                is_retained_collector_fallback = (
+                    raw_alert.alert_id.startswith("syslog_fallback_")
+                    and mapping_status == "collector_fallback"
+                    and isinstance(collector_fallback, dict)
+                    and str(collector_fallback.get("status") or "").strip().lower()
+                    == "accepted_with_mapping_error"
+                )
+                if not is_retained_collector_fallback:
+                    raise ValueError("replay mapping alert_id does not match retained raw alert")
+                # A newer mapping profile can resolve a collector-fallback log
+                # that originally had no mapped alert ID. Re-analysis must stay
+                # attached to the immutable stored alert/Case identity rather
+                # than treating the newly derived ID as a different alert.
+                replay_alert.alert_id = raw_alert.alert_id
+                fallback_identity_preserved = True
+
+            result, replayed = self.orchestrator.reanalyze_existing_alert(
+                alert=replay_alert,
+                source_event_id=source_event_id,
+                case_id=case_id,
+                correlation_key=str(case.get("correlation_key") or ""),
+                actor=str(actor or "dashboard-analyst"),
+                replay_context={
+                    "profile_id": profile.profile_id,
+                    "profile_version": profile.version,
+                    "source_alert_timestamp": raw_alert.timestamp,
+                    "fallback_identity_preserved": fallback_identity_preserved,
+                },
+            )
+            updated = self.repo.get_case(case_id)
+            return {
+                "ok": True,
+                "replayed": replayed,
+                "case": _case_detail_summary(updated or case),
+                "analysis": result.to_dict(),
+                "replay": {
+                    "source_alert_id": alert_id,
+                    "source_event_id": source_event_id,
+                    "replay_event_id": result.explanation.get("analysis_replay", {}).get(
+                        "replay_event_id", ""
+                    ),
+                    "profile_id": profile.profile_id,
+                    "profile_version": profile.version,
+                },
+            }
+
+    def continue_validation_review(self, case_id: str, validation_id: str, body: dict) -> dict:
+        """Route an injection-only validation review to approval after attestation.
+
+        This preserves the original Validator result and leaves automatic memory
+        writes suppressed. The analyst's append-only resolution is the only
+        credential accepted by Repository.insert_approval for a review result.
+        """
+        actor = str(body.get("actor") or "").strip()
+        reason = str(body.get("reason") or "").strip()
+        if not actor:
+            raise ValueError("manual review actor is required")
+        if len(reason) < 8:
+            raise ValueError("manual review reason must describe the evidence checked")
+        if len(reason) > 1000:
+            raise ValueError("manual review reason is too long")
+
+        with self.lock:
+            case = self.repo.get_case(case_id)
+            if not case:
+                raise KeyError("case not found")
+            if case["status"] in {"closed", "false_positive"}:
+                raise ValueError("terminal case cannot continue validation review")
+
+            validation_payload = self.repo.get_validation(validation_id)
+            if not validation_payload:
+                raise KeyError("validation not found")
+            validation = ValidationResult.from_dict(validation_payload)
+            if validation.case_id != case_id:
+                raise ValueError("validation does not belong to case")
+            if not can_continue_after_manual_review(validation):
+                raise ValueError(
+                    "only a prompt-injection-only review with all other checks passing can continue"
+                )
+
+            result_payload = self.repo.get_agent_result_for_event(validation.event_id)
+            if not result_payload:
+                raise ValueError("analysis result for validation event not found")
+            result = AgentResult.from_dict(result_payload)
+            if result.case_id != case_id:
+                raise ValueError("analysis result does not belong to case")
+
+            existing = self.repo.get_validation_review_resolution(validation_id)
+            if existing:
+                approvals = self.repo.list_approvals(
+                    case_id=case_id,
+                    review_resolution_id=str(existing["resolution_id"]),
+                    limit=100,
+                )
+                return {
+                    "ok": True,
+                    "created": False,
+                    "resolution": existing,
+                    "approvals": approvals,
+                }
+
+            with self.repo.transaction():
+                resolution, created = self.repo.create_validation_review_resolution(
+                    new_id("review"),
+                    validation.validation_id,
+                    case_id,
+                    validation.event_id,
+                    actor,
+                    reason,
+                    _commit=False,
+                )
+                if not created:
+                    approvals = self.repo.list_approvals(
+                        case_id=case_id,
+                        review_resolution_id=str(resolution["resolution_id"]),
+                        limit=100,
+                    )
+                    return {
+                        "ok": True,
+                        "created": False,
+                        "resolution": resolution,
+                        "approvals": approvals,
+                    }
+
+                requests = self.orchestrator.response_advisor.prepare_after_manual_review(
+                    validation.event_id,
+                    result,
+                    validation,
+                    str(resolution["resolution_id"]),
+                )
+                approvals = []
+                for request in requests:
+                    if not self.repo.insert_approval(request.to_dict(), _commit=False):
+                        raise RuntimeError("manual review approval routing was rejected")
+                    approval = self.repo.get_approval(request.approval_id)
+                    if approval:
+                        approvals.append(approval)
+
+                self.repo.insert_audit(
+                    new_id("audit"),
+                    case_id,
+                    actor,
+                    "manual_validation_review_continued",
+                    {
+                        "case_id": case_id,
+                        "validation_id": validation.validation_id,
+                        "event_id": validation.event_id,
+                        "resolution_id": resolution["resolution_id"],
+                        "reason": reason,
+                        "approval_ids": [approval["approval_id"] for approval in approvals],
+                        "automatic_memory_write": "remains_suppressed",
+                    },
+                    _commit=False,
+                )
+                for approval in approvals:
+                    self.repo.insert_audit(
+                        new_id("audit"),
+                        case_id,
+                        self.orchestrator.response_advisor.name,
+                        "approval_requested",
+                        {
+                            "approval_id": approval["approval_id"],
+                            "case_id": case_id,
+                            "event_id": validation.event_id,
+                            "action": approval["action"]["action"],
+                            "execution_status": "not_executed",
+                            "validation_id": validation.validation_id,
+                            "review_resolution_id": resolution["resolution_id"],
+                            "routing": "manual_validation_review",
+                        },
+                        _commit=False,
+                    )
+
+            return {
+                "ok": True,
+                "created": True,
+                "resolution": resolution,
+                "approvals": approvals,
+            }
+
     def decide_approval(self, approval_id: str, body: dict) -> dict:
         decision = str(body.get("decision") or "").strip().lower()
         actor = str(body.get("actor") or "").strip()
@@ -1816,12 +2702,70 @@ class GatewayState:
                 if body.get("expires_at_ms")
                 else None
             )
+            case_id = str(linked.get("case_id") or "")
+            existing_confirmation = self.repo.get_confirmed_false_positive_memory(
+                alert_id, case_id
+            )
+            if existing_confirmation:
+                disposition = self.repo.get_alert_disposition_summary(alert_id)
+                outcome = {
+                    "memory_id": existing_confirmation["memory_id"],
+                    "features": self.memory.extract_false_positive_features(linked),
+                }
+                if (
+                    disposition
+                    and disposition["case_id"] == case_id
+                    and disposition["disposition"] == "false_positive"
+                ):
+                    return {
+                        "ok": True,
+                        "alert_id": alert_id,
+                        "alert_disposition": disposition,
+                        "case_closed": bool(disposition["case_can_close_as_false_positive"]),
+                        **outcome,
+                    }
+
+                # Reconcile a legacy/incomplete companion disposition without
+                # creating a second long-term memory for the same confirmation.
+                with self.repo.transaction():
+                    disposition = self.repo.set_alert_disposition(
+                        alert_id,
+                        "false_positive",
+                        analyst,
+                        reason,
+                        _commit=False,
+                    )
+                    if not disposition:
+                        raise ValueError("alert is not linked to a case")
+                    if case_id and disposition["case_can_close_as_false_positive"]:
+                        self.repo.update_case_status(case_id, "false_positive", _commit=False)
+                    self.repo.insert_audit(
+                        new_id("audit"),
+                        case_id or alert_id,
+                        analyst,
+                        "confirm_business_false_positive_repaired",
+                        {
+                            "alert_id": alert_id,
+                            "case_id": case_id,
+                            "memory_id": outcome["memory_id"],
+                            "reason": reason,
+                            "case_closed": bool(disposition["case_can_close_as_false_positive"]),
+                        },
+                        _commit=False,
+                    )
+                return {
+                    "ok": True,
+                    "alert_id": alert_id,
+                    "alert_disposition": disposition,
+                    "case_closed": bool(disposition["case_can_close_as_false_positive"]),
+                    **outcome,
+                }
+
             # Atomic: the FP memory write and its audit_log row commit together.
             # confirm_business_false_positive opens a nested transaction (no-op
             # commit); the outer block owns the commit including the audit insert.
             with self.repo.transaction():
                 outcome = self.memory.confirm_business_false_positive(linked, analyst, reason, expires_at_ms)
-                case_id = str(linked.get("case_id") or "")
                 disposition = self.repo.set_alert_disposition(
                     alert_id,
                     "false_positive",
@@ -2155,6 +3099,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 return
             self._json(200, self.state.syslog_config_payload())
             return
+        if parsed.path == "/api/config/syslog/deployment":
+            if not self._require_roles(_ROLE_CONFIG):
+                return
+            self._json(200, self.state.syslog_deployment_payload())
+            return
         if parsed.path == "/api/mapping-profiles":
             if not self._require_roles(_ROLE_READ, _ROLE_CONFIG, _ROLE_ANALYST):
                 return
@@ -2185,7 +3134,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 return
             query = parse_qs(parsed.query)
             status = _query_first(query, "status") or None
-            allowed = {"pending", "retry", "processing", "completed", "dead_letter"}
+            allowed = {"pending", "retry", "deferred", "processing", "completed", "dead_letter"}
             if status and status not in allowed:
                 self._json(400, {"error": f"unsupported inbox status: {status}"})
                 return
@@ -2333,6 +3282,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             authorized = self._require_roles(_ROLE_ANALYST)
         elif parsed.path.startswith("/api/approvals/"):
             authorized = self._require_roles(_ROLE_APPROVER)
+        elif parsed.path == "/api/alerts/inbox/release-llm-deferred":
+            authorized = self._require_roles(_ROLE_ANALYST)
         elif parsed.path.endswith("/confirm-false-positive"):
             authorized = self._require_roles(_ROLE_ANALYST, _ROLE_MEMORY)
         elif parsed.path == "/api/alerts":
@@ -2383,6 +3334,19 @@ class GatewayHandler(BaseHTTPRequestHandler):
             except _PayloadTooLarge:
                 self._json(413, {"error": "request body too large"})
             except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                self._client_error(exc)
+            except Exception as exc:
+                self._server_error(exc)
+            return
+        if parsed.path == "/api/config/syslog/deployment":
+            try:
+                updated = self.state.update_syslog_deployment_config(
+                    self._governance_body(self._read_json())
+                )
+                self._json(200, {"ok": True, "deployment": updated})
+            except _PayloadTooLarge:
+                self._json(413, {"error": "request body too large"})
+            except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
                 self._client_error(exc)
             except Exception as exc:
                 self._server_error(exc)
@@ -2472,6 +3436,65 @@ class GatewayHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._server_error(exc)
             return
+        if (
+            parsed.path.startswith("/api/cases/")
+            and "/validation-reviews/" in parsed.path
+            and parsed.path.endswith("/continue")
+        ):
+            parts = parsed.path.split("/")
+            if len(parts) != 7 or parts[4] != "validation-reviews":
+                self._json(404, {"error": "validation review endpoint not found"})
+                return
+            case_id = unquote(parts[3])
+            validation_id = unquote(parts[5])
+            try:
+                self._json(
+                    200,
+                    self.state.continue_validation_review(
+                        case_id,
+                        validation_id,
+                        self._governance_body(self._read_json()),
+                    ),
+                )
+            except _PayloadTooLarge:
+                self._json(413, {"error": "request body too large"})
+            except KeyError:
+                self._json(404, {"error": "case or validation not found"})
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                self._client_error(exc)
+            except Exception as exc:
+                self._server_error(exc)
+            return
+        if (
+            parsed.path.startswith("/api/cases/")
+            and "/alerts/" in parsed.path
+            and parsed.path.endswith("/replay-analysis")
+        ):
+            parts = parsed.path.split("/")
+            if len(parts) != 7 or parts[4] != "alerts":
+                self._json(404, {"error": "analysis replay endpoint not found"})
+                return
+            case_id = unquote(parts[3])
+            alert_id = unquote(parts[5])
+            try:
+                body = self._governance_body(self._read_json(), actor_field="analyst")
+                self._json(
+                    200,
+                    self.state.replay_case_alert_analysis(
+                        case_id,
+                        alert_id,
+                        str(body.get("_actor") or "dashboard-analyst"),
+                    ),
+                )
+            except _PayloadTooLarge:
+                self._json(413, {"error": "request body too large"})
+            except KeyError:
+                self._json(404, {"error": "case or raw alert not found"})
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                self._client_error(exc)
+            except Exception as exc:
+                self._server_error(exc)
+            return
         if parsed.path.startswith("/api/cases/") and parsed.path.endswith("/disposition"):
             case_id = unquote(parsed.path.split("/")[-2])
             try:
@@ -2511,6 +3534,25 @@ class GatewayHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._server_error(exc)
             return
+        if parsed.path == "/api/alerts/inbox/release-llm-deferred":
+            try:
+                body = self._governance_body(self._read_json(), actor_field="analyst")
+                limit = max(1, min(int(body.get("limit", 100)), 500))
+                self._json(
+                    200,
+                    self.state.release_llm_deferred_alerts(
+                        limit=limit,
+                        actor=str(body.get("_actor") or "runtime-operator"),
+                        force=True,
+                    ),
+                )
+            except _PayloadTooLarge:
+                self._json(413, {"error": "request body too large"})
+            except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                self._client_error(exc)
+            except Exception as exc:
+                self._server_error(exc)
+            return
         if parsed.path != "/api/alerts":
             self._json(404, {"error": "not found"})
             return
@@ -2526,6 +3568,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._json(413, {"error": "request body too large"})
         except AlertQueueFull as exc:
             self._json(429, {"error": str(exc), "processing": self.state.processing_stats()})
+        except AlertIdentityConflict as exc:
+            self._json(
+                409,
+                {
+                    "error": "alert_id_conflict",
+                    "alert_id": exc.alert_id,
+                    "message": str(exc),
+                },
+            )
         except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
             self._client_error(exc)
         except Exception as exc:  # pragma: no cover - surfaced to local operator

@@ -1,0 +1,78 @@
+name: defensive-ai-gateway
+
+# Single-host deployment for an isolated demo or a small internal environment.
+# The gateway stays on loopback; Caddy provides the HTTPS edge and Vector owns
+# the externally reachable Syslog listener ports through host networking.
+services:
+  gateway:
+    build:
+      # Compose resolves this relative to deploy/docker, while the Dockerfile
+      # copies application paths from the repository root.
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      args:
+        APP_VERSION: "${DEFENSIVE_AI_APP_VERSION:-single-host}"
+        VCS_REF: "${DEFENSIVE_AI_VCS_REF:-unknown}"
+    image: defensive-ai-gateway:single-host
+    command: ["--config", "config/container.yaml"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${DEFENSIVE_AI_LOCAL_PORT:-8080}:8080"
+    environment:
+      DEFENSIVE_AI_API_TOKEN: "${DEFENSIVE_AI_API_TOKEN:?set a strong admin token}"
+      DEFENSIVE_AI_INGEST_TOKEN: "${DEFENSIVE_AI_INGEST_TOKEN:?set a distinct ingest token}"
+      DEFENSIVE_AI_OPERATOR_TOKEN: "${DEFENSIVE_AI_OPERATOR_TOKEN:?set a distinct operator token}"
+      DEFENSIVE_AI_APPROVER_TOKEN: "${DEFENSIVE_AI_APPROVER_TOKEN:?set a distinct approver token}"
+      DEFENSIVE_AI_AUTH_LOOPBACK: "0"
+      DEFENSIVE_AI_AUTH_REQUIRE_REMOTE_TOKEN: "1"
+      DEFENSIVE_AI_DEMO_MODE: "0"
+      DEFENSIVE_AI_APPROVAL_QUORUM: "2"
+      DEFENSIVE_AI_LLM_PROVIDER: "${DEFENSIVE_AI_LLM_PROVIDER:-local}"
+      DEFENSIVE_AI_LLM_ENDPOINT: "${DEFENSIVE_AI_LLM_ENDPOINT:-}"
+      DEFENSIVE_AI_LLM_MODEL: "${DEFENSIVE_AI_LLM_MODEL:-local-rule-analyst}"
+      DEFENSIVE_AI_LLM_ALLOWED_HOSTS: "${DEFENSIVE_AI_LLM_ALLOWED_HOSTS:-127.0.0.1,localhost,::1}"
+      DEFENSIVE_AI_LLM_API_KEY: "${DEFENSIVE_AI_LLM_API_KEY:-}"
+      DEFENSIVE_AI_DATA_RETENTION_DAYS: "${DEFENSIVE_AI_DATA_RETENTION_DAYS:-90}"
+      DEFENSIVE_AI_AUDIT_RETENTION_DAYS: "${DEFENSIVE_AI_AUDIT_RETENTION_DAYS:-365}"
+      DEFENSIVE_AI_MEMORY_EVENT_RETENTION_DAYS: "${DEFENSIVE_AI_MEMORY_EVENT_RETENTION_DAYS:-365}"
+    volumes:
+      - "${DEFENSIVE_AI_DATA_DIR:?set an absolute persistent data directory}/gateway:/data"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 1200m
+    cpus: 1.5
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/ready', timeout=2).read()"]
+      interval: 15s
+      timeout: 3s
+      retries: 4
+      start_period: 15s
+
+  vector:
+    image: "${DEFENSIVE_AI_VECTOR_IMAGE:-timberio/vector:0.46.1-alpine}"
+    command: ["--config", "/etc/vector/vector.toml", "--watch-config"]
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      DEFENSIVE_AI_INGEST_TOKEN: "${DEFENSIVE_AI_INGEST_TOKEN:?set a distinct ingest token}"
+    depends_on:
+      gateway:
+        condition: service_healthy
+    volumes:
+      - "${DEFENSIVE_AI_DATA_DIR:?set an absolute persistent data directory}/vector:/etc/vector:ro"
+      - "${DEFENSIVE_AI_DATA_DIR:?set an absolute persistent data directory}/vector:/var/lib/vector"
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    user: "1000:1000"
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 0.5

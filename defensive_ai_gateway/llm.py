@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ipaddress
 import json
 import os
 import re
@@ -13,8 +12,17 @@ import urllib.request
 from typing import Any
 
 from .config import LLMConfig
-from .agents.evidence_helpers import fact, join_facts, normalize_classification, short_text
+from .agents.evidence_helpers import (
+    fact,
+    hook_data_fact,
+    join_facts,
+    normalize_classification,
+    request_context_fact,
+    request_parameters_fact,
+    short_text,
+)
 from .json_safety import loads_bounded_json
+from .network_safety import EndpointPin, pinned_endpoint_handlers, resolve_http_endpoint_pin
 
 
 MAX_LLM_RESPONSE_BYTES = 2_000_000
@@ -24,6 +32,37 @@ _RETRYABLE_HTTP_CODES = {429, 502, 503, 504}
 ANTHROPIC_VERSION = "2023-06-01"
 ANTHROPIC_MAX_TOKENS = 4096
 GATEWAY_USER_AGENT = "defensive-ai-gateway/1.0"
+_WEBSOCKET_ENDPOINT_PATH_SEGMENTS = frozenset({"realtime", "socket.io", "websocket", "ws"})
+WEBSOCKET_ENDPOINT_GUIDANCE = (
+    "LLM gateway endpoint requires a WebSocket/Realtime protocol, but this service only supports "
+    "HTTP JSON APIs. Configure an HTTP endpoint such as /v1/responses or /v1/chat/completions."
+)
+
+
+class LLMEndpointConfigurationError(RuntimeError):
+    """A remote-model endpoint cannot be used by the HTTP request client."""
+
+
+def is_websocket_endpoint(endpoint: str) -> bool:
+    """Identify conventional WebSocket-only endpoint URLs before sending a prompt."""
+    parsed = urllib.parse.urlsplit(str(endpoint or ""))
+    if parsed.scheme.lower() in {"ws", "wss"}:
+        return True
+    path_segments = {
+        urllib.parse.unquote(segment).strip().lower()
+        for segment in parsed.path.split("/")
+        if segment.strip()
+    }
+    return bool(path_segments & _WEBSOCKET_ENDPOINT_PATH_SEGMENTS)
+
+
+def validate_gateway_http_endpoint(endpoint: str) -> None:
+    if is_websocket_endpoint(endpoint):
+        raise ValueError(WEBSOCKET_ENDPOINT_GUIDANCE)
+
+
+def is_websocket_upgrade_required(status: int, body: str) -> bool:
+    return int(status) == 426 and "websocket" in str(body or "").lower()
 
 
 def _bounded_timeout(value: Any) -> float:
@@ -34,73 +73,30 @@ def _bounded_timeout(value: Any) -> float:
     return max(1.0, min(timeout, 120.0))
 
 
-def _is_loopback_host(host: str) -> bool:
-    host = host.strip().lower().rstrip(".")
-    if host == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
-
-
 def _validate_http_endpoint(
     endpoint: str,
     *,
     backend: str,
     loopback_only: bool = False,
     allowed_hosts: list[str] | None = None,
-) -> None:
-    parsed = urllib.parse.urlsplit(endpoint)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise RuntimeError(f"{backend} endpoint must be an absolute HTTP(S) URL")
-    if parsed.username or parsed.password:
-        raise RuntimeError(f"{backend} endpoint must not contain user information")
-    host = parsed.hostname
-    is_loopback = _is_loopback_host(host)
-    if loopback_only and not is_loopback:
-        raise RuntimeError(f"{backend} endpoint must use a loopback host")
-    try:
-        address = ipaddress.ip_address(host)
-    except ValueError:
-        address = None
-    if address and not is_loopback and (
-        address.is_link_local or address.is_multicast or address.is_reserved or address.is_unspecified
-    ):
-        raise RuntimeError(f"{backend} endpoint uses a disallowed network address")
-    if backend == "LLM gateway" and parsed.scheme != "https" and not is_loopback:
-        raise RuntimeError("remote LLM gateway endpoints must use HTTPS")
-    if not is_loopback and allowed_hosts is not None:
-        allowed = {
-            str(item).strip().lower().rstrip(".")
-            for item in (allowed_hosts or [])
-            if str(item).strip()
-        }
-        if host.lower().rstrip(".") not in allowed:
-            raise RuntimeError(f"{backend} host '{host}' is not allowlisted")
+) -> EndpointPin:
+    """Validate an endpoint and retain the exact safe addresses for the request."""
+    if backend == "LLM gateway":
         try:
-            resolved = {
-                item[4][0]
-                for item in socket.getaddrinfo(
-                    host,
-                    parsed.port or 11434,
-                    type=socket.SOCK_STREAM,
-                )
-            }
-        except OSError as exc:
-            raise RuntimeError(f"Ollama endpoint cannot be resolved: {exc}") from exc
-        if not resolved:
-            raise RuntimeError("Ollama endpoint did not resolve")
-        for resolved_address in resolved:
-            resolved_ip = ipaddress.ip_address(resolved_address)
-            if (
-                resolved_ip.is_loopback
-                or resolved_ip.is_link_local
-                or resolved_ip.is_multicast
-                or resolved_ip.is_reserved
-                or resolved_ip.is_unspecified
-            ):
-                raise RuntimeError(f"{backend} endpoint resolves to a disallowed network address")
+            validate_gateway_http_endpoint(endpoint)
+        except ValueError as exc:
+            raise LLMEndpointConfigurationError(str(exc)) from exc
+    try:
+        return resolve_http_endpoint_pin(
+            endpoint,
+            backend=backend,
+            loopback_only=loopback_only,
+            allowed_hosts=allowed_hosts,
+            require_https_for_remote=backend == "LLM gateway",
+            resolver=socket.getaddrinfo,
+        )
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -113,6 +109,7 @@ def _open_no_redirect(
     timeout: float,
     *,
     bypass_proxy: bool = False,
+    endpoint_pin: EndpointPin | None = None,
 ):
     handlers: list[Any] = [_NoRedirectHandler()]
     if bypass_proxy:
@@ -121,6 +118,8 @@ def _open_no_redirect(
         # can send localhost requests to a corporate proxy and turn a healthy
         # local Ollama instance into an unexpected HTTP 403.
         handlers.insert(0, urllib.request.ProxyHandler({}))
+    if endpoint_pin is not None:
+        handlers.extend(pinned_endpoint_handlers(endpoint_pin))
     return urllib.request.build_opener(*handlers).open(req, timeout=timeout)
 
 
@@ -130,6 +129,7 @@ def _open_with_retry(
     max_retries: int = 1,
     *,
     bypass_proxy: bool = False,
+    endpoint_pin: EndpointPin | None = None,
 ):
     bounded_timeout = _bounded_timeout(timeout)
     attempts = max(1, min(int(max_retries) + 1, 4))
@@ -139,6 +139,7 @@ def _open_with_retry(
                 req,
                 timeout=bounded_timeout,
                 bypass_proxy=bypass_proxy,
+                endpoint_pin=endpoint_pin,
             )
         except urllib.error.HTTPError as exc:
             if exc.code not in _RETRYABLE_HTTP_CODES or attempt + 1 >= attempts:
@@ -189,6 +190,16 @@ def is_anthropic_messages_endpoint(endpoint: str) -> bool:
     return path == "/v1/messages"
 
 
+def is_openai_responses_endpoint(endpoint: str) -> bool:
+    path = urllib.parse.urlsplit(endpoint).path.rstrip("/")
+    return path == "/v1/responses"
+
+
+def is_openai_chat_completions_endpoint(endpoint: str) -> bool:
+    path = urllib.parse.urlsplit(endpoint).path.rstrip("/")
+    return path == "/v1/chat/completions"
+
+
 def resolve_gateway_api_key(
     endpoint: str,
     configured_key: str = "",
@@ -235,6 +246,24 @@ def build_gateway_request(
             "messages": [{"role": "user", "content": prompt}],
         }
         headers["anthropic-version"] = ANTHROPIC_VERSION
+    elif is_openai_responses_endpoint(endpoint):
+        payload = {
+            "model": model,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": prompt}],
+                }
+            ],
+            "max_output_tokens": max(1, min(int(max_tokens), ANTHROPIC_MAX_TOKENS)),
+        }
+    elif is_openai_chat_completions_endpoint(endpoint):
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max(1, min(int(max_tokens), ANTHROPIC_MAX_TOKENS)),
+        }
     else:
         payload = {"model": model, "prompt": prompt, "context": context}
     if api_key:
@@ -247,16 +276,57 @@ def build_gateway_request(
     )
 
 
+def _text_from_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(
+        str(item.get("text", ""))
+        for item in content
+        if isinstance(item, dict)
+        and str(item.get("type", "")).lower() in {"text", "output_text"}
+        and isinstance(item.get("text"), str)
+    ).strip()
+
+
+def _openai_response_text(parsed: dict[str, Any]) -> str:
+    text = _text_from_content(parsed.get("output_text"))
+    if text:
+        return text
+    output = parsed.get("output")
+    if isinstance(output, list):
+        parts = [
+            _text_from_content(item.get("content"))
+            for item in output
+            if isinstance(item, dict) and isinstance(item.get("content"), list)
+        ]
+        text = "\n".join(part for part in parts if part).strip()
+        if text:
+            return text
+    choices = parsed.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            message = choice.get("message")
+            if isinstance(message, dict):
+                text = _text_from_content(message.get("content"))
+                if text:
+                    return text
+    return ""
+
+
 def parse_gateway_response(parsed: Any, model: str) -> dict[str, Any]:
     if isinstance(parsed, dict) and parsed.get("type") == "message" and isinstance(parsed.get("content"), list):
-        text = "\n".join(
-            str(item.get("text", ""))
-            for item in parsed["content"]
-            if isinstance(item, dict) and item.get("type") == "text"
-        ).strip()
+        text = _text_from_content(parsed["content"])
         if not text:
             raise RuntimeError("Anthropic gateway returned no text content")
         parsed = _parse_json_object(text)
+    elif isinstance(parsed, dict):
+        text = _openai_response_text(parsed)
+        if text:
+            parsed = _parse_json_object(text)
     return _validate_result_shape(parsed, model)
 
 
@@ -272,6 +342,16 @@ class LLMClient:
     @property
     def runtime_metadata(self) -> dict[str, Any]:
         return {"provider": "unknown", "model": "", "endpoint_host": ""}
+
+    @property
+    def defer_on_failure(self) -> bool:
+        """Whether a model failure should return work to the durable inbox."""
+        return False
+
+    @property
+    def retry_after_seconds(self) -> float:
+        """Minimum delay before a durable retry after the latest failure."""
+        return 0.0
 
 
 class _CircuitBreaker:
@@ -301,6 +381,19 @@ class _CircuitBreaker:
             self.failures += 1
             if self.failures >= self.threshold:
                 self.opened_until = time.monotonic() + self.reset_seconds
+
+    def retry_after_seconds(self) -> float:
+        with self._lock:
+            return max(0.0, self.opened_until - time.monotonic())
+
+    def snapshot(self) -> dict[str, Any]:
+        retry_after = self.retry_after_seconds()
+        with self._lock:
+            return {
+                "state": "open" if retry_after > 0 else "closed",
+                "consecutive_failures": self.failures,
+                "retry_after_seconds": round(retry_after, 3),
+            }
 
 
 class LocalHeuristicLLM(LLMClient):
@@ -573,7 +666,50 @@ class LocalHeuristicLLM(LLMClient):
                 return True
         if product == "waf":
             action = str((context.get("entities") or {}).get("action") or by_type.get("action") or "").lower()
-            return severity in {"critical", "high"} and score >= 2 and any(word in action for word in ["block", "阻断"])
+            if not (
+                severity in {"critical", "high"}
+                and any(word in action for word in ["block", "阻断"])
+            ):
+                return False
+            # A single detector phrase such as "SQL injection" contributes only
+            # one keyword to the generic score.  For a high-severity request
+            # already blocked by the WAF, a specific detector-level attack
+            # marker is independent evidence and is sufficient to escalate the
+            # local, deterministic assessment to malicious.  This still avoids
+            # treating a generic high-severity block as a confirmed attack.
+            detector_text = " ".join(
+                str(value or "")
+                for value in (
+                    context.get("event_type"),
+                    (context.get("entities") or {}).get("rule"),
+                    by_type.get("rule_id"),
+                    by_type.get("rule_name"),
+                    by_type.get("payload_category"),
+                )
+            ).lower()
+            detector_markers = (
+                "sqli",
+                "sql injection",
+                "sql注入",
+                "xss",
+                "cross-site scripting",
+                "cross site scripting",
+                "rce",
+                "remote code execution",
+                "command injection",
+                "命令注入",
+                "ssrf",
+                "server-side request forgery",
+                "path traversal",
+                "directory traversal",
+                "路径遍历",
+                "file inclusion",
+                "文件包含",
+                "webshell",
+                "deserialization",
+                "反序列化",
+            )
+            return score >= 2 or any(marker in detector_text for marker in detector_markers)
         if product in {"hips", "ndr", "siem"}:
             return severity in {"critical", "high"} and score >= 2
         return severity == "critical" and score >= 3
@@ -603,6 +739,8 @@ class LocalHeuristicLLM(LLMClient):
                     [
                         self._fact("方法", entities.get("method") or by_type.get("method")),
                         self._fact("URL", entities.get("url") or by_type.get("url") or by_type.get("uri")),
+                        request_context_fact(by_type.get("request_context")),
+                        request_parameters_fact(by_type.get("request_parameters")),
                         self._fact("污染源", by_type.get("taint_source")),
                         self._fact("载荷摘要", by_type.get("payload_category")),
                     ],
@@ -619,7 +757,16 @@ class LocalHeuristicLLM(LLMClient):
             if "规则" in title:
                 return self._join_facts([self._fact("规则", entities.get("rule") or by_type.get("rule_id") or by_type.get("rule_name"))], "缺少 RASP 规则信息。")
             if "上下文" in title:
-                return self._join_facts([self._fact("hook_data", by_type.get("hook_data")), self._fact("动作", entities.get("action") or by_type.get("action")), self._fact("应用", entities.get("app")), self._fact("主机", entities.get("host"))], "缺少 hook_data、动作或应用上下文。")
+                return self._join_facts(
+                    [
+                        hook_data_fact(by_type.get("hook_data")),
+                        request_context_fact(by_type.get("request_context")),
+                        self._fact("动作", entities.get("action") or by_type.get("action")),
+                        self._fact("应用", entities.get("app")),
+                        self._fact("主机", entities.get("host")),
+                    ],
+                    "缺少 hook_data、动作或应用上下文。",
+                )
             if "成功" in title:
                 action = entities.get("action") or by_type.get("action")
                 return f"产品动作为 {self._short(action)}；需要结合响应、异常和后续日志确认是否成功。" if action else "缺少动作、响应或异常证据，无法判断成功性。"
@@ -700,7 +847,19 @@ class GatewayLLM(LLMClient):
             "provider": "gateway",
             "model": self.config.model,
             "endpoint_host": parsed.hostname or "",
+            "failure_mode": "durable_retry",
+            "circuit": self._circuit.snapshot(),
         }
+
+    @property
+    def defer_on_failure(self) -> bool:
+        return True
+
+    @property
+    def retry_after_seconds(self) -> float:
+        # A short floor avoids exhausting the durable attempt budget during a
+        # fast 401/5xx loop; an open breaker extends it to its remaining window.
+        return max(5.0, self._circuit.retry_after_seconds())
 
     def analyze(self, prompt: str, context: dict[str, Any]) -> dict[str, Any]:
         self._circuit.before_request()
@@ -715,7 +874,7 @@ class GatewayLLM(LLMClient):
     def _analyze(self, prompt: str, context: dict[str, Any]) -> dict[str, Any]:
         if not self.config.endpoint:
             raise RuntimeError("LLM endpoint is not configured")
-        _validate_http_endpoint(
+        endpoint_pin = _validate_http_endpoint(
             self.config.endpoint,
             backend="LLM gateway",
             allowed_hosts=self.config.allowed_hosts,
@@ -725,6 +884,11 @@ class GatewayLLM(LLMClient):
             self.config.api_key,
             self.config.api_key_env,
         )
+        if not api_key:
+            # Do not send an analysis prompt to a remote endpoint that cannot
+            # authenticate it. The orchestrator records this as a durable
+            # retry so an operator can add the deployment secret and resume.
+            raise RuntimeError("LLM gateway API key is not configured")
         # ``context`` is already redacted + size-bounded by SecurityAgent.analyze.
         # Anthropic receives it inside ``prompt``; generic gateways retain the
         # separate context field used by the original enterprise contract.
@@ -741,13 +905,16 @@ class GatewayLLM(LLMClient):
                 self.config.timeout_seconds,
                 self.config.max_retries,
                 bypass_proxy=True,
+                endpoint_pin=endpoint_pin,
             ) as resp:
                 if resp.status >= 400:
                     raise RuntimeError(f"LLM gateway returned HTTP {resp.status}")
                 limit = max(65_536, min(int(self.config.max_response_bytes), 10_000_000))
                 body = _read_limited_response(resp, limit).decode("utf-8")
         except urllib.error.HTTPError as exc:
-            exc.close()
+            body = _read_error_body(exc)
+            if is_websocket_upgrade_required(exc.code, body):
+                raise LLMEndpointConfigurationError(WEBSOCKET_ENDPOINT_GUIDANCE) from exc
             raise RuntimeError(f"LLM gateway HTTP {exc.code}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"LLM gateway unreachable: {exc.reason}") from exc
@@ -863,7 +1030,17 @@ class OllamaLLM(LLMClient):
             "provider": "ollama",
             "model": self.config.model or "gemma3:4b",
             "endpoint_host": parsed.hostname or "",
+            "failure_mode": "durable_retry",
+            "circuit": self._circuit.snapshot(),
         }
+
+    @property
+    def defer_on_failure(self) -> bool:
+        return True
+
+    @property
+    def retry_after_seconds(self) -> float:
+        return max(5.0, self._circuit.retry_after_seconds())
 
     def analyze(self, prompt: str, context: dict[str, Any]) -> dict[str, Any]:
         self._circuit.before_request()
@@ -905,7 +1082,7 @@ class OllamaLLM(LLMClient):
             raise RuntimeError("Ollama returned invalid JSON response") from exc
 
     def _generate(self, model: str, prompt: str) -> dict[str, Any]:
-        _validate_http_endpoint(
+        endpoint_pin = _validate_http_endpoint(
             self.endpoint,
             backend="Ollama",
             allowed_hosts=self.config.allowed_hosts,
@@ -938,6 +1115,7 @@ class OllamaLLM(LLMClient):
             self.config.timeout_seconds,
             self.config.max_retries,
             bypass_proxy=True,
+            endpoint_pin=endpoint_pin,
         ) as resp:
             limit = max(65_536, min(int(self.config.max_response_bytes), 10_000_000))
             data = loads_bounded_json(_read_limited_response(resp, limit).decode("utf-8"))

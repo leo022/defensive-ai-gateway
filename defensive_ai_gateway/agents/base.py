@@ -8,7 +8,16 @@ from typing import Any
 from ..llm import LLMClient
 from ..models import AgentResult, NormalizedEvent, RecommendedAction, new_id
 from ..policy import PolicyEngine
-from .evidence_helpers import fact, join_facts, normalize_classification, short_text, strip_terminal
+from .evidence_helpers import (
+    fact,
+    hook_data_fact,
+    join_facts,
+    normalize_classification,
+    request_context_fact,
+    request_parameters_fact,
+    short_text,
+    strip_terminal,
+)
 
 
 class SecurityAgent(ABC):
@@ -141,12 +150,153 @@ class SecurityAgent(ABC):
             f"关键实体：{entity_bits}。核心依据：{self._strip_terminal(core_evidence)}。{impact_text}"
         )
 
+    def _correct_rasp_evidence_claims(
+        self,
+        llm_result: dict[str, Any],
+        event: NormalizedEvent,
+    ) -> dict[str, Any]:
+        """Prevent an LLM from calling retained RASP evidence a transport loss.
+
+        Exact request bodies and hook values intentionally do not leave the
+        gateway. A present semantic summary proves the source supplied the field,
+        while the immutable raw alert remains available to authorized analysts.
+        This correction only applies when that proof exists, never to a genuinely
+        missing upstream field.
+        """
+        if event.product.lower() != "rasp":
+            return llm_result
+        by_type: dict[str, Any] = {}
+        for item in event.evidence or []:
+            if isinstance(item, dict) and item.get("type") and item.get("type") not in by_type:
+                by_type[str(item["type"])] = item.get("value")
+
+        request_context = by_type.get("request_context")
+        request_available = self._rasp_request_content_available(request_context)
+        hook_value = by_type.get("hook_data") or by_type.get("hook_data_summary")
+        hook_available = self._rasp_hook_available(hook_value)
+        if not request_available and not hook_available:
+            return llm_result
+
+        rewrites: list[tuple[list[str], str]] = []
+        if request_available:
+            rewrites.append(
+                (
+                    [
+                        r"缺少(?:完整)?请求体",
+                        r"缺失(?:完整)?请求体",
+                        r"缺乏(?:完整)?请求体",
+                        r"缺少(?:完整)?原始\s*HTTP\s*请求(?:上下文)?",
+                        r"缺失(?:完整)?原始\s*HTTP\s*请求(?:上下文)?",
+                    ],
+                    "请求上下文已由 RASP 提供并保留原始证据（模型仅接收脱敏摘要，原文需授权复核）",
+                )
+            )
+        if hook_available:
+            rewrites.append(
+                (
+                    [
+                        r"缺少\s*hook_data",
+                        r"缺失\s*hook_data",
+                        r"缺乏\s*hook_data",
+                        r"缺少(?:具体|完整)?执行命令(?:内容)?",
+                        r"缺失(?:具体|完整)?执行命令(?:内容)?",
+                        r"缺乏(?:具体|完整)?执行命令(?:内容)?",
+                    ],
+                    "RASP 已提供关键 hook 字段并保留原始值（模型仅接收受控摘要，精确值需授权复核）",
+                )
+            )
+
+        def rewrite(value: Any) -> tuple[Any, bool]:
+            if not isinstance(value, str):
+                return value, False
+            updated = value
+            changed = False
+            for patterns, replacement in rewrites:
+                for pattern in patterns:
+                    updated, count = re.subn(pattern, replacement, updated, flags=re.IGNORECASE)
+                    changed = changed or bool(count)
+            return updated, changed
+
+        def retained_evidence_review(value: Any) -> str | None:
+            """Convert raw-value requests into an authorized-review requirement.
+
+            A model may ask for a JDBC URL or command "from the original RASP
+            alert" because it only receives a redacted summary.  When the
+            normalizer has already proven retention, that is not an ingestion
+            gap and must not be shown as one on the Case.
+            """
+            if not isinstance(value, str):
+                return None
+            compact = re.sub(r"\s+", "", value).casefold()
+            request_terms = ("请求体", "请求参数", "原始http请求", "jdbc连接url", "连接url")
+            if request_available and any(term in compact for term in request_terms):
+                return "授权分析员对保留的 RASP 请求字段的复核结论（原始值已保留，非传输缺失）"
+            hook_terms = ("hook_data", "hookdata", "原始command", "原始命令", "具体执行命令")
+            if hook_available and any(term in compact for term in hook_terms):
+                return "授权分析员对保留的 RASP hook 字段的复核结论（原始值已保留，非传输缺失）"
+            return None
+
+        corrected = dict(llm_result)
+        for key in ("verdict", "reason", "business_impact"):
+            if key not in corrected:
+                continue
+            updated, _changed = rewrite(corrected.get(key))
+            corrected[key] = updated
+        dimensions = corrected.get("analysis_dimensions")
+        if isinstance(dimensions, list):
+            corrected_dimensions = []
+            for item in dimensions:
+                if not isinstance(item, dict):
+                    corrected_dimensions.append(item)
+                    continue
+                updated_item = dict(item)
+                if "evidence" in updated_item:
+                    updated_item["evidence"], _changed = rewrite(updated_item.get("evidence"))
+                corrected_dimensions.append(updated_item)
+            corrected["analysis_dimensions"] = corrected_dimensions
+        missing = corrected.get("missing_evidence")
+        if isinstance(missing, list):
+            normalized_missing = []
+            for item in missing:
+                if isinstance(item, str) and rewrite(item)[1]:
+                    continue
+                replacement = retained_evidence_review(item)
+                candidate = replacement or item
+                if candidate not in normalized_missing:
+                    normalized_missing.append(candidate)
+            corrected["missing_evidence"] = normalized_missing
+        return corrected
+
+    @staticmethod
+    def _rasp_request_content_available(value: Any) -> bool:
+        if not isinstance(value, dict):
+            return False
+        if value.get("raw_evidence_retained"):
+            return True
+        return any(
+            isinstance(value.get(key), dict) and value[key].get("state") == "present"
+            for key in ("parameter", "body")
+        )
+
+    @staticmethod
+    def _rasp_hook_available(value: Any) -> bool:
+        if value in (None, "", [], {}):
+            return False
+        if not isinstance(value, dict):
+            return True
+        state = str(value.get("state") or "").strip().lower()
+        if state == "present":
+            return True
+        return bool(value.get("semantic_fields") or value.get("semantic_field_names"))
+
     def _ensure_explainable_result(self, llm_result: dict[str, Any], event: NormalizedEvent) -> dict[str, Any]:
         # Gateways often satisfy the JSON contract with a placeholder object
         # whose fields are all empty strings.  Treat that as "no recommendation"
         # before reconciliation, otherwise it can suppress a structured sample
         # recommendation and leak a visually non-empty object to the dashboard.
-        llm_result = self._normalize_whitelist_result(llm_result)
+        llm_result = self._correct_rasp_evidence_claims(
+            self._normalize_whitelist_result(llm_result), event
+        )
         explanation = self._explanation(llm_result)
         llm_verdict = explanation.get("verdict", "")
         llm_dims = explanation.get("dimensions", [])
@@ -469,6 +619,8 @@ class SecurityAgent(ABC):
                     [
                         self._fact("方法", entities.get("method") or by_type.get("method")),
                         self._fact("路径/URL", entities.get("url") or by_type.get("url") or by_type.get("uri")),
+                        request_context_fact(by_type.get("request_context")),
+                        request_parameters_fact(by_type.get("request_parameters")),
                         self._fact("污染源", by_type.get("taint_source")),
                         self._fact("载荷摘要", by_type.get("payload_category")),
                     ],
@@ -488,7 +640,8 @@ class SecurityAgent(ABC):
             if "上下文" in title:
                 return self._join_facts(
                     [
-                        self._fact("hook_data", by_type.get("hook_data")),
+                        hook_data_fact(by_type.get("hook_data")),
+                        request_context_fact(by_type.get("request_context")),
                         self._fact("动作", action),
                         self._fact("应用", entities.get("app")),
                         self._fact("主机", entities.get("host")),
@@ -619,8 +772,9 @@ class SecurityAgent(ABC):
 
     def _collect_attack_indicators(self, event: NormalizedEvent, by_type: dict[str, Any], entities: dict[str, Any]) -> str:
         parts: list[str] = []
-        if by_type.get("hook_data"):
-            parts.append(f"hook_data={self._short(by_type['hook_data'])}")
+        hook_fact = hook_data_fact(by_type.get("hook_data"))
+        if hook_fact:
+            parts.append(hook_fact)
         if by_type.get("taint_source"):
             parts.append(f"污染源={by_type['taint_source']}")
         if by_type.get("payload_category"):

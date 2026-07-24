@@ -109,6 +109,9 @@ class OperationsConfig:
     maintenance_interval_seconds: int = 60
     inbox_retention_days: int = 7
     stale_claim_seconds: int = 600
+    # Bounded recovery work per maintenance cycle prevents a restored model
+    # from being flooded by a long deferred-alert backlog.
+    llm_recovery_batch_size: int = 100
     # Zero keeps local/demo databases untouched. Production overlays should set
     # finite retention windows so terminal operational history cannot grow
     # without bound.
@@ -169,7 +172,10 @@ class SyslogConfig:
         }
     )
     embedded_listeners_enabled: bool = False
-    max_frame_bytes: int = 1_000_000
+    # RASP stack traces routinely exceed the 100 KiB default of common syslog
+    # collectors. Keep the embedded receiver aligned with the external Vector
+    # RASP source while retaining a finite untrusted-input boundary.
+    max_frame_bytes: int = 2_000_000
     max_connections: int = 64
 
 
@@ -375,6 +381,10 @@ def load_config(path: str | None = None) -> GatewayConfig:
             maintenance_interval_seconds=max(10, min(int(operations.get("maintenance_interval_seconds", 60)), 3600)),
             inbox_retention_days=max(1, min(int(operations.get("inbox_retention_days", 7)), 365)),
             stale_claim_seconds=max(30, min(int(operations.get("stale_claim_seconds", 600)), 86400)),
+            llm_recovery_batch_size=max(
+                1,
+                min(int(operations.get("llm_recovery_batch_size", 100)), 500),
+            ),
             data_retention_days=max(
                 0,
                 min(

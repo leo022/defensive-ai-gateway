@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 from defensive_ai_gateway.app import (
     GatewayHandler,
+    MAX_BODY_BYTES,
     _trusted_loopback_request_headers,
     _validate_exposed_server_config,
     build_server,
@@ -143,13 +144,13 @@ class HttpAuthTest(unittest.TestCase):
             os.environ,
             {
                 "DEFENSIVE_AI_LLM_PROVIDER": "gateway",
-                "ANTHROPIC_BASE_URL": "https://kkcoder.com",
+                "ANTHROPIC_BASE_URL": "https://messages.example",
                 "ANTHROPIC_AUTH_TOKEN": "test-anthropic-token",
             },
             clear=True,
         ):
             config = load_config()
-        self.assertEqual(config.llm.endpoint, "https://kkcoder.com/v1/messages")
+        self.assertEqual(config.llm.endpoint, "https://messages.example/v1/messages")
         self.assertEqual(config.llm.api_key_env, "ANTHROPIC_AUTH_TOKEN")
         self.assertEqual(config.llm.api_key, "test-anthropic-token")
 
@@ -327,12 +328,76 @@ auth:
             config.auth.operator_token = "read-only-operator-token"
             srv = _Server(config)
             try:
-                for path in ("/api/config/llm", "/api/config/llm/models", "/api/config/syslog"):
+                for path in (
+                    "/api/config/llm",
+                    "/api/config/llm/models",
+                    "/api/config/syslog",
+                    "/api/config/syslog/deployment",
+                ):
                     with self.subTest(path=path):
                         status, _ = srv.get(path, token="read-only-operator-token")
                         self.assertEqual(status, 403)
                 status, _ = srv.get("/api/config/llm", token="admin-token")
                 self.assertEqual(status, 200)
+            finally:
+                srv.stop()
+
+    def test_llm_deferred_replay_requires_analyst_role(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(Path(tmp), token="admin-token")
+            config.auth.ingest_token = "collector-token"
+            config.auth.operator_token = "analyst-token"
+            srv = _Server(config)
+            try:
+                status, _ = srv.post(
+                    "/api/alerts/inbox/release-llm-deferred",
+                    {"limit": 10},
+                    token="collector-token",
+                )
+                self.assertEqual(status, 403)
+
+                status, response = srv.post(
+                    "/api/alerts/inbox/release-llm-deferred",
+                    {"limit": 10},
+                    token="analyst-token",
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(response["released"], 0)
+                self.assertIn("queue", response)
+            finally:
+                srv.stop()
+
+    def test_syslog_deployment_api_is_config_scoped_and_never_returns_ingest_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(Path(tmp), token="admin-token")
+            config.auth.operator_token = "read-only-operator-token"
+            config.auth.ingest_token = "collector-secret-must-not-be-returned"
+            srv = _Server(config)
+            try:
+                body = {
+                    "collector_address": "syslog-gateway.internal.example",
+                    "source_cidrs": "10.20.10.15/32,10.20.11.0/24",
+                }
+                status, _ = srv.post(
+                    "/api/config/syslog/deployment",
+                    body,
+                    token="read-only-operator-token",
+                )
+                self.assertEqual(status, 403)
+
+                status, response = srv.post(
+                    "/api/config/syslog/deployment",
+                    body,
+                    token="admin-token",
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(response["deployment"]["collector_address"], "syslog-gateway.internal.example")
+                self.assertNotIn(config.auth.ingest_token, json.dumps(response))
+
+                status, response = srv.get("/api/config/syslog/deployment", token="admin-token")
+                self.assertEqual(status, 200)
+                self.assertEqual(response["source_cidrs"], ["10.20.10.15/32", "10.20.11.0/24"])
+                self.assertFalse(response["ingest_auth"]["exposed"])
             finally:
                 srv.stop()
 
@@ -395,7 +460,7 @@ auth:
         with tempfile.TemporaryDirectory() as tmp:
             srv = _Server(_config(Path(tmp), token=""))
             try:
-                big = {"x": "a" * 2_000_001}
+                big = {"x": "a" * (MAX_BODY_BYTES + 1)}
                 status, _ = srv.post("/api/alerts", big, token="")
                 self.assertEqual(status, 413)
             finally:
@@ -446,6 +511,46 @@ auth:
                 self.assertEqual(body["queue"]["submitted"], 1)
             finally:
                 release.set()
+                srv.stop()
+
+    def test_alert_id_conflict_rejects_new_evidence_without_rewriting_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(Path(tmp), token="")
+            config.processing.async_enabled = False
+            config.syslog.embedded_listeners_enabled = False
+            srv = _Server(config)
+            try:
+                original = {
+                    "alert_id": "http-alert-id-conflict",
+                    "source": "test",
+                    "product": "waf",
+                    "event_type": "partner_header_anomaly",
+                    "severity": "low",
+                    "timestamp": "2026-07-24T09:00:00+08:00",
+                    "payload": {"rule_id": "WAF-PARTNER-HEADER", "uri": "/partner/upload"},
+                }
+                status, first = srv.post("/api/alerts", original)
+                self.assertEqual(status, 202)
+
+                status, replay = srv.post("/api/alerts", original)
+                self.assertEqual(status, 202)
+                self.assertTrue(replay["duplicate"])
+                self.assertEqual(replay["case_id"], first["case_id"])
+
+                conflicting = {
+                    **original,
+                    "timestamp": "2026-07-24T09:05:00+08:00",
+                    "payload": {"rule_id": "WAF-PARTNER-HEADER", "uri": "/partner/changed"},
+                }
+                status, body = srv.post("/api/alerts", conflicting)
+                self.assertEqual(status, 409)
+                self.assertEqual(body["error"], "alert_id_conflict")
+                self.assertEqual(body["alert_id"], original["alert_id"])
+
+                persisted = srv.server.state.repo.get_raw_alert(original["alert_id"])
+                self.assertEqual(persisted.timestamp, original["timestamp"])
+                self.assertEqual(persisted.payload, original["payload"])
+            finally:
                 srv.stop()
 
 
@@ -562,7 +667,13 @@ class EvidenceAppendOnlyTest(unittest.TestCase):
 
 class GatewayLLMHardeningTest(unittest.TestCase):
     def test_non_json_gateway_response_raises_runtime_error(self):
-        cfg = LLMConfig(provider="gateway", endpoint="http://127.0.0.1:9999/x", model="m", timeout_seconds=2)
+        cfg = LLMConfig(
+            provider="gateway",
+            endpoint="http://127.0.0.1:9999/x",
+            model="m",
+            timeout_seconds=2,
+            api_key="test-secret",
+        )
         llm = GatewayLLM(cfg)
         with patch("defensive_ai_gateway.llm._open_no_redirect") as mock:
             class _R:

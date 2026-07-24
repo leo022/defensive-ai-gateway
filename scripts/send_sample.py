@@ -210,7 +210,14 @@ def main():
         req = urllib.request.Request(args.url, data=data, headers=headers, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=args.timeout) as resp:
-                responses.append({"status": resp.status, "alert_id": payload.get("alert_id"), "response": json.loads(resp.read().decode("utf-8"))})
+                response = json.loads(resp.read().decode("utf-8"))
+                item = {"status": resp.status, "alert_id": payload.get("alert_id"), "response": response}
+                if isinstance(response, dict) and response.get("duplicate"):
+                    item["notice"] = (
+                        "The gateway reused the existing alert because alert_id is the idempotency key. "
+                        "Use --mutate for a new sample occurrence."
+                    )
+                responses.append(item)
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             try:
@@ -220,7 +227,18 @@ def main():
             responses.append({"status": exc.code, "alert_id": payload.get("alert_id"), "error": response})
             print(json.dumps({"sent": len(responses) - 1, "failed": 1, "results": responses}, ensure_ascii=False, indent=2))
             raise SystemExit(1) from None
-    print(json.dumps({"sent": len(responses), "results": responses}, ensure_ascii=False, indent=2))
+    duplicate_count = sum(
+        1
+        for item in responses
+        if isinstance(item.get("response"), dict) and item["response"].get("duplicate")
+    )
+    summary = {"sent": len(responses), "results": responses}
+    if duplicate_count:
+        summary["notice"] = (
+            f"{duplicate_count} submission(s) reused an existing alert_id. "
+            "Use --mutate to create a distinct same-type sample alert."
+        )
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

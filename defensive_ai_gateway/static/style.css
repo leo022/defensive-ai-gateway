@@ -315,6 +315,21 @@ h1 {
   width: 100%;
 }
 
+.manual-review-dialog {
+  width: min(560px, calc(100vw - 32px));
+}
+
+.manual-review-dialog textarea {
+  width: 100%;
+  min-height: 120px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink);
+  padding: 9px 10px;
+  resize: vertical;
+}
+
 .icon-button {
   display: inline-grid;
   width: 36px;
@@ -1366,6 +1381,165 @@ h4 {
   color: var(--risk);
 }
 
+.prompt-injection-clues {
+  display: grid;
+  gap: 9px;
+  border-left: 3px solid var(--warning);
+  background: var(--warning-bg);
+  padding: 10px 12px;
+}
+
+.prompt-injection-clues-head,
+.prompt-injection-clues-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.prompt-injection-clues-head {
+  justify-content: space-between;
+}
+
+.prompt-injection-clues-title strong,
+.prompt-injection-legacy strong {
+  color: var(--warning);
+  font-size: 12px;
+  font-weight: 780;
+}
+
+.prompt-injection-untrusted {
+  border: 1px solid var(--warning-line);
+  border-radius: 999px;
+  color: var(--warning);
+  padding: 1px 7px;
+  font-size: 11px;
+  font-weight: 740;
+}
+
+.prompt-injection-clues > p,
+.prompt-injection-legacy > span {
+  margin: 0;
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.prompt-injection-evidence-link {
+  color: var(--brand-strong);
+  font-size: 12px;
+  font-weight: 740;
+  text-decoration: none;
+}
+
+.prompt-injection-evidence-link:hover {
+  text-decoration: underline;
+}
+
+.prompt-injection-clue-list {
+  display: grid;
+  border-top: 1px solid var(--warning-line);
+}
+
+.prompt-injection-clue {
+  border-bottom: 1px solid var(--warning-line);
+  padding: 8px 0;
+}
+
+.prompt-injection-clue dl {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+}
+
+.prompt-injection-clue dl > div {
+  display: grid;
+  grid-template-columns: minmax(88px, auto) minmax(0, 1fr);
+  gap: 8px;
+}
+
+.prompt-injection-clue dt {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 720;
+}
+
+.prompt-injection-clue dd {
+  min-width: 0;
+  margin: 0;
+}
+
+.prompt-injection-clue code,
+.prompt-injection-ref-list code {
+  display: block;
+  min-width: 0;
+  color: var(--ink-strong);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.prompt-injection-legacy {
+  display: grid;
+  gap: 6px;
+  border-top: 1px solid var(--warning-line);
+  padding-top: 9px;
+}
+
+.prompt-injection-ref-list {
+  display: grid;
+  gap: 4px;
+}
+
+.manual-review-continuation,
+.manual-review-resolution {
+  display: grid;
+  gap: 7px;
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}
+
+.manual-review-continuation {
+  justify-items: start;
+}
+
+.validation-review-continue {
+  min-height: 30px;
+  border-color: var(--warning);
+  background: var(--surface-2);
+  color: var(--ink-strong);
+  padding: 5px 10px;
+  font-size: 12px;
+  font-weight: 720;
+}
+
+.validation-review-continue:hover {
+  background: color-mix(in srgb, var(--warning) 12%, var(--surface-2));
+}
+
+.validation-review-continue:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.manual-review-status,
+.manual-review-resolution span,
+.manual-review-resolution p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.manual-review-resolution strong {
+  color: var(--success);
+  font-size: 12px;
+}
+
 .approval-item {
   display: grid;
   gap: 8px;
@@ -1943,6 +2117,82 @@ h4 {
   background: var(--brand-bg);
   color: var(--brand-strong);
   font-weight: 760;
+}
+
+.syslog-deployment-panel {
+  display: grid;
+  gap: 2px;
+}
+
+.syslog-deployment-form > label {
+  grid-template-rows: auto minmax(84px, 1fr);
+  min-height: 0;
+}
+
+.syslog-deployment-form > label > input,
+.syslog-deployment-form > label > textarea {
+  box-sizing: border-box;
+  height: 100%;
+}
+
+.syslog-deployment-form textarea {
+  min-height: 84px;
+}
+
+.syslog-deployment-identity {
+  display: flex;
+  grid-column: 1 / -1;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+
+.syslog-deployment-identity span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.syslog-deployment-identity code,
+.syslog-deployment-target code {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--ink-strong);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 12px;
+}
+
+.syslog-deployment-targets {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  background: var(--line);
+  border-top: 1px solid var(--line);
+}
+
+.syslog-deployment-target {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  background: var(--panel);
+  padding: 14px 16px 16px;
+}
+
+.syslog-deployment-target strong {
+  color: var(--ink-strong);
+  font-size: 13px;
+}
+
+.syslog-deployment-target code {
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.syslog-deployment-target span {
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .intake-flow {
@@ -3034,7 +3284,8 @@ button.memory-audit-row:hover {
   .form-actions,
   .memory-browser-panel .panel-heading,
   .memory-audit-panel .panel-heading,
-  .syslog-config-heading {
+  .syslog-config-heading,
+  .syslog-deployment-identity {
     align-items: stretch;
     flex-direction: column;
   }
@@ -3051,7 +3302,8 @@ button.memory-audit-row:hover {
   .form-actions button,
   .memory-browser-panel .panel-heading button,
   .memory-audit-panel .panel-heading button,
-  .syslog-config-heading button {
+  .syslog-config-heading button,
+  .syslog-deployment-form .form-actions button {
     width: 100%;
   }
 
@@ -3075,6 +3327,10 @@ button.memory-audit-row:hover {
 
   .nav-subbutton {
     width: 100%;
+  }
+
+  .syslog-deployment-targets {
+    grid-template-columns: 1fr;
   }
 
   .stats,

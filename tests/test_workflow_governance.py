@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,14 +8,14 @@ from unittest.mock import patch
 
 from defensive_ai_gateway.app import GatewayState
 from defensive_ai_gateway.config import GatewayConfig
-from defensive_ai_gateway.database import Repository
+from defensive_ai_gateway.database import AlertIdentityConflict, Repository
 from defensive_ai_gateway.llm import LLMClient
 from defensive_ai_gateway.memory import (
     LAYER_CASE_SHORT_TERM,
     MemoryManager,
     STATUS_EXPIRED,
 )
-from defensive_ai_gateway.models import RawAlert
+from defensive_ai_gateway.models import NormalizedEvent, RawAlert
 from defensive_ai_gateway.normalizer import EventNormalizer
 from defensive_ai_gateway.orchestrator import Orchestrator
 from defensive_ai_gateway.policy import PolicyEngine
@@ -200,6 +201,115 @@ class WorkflowGovernanceTest(unittest.TestCase):
             ).fetchone()
             self.assertEqual(audit["count"], 2)
 
+    def test_cross_product_context_filters_by_event_time_before_candidate_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _, _ = _build(tmp)
+            target_timestamp = "2026-07-22T12:00:00Z"
+            target_at_ms = repo.timestamp_ms(target_timestamp)
+            noise_timestamp = "2026-07-20T12:00:00Z"
+            noise_at_ms = repo.timestamp_ms(noise_timestamp)
+            now = target_at_ms
+
+            raw_rows = []
+            event_rows = []
+            for index in range(2000):
+                alert_id = f"noise-alert-{index}"
+                event_id = f"noise-event-{index}"
+                raw_rows.append(
+                    (
+                        alert_id,
+                        "test",
+                        "waf",
+                        "noise",
+                        "low",
+                        noise_timestamp,
+                        "{}",
+                        now + index + 1,
+                    )
+                )
+                event_rows.append(
+                    (
+                        event_id,
+                        alert_id,
+                        "test",
+                        "waf",
+                        "noise",
+                        "low",
+                        noise_timestamp,
+                        json.dumps({"host": f"noise-{index}"}),
+                        "[]",
+                        "[]",
+                        "",
+                        noise_at_ms,
+                        now + index + 1,
+                    )
+                )
+            repo.conn.executemany(
+                """
+                INSERT INTO raw_alerts
+                (alert_id, source, product, event_type, severity, timestamp, payload_json, created_at_ms)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                raw_rows,
+            )
+            repo.conn.executemany(
+                """
+                INSERT INTO normalized_events
+                (event_id, alert_id, source, product, event_type, severity, timestamp,
+                 entities_json, evidence_json, sensitivity_tags_json, evidence_hash, event_at_ms, created_at_ms)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                event_rows,
+            )
+            repo.conn.execute(
+                """
+                INSERT INTO raw_alerts
+                (alert_id, source, product, event_type, severity, timestamp, payload_json, created_at_ms)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("matching-alert", "test", "waf", "rule", "high", target_timestamp, "{}", 1),
+            )
+            repo.conn.execute(
+                """
+                INSERT INTO normalized_events
+                (event_id, alert_id, source, product, event_type, severity, timestamp,
+                 entities_json, evidence_json, sensitivity_tags_json, evidence_hash, event_at_ms, created_at_ms)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "matching-event",
+                    "matching-alert",
+                    "test",
+                    "waf",
+                    "rule",
+                    "high",
+                    "2026-07-22T11:59:00Z",
+                    json.dumps({"host": "shared-host"}),
+                    "[]",
+                    "[]",
+                    "",
+                    target_at_ms - 60_000,
+                    1,
+                ),
+            )
+            repo.conn.commit()
+
+            target = NormalizedEvent(
+                event_id="target-event",
+                raw_ref="target-alert",
+                source="test",
+                product="hips",
+                event_type="rule",
+                severity="high",
+                timestamp=target_timestamp,
+                entities={"host": "shared-host"},
+                evidence=[],
+                sensitivity_tags=[],
+            )
+            matches = repo.query_correlated_alerts(target)
+
+            self.assertEqual([item["event_id"] for item in matches], ["matching-event"])
+
     def test_new_analysis_and_case_close_cancel_stale_approvals(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo, _, orchestrator = _build(tmp, _StaticLLM("malicious", 0.91))
@@ -277,6 +387,31 @@ class OperationalPersistenceTest(unittest.TestCase):
             )
             self.assertEqual(repo.inbox_stats()["pending"], 1)
 
+    def test_durable_inbox_rejects_reused_alert_id_with_different_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repository(str(Path(tmp) / "gateway.db"))
+            original = _alert("alert-id-collision")
+            changed = RawAlert(
+                source=original.source,
+                product=original.product,
+                event_type=original.event_type,
+                severity=original.severity,
+                timestamp="2026-07-14T10:05:00+08:00",
+                payload={**original.payload, "uri": "/different-occurrence"},
+                alert_id=original.alert_id,
+            )
+
+            self.assertEqual(
+                repo.enqueue_alert_bounded(original, capacity=10, max_attempts=2),
+                "inserted",
+            )
+            with self.assertRaisesRegex(AlertIdentityConflict, "alert_id collision"):
+                repo.enqueue_alert_bounded(changed, capacity=10, max_attempts=2)
+
+            persisted = repo.get_inbox_alert(original.alert_id)
+            self.assertEqual(persisted["raw_alert"]["timestamp"], original.timestamp)
+            self.assertEqual(persisted["raw_alert"]["payload"], original.payload)
+
     def test_runtime_settings_and_durable_inbox_retry_dlq(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Repository(str(Path(tmp) / "gateway.db"))
@@ -347,6 +482,24 @@ class OperationalPersistenceTest(unittest.TestCase):
             deleted = _delete(repo.conn, False, False, False)
             self.assertEqual(deleted["durable_alert_inbox"], 1)
             self.assertEqual(repo.inbox_stats()["completed"], 0)
+
+    def test_clean_rejects_remote_model_deferred_inbox(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repository(str(Path(tmp) / "gateway.db"))
+            alert = _alert("alert-clean-deferred-guard")
+            repo.enqueue_alert(alert)
+            self.assertIsNotNone(repo.claim_inbox_alert(alert.alert_id))
+            self.assertTrue(
+                repo.defer_inbox_alert(
+                    alert.alert_id,
+                    retry_delay_ms=60_000,
+                    reason="remote LLM analysis deferred for durable retry",
+                )
+            )
+
+            with self.assertRaises(ActiveAlertProcessingError):
+                _delete(repo.conn, False, False, False)
+            self.assertEqual(repo.inbox_stats()["deferred"], 1)
 
     def test_demo_waits_until_every_target_alert_is_terminal(self):
         first = {

@@ -47,6 +47,32 @@ class DashboardQueueMetricTest(unittest.TestCase):
         self.assertIn('unfinishedAlertCount(processing)', JS)
         self.assertIn("const DASHBOARD_REFRESH_MS = 5000;", JS)
         self.assertIn("{queued} 等待，{inflight} 分析中", JS)
+        self.assertIn('llmProvider === "gateway" && !Boolean(llmConfig?.api_key_set)', JS)
+        self.assertIn("modelCredentialMissing", JS)
+        self.assertIn("modelDurableRetry", JS)
+        self.assertIn("processing?.llm_deferred?.total", JS)
+        self.assertIn("modelDeferredBacklog", JS)
+        self.assertEqual(JS.count("modelDeferredBacklog:"), 2)
+
+
+class DeferredLlmReplayRenderingTest(unittest.TestCase):
+    def test_operator_can_resume_only_durable_remote_model_work(self):
+        self.assertIn('id="resume-llm-deferred"', HTML)
+        self.assertIn("async function resumeDeferredLlmAlerts", JS)
+        self.assertIn("/api/alerts/inbox/release-llm-deferred", JS)
+        self.assertIn('applyPermission("#resume-llm-deferred", ["analyst"])', JS)
+        self.assertEqual(JS.count("resumeDeferredAlerts:"), 2)
+        self.assertEqual(JS.count("resumingDeferredAlerts:"), 2)
+        self.assertEqual(JS.count("deferredAlertsReleased:"), 2)
+        self.assertEqual(JS.count("deferredAlertsNeedRemoteModel:"), 2)
+
+
+class GatewayModelDefaultRenderingTest(unittest.TestCase):
+    def test_gateway_form_defaults_use_the_supported_http_responses_api(self):
+        self.assertIn('gateway: "例如 gpt-5.5"', JS)
+        self.assertIn('endpoint.value = "https://kkcoder.com/v1/responses";', JS)
+        self.assertIn('model.value = "gpt-5.5";', JS)
+        self.assertNotIn('endpoint.value = "https://kkcoder.com/v1/messages";', JS)
 
 
 class WhitelistRecommendationRenderingTest(unittest.TestCase):
@@ -66,6 +92,47 @@ class FalsePositiveMemoryActionRenderingTest(unittest.TestCase):
         self.assertIn("/api/alerts/${encodeURIComponent(alertId)}/confirm-false-positive", JS)
         self.assertIn("disposition?.memory_confirmation?.memory_id", JS)
         self.assertIn("确认误报并写入长期记忆", JS)
+
+
+class ManualValidationReviewRenderingTest(unittest.TestCase):
+    def test_prompt_injection_review_has_a_separate_audited_continuation_control(self):
+        self.assertIn("function canContinueValidationReview", JS)
+        self.assertIn("function manualReviewContinuation", JS)
+        self.assertIn("prompt_injection_detected", JS)
+        self.assertIn("manual_review_resolution", JS)
+        self.assertIn("validation-review-continue", JS)
+        self.assertIn(
+            "/validation-reviews/${encodeURIComponent(validationId)}/continue",
+            JS,
+        )
+        self.assertIn("function continueValidationReview", JS)
+        self.assertIn("async function submitManualReviewContinuation", JS)
+        self.assertIn("#manual-review-dialog", JS)
+        self.assertIn('id="manual-review-dialog"', HTML)
+        self.assertIn('id="manual-review-form"', HTML)
+        manual_review_flow = JS[
+            JS.index("function continueValidationReview") : JS.index("async function decideApproval")
+        ]
+        self.assertNotIn("window.prompt", manual_review_flow)
+        self.assertIn("submitManualReviewContinuation", manual_review_flow)
+        self.assertIn("manualReviewReasonPrompt:", JS)
+        self.assertEqual(JS.count("manualReviewReasonPrompt:"), 2)
+        self.assertIn(".manual-review-continuation", CSS)
+        self.assertIn(".manual-review-resolution", CSS)
+        self.assertIn(".manual-review-dialog", CSS)
+
+
+class PromptInjectionEvidenceRenderingTest(unittest.TestCase):
+    def test_prompt_injection_finding_exposes_structured_clues_in_both_detail_surfaces(self):
+        self.assertIn("function promptInjectionCluesBlock", JS)
+        self.assertIn("evidence_clues", JS)
+        self.assertIn("promptInjectionUntrustedInput", JS)
+        self.assertIn("section=normalized-evidence", JS)
+        self.assertIn("function promptInjectionCluesBlock", DETAIL_JS)
+        self.assertIn("evidence_clues", DETAIL_JS)
+        self.assertIn("injectionUntrustedInput", DETAIL_JS)
+        self.assertIn(".prompt-injection-clues", CSS)
+        self.assertIn(".prompt-injection-clue-list", CSS)
 
 
 class FrontendSecondaryNavigationTest(unittest.TestCase):
@@ -116,6 +183,8 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
             "memory-detail": "memory-inventory-panel",
             "memory-audit-list": "memory-audit-panel",
             "syslog-config-table": "adapter-intake-panel",
+            "syslog-deployment-form": "adapter-intake-panel",
+            "syslog-deployment-targets": "adapter-intake-panel",
             "infer-form": "adapter-config-panel",
             "dry-run-form": "adapter-config-panel",
         }
@@ -155,6 +224,20 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertIn(".field-mapping-table table {\n  width: 100%;\n  min-width: 0;", CSS)
         self.assertIn("fieldConfirmation:", JS)
         self.assertEqual(JS.count("fieldConfirmationHint:"), 2)
+
+    def test_syslog_deployment_module_keeps_credentials_out_of_the_browser(self):
+        self.assertIn('id="syslog-deployment-form"', HTML)
+        self.assertIn('id="syslog-collector-address"', HTML)
+        self.assertIn('id="syslog-source-cidrs"', HTML)
+        self.assertIn('id="export-syslog-deployment"', HTML)
+        self.assertIn("async function loadSyslogDeployment", JS)
+        self.assertIn('json("/api/config/syslog/deployment")', JS)
+        self.assertIn('json("/api/config/syslog/deployment", {', JS)
+        self.assertIn("DEFENSIVE_AI_SYSLOG_SOURCE_CIDRS=${sourceCidrs.join(\",\")}", JS)
+        self.assertIn('anchor.download = "defensive-ai-syslog-console.env"', JS)
+        self.assertNotIn("ingest_token", JS)
+        self.assertIn(".syslog-deployment-panel", CSS)
+        self.assertIn(".syslog-deployment-targets", CSS)
 
     def test_frontend_operability_guards_are_present(self):
         self.assertIn('return new URLSearchParams({ limit: "50" }).toString();', JS)
@@ -205,7 +288,7 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         )[0]
         self.assertIn("await loadSession()", bootstrap)
         self.assertIn("if (canReadRuntimeConfig())", bootstrap)
-        self.assertIn("tasks.push(loadLlmConfig(), loadSyslogConfig())", bootstrap)
+        self.assertIn("tasks.push(loadLlmConfig(), loadSyslogConfig(), loadSyslogDeployment())", bootstrap)
         self.assertIn("if (canReadMappingProfiles())", bootstrap)
         self.assertIn("tasks.push(loadMappingProfiles())", bootstrap)
         self.assertNotIn("return Promise.all([", bootstrap)

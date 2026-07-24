@@ -37,6 +37,15 @@ _SAMPLE_CONTROL_FIELDS = {
     "tuning_candidate",
 }
 
+_COMPOUND_EVIDENCE_FIELDS = {
+    "hook_data",
+    "request_parameters",
+    "request_context",
+    "rasp_items_context",
+    "rasp_evidence_integrity",
+    "collector_mapping_fallback",
+}
+
 
 class EventNormalizer:
     def __init__(self, policy: PolicyEngine):
@@ -89,6 +98,8 @@ class EventNormalizer:
     def _flatten(self, value: Any, prefix: str = "") -> dict[str, Any]:
         out: dict[str, Any] = {}
         if isinstance(value, dict):
+            if prefix and prefix.lower().split(".")[-1] in _COMPOUND_EVIDENCE_FIELDS:
+                out[prefix] = copy.deepcopy(value)
             for key, item in value.items():
                 path = f"{prefix}.{key}" if prefix else key
                 out.update(self._flatten(item, path))
@@ -142,10 +153,14 @@ class EventNormalizer:
             "ja4",
             "sni",
             "matched_parameters",
+            "request_context",
+            "request_parameters",
             "payload_category",
             "stacktrace",
             "stack_trace",
             "hook_data",
+            "rasp_items_context",
+            "rasp_evidence_integrity",
             "taint_source",
             "sink",
             "exception",
@@ -155,7 +170,14 @@ class EventNormalizer:
             "beacon_interval_seconds",
             "query",
             "case_summary",
+            "collector_mapping_fallback",
         ]:
+            if key in _COMPOUND_EVIDENCE_FIELDS and any(
+                str(item.get("type") or "").lower() == key
+                for item in evidence
+                if isinstance(item, dict)
+            ):
+                continue
             for path, value in flat.items():
                 if path.lower().endswith(key) and value:
                     evidence.append(
@@ -301,10 +323,14 @@ class EventNormalizer:
             "ja4": "TLS 指纹可辅助判断异常客户端或 C2 行为。",
             "sni": "SNI 可辅助判断外联目的地和业务合法性。",
             "matched_parameters": "命中参数用于判断 payload 位置和白名单粒度。",
+            "request_parameters": "请求参数摘要用于判断入口特征；空对象表示上游未提供有效请求参数。",
+            "request_context": "请求参数和请求体的受控语义摘要表明 RASP 是否已提供 HTTP 上下文；原始内容保留在原始告警中。",
             "payload_category": "载荷类别提供攻击特征摘要，同时避免泄露完整 payload。",
             "stacktrace": "调用栈用于验证 RASP hook 是否经过危险函数。",
             "stack_trace": "调用栈用于验证 RASP hook 是否经过危险函数。",
             "hook_data": "hook_data 是 RASP 判断攻击载荷与危险 sink 的关键上下文。",
+            "rasp_items_context": "RASP items[] 的受控摘要保留每条规则、动作、hook_data 状态和危险 sink，避免仅分析第一条规则。",
+            "rasp_evidence_integrity": "原始 RASP 日志指纹及请求/items 状态用于审计从收集到分析的证据连续性。",
             "taint_source": "污染源说明数据是否来自用户可控输入。",
             "sink": "危险 sink 用于确认攻击链是否触达敏感执行点。",
             "exception": "异常信息可辅助判断攻击是否被阻断或触发保护。",
@@ -314,6 +340,7 @@ class EventNormalizer:
             "beacon_interval_seconds": "固定间隔是 C2 beacon 的重要行为特征。",
             "query": "查询串可辅助判断业务请求上下文。",
             "case_summary": "Case 摘要提供 SIEM 聚合判断背景。",
+            "collector_mapping_fallback": "该事件因 Syslog Profile 映射不完整而被保留，需修正映射后复核原始日志。",
             "success_assessment": "成功性判断帮助区分已阻断攻击和已造成影响的事件。",
             "business_impact": "业务影响说明处置优先级和潜在损害。",
             "missing_evidence": "证据缺口指导下一步只读验证。",

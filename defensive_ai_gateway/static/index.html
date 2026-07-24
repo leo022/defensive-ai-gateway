@@ -407,6 +407,7 @@
             <div class="form-actions">
               <button type="submit" data-i18n="saveConfig">保存配置</button>
               <button type="button" id="test-llm-connection" data-i18n="testConnection">测试连接</button>
+              <button type="button" id="resume-llm-deferred" data-i18n="resumeDeferredAlerts">重新推送待分析告警</button>
               <button type="button" id="reload-llm-config" data-i18n="reload">重新加载</button>
               <button type="button" id="restore-llm-defaults" data-i18n="restoreDefaults">恢复默认</button>
             </div>
@@ -493,6 +494,35 @@
                   <p><code>deploy/k3s/syslog-collector-vector.yaml</code></p>
                 </div>
               </div>
+            </section>
+            <section class="panel syslog-deployment-panel" aria-labelledby="syslog-deployment-title">
+              <div class="panel-heading">
+                <div>
+                  <h2 id="syslog-deployment-title" data-i18n="syslogDeploymentTitle">Syslog 接入部署</h2>
+                  <p data-i18n="syslogDeploymentHint">集中维护安全设备的发送目标与来源网段。</p>
+                </div>
+                <span id="syslog-deployment-sync" class="field-status needs_review"></span>
+              </div>
+              <form id="syslog-deployment-form" class="settings-form syslog-deployment-form">
+                <label>
+                  <span data-i18n="syslogCollectorAddress">Collector 对外地址</span>
+                  <input id="syslog-collector-address" name="collector_address" type="text" autocomplete="off" placeholder="10.20.30.40" data-i18n-placeholder="syslogCollectorAddressPlaceholder" />
+                </label>
+                <label>
+                  <span data-i18n="syslogSourceCidrs">安全设备来源 CIDR</span>
+                  <textarea id="syslog-source-cidrs" name="source_cidrs" rows="3" spellcheck="false" placeholder="10.20.10.15/32, 10.20.11.0/24" data-i18n-placeholder="syslogSourceCidrsPlaceholder"></textarea>
+                </label>
+                <div class="syslog-deployment-identity">
+                  <span data-i18n="syslogIngestIdentity">Collector 接入身份</span>
+                  <code id="syslog-ingest-identity">Kubernetes Secret</code>
+                </div>
+                <div class="form-actions">
+                  <button type="submit" id="save-syslog-deployment" data-i18n="saveSyslogDeployment">保存部署配置</button>
+                  <button type="button" id="export-syslog-deployment" data-i18n="exportSyslogDeployment">下载部署参数</button>
+                </div>
+                <p id="syslog-deployment-status" class="form-status"></p>
+              </form>
+              <div id="syslog-deployment-targets" class="syslog-deployment-targets"></div>
             </section>
             </div>
             <div id="adapter-config-panel" class="secondary-view" aria-labelledby="adapter-tab-config" data-secondary-panel="adapter" data-secondary-name="config" hidden>
@@ -588,6 +618,24 @@
         <div class="form-actions">
           <button type="submit" data-i18n="authConnect">连接</button>
           <button id="auth-clear" type="button" data-i18n="authClear">清除</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="manual-review-dialog" class="auth-dialog manual-review-dialog">
+      <form id="manual-review-form">
+        <div class="auth-dialog-heading">
+          <h2 data-i18n="manualReviewDialogTitle">记录人工复核</h2>
+          <button id="manual-review-close" class="icon-button" type="button" aria-label="关闭" data-i18n-aria-label="authClose">&times;</button>
+        </div>
+        <p data-i18n="manualReviewReasonPrompt">请记录已核对的原始日志、证据引用和未采纳外部文本的原因（至少 8 个字符）。</p>
+        <label>
+          <span data-i18n="manualReviewReasonLabel">复核依据</span>
+          <textarea id="manual-review-reason" rows="5" minlength="8" required></textarea>
+        </label>
+        <p id="manual-review-form-status" class="form-status" role="status"></p>
+        <div class="form-actions">
+          <button id="manual-review-submit" type="submit" data-i18n="manualReviewSubmit">记录并转入审批</button>
+          <button id="manual-review-cancel" type="button" data-i18n="manualReviewCancel">取消</button>
         </div>
       </form>
     </dialog>

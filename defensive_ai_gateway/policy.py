@@ -39,6 +39,61 @@ _BUILTIN_SENSITIVE_FIELDS = {
 _OMIT = object()
 
 
+# Evidence arrives in source order. RASP sources commonly put a long stack trace
+# before hook_data and request context, so a generic list truncation can consume
+# the whole model budget before the decisive fields are reached. Keep the model
+# projection ordered by analytical value instead. The immutable original alert
+# is retained separately; this only shapes the bounded LLM-facing copy.
+_EVIDENCE_CONTEXT_PRIORITY = {
+    "request_context": 0,
+    "hook_data": 0,
+    "hook_data_summary": 0,
+    "rasp_items_context": 0,
+    "request_parameters": 1,
+    "sink": 1,
+    "taint_source": 1,
+    "payload_category": 1,
+    "rule_id": 2,
+    "rule_name": 2,
+    "action": 2,
+    "method": 2,
+    "url": 2,
+    "uri": 2,
+    "src_ip": 2,
+    "host": 2,
+    "status": 2,
+    "exception": 3,
+    "stack_trace": 4,
+    "stacktrace": 4,
+    "rasp_evidence_integrity": 2,
+}
+
+_EVIDENCE_CONTEXT_ITEM_CAPS = {
+    "request_context": 700,
+    "hook_data": 700,
+    "hook_data_summary": 700,
+    "rasp_items_context": 1500,
+    "request_parameters": 450,
+    "sink": 500,
+    "taint_source": 500,
+    "payload_category": 500,
+    "rule_id": 350,
+    "rule_name": 350,
+    "action": 300,
+    "method": 200,
+    "url": 450,
+    "uri": 450,
+    "src_ip": 200,
+    "host": 300,
+    "status": 200,
+    "exception": 500,
+    "stack_trace": 1000,
+    "stacktrace": 1000,
+    "rasp_evidence_integrity": 450,
+}
+_DEFAULT_EVIDENCE_CONTEXT_ITEM_CAP = 320
+
+
 def _canonical_field_name(value: Any) -> str:
     text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(value).strip())
     return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
@@ -120,6 +175,57 @@ def _fit_json_value(value: Any, budget: int, *, top_level: bool = False) -> Any:
         return result if _json_size(result) <= budget else _OMIT
 
     return _OMIT
+
+
+def _evidence_type(item: Any) -> str:
+    if not isinstance(item, dict):
+        return "evidence"
+    return str(item.get("type") or "evidence").strip().lower()
+
+
+def _compact_evidence_item(item: Any) -> dict[str, Any]:
+    """Keep the model contract fields while discarding storage-only metadata."""
+    if not isinstance(item, dict):
+        return {"type": "evidence", "value": item}
+    compact: dict[str, Any] = {"type": str(item.get("type") or "evidence")}
+    if "value" in item:
+        compact["value"] = item.get("value")
+    why = item.get("why_it_matters")
+    if why not in (None, ""):
+        compact["why_it_matters"] = why
+    return compact
+
+
+def _fit_evidence_context(evidence: list[Any], budget: int) -> list[dict[str, Any]]:
+    """Fit evidence without allowing an early bulky item to hide later context."""
+    if budget < 2:
+        return []
+    ranked = sorted(
+        enumerate(evidence),
+        key=lambda pair: (_EVIDENCE_CONTEXT_PRIORITY.get(_evidence_type(pair[1]), 3), pair[0]),
+    )
+    result: list[dict[str, Any]] = []
+    for _index, original_item in ranked:
+        item_type = _evidence_type(original_item)
+        compact = _compact_evidence_item(original_item)
+        # Work out the exact room for an additional array element. This avoids
+        # relying on a best-effort share after an earlier stack trace is trimmed.
+        with_null = [*result, None]
+        available = budget - (_json_size(with_null) - _json_size(None))
+        if available < 2:
+            break
+        cap = _EVIDENCE_CONTEXT_ITEM_CAPS.get(item_type, _DEFAULT_EVIDENCE_CONTEXT_ITEM_CAP)
+        fitted = _fit_json_value(compact, min(available, cap))
+        if not isinstance(fitted, dict):
+            continue
+        # A meaningful item must retain its type. Do not add a value-only or
+        # empty fragment simply because it happens to fit in the final bytes.
+        if not str(fitted.get("type") or "").strip():
+            continue
+        candidate = [*result, fitted]
+        if _json_size(candidate) <= budget:
+            result = candidate
+    return result
 
 
 class PolicyEngine:
@@ -228,7 +334,22 @@ class PolicyEngine:
             "focus": 0.10,
             "report_outline": 0.10,
         }
+        # For RASP, the evidence itself is the primary source of truth. Preserve
+        # enough room for request context, hook data, every item summary and the
+        # dangerous call path before allocating optional long-term memory.
+        if str(redacted.get("product") or "").strip().lower() == "rasp":
+            shares["evidence"] = 0.50
+            shares["memory"] = 0.15
+
+        evidence = redacted.get("evidence")
+        if isinstance(evidence, list):
+            redacted["evidence"] = _fit_evidence_context(
+                evidence,
+                max(2, int(max_bytes * shares["evidence"])),
+            )
         for key, share in shares.items():
+            if key == "evidence":
+                continue
             if key not in redacted:
                 continue
             fitted = _fit_json_value(redacted[key], max(2, int(max_bytes * share)))

@@ -57,7 +57,7 @@ flowchart TB
 
     subgraph QUEUE["⚙️ 持久接入队列 (database.py / processing.py)"]
         direction LR
-        INBOX["durable_alert_inbox<br/>返回 202 前提交<br/>pending · retry · processing<br/>completed · dead_letter"]
+        INBOX["durable_alert_inbox<br/>返回 202 前提交<br/>pending · retry · deferred · processing<br/>completed · dead_letter"]
         AP["AlertProcessor<br/>bounded execution queue<br/>worker pool<br/>bounded shutdown"]
         STATS["Operational Stats<br/>queued / processed / retried<br/>dead_lettered / rejected / inflight"]
         INBOX --> AP --> STATS

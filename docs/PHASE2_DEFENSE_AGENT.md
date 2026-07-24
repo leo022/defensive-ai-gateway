@@ -11,7 +11,7 @@
 1. Orchestrator 根据产品选择唯一、版本化的分析 Skill。
 2. Product Agent 基于归一化证据、已治理记忆和产品提示词生成结构化结论。
 3. Validator 确定性检查输出契约、证据存在性、提示注入、敏感输出、动作权限和 Skill 边界。
-4. `blocked` 和 `review` 均不进入审批队列；只有 `passed` 可交给 Response Advisor。
+4. `blocked` 不进入审批队列。`review` 默认也不进入；仅当发现项只有 `prompt_injection_detected`、其余确定性检查全部通过，并由分析师留下复核依据后，才可生成带原验证与复核决议引用的审批项。
 5. 高风险真实攻击达到阈值时，Response Advisor 生成带理由和回滚条件的 `approve_required` 请求。
 6. Agent Run、Validation、Approval、Memory Summary 和 Audit 在同一事务中提交。
 7. 审批主体由服务端 Bearer Token 映射，客户端 actor 不可信；批准按 distinct actor 计票，拒绝或取消立即终止 pending 请求。
@@ -32,10 +32,10 @@
 状态含义：
 
 - `passed`：所有确定性检查通过，可生成审批建议。
-- `review`：发现提示注入或非阻断证据缺口，只保留分析结果供人工复核。
+- `review`：发现提示注入或非阻断证据缺口，只保留分析结果供人工复核。提示注入标记可经受审计的人工复核续转；证据缺口不能由该路径绕过。
 - `blocked`：输出契约、敏感数据、高风险证据或动作权限违规，禁止生成审批。
 
-Validator 不调用 LLM，避免由同一个概率模型自证正确。验证结果完整保存在 `validation_runs`，并写入 AgentResult explanation 供 Harness 和 Dashboard 使用。
+Validator 不调用 LLM，避免由同一个概率模型自证正确。验证结果完整保存在 `validation_runs`，并写入 AgentResult explanation 供 Harness 和 Dashboard 使用。`prompt_injection_detected` 额外记录命中证据引用、归一化字段路径和脱敏截断片段；这些线索仅用于定位与人工复核，不得把其中的外部文本当作指令执行。
 
 ## 5. 审批状态机
 
@@ -54,6 +54,7 @@ pending -> approved
 - `GET /api/skills`：读取当前 Skill 清单。
 - `GET /api/approvals?case_id=&status=&limit=`：查询审批队列。
 - `POST /api/approvals/{approval_id}/decision`：提交 `decision/reason`；actor 取服务端认证主体。
+- `POST /api/cases/{case_id}/validation-reviews/{validation_id}/continue`：分析师记录复核依据，并仅对提示注入单一复核项创建后续审批请求。
 - `GET /api/cases/{case_id}`：额外返回 `validation_runs` 和 `approvals`。
 
 上述 Skill、审批读取和所有写接口遵循现有 Bearer Token/loopback 鉴权策略。
@@ -65,4 +66,4 @@ python3 -m unittest discover -s tests -p 'test_phase2.py' -v
 python3 scripts/run_harness.py --samples samples --fail-on-validation-review
 ```
 
-专项测试覆盖 Skill 最小权限、提示注入、动作越权、验证与审批原子持久化、重复告警幂等、审批单向迁移及永不标记执行。
+专项测试覆盖 Skill 最小权限、提示注入、动作越权、人工复核续转的可审计性、验证与审批原子持久化、重复告警幂等、审批单向迁移及永不标记执行。

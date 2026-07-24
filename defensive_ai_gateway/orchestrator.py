@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import threading
 from contextlib import contextmanager
 
 from .agents.base import run_id
 from .agents.registry import build_agent
 from .database import Repository
-from .llm import LLMClient, LocalHeuristicLLM
+from .llm import LLMClient, LLMEndpointConfigurationError, LocalHeuristicLLM
 from .memory import MemoryManager
 from .memory_matcher import MemoryMatchEvaluation, MemoryMatcher
 from .models import AgentResult, NormalizedEvent, RawAlert, RecommendedAction, new_id
 from .normalizer import EventNormalizer
 from .policy import PolicyEngine
+from .processing import AlertRetryableError
 from .response import ResponseAdvisor
 from .skills import SkillRegistry
 from .validation import Validator
@@ -89,13 +92,137 @@ class Orchestrator:
             existing = self.repo.get_agent_result_for_event(event.event_id)
             if existing:
                 return self._agent_result_from_dict(existing)
-        correlation_key = self._case_correlation_key(event)
-        case_id, case_resolution = self.repo.resolve_case_id(
-            correlation_key,
-            event.event_id,
-            event.timestamp,
-            window_ms=self.CASE_CORRELATION_WINDOW_MS,
-        )
+        return self._analyze_event(alert=alert, event=event, trace_id=trace_id)
+
+    def reanalyze_existing_alert(
+        self,
+        *,
+        alert: RawAlert,
+        source_event_id: str,
+        case_id: str,
+        correlation_key: str = "",
+        actor: str = "runtime-operator",
+        replay_context: dict | None = None,
+    ) -> tuple[AgentResult, bool]:
+        """Append a corrected analysis version for one immutable raw alert.
+
+        Delivery retries reuse the original normalized event by design. A human
+        requested re-analysis is different: it normalizes retained raw evidence
+        under the current profile, writes a distinct deterministic event version,
+        and refreshes the live Case summary without deleting prior runs.
+        """
+        if not source_event_id or not case_id:
+            raise ValueError("source_event_id and case_id are required for analysis replay")
+        if not str(alert.alert_id or "").strip():
+            raise ValueError("analysis replay requires a stable source alert id")
+
+        lock_id = f"{alert.alert_id}:analysis-replay"
+        with self._lock_for_alert(lock_id):
+            current_case = self.repo.get_case(case_id)
+            if not current_case:
+                raise KeyError("case not found")
+            if str(current_case.get("product") or "").lower() != alert.product.lower():
+                raise ValueError("alert product does not match the Case")
+
+            event = self.normalizer.normalize(alert)
+            agent = build_agent(event.product, self.llm, self.policy)
+            replay_material = {
+                "source_event_id": source_event_id,
+                "prompt_version": agent.prompt_version,
+                "entities": event.entities,
+                "evidence": event.evidence,
+            }
+            replay_fingerprint = hashlib.sha256(
+                json.dumps(replay_material, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()[:16]
+            event.event_id = f"{source_event_id}__replay_{replay_fingerprint}"
+            metadata = {
+                "case_id": case_id,
+                "source_alert_id": alert.alert_id,
+                "source_event_id": source_event_id,
+                "replay_event_id": event.event_id,
+                "prompt_version": agent.prompt_version,
+                **dict(replay_context or {}),
+            }
+            event.evidence.append(
+                {
+                    "ref": source_event_id,
+                    "source": "gateway",
+                    "type": "analysis_replay",
+                    "value": {
+                        "source_event_id": source_event_id,
+                        "prompt_version": agent.prompt_version,
+                    },
+                    "why_it_matters": "该事件由授权分析师基于保留的原始告警重新映射并复核。",
+                }
+            )
+
+            existing = self.repo.get_agent_result_for_event(event.event_id)
+            if existing:
+                self.repo.insert_audit(
+                    new_id("audit"),
+                    event.event_id,
+                    str(actor or "runtime-operator"),
+                    "analysis_replay_reused",
+                    metadata,
+                )
+                return self._agent_result_from_dict(existing), False
+
+            trace_id = new_id("trace")
+            with self.repo.transaction():
+                inserted = self.repo.insert_normalized_event(event, _commit=False)
+                self.repo.insert_audit(
+                    new_id("audit"),
+                    trace_id,
+                    str(actor or "runtime-operator"),
+                    "analysis_replay_requested",
+                    metadata,
+                    _commit=False,
+                )
+            if not inserted:
+                event = self.repo.get_normalized_event(event.event_id) or event
+                existing = self.repo.get_agent_result_for_event(event.event_id)
+                if existing:
+                    return self._agent_result_from_dict(existing), False
+
+            return (
+                self._analyze_event(
+                    alert=alert,
+                    event=event,
+                    trace_id=trace_id,
+                    target_case_id=case_id,
+                    correlation_key=str(current_case.get("correlation_key") or correlation_key),
+                    case_resolution="analysis_replay",
+                    record_memory=False,
+                    replay_metadata=metadata,
+                ),
+                True,
+            )
+
+    def _analyze_event(
+        self,
+        *,
+        alert: RawAlert,
+        event: NormalizedEvent,
+        trace_id: str,
+        target_case_id: str | None = None,
+        correlation_key: str = "",
+        case_resolution: str = "",
+        record_memory: bool = True,
+        replay_metadata: dict | None = None,
+    ) -> AgentResult:
+        if target_case_id:
+            case_id = target_case_id
+            correlation_key = correlation_key or self._case_correlation_key(event)
+            case_resolution = case_resolution or "analysis_replay"
+        else:
+            correlation_key = self._case_correlation_key(event)
+            case_id, case_resolution = self.repo.resolve_case_id(
+                correlation_key,
+                event.event_id,
+                event.timestamp,
+                window_ms=self.CASE_CORRELATION_WINDOW_MS,
+            )
         # alert_received is deliberately persisted before model work, when the
         # Case is not known yet. Record the explicit relationship as soon as
         # correlation resolves it so audit retention never relies on trace_id
@@ -107,6 +234,16 @@ class Orchestrator:
         # a sweep. Expired memories are therefore never presented as live context.
         self.memory.expire_due()
         memory_context = self.memory.load_context(event.product, case_id=case_id, asset_id=asset_id)
+        if replay_metadata:
+            # A replaced conclusion must not feed itself back into its corrected
+            # run through low-trust case memory or pending candidates.
+            memory_context["case_short_term"] = []
+            memory_context["evidence_refs"] = []
+            memory_context["product_long_term"] = [
+                item
+                for item in memory_context.get("product_long_term", [])
+                if str(item.get("source_case_id") or "") != case_id
+            ]
         cross_product_context = self.repo.query_correlated_alerts(
             event,
             window_ms=self.CROSS_PRODUCT_WINDOW_MS,
@@ -117,6 +254,12 @@ class Orchestrator:
             event.product,
             limit=self.memory_matcher.config.candidate_limit,
         )
+        if replay_metadata:
+            match_candidates = [
+                item
+                for item in match_candidates
+                if str(item.get("source_case_id") or "") != case_id
+            ]
         memory_evaluation = self.memory_matcher.match(event, match_candidates)
         memory_context["product_long_term"] = [
             candidate.memory
@@ -131,9 +274,42 @@ class Orchestrator:
         try:
             result = agent.analyze(case_id, event, memory_context)
         except Exception as exc:
-            # Never abort alert handling on an LLM/network failure: audit it and
-            # degrade to the deterministic heuristic so the alert still produces a
-            # traceable, explainable result (risk 6: model dependency).
+            if isinstance(exc, LLMEndpointConfigurationError):
+                # A WebSocket-only endpoint cannot recover on its own. Preserve
+                # the alert as a terminal failure instead of requeueing it forever.
+                self.repo.insert_audit(
+                    new_id("audit"), trace_id, agent.name, "analysis_failed",
+                    {
+                        "provider": model_runtime.get("provider", "unknown"),
+                        "endpoint_host": model_runtime.get("endpoint_host", ""),
+                        "error_type": type(exc).__name__,
+                        "reason": str(exc),
+                        "fallback": "not_used",
+                    },
+                )
+                raise
+            if self.llm.defer_on_failure:
+                retry_after = self.llm.retry_after_seconds
+                # Remote-model output must not silently become a local judgment.
+                # The raw alert and normalized event are already durable above;
+                # returning this typed error lets the inbox retry it after the
+                # circuit-breaker window instead of treating it as completed.
+                self.repo.insert_audit(
+                    new_id("audit"), trace_id, agent.name, "analysis_deferred",
+                    {
+                        "provider": model_runtime.get("provider", "unknown"),
+                        "endpoint_host": model_runtime.get("endpoint_host", ""),
+                        "error_type": type(exc).__name__,
+                        "retry_after_seconds": retry_after,
+                    },
+                )
+                raise AlertRetryableError(
+                    "remote LLM analysis deferred for durable retry",
+                    retry_after_seconds=retry_after,
+                ) from exc
+
+            # Custom/test analyzers retain the historical deterministic fallback
+            # unless they explicitly declare remote retry semantics above.
             self.repo.insert_audit(
                 new_id("audit"), trace_id, agent.name, "analysis_failed",
                 {"error": str(exc), "fallback": "local_heuristic"},
@@ -179,8 +355,14 @@ class Orchestrator:
         result.dashboard_cards.append({"title": "验证门禁", "body": validation.status})
         if validation.status == "blocked":
             result.missing_evidence.append("Validator 已阻断审批流转，请按验证发现补证或修正策略违规。")
+        if replay_metadata:
+            result.explanation["analysis_replay"] = dict(replay_metadata)
         result.explanation["memory_write_status"] = (
-            "committed" if validation.status == "passed" else "suppressed_by_validator"
+            "committed"
+            if validation.status == "passed" and record_memory
+            else "suppressed_for_analysis_replay"
+            if replay_metadata
+            else "suppressed_by_validator"
         )
 
         # Post-analysis writes are atomic: case row, link, agent run, validation,
@@ -222,7 +404,7 @@ class Orchestrator:
             )
             for approval in approvals:
                 self.repo.insert_approval(approval.to_dict(), _commit=False)
-            if validation.status == "passed":
+            if validation.status == "passed" and record_memory:
                 self.memory.record_case_summary(event.product, result, asset_id=asset_id, trace_id=trace_id)
             self.repo.insert_audit(
                 new_id("audit"), trace_id, agent.name, "analysis_completed", result.to_dict(), _commit=False,
@@ -266,6 +448,21 @@ class Orchestrator:
                 },
                 _commit=False,
             )
+            if replay_metadata:
+                self.repo.insert_audit(
+                    new_id("audit"),
+                    trace_id,
+                    "analysis-replay",
+                    "analysis_replay_completed",
+                    {
+                        **replay_metadata,
+                        "analysis_run_id": analysis_run_id,
+                        "classification": result.classification,
+                        "confidence": result.confidence,
+                        "validation_status": validation.status,
+                    },
+                    _commit=False,
+                )
             if cancelled_approvals:
                 self.repo.insert_audit(
                     new_id("audit"), trace_id, self.response_advisor.name, "approvals_cancelled",
@@ -313,25 +510,7 @@ class Orchestrator:
     @staticmethod
     def _agent_result_from_dict(payload: dict) -> AgentResult:
         """Rehydrate a persisted result for an idempotent alert retry."""
-        actions = [
-            item if isinstance(item, RecommendedAction) else RecommendedAction(**item)
-            for item in payload.get("recommended_actions", [])
-            if isinstance(item, (RecommendedAction, dict))
-        ]
-        return AgentResult(
-            case_id=str(payload["case_id"]),
-            agent=str(payload["agent"]),
-            classification=str(payload["classification"]),
-            confidence=float(payload["confidence"]),
-            severity=str(payload["severity"]),
-            summary=str(payload["summary"]),
-            evidence=list(payload.get("evidence", [])),
-            missing_evidence=list(payload.get("missing_evidence", [])),
-            recommended_actions=actions,
-            dashboard_cards=list(payload.get("dashboard_cards", [])),
-            explanation=dict(payload.get("explanation", {})),
-            created_at_ms=int(payload.get("created_at_ms", 0)),
-        )
+        return AgentResult.from_dict(payload)
 
     def _case_correlation_key(self, event: NormalizedEvent) -> str:
         host = event.entities.get("host") or event.entities.get("src_ip") or "unknown"

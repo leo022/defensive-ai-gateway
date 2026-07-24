@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from datetime import datetime, timezone
@@ -68,6 +69,14 @@ def _raw_message(message: bytes | str | dict[str, Any]) -> str:
     return json.dumps(message, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
+def _raw_message_bytes(message: bytes | str | dict[str, Any]) -> bytes:
+    if isinstance(message, bytes):
+        return message
+    if isinstance(message, str):
+        return message.encode("utf-8")
+    return json.dumps(message, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+
+
 def _message_format(message: bytes | str | dict[str, Any], structured: dict[str, Any]) -> str:
     if isinstance(message, dict):
         return "object"
@@ -114,6 +123,7 @@ class SyslogPortRouter:
 
         profile_id = self.gateway_profiles.get(product, "")
         route_reason = "port_profile" if profile_id else "port_standard"
+        raw_bytes = _raw_message_bytes(message)
         envelope = self._route_meta(
             port,
             product,
@@ -121,6 +131,7 @@ class SyslogPortRouter:
             appname,
             warnings,
             raw_message=_raw_message(message),
+            raw_message_bytes=raw_bytes,
             message_format=_message_format(message, structured),
             protocol=protocol,
             route_reason=route_reason,
@@ -151,6 +162,7 @@ class SyslogPortRouter:
         warnings: list[str],
         *,
         raw_message: str,
+        raw_message_bytes: bytes,
         message_format: str,
         protocol: str,
         route_reason: str,
@@ -165,6 +177,8 @@ class SyslogPortRouter:
             "route_reason": route_reason,
             "message_format": message_format,
             "raw_message": raw_message,
+            "raw_message_bytes": len(raw_message_bytes),
+            "raw_message_sha256": hashlib.sha256(raw_message_bytes).hexdigest(),
             "received_at_ms": int(time.time() * 1000),
             "received_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "warnings": list(warnings),

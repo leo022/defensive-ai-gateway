@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import queue
 import threading
 import time
@@ -10,8 +11,30 @@ from typing import Callable
 from .models import RawAlert
 
 
+_MAX_RETRY_AFTER_SECONDS = 300.0
+
+
+def _bounded_retry_after_seconds(value: object) -> float:
+    """Accept an optional retry hint without allowing a worker to stall forever."""
+    try:
+        delay = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    if not math.isfinite(delay):
+        return 0.0
+    return min(_MAX_RETRY_AFTER_SECONDS, max(0.0, delay))
+
+
 class AlertQueueFull(Exception):
     """Raised when the bounded alert queue refuses a new item."""
+
+
+class AlertRetryableError(RuntimeError):
+    """A handler failure that should wait before the durable inbox retries it."""
+
+    def __init__(self, message: str, *, retry_after_seconds: float = 0.0):
+        super().__init__(message)
+        self.retry_after_seconds = _bounded_retry_after_seconds(retry_after_seconds)
 
 
 @dataclass(frozen=True)
@@ -28,6 +51,7 @@ class DeadLetter:
     reason: str
     error: str
     created_at_ms: int
+    retry_after_seconds: float = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -47,6 +71,28 @@ class DeadLetter:
             "reason": self.reason,
             "error": self.error,
             "created_at_ms": self.created_at_ms,
+            "retry_after_seconds": self.retry_after_seconds,
+        }
+
+
+@dataclass(frozen=True)
+class DeferredAlert:
+    """A remote-analysis failure returned to the durable inbox without loss."""
+
+    alert: RawAlert
+    attempts: int
+    error: str
+    created_at_ms: int
+    retry_after_seconds: float = 0.0
+
+    def to_dict(self) -> dict:
+        return {
+            "alert_id": self.alert.alert_id,
+            "product": self.alert.product,
+            "attempts": self.attempts,
+            "error": self.error,
+            "created_at_ms": self.created_at_ms,
+            "retry_after_seconds": self.retry_after_seconds,
         }
 
 
@@ -63,6 +109,7 @@ class AlertProcessorStats:
     retried: int
     dead_lettered: int
     rejected: int
+    deferred: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -77,6 +124,7 @@ class AlertProcessorStats:
             "retried": self.retried,
             "dead_lettered": self.dead_lettered,
             "rejected": self.rejected,
+            "deferred": self.deferred,
         }
 
 
@@ -93,6 +141,7 @@ class AlertProcessor:
         retry_base_delay: float = 0.1,
         retry_max_delay: float = 2.0,
         dead_letter_handler: Callable[[DeadLetter], object] | None = None,
+        deferred_handler: Callable[[DeferredAlert], object] | None = None,
         dead_letter_max_size: int = 1000,
     ):
         self._handler = handler
@@ -102,6 +151,7 @@ class AlertProcessor:
         self._retry_base_delay = max(0.0, float(retry_base_delay))
         self._retry_max_delay = max(self._retry_base_delay, float(retry_max_delay))
         self._dead_letter_handler = dead_letter_handler
+        self._deferred_handler = deferred_handler
         self._dead_letters: deque[DeadLetter] = deque(maxlen=max(1, int(dead_letter_max_size)))
         self._threads: list[threading.Thread] = []
         self._lock = threading.Lock()
@@ -114,6 +164,7 @@ class AlertProcessor:
         self._retried = 0
         self._dead_lettered = 0
         self._rejected = 0
+        self._deferred = 0
         self._inflight = 0
 
     def start(self) -> None:
@@ -200,6 +251,7 @@ class AlertProcessor:
                 retried=self._retried,
                 dead_lettered=self._dead_lettered,
                 rejected=self._rejected,
+                deferred=self._deferred,
             )
 
     def is_healthy(self) -> bool:
@@ -243,12 +295,31 @@ class AlertProcessor:
             try:
                 self._handler(alert)
             except Exception as exc:  # noqa: BLE001 - failure is retried/DLQed, worker survives
+                retry_after = _bounded_retry_after_seconds(
+                    getattr(exc, "retry_after_seconds", 0.0)
+                )
+                if (
+                    isinstance(exc, AlertRetryableError)
+                    and self._deferred_handler
+                    and not self._abort.is_set()
+                ):
+                    self._record_deferred(alert, attempt, repr(exc), retry_after)
+                    return
                 if attempt < self._max_attempts and not self._abort.is_set():
                     with self._lock:
                         self._retried += 1
-                    delay = min(self._retry_max_delay, self._retry_base_delay * (2 ** (attempt - 1)))
+                    delay = max(
+                        retry_after,
+                        min(self._retry_max_delay, self._retry_base_delay * (2 ** (attempt - 1))),
+                    )
                     if delay and self._abort.wait(delay):
-                        self._record_dead_letter(alert, attempt, "shutdown_timeout", repr(exc))
+                        self._record_dead_letter(
+                            alert,
+                            attempt,
+                            "shutdown_timeout",
+                            repr(exc),
+                            retry_after_seconds=retry_after,
+                        )
                         return
                     continue
                 reason = "shutdown_timeout" if self._abort.is_set() else "handler_error"
@@ -256,20 +327,64 @@ class AlertProcessor:
                     f"[gateway] alert worker exhausted for {alert.alert_id} "
                     f"after {attempt} attempt(s): {exc!r}"
                 )
-                self._record_dead_letter(alert, attempt, reason, repr(exc))
+                self._record_dead_letter(
+                    alert,
+                    attempt,
+                    reason,
+                    repr(exc),
+                    retry_after_seconds=retry_after,
+                )
                 return
             else:
                 with self._lock:
                     self._processed += 1
                 return
 
-    def _record_dead_letter(self, alert: RawAlert, attempts: int, reason: str, error: str) -> None:
+    def _record_deferred(
+        self,
+        alert: RawAlert,
+        attempts: int,
+        error: str,
+        retry_after_seconds: float,
+    ) -> None:
+        entry = DeferredAlert(
+            alert=alert,
+            attempts=max(1, int(attempts)),
+            error=str(error),
+            created_at_ms=int(time.time() * 1000),
+            retry_after_seconds=_bounded_retry_after_seconds(retry_after_seconds),
+        )
+        try:
+            self._deferred_handler(entry)  # type: ignore[misc]
+        except Exception as exc:  # noqa: BLE001 - preserve the alert if durable deferral fails
+            print(f"[gateway] durable deferral hook failed for {alert.alert_id}: {exc!r}")
+            self._record_dead_letter(
+                alert,
+                attempts,
+                "deferred_persistence_failed",
+                f"{error}; deferred persistence failed: {exc!r}",
+                retry_after_seconds=retry_after_seconds,
+            )
+            return
+        with self._lock:
+            self._deferred += 1
+
+    def _record_dead_letter(
+        self,
+        alert: RawAlert,
+        attempts: int,
+        reason: str,
+        error: str,
+        *,
+        retry_after_seconds: float = 0.0,
+    ) -> None:
         entry = DeadLetter(
             alert=alert,
             attempts=max(0, int(attempts)),
             reason=str(reason),
             error=str(error),
             created_at_ms=int(time.time() * 1000),
+            retry_after_seconds=_bounded_retry_after_seconds(retry_after_seconds),
         )
         with self._lock:
             self._failed += 1

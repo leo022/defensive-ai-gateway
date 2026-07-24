@@ -9,7 +9,7 @@
 - Python 标准库优先：第一版不依赖 pip/npm，降低内网迁移和供应链审查成本。
 - SQLite 事实库：PoC 阶段开箱即用，生产可替换为 PostgreSQL。
 - HTTP API + 静态 Dashboard：接收 HIPS/RASP/NDR/WAF/SIEM 告警，实时查看 Case。
-- 持久告警队列：HTTP 入口在返回 `202` 前写入 SQLite inbox；后台 worker 有限重试，终态失败进入可查询 DLQ，进程重启可恢复。
+- 持久告警队列：HTTP 入口在返回 `202` 前写入 SQLite inbox；后台 worker 有限重试，终态失败进入可查询 DLQ。远程 LLM 不可达的告警进入独立 `deferred` 状态，只由定时恢复或分析师手工释放，进程重启可恢复。
 - Agent/Skill/Harness 分层：产品专属提示词、记忆命名空间、策略检查和离线回放分开演进。
 - LLM 可插拔：开发配置默认使用 deterministic 本地规则分析器 `local-rule-analyst`；需要真实模型验证时，可在 Dashboard 切换到本地 Ollama 或内网 LLM Gateway。
 - 随机样例 + 记忆降噪：样例脚本可随机生成 attack / false_positive 告警；已批准产品长期记忆可辅助同系统重复告警的误报分辨。
@@ -26,20 +26,26 @@ python3 -m defensive_ai_gateway --config config/dev.yaml
 - 健康检查: `GET /api/health`
 - 提交告警: `POST /api/alerts`
 - 查看 Case: `GET /api/cases`
-- 查询接入队列/DLQ: `GET /api/alerts/inbox?status=dead_letter`
+- 查询接入队列/DLQ: `GET /api/alerts/inbox?status=deferred` 或 `GET /api/alerts/inbox?status=dead_letter`
 
-Dashboard 的“模型服务 -> 内网 Gateway”预设使用 Anthropic Messages API：
+Dashboard 的“模型服务 -> 内网 Gateway”可接入 kkcoder 的 OpenAI 兼容 API：
 
 ```bash
 export DEFENSIVE_AI_LLM_PROVIDER=gateway
-export ANTHROPIC_BASE_URL="https://kkcoder.com"
-export ANTHROPIC_AUTH_TOKEN="<secret>"
-export DEFENSIVE_AI_LLM_MODEL="claude-sonnet-4-6"
+export DEFENSIVE_AI_LLM_ENDPOINT="https://kkcoder.com/v1/responses"
+export DEFENSIVE_AI_LLM_API_KEY="<secret>"
+export DEFENSIVE_AI_LLM_MODEL="gpt-5.5"
 export DEFENSIVE_AI_LLM_ALLOWED_HOSTS="kkcoder.com"
 ```
 
-`ANTHROPIC_BASE_URL` 会规范化为 `https://kkcoder.com/v1/messages`。访问凭据只会
-用于同源 Messages 端点；不要把 token 写入 YAML、README 或其他仓库文件。
+Gateway 支持 `/v1/responses`、`/v1/chat/completions`、Anthropic Messages 和现有企业
+JSON 协议。Anthropic Messages 仅用于实际兼容该协议的服务：设置
+`ANTHROPIC_BASE_URL` 与 `ANTHROPIC_AUTH_TOKEN` 后，会规范化为 `/v1/messages`。
+访问凭据只用于配置的同源端点；不要把 token 写入 YAML、README 或其他仓库文件。
+
+Gateway 只调用 HTTP 请求-响应 API，不支持 `wss://`、`/v1/realtime`、`/ws` 等
+WebSocket 入口。出现 HTTP 426 `WebSocket upgrade required` 时，应改用服务商提供的
+`/v1/responses` 或 `/v1/chat/completions` HTTP 地址，而不是重试同一地址。
 
 ## 提交样例告警
 
@@ -49,11 +55,25 @@ python3 scripts/send_sample.py --file samples/siem_case.json
 python3 scripts/send_demo_alerts.py
 ```
 
+`alert_id` 是告警实例的幂等键。以上 `--file` 命令会原样重放固定样本；再次发送同一文件是重试，不会创建第二条原始告警或重新执行长期记忆匹配。要模拟同类型的新告警，请保留规则语义、生成新的实例 ID 和时间戳：
+
+```bash
+python3 scripts/send_sample.py --file samples/waf_alert.json --mutate
+```
+
+若同一 `alert_id` 携带不同的时间戳、字段或证据，接口会返回 `409 alert_id_conflict`，要求上游为新的告警实例分配唯一 ID，避免静默丢弃或篡改既有审计证据。
+不同 ID 的同类告警在默认一小时相关窗口内会聚合为同一个 Case；这表示关联，不表示覆盖。应在该 Case 的“关联原始告警”中看到递增的告警数量和每条原始记录。
+
 `send_demo_alerts.py` 默认提交 16 条覆盖五类产品的 Demo 告警，其中额外包含一条
 WAF XSS 提示注入样本，预期触发 Validator `review` 且不生成审批项；脚本会等待所有目标告警
 进入 `completed` 或 `dead_letter` 后再退出；只需提交、不等待时使用
 `--wait-seconds 0`。`clean_alerts_and_memory.py` 会同步清理 durable inbox，并在仍有
-`pending/retry/processing` 任务时拒绝执行，避免处理中的事实记录被删除。
+`pending/retry/deferred/processing` 任务时拒绝执行，避免处理中的事实记录被删除。
+
+对于该类 Case，分析师可在“处置台 → 研判与处置”的验证门禁中核对原始日志和证据后，选择
+“复核通过并转入审批”。该操作必须填写复核依据，原始验证仍保持 `review`，自动记忆写入仍被
+抑制；只有发现项仅为 `prompt_injection_detected` 且其他确定性检查通过时，才会创建可由审批人
+继续处理的非执行型审批项。
 
 如需单独演示该门禁负向路径，可使用：
 
@@ -68,8 +88,11 @@ python3 scripts/send_demo_alerts.py --batch validation-review
 也可以随机生成不同特征的攻击或误报告警：
 
 ```bash
-# --file 永远按原 JSON 发送固定样本
+# --file 永远按原 JSON 发送固定样本；重复提交是幂等重放
 python3 scripts/send_sample.py --file samples/ndr_alert.json
+
+# --mutate 保留同类规则语义，但生成新的告警实例 ID、时间戳和可变字段
+python3 scripts/send_sample.py --file samples/ndr_alert.json --mutate --count 2
 
 # --random 随机选择产品、场景和该产品支持的攻击特征
 python3 scripts/send_sample.py --random --count 5 --product waf --scenario random
@@ -93,7 +116,7 @@ python3 scripts/run_harness.py --samples samples --random-count 10 --random-prod
 
 Dashboard 的“适配”页面可配置 Mapping Profile，把内网真实告警日志映射为内部稳定 `RawAlert`，并通过 dry-run 预览 `RawAlert` 与 `NormalizedEvent`。正式接入时可通过 `POST /api/alerts?profile=<profile_id>` 或请求体中的 `profile_id` 提交真实日志；映射失败的日志不会进入 LLM 分析。
 
-不带 `profile` 直接提交厂商原生日志时，网关会按内容指纹识别来源（例如 cloudrasp 的 `data_type=attack_event` 识别为 `rasp`）；WAF、HIPS、NDR、RASP 和 SIEM 默认均注册 `auto-<product>-json` 自动 Profile，识别后会自动做深度字段映射。既无显式 `product` 字段、又无法识别的日志会被拒绝（400），不再静默降级为 `siem`。
+不带 `profile` 直接提交厂商原生日志时，网关会按内容指纹识别来源（例如 cloudrasp 的 `data_type=attack_event` 识别为 `rasp`）；WAF、HIPS、NDR、RASP 和 SIEM 默认均注册 `auto-<product>-json` 自动 Profile，识别后会自动做深度字段映射。既无显式 `product` 字段、又无法识别且不含标准告警字段的日志会被拒绝（400）。为兼容既有标准 `RawAlert` 调用，带有 `event_type`、`severity`、`alert_id`、`source` 或 `timestamp` 但缺少 `product` 的请求仍会按 SIEM 处理；生产接入应始终提供明确的 `product` 或 Mapping Profile。
 
 Harness 也支持用 profile 回放脱敏真实日志：
 
@@ -170,7 +193,7 @@ docker compose -f deploy/docker/compose.production.yaml up -d
 生产接入推荐在 k3s 中用独立 collector 接收 syslog，再转发到网关 HTTP 入口：
 
 ```text
-Security Product -> Syslog UDP/TCP 15140-15144 -> Collector -> POST /api/alerts
+Security Product -> Syslog 15140-15144 (RASP 15143 uses TCP; UDP is migration-only) -> Collector -> POST /api/alerts
 ```
 
 参考清单：

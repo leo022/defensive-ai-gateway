@@ -747,21 +747,21 @@ class ModelReconciliationTest(unittest.TestCase):
             self.assertTrue(statuses <= {"benign", "normal", "review"})
             self.assertNotIn("risk", statuses)
 
-    def test_non_sample_keeps_classification_but_synthesizes_consistent_dims(self):
+    def test_lab_target_requires_review_without_authorization_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = self._state_with_llm(tmp, self._FakeModelLLM(self._weak_malicious_result()))
             payload = json.loads(Path("samples/rasp_alert.json").read_text(encoding="utf-8"))
             result = state.orchestrator.handle_alert(state.alert_from_payload(payload))
-            # No structured ground truth: model classification is kept (real JNDI
-            # attack), but all-info dimensions must be replaced with risk dims.
-            self.assertEqual(result.classification, "malicious")
+            # A known lab route proves neither authorization nor an unapproved
+            # attack. Dangerous evidence remains actionable, but must be reviewed.
+            self.assertEqual(result.classification, "suspicious")
             dims = result.explanation.get("dimensions", [])
             self.assertGreaterEqual(len(dims), 1)
             self.assertTrue(any(d["status"] in {"risk", "blocked"} for d in dims),
                             f"expected a risk/blocked dimension, got {dims}")
             self.assertFalse(all(d["status"] == "info" for d in dims))
 
-    def test_consistent_model_result_is_trusted(self):
+    def test_lab_target_calibration_overrides_consistent_malicious_model_result(self):
         with tempfile.TemporaryDirectory() as tmp:
             consistent = self._weak_malicious_result()
             consistent["analysis_dimensions"] = [
@@ -771,7 +771,8 @@ class ModelReconciliationTest(unittest.TestCase):
             state = self._state_with_llm(tmp, self._FakeModelLLM(consistent))
             payload = json.loads(Path("samples/rasp_alert.json").read_text(encoding="utf-8"))
             result = state.orchestrator.handle_alert(state.alert_from_payload(payload))
-            self.assertEqual(result.classification, "malicious")
+            self.assertEqual(result.classification, "suspicious")
+            self.assertIn("【需人工复核】", result.explanation["verdict"])
             titles = {d["title"] for d in result.explanation["dimensions"]}
             self.assertIn("请求特征", titles)
 
@@ -790,7 +791,7 @@ class ModelReconciliationTest(unittest.TestCase):
 
 
 class AlertProductRoutingTest(unittest.TestCase):
-    """Raw vendor-format logs without ?profile= must not silently default to siem."""
+    """Vendor logs use fingerprints; legacy standard alerts retain the SIEM fallback."""
 
     def _state(self, tmp) -> GatewayState:
         config = GatewayConfig()
@@ -933,11 +934,70 @@ class AlertProductRoutingTest(unittest.TestCase):
                     self.assertEqual(hips_config["protocol"], "udp")
                     self.assertTrue(hips_config["saved"])
 
+                    with self.assertRaisesRegex(ValueError, "RASP Syslog requires TCP"):
+                        state.update_syslog_config({"product": "rasp", "port": 25143, "protocol": "udp"})
+
                 listeners = state.syslog_config_payload()["listeners"]
                 self.assertIn({"product": "waf", "port": tcp_port, "protocol": "tcp", "active": True}, listeners)
                 self.assertIn({"product": "hips", "port": udp_port, "protocol": "udp", "active": True}, listeners)
             finally:
                 state.stop()
+
+    def test_embedded_rasp_listener_forces_tcp_when_a_legacy_config_says_udp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            config.database.path = str(Path(tmp) / "gateway.db")
+            config.processing.async_enabled = False
+            config.syslog.embedded_listeners_enabled = False
+            config.syslog.product_ports["rasp"] = 25143
+            config.syslog.product_protocols["rasp"] = "udp"
+            state = GatewayState(config)
+            try:
+                config.syslog.embedded_listeners_enabled = True
+                with patch.object(state.syslog_receiver, "update") as update:
+                    state._activate_configured_syslog_listeners()
+
+                specs = update.call_args.args[0]
+                rasp_spec = next(spec for spec in specs if spec.product == "rasp")
+                self.assertEqual(rasp_spec.protocol, "tcp")
+            finally:
+                state.stop()
+
+    def test_external_syslog_deployment_config_is_audited_and_persists_without_credentials(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            config.database.path = str(Path(tmp) / "gateway.db")
+            config.processing.async_enabled = False
+            config.auth.ingest_token = "collector-secret-must-not-be-returned"
+            state = GatewayState(config)
+            try:
+                payload = state.update_syslog_deployment_config(
+                    {
+                        "collector_address": "10.20.30.40",
+                        "source_cidrs": "10.20.10.15/32, 10.20.11.2/24",
+                        "_actor": "config-admin",
+                    }
+                )
+                self.assertEqual(payload["collector_address"], "10.20.30.40")
+                self.assertEqual(payload["source_cidrs"], ["10.20.10.15/32", "10.20.11.0/24"])
+                self.assertTrue(payload["sync_required"])
+                self.assertFalse(payload["ingest_auth"]["exposed"])
+                self.assertNotIn(config.auth.ingest_token, json.dumps(payload))
+                self.assertEqual(payload["targets"][0], {"product": "waf", "label": "WAF", "port": 15140, "protocol": "tcp"})
+                with self.assertRaisesRegex(ValueError, "entire internet"):
+                    state.update_syslog_deployment_config(
+                        {"collector_address": "10.20.30.40", "source_cidrs": "0.0.0.0/0"}
+                    )
+            finally:
+                state.stop()
+
+            restored = GatewayState(config)
+            try:
+                restored_payload = restored.syslog_deployment_payload()
+                self.assertEqual(restored_payload["collector_address"], "10.20.30.40")
+                self.assertEqual(restored_payload["source_cidrs"], ["10.20.10.15/32", "10.20.11.0/24"])
+            finally:
+                restored.stop()
 
 
 if __name__ == "__main__":

@@ -8,7 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .models import AgentResult, NormalizedEvent, RawAlert, now_ms
+from .models import AgentResult, NormalizedEvent, RawAlert, ValidationResult, now_ms
+from .validation import can_continue_after_manual_review
 
 
 SCHEMA = """
@@ -39,6 +40,7 @@ CREATE TABLE IF NOT EXISTS normalized_events (
   evidence_json TEXT NOT NULL,
   sensitivity_tags_json TEXT NOT NULL,
   evidence_hash TEXT NOT NULL DEFAULT '',
+  event_at_ms INTEGER NOT NULL DEFAULT 0,
   created_at_ms INTEGER NOT NULL,
   FOREIGN KEY (alert_id) REFERENCES raw_alerts(alert_id)
 );
@@ -156,10 +158,23 @@ CREATE TABLE IF NOT EXISTS validation_runs (
   FOREIGN KEY (event_id) REFERENCES normalized_events(event_id),
   CHECK (status IN ('passed','review','blocked'))
 );
+CREATE TABLE IF NOT EXISTS validation_review_resolutions (
+  resolution_id TEXT PRIMARY KEY,
+  validation_id TEXT NOT NULL UNIQUE,
+  case_id TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  CHECK (decision = 'continue')
+);
 CREATE TABLE IF NOT EXISTS action_approvals (
   approval_id TEXT PRIMARY KEY,
   case_id TEXT NOT NULL,
   event_id TEXT NOT NULL,
+  validation_id TEXT NOT NULL DEFAULT '',
+  review_resolution_id TEXT NOT NULL DEFAULT '',
   action_json TEXT NOT NULL,
   status TEXT NOT NULL,
   requested_by TEXT NOT NULL,
@@ -217,7 +232,7 @@ CREATE TABLE IF NOT EXISTS durable_alert_inbox (
   last_error TEXT NOT NULL DEFAULT '',
   created_at_ms INTEGER NOT NULL,
   updated_at_ms INTEGER NOT NULL,
-  CHECK (status IN ('pending','processing','retry','completed','dead_letter'))
+  CHECK (status IN ('pending','processing','retry','deferred','completed','dead_letter'))
 );
 CREATE INDEX IF NOT EXISTS idx_normalized_alert ON normalized_events(alert_id);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_case ON agent_runs(case_id);
@@ -234,6 +249,7 @@ CREATE INDEX IF NOT EXISTS idx_memory_matches_case ON memory_matches(case_id, cr
 CREATE INDEX IF NOT EXISTS idx_audit_case ON audit_log(case_id, created_at_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_memory ON audit_log(memory_id, created_at_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_validation_case ON validation_runs(case_id, created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_validation_review_case ON validation_review_resolutions(case_id, created_at_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_approvals_case ON action_approvals(case_id, created_at_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON action_approvals(status, created_at_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_approval_votes_approval ON approval_votes(approval_id, created_at_ms ASC);
@@ -241,7 +257,20 @@ CREATE INDEX IF NOT EXISTS idx_alert_dispositions_case ON alert_dispositions(cas
 CREATE INDEX IF NOT EXISTS idx_inbox_claim ON durable_alert_inbox(status, available_at_ms, created_at_ms);
 """
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 12
+_LLM_DEFERRED_ERROR_PREFIX = "analysis_deferred:"
+_LEGACY_LLM_DEFERRED_ERROR_FRAGMENT = "remote LLM analysis deferred"
+
+
+class AlertIdentityConflict(ValueError):
+    """An alert ID was reused for a different source event."""
+
+    def __init__(self, alert_id: str):
+        self.alert_id = str(alert_id)
+        super().__init__(
+            f"alert_id collision: {self.alert_id} is already bound to different alert evidence; "
+            "use a new alert_id for a new alert occurrence"
+        )
 
 
 class Repository:
@@ -574,6 +603,144 @@ class Repository:
                     (now_ms(),),
                 )
 
+            if current < 10:
+                # v10 stores normalized event time separately from insertion
+                # time. Cross-product correlation can then bound candidates by
+                # the actual event window before applying its defensive limit.
+                norm_columns = {
+                    row["name"]
+                    for row in self.conn.execute("PRAGMA table_info(normalized_events)").fetchall()
+                }
+                if "event_at_ms" not in norm_columns:
+                    self.conn.execute(
+                        "ALTER TABLE normalized_events "
+                        "ADD COLUMN event_at_ms INTEGER NOT NULL DEFAULT 0"
+                    )
+                legacy_rows = self.conn.execute(
+                    "SELECT event_id, timestamp FROM normalized_events WHERE event_at_ms <= 0"
+                ).fetchall()
+                self.conn.executemany(
+                    "UPDATE normalized_events SET event_at_ms = ? WHERE event_id = ?",
+                    [
+                        (self.timestamp_ms(str(row["timestamp"])), str(row["event_id"]))
+                        for row in legacy_rows
+                    ],
+                )
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_normalized_event_time "
+                    "ON normalized_events(event_at_ms DESC, product)"
+                )
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO schema_version(version, applied_at_ms) VALUES (10, ?)",
+                    (now_ms(),),
+                )
+
+            if current < 11:
+                # v11 adds an append-only human decision for the narrow
+                # prompt-injection review continuation path. The original
+                # validation stays ``review``; approvals can prove their
+                # explicit review provenance through these columns.
+                approval_columns = {
+                    row["name"]
+                    for row in self.conn.execute("PRAGMA table_info(action_approvals)").fetchall()
+                }
+                additions = {
+                    "validation_id": "TEXT NOT NULL DEFAULT ''",
+                    "review_resolution_id": "TEXT NOT NULL DEFAULT ''",
+                }
+                for column, declaration in additions.items():
+                    if column not in approval_columns:
+                        self.conn.execute(
+                            f"ALTER TABLE action_approvals ADD COLUMN {column} {declaration}"
+                        )
+                resolution_table = self.conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'validation_review_resolutions'"
+                ).fetchone()
+                if not resolution_table:
+                    raise RuntimeError("schema v11 validation review resolutions table is missing")
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_validation_review_case "
+                    "ON validation_review_resolutions(case_id, created_at_ms DESC)"
+                )
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_approvals_review_resolution "
+                    "ON action_approvals(review_resolution_id, created_at_ms DESC)"
+                )
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO schema_version(version, applied_at_ms) VALUES (11, ?)",
+                    (now_ms(),),
+                )
+
+            if current < 12:
+                # v12 separates remote-model deferrals from ordinary retryable
+                # processing failures.  The dispatcher must never reclaim a
+                # deferred alert on its normal polling loop: maintenance or an
+                # analyst explicitly releases it once model recovery is due.
+                # SQLite cannot alter a CHECK constraint in place, so rebuild
+                # the small inbox table atomically while preserving every row.
+                inbox_row = self.conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' "
+                    "AND name = 'durable_alert_inbox'"
+                ).fetchone()
+                inbox_sql = str((inbox_row["sql"] if inbox_row else "") or "").lower()
+                if "'deferred'" not in inbox_sql:
+                    self.conn.execute("DROP INDEX IF EXISTS idx_inbox_claim")
+                    self.conn.execute(
+                        "ALTER TABLE durable_alert_inbox RENAME TO durable_alert_inbox_v11"
+                    )
+                    self.conn.execute(
+                        """
+                        CREATE TABLE durable_alert_inbox (
+                          alert_id TEXT PRIMARY KEY,
+                          raw_alert_json TEXT NOT NULL,
+                          source TEXT NOT NULL,
+                          product TEXT NOT NULL,
+                          status TEXT NOT NULL DEFAULT 'pending',
+                          attempts INTEGER NOT NULL DEFAULT 0,
+                          max_attempts INTEGER NOT NULL DEFAULT 5,
+                          available_at_ms INTEGER NOT NULL,
+                          claimed_at_ms INTEGER,
+                          completed_at_ms INTEGER,
+                          last_error TEXT NOT NULL DEFAULT '',
+                          created_at_ms INTEGER NOT NULL,
+                          updated_at_ms INTEGER NOT NULL,
+                          CHECK (status IN ('pending','processing','retry','deferred','completed','dead_letter'))
+                        )
+                        """
+                    )
+                    self.conn.execute(
+                        """
+                        INSERT INTO durable_alert_inbox
+                        (alert_id, raw_alert_json, source, product, status, attempts, max_attempts,
+                         available_at_ms, claimed_at_ms, completed_at_ms, last_error,
+                         created_at_ms, updated_at_ms)
+                        SELECT alert_id, raw_alert_json, source, product,
+                               CASE
+                                 WHEN status = 'retry'
+                                      AND (last_error LIKE ? OR last_error LIKE ?)
+                                   THEN 'deferred'
+                                 ELSE status
+                               END,
+                               attempts, max_attempts, available_at_ms, claimed_at_ms,
+                               completed_at_ms, last_error, created_at_ms, updated_at_ms
+                        FROM durable_alert_inbox_v11
+                        """,
+                        (
+                            f"{_LLM_DEFERRED_ERROR_PREFIX}%",
+                            f"%{_LEGACY_LLM_DEFERRED_ERROR_FRAGMENT}%",
+                        ),
+                    )
+                    self.conn.execute("DROP TABLE durable_alert_inbox_v11")
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_inbox_claim "
+                    "ON durable_alert_inbox(status, available_at_ms, created_at_ms)"
+                )
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO schema_version(version, applied_at_ms) VALUES (12, ?)",
+                    (now_ms(),),
+                )
+
             self.conn.commit()
 
     def readiness_check(self) -> dict[str, Any]:
@@ -650,6 +817,28 @@ class Repository:
                 self.conn.commit()
             return cur.rowcount > 0
 
+    def get_raw_alert(self, alert_id: str) -> RawAlert | None:
+        """Rehydrate preserved intake evidence for an analyst-requested replay."""
+        with self._lock:
+            row = self.conn.execute(
+                """
+                SELECT alert_id, source, product, event_type, severity, timestamp, payload_json
+                FROM raw_alerts WHERE alert_id = ?
+                """,
+                (alert_id,),
+            ).fetchone()
+            if not row:
+                return None
+            return RawAlert(
+                alert_id=str(row["alert_id"]),
+                source=str(row["source"]),
+                product=str(row["product"]),
+                event_type=str(row["event_type"]),
+                severity=str(row["severity"]),
+                timestamp=str(row["timestamp"]),
+                payload=json.loads(row["payload_json"]),
+            )
+
     def insert_normalized_event(self, event: NormalizedEvent, _commit: bool = True) -> bool:
         """Append-only insert of a normalized event.
 
@@ -666,8 +855,8 @@ class Repository:
                 """
                 INSERT OR IGNORE INTO normalized_events
                 (event_id, alert_id, source, product, event_type, severity, timestamp,
-                 entities_json, evidence_json, sensitivity_tags_json, evidence_hash, created_at_ms)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 entities_json, evidence_json, sensitivity_tags_json, evidence_hash, event_at_ms, created_at_ms)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event.event_id,
@@ -681,6 +870,7 @@ class Repository:
                     evidence_json,
                     json.dumps(event.sensitivity_tags, ensure_ascii=False),
                     evidence_hash,
+                    self.timestamp_ms(event.timestamp),
                     now_ms(),
                 ),
             )
@@ -783,21 +973,128 @@ class Repository:
             if _commit:
                 self.conn.commit()
 
+    def get_validation(self, validation_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT result_json FROM validation_runs WHERE validation_id = ?",
+                (validation_id,),
+            ).fetchone()
+            return json.loads(row["result_json"]) if row else None
+
+    def get_validation_review_resolution(self, validation_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM validation_review_resolutions WHERE validation_id = ?",
+                (validation_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def create_validation_review_resolution(
+        self,
+        resolution_id: str,
+        validation_id: str,
+        case_id: str,
+        event_id: str,
+        actor: str,
+        reason: str,
+        _commit: bool = True,
+    ) -> tuple[dict[str, Any], bool]:
+        """Persist the one allowed analyst continuation for a validation run.
+
+        ``validation_id`` is unique, making retry/double-click behavior
+        idempotent. This lower layer repeats the eligibility check so a caller
+        cannot turn another kind of review into an approval by bypassing the
+        HTTP/state boundary.
+        """
+        with self._lock:
+            validation_row = self.conn.execute(
+                """
+                SELECT case_id, event_id, result_json FROM validation_runs
+                WHERE validation_id = ?
+                """,
+                (validation_id,),
+            ).fetchone()
+            if (
+                not validation_row
+                or validation_row["case_id"] != case_id
+                or validation_row["event_id"] != event_id
+            ):
+                raise ValueError("validation does not match the requested case and event")
+            validation = ValidationResult.from_dict(json.loads(validation_row["result_json"]))
+            if not can_continue_after_manual_review(validation):
+                raise ValueError("validation review is not eligible for manual continuation")
+            cur = self.conn.execute(
+                """
+                INSERT OR IGNORE INTO validation_review_resolutions
+                (resolution_id, validation_id, case_id, event_id, decision, actor, reason, created_at_ms)
+                VALUES (?, ?, ?, ?, 'continue', ?, ?, ?)
+                """,
+                (resolution_id, validation_id, case_id, event_id, actor, reason, now_ms()),
+            )
+            row = self.conn.execute(
+                "SELECT * FROM validation_review_resolutions WHERE validation_id = ?",
+                (validation_id,),
+            ).fetchone()
+            if _commit:
+                self.conn.commit()
+            if not row:  # pragma: no cover - INSERT OR IGNORE must select a row.
+                raise RuntimeError("validation review resolution was not persisted")
+            return dict(row), cur.rowcount > 0
+
     def insert_approval(self, approval: dict[str, Any], _commit: bool = True) -> bool:
         with self._lock:
             case = self.conn.execute(
                 "SELECT status FROM cases WHERE case_id = ?", (approval["case_id"],)
             ).fetchone()
-            validation = self.conn.execute(
-                """
-                SELECT status FROM validation_runs
-                WHERE case_id = ? AND event_id = ? ORDER BY created_at_ms DESC LIMIT 1
-                """,
-                (approval["case_id"], approval["event_id"]),
-            ).fetchone()
+            validation_id = str(approval.get("validation_id") or "")
+            if validation_id:
+                validation = self.conn.execute(
+                    """
+                    SELECT validation_id, case_id, event_id, status FROM validation_runs
+                    WHERE validation_id = ?
+                    """,
+                    (validation_id,),
+                ).fetchone()
+            else:
+                validation = self.conn.execute(
+                    """
+                    SELECT validation_id, case_id, event_id, status FROM validation_runs
+                    WHERE case_id = ? AND event_id = ? ORDER BY created_at_ms DESC LIMIT 1
+                    """,
+                    (approval["case_id"], approval["event_id"]),
+                ).fetchone()
             if not case or case["status"] in {"closed", "false_positive"}:
                 return False
-            if not validation or validation["status"] != "passed":
+            if (
+                not validation
+                or validation["case_id"] != approval["case_id"]
+                or validation["event_id"] != approval["event_id"]
+            ):
+                return False
+            review_resolution_id = str(approval.get("review_resolution_id") or "")
+            if validation["status"] == "passed":
+                allowed = not review_resolution_id
+            elif validation["status"] == "review" and review_resolution_id:
+                resolution = self.conn.execute(
+                    """
+                    SELECT 1 FROM validation_review_resolutions
+                    WHERE resolution_id = ?
+                      AND validation_id = ?
+                      AND case_id = ?
+                      AND event_id = ?
+                      AND decision = 'continue'
+                    """,
+                    (
+                        review_resolution_id,
+                        validation["validation_id"],
+                        approval["case_id"],
+                        approval["event_id"],
+                    ),
+                ).fetchone()
+                allowed = bool(resolution)
+            else:
+                allowed = False
+            if not allowed:
                 return False
             action_json = json.dumps(
                 {
@@ -812,15 +1109,18 @@ class Repository:
             cur = self.conn.execute(
                 """
                 INSERT OR IGNORE INTO action_approvals
-                (approval_id, case_id, event_id, action_json, status, requested_by,
+                (approval_id, case_id, event_id, validation_id, review_resolution_id,
+                 action_json, status, requested_by,
                  decided_by, decision_reason, execution_status, required_approvals,
                  created_at_ms, updated_at_ms)
-                VALUES (?, ?, ?, ?, 'pending', ?, '', '', 'not_executed', ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, '', '', 'not_executed', ?, ?, ?)
                 """,
                 (
                     approval["approval_id"],
                     approval["case_id"],
                     approval["event_id"],
+                    validation["validation_id"],
+                    review_resolution_id,
                     action_json,
                     approval["requested_by"],
                     max(1, min(int(approval.get("required_approvals", 1)), 5)),
@@ -895,7 +1195,11 @@ class Repository:
             return self._approval_row(row) if row else None
 
     def list_approvals(
-        self, case_id: str | None = None, status: str | None = None, limit: int = 100
+        self,
+        case_id: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+        review_resolution_id: str | None = None,
     ) -> list[dict[str, Any]]:
         with self._lock:
             clauses: list[str] = []
@@ -906,6 +1210,9 @@ class Repository:
             if status:
                 clauses.append("status = ?")
                 params.append(status)
+            if review_resolution_id:
+                clauses.append("review_resolution_id = ?")
+                params.append(review_resolution_id)
             sql = "SELECT * FROM action_approvals"
             if clauses:
                 sql += " WHERE " + " AND ".join(clauses)
@@ -991,14 +1298,10 @@ class Repository:
                 for row in rows
             ]
 
-    def enqueue_alert(
-        self,
-        alert: RawAlert | dict[str, Any],
-        max_attempts: int = 5,
-        _commit: bool = True,
-    ) -> bool:
-        payload = (
-            {
+    @staticmethod
+    def _durable_alert_payload(alert: RawAlert | dict[str, Any]) -> dict[str, Any]:
+        if isinstance(alert, RawAlert):
+            return {
                 "source": alert.source,
                 "product": alert.product,
                 "event_type": alert.event_type,
@@ -1006,15 +1309,81 @@ class Repository:
                 "timestamp": alert.timestamp,
                 "payload": alert.payload,
                 "alert_id": alert.alert_id,
-                "trusted_sample": bool(getattr(alert, "trusted_sample", False)),
+                "trusted_sample": bool(alert.trusted_sample),
             }
-            if isinstance(alert, RawAlert)
-            else dict(alert)
+        return dict(alert)
+
+    @staticmethod
+    def _alert_identity_json(payload: dict[str, Any]) -> str:
+        """Render the immutable source-event identity stored under ``alert_id``.
+
+        ``trusted_sample`` is deliberately excluded: it controls local demo
+        parsing, while the source evidence determines whether a retry is the
+        same alert occurrence.
+        """
+        return json.dumps(
+            {
+                "source": str(payload.get("source") or "unknown"),
+                "product": str(payload.get("product") or "unknown").lower(),
+                "event_type": str(payload.get("event_type") or "unknown"),
+                "severity": str(payload.get("severity") or "medium").lower(),
+                "timestamp": str(payload.get("timestamp") or ""),
+                "payload": payload.get("payload", {}),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
         )
+
+    def _assert_alert_identity_consistent_locked(
+        self,
+        alert_id: str,
+        identity_json: str,
+    ) -> None:
+        """Fail closed when an idempotency key points at different evidence."""
+        inbox = self.conn.execute(
+            "SELECT raw_alert_json FROM durable_alert_inbox WHERE alert_id = ?",
+            (alert_id,),
+        ).fetchone()
+        if inbox:
+            prior_payload = json.loads(inbox["raw_alert_json"])
+            if self._alert_identity_json(prior_payload) != identity_json:
+                raise AlertIdentityConflict(alert_id)
+
+        raw = self.conn.execute(
+            """
+            SELECT source, product, event_type, severity, timestamp, payload_json
+            FROM raw_alerts WHERE alert_id = ?
+            """,
+            (alert_id,),
+        ).fetchone()
+        if raw:
+            prior_payload = {
+                "source": raw["source"],
+                "product": raw["product"],
+                "event_type": raw["event_type"],
+                "severity": raw["severity"],
+                "timestamp": raw["timestamp"],
+                "payload": json.loads(raw["payload_json"]),
+            }
+            if self._alert_identity_json(prior_payload) != identity_json:
+                raise AlertIdentityConflict(alert_id)
+
+    def enqueue_alert(
+        self,
+        alert: RawAlert | dict[str, Any],
+        max_attempts: int = 5,
+        _commit: bool = True,
+    ) -> bool:
+        payload = self._durable_alert_payload(alert)
         alert_id = str(payload.get("alert_id") or "").strip()
         if not alert_id:
             raise ValueError("alert_id is required for durable enqueue")
         with self._lock:
+            self._assert_alert_identity_consistent_locked(
+                alert_id,
+                self._alert_identity_json(payload),
+            )
             created = now_ms()
             cur = self.conn.execute(
                 """
@@ -1055,12 +1424,15 @@ class Repository:
         Keeping the count, consistency check and insert under the repository
         transaction prevents concurrent submissions from racing the recovery.
         """
-        alert_id = str(
-            alert.alert_id if isinstance(alert, RawAlert) else alert.get("alert_id", "")
-        ).strip()
+        payload = self._durable_alert_payload(alert)
+        alert_id = str(payload.get("alert_id") or "").strip()
         if not alert_id:
             raise ValueError("alert_id is required for durable enqueue")
         with self.transaction():
+            self._assert_alert_identity_consistent_locked(
+                alert_id,
+                self._alert_identity_json(payload),
+            )
             existing = self.conn.execute(
                 "SELECT status FROM durable_alert_inbox WHERE alert_id = ?",
                 (alert_id,),
@@ -1075,7 +1447,7 @@ class Repository:
             backlog = self.conn.execute(
                 """
                 SELECT COUNT(*) AS count FROM durable_alert_inbox
-                WHERE status IN ('pending', 'retry', 'processing')
+                WHERE status IN ('pending', 'retry', 'deferred', 'processing')
                 """
             ).fetchone()["count"]
             if int(backlog) >= max(1, int(capacity)):
@@ -1202,6 +1574,120 @@ class Repository:
                 self.conn.commit()
             return status
 
+    def defer_inbox_alert(
+        self,
+        alert_id: str,
+        *,
+        retry_delay_ms: int,
+        reason: str = "remote_llm_unavailable",
+        _commit: bool = True,
+    ) -> bool:
+        """Return a remote-model failure to the Inbox without consuming retry budget.
+
+        ``claim_inbox_alert`` increments ``attempts`` before an executor calls
+        the model. A remote outage is not an alert-processing defect, so that
+        claim must not turn into a terminal dead letter merely because the
+        endpoint was unavailable for an extended period.
+        """
+        with self._lock:
+            deferred_at = now_ms()
+            normalized_reason = str(reason or "remote_llm_unavailable").strip()[:512]
+            cur = self.conn.execute(
+                """
+                UPDATE durable_alert_inbox
+                SET status = 'deferred',
+                    attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
+                    available_at_ms = ?,
+                    claimed_at_ms = NULL,
+                    last_error = ?,
+                    updated_at_ms = ?
+                WHERE alert_id = ? AND status = 'processing'
+                """,
+                (
+                    deferred_at + max(0, int(retry_delay_ms)),
+                    f"{_LLM_DEFERRED_ERROR_PREFIX}{normalized_reason}",
+                    deferred_at,
+                    alert_id,
+                ),
+            )
+            if _commit:
+                self.conn.commit()
+            return cur.rowcount == 1
+
+    def release_llm_deferred_alerts(
+        self,
+        *,
+        limit: int = 100,
+        force: bool = True,
+        _commit: bool = True,
+    ) -> dict[str, int]:
+        """Make recoverable remote-LLM work eligible for dispatch.
+
+        This includes legacy rows that reached ``dead_letter`` before remote
+        deferrals stopped consuming the durable attempt budget. Generic dead
+        letters are intentionally excluded. Scheduled recovery only touches due
+        ``deferred`` rows. Legacy dead letters require an explicit analyst replay
+        after the model service has been repaired, preventing a stale 4xx
+        credential failure from being reissued on every maintenance interval.
+        """
+        batch_size = max(1, min(int(limit), 500))
+        with self.transaction():
+            released_at = now_ms()
+            rows = self.conn.execute(
+                """
+                SELECT alert_id, status
+                FROM durable_alert_inbox
+                WHERE (
+                    (status = 'deferred' AND (last_error LIKE ? OR last_error LIKE ?))
+                    OR (status = 'dead_letter' AND (last_error LIKE ? OR last_error LIKE ?))
+                )
+                  AND (? = 1 OR (status = 'deferred' AND available_at_ms <= ?))
+                ORDER BY CASE status WHEN 'dead_letter' THEN 0 ELSE 1 END,
+                         available_at_ms ASC, created_at_ms ASC
+                LIMIT ?
+                """,
+                (
+                    f"{_LLM_DEFERRED_ERROR_PREFIX}%",
+                    f"%{_LEGACY_LLM_DEFERRED_ERROR_FRAGMENT}%",
+                    f"{_LLM_DEFERRED_ERROR_PREFIX}%",
+                    f"%{_LEGACY_LLM_DEFERRED_ERROR_FRAGMENT}%",
+                    1 if force else 0,
+                    released_at,
+                    batch_size,
+                ),
+            ).fetchall()
+            deferred_released = 0
+            dead_letter_recovered = 0
+            for row in rows:
+                status = str(row["status"])
+                self.conn.execute(
+                    """
+                    UPDATE durable_alert_inbox
+                    SET status = 'retry', attempts = 0, available_at_ms = ?,
+                        claimed_at_ms = NULL,
+                        last_error = ?, updated_at_ms = ?
+                    WHERE alert_id = ? AND status = ?
+                    """,
+                    (
+                        released_at,
+                        f"{_LLM_DEFERRED_ERROR_PREFIX}recovery_dispatch",
+                        released_at,
+                        row["alert_id"],
+                        status,
+                    ),
+                )
+                if status == "dead_letter":
+                    dead_letter_recovered += 1
+                else:
+                    deferred_released += 1
+            return {
+                "released": len(rows),
+                # Keep the historical field for callers that already display it.
+                "retry_released": deferred_released,
+                "deferred_released": deferred_released,
+                "dead_letter_recovered": dead_letter_recovered,
+            }
+
     def recover_stale_inbox(self, stale_before_ms: int, _commit: bool = True) -> int:
         with self._lock:
             recovered_at = now_ms()
@@ -1251,7 +1737,37 @@ class Repository:
             }
             return {
                 status: counts.get(status, 0)
-                for status in ("pending", "retry", "processing", "completed", "dead_letter")
+                for status in ("pending", "retry", "deferred", "processing", "completed", "dead_letter")
+            }
+
+    def llm_deferred_inbox_stats(self) -> dict[str, int]:
+        """Return the recoverable remote-LLM portion of the durable Inbox."""
+        with self._lock:
+            counts = {
+                str(row["status"]): int(row["count"])
+                for row in self.conn.execute(
+                    """
+                    SELECT status, COUNT(*) AS count
+                    FROM durable_alert_inbox
+                    WHERE status IN ('deferred', 'dead_letter')
+                      AND (last_error LIKE ? OR last_error LIKE ?)
+                    GROUP BY status
+                    """,
+                    (
+                        f"{_LLM_DEFERRED_ERROR_PREFIX}%",
+                        f"%{_LEGACY_LLM_DEFERRED_ERROR_FRAGMENT}%",
+                    ),
+                ).fetchall()
+            }
+            deferred = counts.get("deferred", 0)
+            dead_letter = counts.get("dead_letter", 0)
+            return {
+                "deferred": deferred,
+                # Backwards-compatible zero while clients migrate to the
+                # explicit durable deferral state.
+                "retry": 0,
+                "dead_letter": dead_letter,
+                "total": deferred + dead_letter,
             }
 
     def purge_completed_inbox(self, before_ms: int, _commit: bool = True) -> int:
@@ -1289,6 +1805,7 @@ class Repository:
             "normalized_events": 0,
             "agent_runs": 0,
             "validations": 0,
+            "validation_review_resolutions": 0,
             "approvals": 0,
             "memory_matches": 0,
             "audit_events": 0,
@@ -1461,6 +1978,11 @@ class Repository:
                 )
                 counts["approvals"] += cur.rowcount
                 cur = self.conn.execute(
+                    "DELETE FROM validation_review_resolutions WHERE case_id = ?",
+                    (case_id,),
+                )
+                counts["validation_review_resolutions"] += cur.rowcount
+                cur = self.conn.execute(
                     "DELETE FROM validation_runs WHERE case_id = ?",
                     (case_id,),
                 )
@@ -1521,6 +2043,12 @@ class Repository:
     def _inbox_row(row: sqlite3.Row) -> dict[str, Any]:
         payload = dict(row)
         payload["raw_alert"] = json.loads(payload.pop("raw_alert_json"))
+        error = str(payload.get("last_error") or "")
+        payload["analysis_deferred"] = (
+            str(payload.get("status") or "") == "deferred"
+            or error.startswith(_LLM_DEFERRED_ERROR_PREFIX)
+            or _LEGACY_LLM_DEFERRED_ERROR_FRAGMENT in error
+        )
         return payload
 
     def get_normalized_event(self, event_id: str) -> NormalizedEvent | None:
@@ -1583,10 +2111,18 @@ class Repository:
                        l.case_id
                 FROM normalized_events ne
                 LEFT JOIN case_alert_links l ON l.event_id = ne.event_id
-                WHERE ne.event_id != ? AND ne.product != ?
-                ORDER BY ne.created_at_ms DESC LIMIT 2000
+                WHERE ne.event_id != ?
+                  AND ne.product != ?
+                  AND ne.event_at_ms BETWEEN ? AND ?
+                ORDER BY ABS(ne.event_at_ms - ?) ASC, ne.event_id ASC LIMIT 2000
                 """,
-                (event.event_id, event.product),
+                (
+                    event.event_id,
+                    event.product,
+                    event_at - bounded_window,
+                    event_at + bounded_window,
+                    event_at,
+                ),
             ).fetchall()
         matches: list[dict[str, Any]] = []
         current_network = {current.get("src_ip"), current.get("dst_ip")} - {None, ""}
@@ -1915,6 +2451,41 @@ class Repository:
                 "SELECT * FROM alert_dispositions WHERE alert_id = ?", (alert_id,)
             ).fetchone()
             return dict(row) if row else None
+
+    def get_alert_disposition_summary(self, alert_id: str) -> dict[str, Any] | None:
+        """Return the stable response shape for an existing alert disposition."""
+        with self._lock:
+            row = self.conn.execute(
+                """
+                SELECT alert_id, case_id, disposition, updated_at_ms
+                FROM alert_dispositions
+                WHERE alert_id = ?
+                """,
+                (alert_id,),
+            ).fetchone()
+            if not row:
+                return None
+            aggregate = self.conn.execute(
+                """
+                SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN d.disposition = 'false_positive' THEN 1 ELSE 0 END) AS false_positives
+                FROM case_alert_links l
+                LEFT JOIN alert_dispositions d ON d.alert_id = l.alert_id
+                WHERE l.case_id = ?
+                """,
+                (row["case_id"],),
+            ).fetchone()
+            total = int(aggregate["total"] or 0)
+            false_positives = int(aggregate["false_positives"] or 0)
+            return {
+                "alert_id": str(row["alert_id"]),
+                "case_id": str(row["case_id"]),
+                "disposition": str(row["disposition"]),
+                "case_alert_count": total,
+                "case_false_positive_count": false_positives,
+                "case_can_close_as_false_positive": total > 0 and false_positives == total,
+                "updated_at_ms": int(row["updated_at_ms"]),
+            }
 
     # ---- mapping profiles -------------------------------------------------
 
@@ -2509,10 +3080,30 @@ class Repository:
                 parsed_runs.append(item)
             result["agent_runs"] = parsed_runs
             validations = self.conn.execute(
-                "SELECT result_json FROM validation_runs WHERE case_id = ? ORDER BY created_at_ms DESC",
+                """
+                SELECT vr.result_json,
+                       rr.resolution_id, rr.decision, rr.actor, rr.reason,
+                       rr.created_at_ms AS resolution_created_at_ms
+                FROM validation_runs vr
+                LEFT JOIN validation_review_resolutions rr ON rr.validation_id = vr.validation_id
+                WHERE vr.case_id = ?
+                ORDER BY vr.created_at_ms DESC
+                """,
                 (case_id,),
             ).fetchall()
-            result["validation_runs"] = [json.loads(item["result_json"]) for item in validations]
+            parsed_validations = []
+            for item in validations:
+                validation = json.loads(item["result_json"])
+                if item["resolution_id"]:
+                    validation["manual_review_resolution"] = {
+                        "resolution_id": item["resolution_id"],
+                        "decision": item["decision"],
+                        "actor": item["actor"],
+                        "reason": item["reason"],
+                        "created_at_ms": item["resolution_created_at_ms"],
+                    }
+                parsed_validations.append(validation)
+            result["validation_runs"] = parsed_validations
             result["approvals"] = self.list_approvals(case_id=case_id, limit=100)
             result["memory_matches"] = self.list_memory_matches(case_id=case_id, limit=200)
             result["linked_alerts"] = self._linked_alerts_locked(case_id)
@@ -2673,6 +3264,13 @@ class Repository:
                     "updated_at_ms": row["updated_at_ms"],
                 }
         return None
+
+    def get_confirmed_false_positive_memory(
+        self, alert_id: str, case_id: str
+    ) -> dict[str, Any] | None:
+        """Return the active human confirmation for one alert/Case pair."""
+        with self._lock:
+            return self._confirmed_false_positive_memory_locked(alert_id, case_id)
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
