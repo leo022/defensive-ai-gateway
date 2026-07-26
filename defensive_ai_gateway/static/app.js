@@ -1258,6 +1258,17 @@ function formatDatetimeLocal(date) {
   ].join("-") + `T${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
+function setPendingCaseSearchCurrentMonth(now = new Date()) {
+  const form = document.querySelector('form[data-case-search-section="pending"]');
+  if (!form) return;
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
+  const monthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 0, 0);
+  const fromInput = form.elements.namedItem("from");
+  const toInput = form.elements.namedItem("to");
+  if (fromInput) fromInput.value = formatDatetimeLocal(monthStart);
+  if (toInput) toInput.value = formatDatetimeLocal(monthEnd);
+}
+
 function datetimeLocalMs(value) {
   if (!value) return null;
   const ms = new Date(value).getTime();
@@ -4295,6 +4306,7 @@ document.querySelectorAll(".case-search-form").forEach((form) => {
   });
   form.querySelector("button[type=button]")?.addEventListener("click", () => {
     form.reset();
+    if (section === "pending") setPendingCaseSearchCurrentMonth();
     casePagination[section].page = 1;
     activeDashboardSection = section;
     setView("dashboard");
@@ -4512,6 +4524,7 @@ document.querySelector("#auth-form").addEventListener("submit", async (event) =>
 });
 
 renderLogProductOptions();
+setPendingCaseSearchCurrentMonth();
 loadApplicationData().catch((err) =>
   showToast(err.message || String(err), "error"),
 );
