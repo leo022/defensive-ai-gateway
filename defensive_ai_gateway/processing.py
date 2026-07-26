@@ -37,6 +37,10 @@ class AlertRetryableError(RuntimeError):
         self.retry_after_seconds = _bounded_retry_after_seconds(retry_after_seconds)
 
 
+class AlertNonRetryableError(RuntimeError):
+    """A permanent processing failure that must enter the DLQ immediately."""
+
+
 @dataclass(frozen=True)
 class DeadLetter:
     """An accepted alert that could not reach a terminal processed state.
@@ -298,6 +302,14 @@ class AlertProcessor:
                 retry_after = _bounded_retry_after_seconds(
                     getattr(exc, "retry_after_seconds", 0.0)
                 )
+                if isinstance(exc, AlertNonRetryableError):
+                    self._record_dead_letter(
+                        alert,
+                        attempt,
+                        "non_retryable",
+                        repr(exc),
+                    )
+                    return
                 if (
                     isinstance(exc, AlertRetryableError)
                     and self._deferred_handler

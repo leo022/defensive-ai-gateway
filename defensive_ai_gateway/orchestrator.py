@@ -5,16 +5,17 @@ import json
 import threading
 from contextlib import contextmanager
 
+from .action_plan import normalize_action_plan
 from .agents.base import run_id
 from .agents.registry import build_agent
 from .database import Repository
-from .llm import LLMClient, LLMEndpointConfigurationError, LocalHeuristicLLM
+from .llm import LLMClient, LocalHeuristicLLM
 from .memory import MemoryManager
 from .memory_matcher import MemoryMatchEvaluation, MemoryMatcher
 from .models import AgentResult, NormalizedEvent, RawAlert, RecommendedAction, new_id
 from .normalizer import EventNormalizer
 from .policy import PolicyEngine
-from .processing import AlertRetryableError
+from .processing import AlertNonRetryableError, AlertRetryableError
 from .response import ResponseAdvisor
 from .skills import SkillRegistry
 from .validation import Validator
@@ -274,9 +275,9 @@ class Orchestrator:
         try:
             result = agent.analyze(case_id, event, memory_context)
         except Exception as exc:
-            if isinstance(exc, LLMEndpointConfigurationError):
-                # A WebSocket-only endpoint cannot recover on its own. Preserve
-                # the alert as a terminal failure instead of requeueing it forever.
+            if isinstance(exc, AlertNonRetryableError):
+                # Credentials, endpoint configuration and response-contract
+                # errors need operator intervention and must not fill deferred.
                 self.repo.insert_audit(
                     new_id("audit"), trace_id, agent.name, "analysis_failed",
                     {
@@ -329,6 +330,9 @@ class Orchestrator:
                 )
                 raise
         result = self.memory_matcher.reconcile(result, memory_evaluation)
+        # Memory reconciliation may append a verification step after the agent
+        # has normalized its plan. Persist one final deterministic plan order.
+        result.recommended_actions = normalize_action_plan(result.recommended_actions)
         result.explanation["model_runtime"] = {
             **model_runtime,
             "fallback_used": fallback_used,

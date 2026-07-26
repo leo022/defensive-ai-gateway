@@ -4,7 +4,7 @@ from .base import SecurityAgent
 class WafAgent(SecurityAgent):
     name = "waf-agent"
     product = "waf"
-    prompt_version = "waf-v2"
+    prompt_version = "waf-v3"
 
     def system_prompt(self) -> str:
         return """

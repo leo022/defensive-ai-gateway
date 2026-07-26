@@ -4,7 +4,7 @@ from .base import SecurityAgent
 class HipsAgent(SecurityAgent):
     name = "hips-agent"
     product = "hips"
-    prompt_version = "hips-v2"
+    prompt_version = "hips-v3"
 
     def system_prompt(self) -> str:
         return """

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" role="img" aria-labelledby="logo-title logo-desc">
+  <title id="logo-title">AI Defensive Agent</title>
+  <desc id="logo-desc">A shield crossed by a verified evidence path.</desc>
+  <rect x="4" y="4" width="88" height="88" rx="18" fill="#0b1f2a" />
+  <path d="M48 14 76 24v20c0 18-10.8 32.4-28 40-17.2-7.6-28-22-28-40V24Z" fill="#0f766e" />
+  <path d="m29 60 12-24 9 16 14-22" fill="none" stroke="#f8fafc" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" />
+  <path d="M29 68h38" fill="none" stroke="#ff7a59" stroke-width="7" stroke-linecap="round" />
+</svg>

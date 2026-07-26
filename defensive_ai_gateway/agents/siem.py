@@ -4,7 +4,7 @@ from .base import SecurityAgent
 class SiemAgent(SecurityAgent):
     name = "siem-fusion-agent"
     product = "siem"
-    prompt_version = "siem-v2"
+    prompt_version = "siem-v3"
 
     def system_prompt(self) -> str:
         return """

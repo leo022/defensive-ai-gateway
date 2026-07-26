@@ -5,6 +5,8 @@ import re
 from abc import ABC, abstractmethod
 from typing import Any
 
+from ..action_plan import normalize_action_plan
+
 from ..llm import LLMClient
 from ..models import AgentResult, NormalizedEvent, RecommendedAction, new_id
 from ..policy import PolicyEngine
@@ -116,6 +118,7 @@ class SecurityAgent(ABC):
             + "\nanalysis_dimensions 必须按输入 report_outline 的小标题组织；每个维度只写结论化证据，不复写完整 payload。没有证据的维度也要说明缺口，而不是留空。"
             + "\nbenign/误报结论必须在至少两个维度引用当前告警中的具体可核验观测值（如规则、资产、路径、动作）；不得用模型自行生成的 normal/benign 状态作为结论依据。"
             + "\nverdict 只能使用三类格式：【真实攻击】- 原因、【误报】- 原因、【需人工复核】- 原因。SIEM 真实事件也归入【真实攻击】标签。"
+            + "\nverdict 是处置台首屏标题：原因部分必须先写具体攻击或风险类型，再写一个最关键事实；控制在 36 个汉字以内，不得堆叠实体、置信度、业务影响或处置建议。"
             + "\n必须返回严格 JSON，字段如下："
             + '\n{"classification":"malicious|suspicious|benign|insufficient_evidence",'
             + '"confidence":0.0,'
@@ -139,16 +142,19 @@ class SecurityAgent(ABC):
         llm_result: dict[str, Any],
         explanation: dict[str, Any],
     ) -> str:
-        entity_bits = ", ".join(f"{k}={v}" for k, v in event.entities.items()) or "缺少关键实体"
-        impact = llm_result.get("business_impact")
         verdict = explanation.get("verdict") or self._first_reason_line(llm_result.get("reason", ""))
-        core_evidence = self._core_evidence_sentence(explanation.get("dimensions", []))
-        impact_value = self._strip_terminal(impact) if impact else "当前证据不足以量化影响范围"
-        impact_text = f"业务影响：{impact_value}。"
-        return (
-            f"{verdict}。{self.product.upper()} {event.event_type} 判定为 {classification}，置信度 {confidence:.2f}。"
-            f"关键实体：{entity_bits}。核心依据：{self._strip_terminal(core_evidence)}。{impact_text}"
-        )
+        # ``summary`` is the Case title used by the queue. Confidence, entities,
+        # evidence and impact already have dedicated fields in the detail view.
+        return self._compact_case_title(verdict, event.event_type)
+
+    def _compact_case_title(self, verdict: Any, event_type: str) -> str:
+        value = re.sub(r"^研判结论[：:]\s*", "", str(verdict or "").strip())
+        value = re.split(r"[。\n]", value, maxsplit=1)[0].strip()
+        if not value:
+            value = f"【需人工复核】- {event_type or '安全告警'}关键证据不足"
+        if len(value) > 72:
+            value = value[:71].rstrip("，,；;：:、 ") + "…"
+        return value
 
     def _correct_rasp_evidence_claims(
         self,
@@ -1090,7 +1096,7 @@ class SecurityAgent(ABC):
                     "AI 置信度达到可疑级别，需要分析师确认。",
                 )
             )
-        return actions
+        return normalize_action_plan(actions)
 
 
 def run_id() -> str:

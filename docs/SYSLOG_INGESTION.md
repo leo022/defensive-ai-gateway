@@ -84,10 +84,12 @@ python3 scripts/simulate_syslog_ports.py --config config/dev.yaml
 processing:
   async_enabled: true
   queue_max_size: 5000
+  queue_max_bytes: 536870912
+  min_free_bytes: 134217728
   workers: 4
 ```
 
-`POST /api/alerts` 完成鉴权、字段映射和 product 路由后，先写入 SQLite 持久 inbox，再返回 `202`；后台 worker 执行 Agent 分析、记忆加载和 Case 写入。进程崩溃后未完成项可恢复，有限重试终止的条目进入 DLQ。远程 LLM 不可达时，告警进入独立 `deferred` 状态而非普通 `retry`，因此调度器不会反复调用不可用模型；定时维护会按批次释放到 `retry`，分析师也可通过 `/api/alerts/inbox/release-llm-deferred` 手工恢复。若当前配置已切到本地规则分析器，释放会被拒绝，避免把远程模型待处理告警静默降级为本地结论。`GET /api/alerts/inbox?status=deferred` 与 `?status=dead_letter` 可查询待恢复或失败记录，`GET /api/health` 提供 queued、processing、deferred、failed/dead-letter 等指标。持久 inbox 达到上限时返回 `429`，让 Vector 磁盘 buffer 持续重试并施加回压。
+`POST /api/alerts` 完成鉴权、字段映射和 product 路由后，先写入 SQLite 持久 inbox，再返回 `202`；后台 worker 执行 Agent 分析、记忆加载和 Case 写入。进程崩溃后未完成项可恢复，有限重试终止的条目进入 DLQ。远程 LLM 不可达时，告警进入独立 `deferred` 状态而非普通 `retry`，因此调度器不会反复调用不可用模型；定时维护会按批次释放到 `retry`，分析师也可通过 `/api/alerts/inbox/release-llm-deferred` 手工恢复。若当前配置已切到本地规则分析器，释放会被拒绝，避免把远程模型待处理告警静默降级为本地结论。401/403、错误 HTTP 端点和响应契约错误属于永久配置问题，会直接进入 DLQ，修复配置后再由分析师恢复。`GET /api/alerts/inbox?status=deferred&limit=100&offset=0` 与 `?status=dead_letter&limit=100&offset=0` 可分页查询，`GET /api/health` 提供 queued、processing、deferred、最老积压时间、队列字节数和磁盘水位。持久 inbox 达到条数/字节上限或磁盘保留水位时返回 `429`，让 Vector 磁盘 buffer 持续重试并施加回压，但 Gateway 仍保持 readiness 供处置台和后台 worker 使用。
 
 ## Collector 输出格式
 

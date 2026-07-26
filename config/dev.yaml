@@ -24,6 +24,8 @@ policy:
 processing:
   async_enabled: true
   queue_max_size: 5000
+  queue_max_bytes: 536870912
+  min_free_bytes: 134217728
   workers: 4
   max_attempts: 3
   retry_base_seconds: 1

@@ -8,6 +8,7 @@ import ipaddress
 import json
 import mimetypes
 import os
+import shutil
 import socket
 import threading
 import time
@@ -60,7 +61,13 @@ from .network_safety import EndpointPin, pinned_endpoint_handlers, resolve_http_
 from .normalizer import EventNormalizer
 from .orchestrator import Orchestrator
 from .policy import PolicyEngine
-from .processing import AlertProcessor, AlertQueueFull, DeadLetter, DeferredAlert
+from .processing import (
+    AlertNonRetryableError,
+    AlertProcessor,
+    AlertQueueFull,
+    DeadLetter,
+    DeferredAlert,
+)
 from .skills import SkillRegistry
 from .syslog_receiver import SyslogListenerSpec, SyslogReceiverManager
 from .syslog_router import SyslogPortRouter
@@ -595,6 +602,18 @@ def _query_optional_int(query: dict[str, list[str]], key: str) -> int | None:
         return None
 
 
+def _pagination_payload(total: int, limit: int, offset: int) -> dict[str, int]:
+    safe_total = max(0, int(total))
+    safe_limit = max(1, int(limit))
+    safe_offset = max(0, int(offset))
+    total_pages = max(1, (safe_total + safe_limit - 1) // safe_limit)
+    return {
+        "total": safe_total,
+        "limit": safe_limit,
+        "offset": safe_offset,
+        "page": safe_offset // safe_limit + 1,
+        "total_pages": total_pages,
+    }
 class GatewayState:
     def __init__(self, config: GatewayConfig, config_path: str = ""):
         self.config = config
@@ -628,6 +647,8 @@ class GatewayState:
         self._dispatcher_stop = threading.Event()
         self._dispatcher_wakeup = threading.Event()
         self._dispatcher_thread: threading.Thread | None = None
+        self._dispatch_products = sorted(SUPPORTED_PRODUCTS)
+        self._dispatch_product_index = 0
         self._maintenance_stop = threading.Event()
         self._maintenance_thread: threading.Thread | None = None
         self._maintenance_last_success_ms = now_ms()
@@ -637,7 +658,9 @@ class GatewayState:
         self.alert_processor = (
             AlertProcessor(
                 self._handle_queued_alert,
-                max_size=config.processing.queue_max_size,
+                # The durable inbox owns backlog. Keep only one waiting item per
+                # worker in memory so claims never age behind a 20k local queue.
+                max_size=max(1, config.processing.workers),
                 workers=config.processing.workers,
                 # Durable inbox attempts are authoritative. Each claim receives
                 # one in-memory execution attempt before durable retry/DLQ.
@@ -757,10 +780,31 @@ class GatewayState:
                 )
 
     def _handle_queued_alert(self, alert: RawAlert):
-        result = self.orchestrator.handle_alert(alert)
-        if not self.repo.complete_inbox_alert(alert.alert_id):
-            raise RuntimeError(f"durable inbox completion failed for {alert.alert_id}")
-        return result
+        lease_stop = threading.Event()
+        lease_interval = min(
+            60.0,
+            max(10.0, self.config.operations.stale_claim_seconds / 3.0),
+        )
+
+        def renew_lease() -> None:
+            while not lease_stop.wait(lease_interval):
+                if not self.repo.renew_inbox_claim(alert.alert_id):
+                    return
+
+        lease_thread = threading.Thread(
+            target=renew_lease,
+            name=f"alert-lease-{alert.alert_id[:24]}",
+            daemon=True,
+        )
+        lease_thread.start()
+        try:
+            result = self.orchestrator.handle_alert(alert)
+            if not self.repo.complete_inbox_alert(alert.alert_id):
+                raise RuntimeError(f"durable inbox completion failed for {alert.alert_id}")
+            return result
+        finally:
+            lease_stop.set()
+            lease_thread.join(timeout=1.0)
 
     @staticmethod
     def _raw_alert_from_inbox(record: dict) -> RawAlert:
@@ -783,11 +827,22 @@ class GatewayState:
                 self._dispatcher_wakeup.wait(0.1)
                 self._dispatcher_wakeup.clear()
                 continue
-            claimed = self.repo.claim_inbox_alert()
+            preferred_product = (
+                self._dispatch_products[self._dispatch_product_index]
+                if self._dispatch_products
+                else None
+            )
+            claimed = self.repo.claim_inbox_alert(
+                preferred_product=preferred_product,
+            )
             if not claimed:
                 self._dispatcher_wakeup.wait(0.2)
                 self._dispatcher_wakeup.clear()
                 continue
+            if self._dispatch_products:
+                self._dispatch_product_index = (
+                    self._dispatch_product_index + 1
+                ) % len(self._dispatch_products)
             alert = self._raw_alert_from_inbox(claimed)
             try:
                 self.alert_processor.submit(alert)
@@ -807,15 +862,30 @@ class GatewayState:
         # Durable attempts are authoritative. Exponential scheduling prevents a
         # short-lived remote outage from immediately exhausting the retry budget.
         retry_delay_seconds = min(300.0, base_delay * (2 ** min(durable_attempt - 1, 8)))
+        jitter_seed = int(hashlib.sha256(entry.alert.alert_id.encode("utf-8")).hexdigest()[:8], 16)
+        retry_delay_seconds = min(
+            300.0,
+            retry_delay_seconds * (0.8 + (jitter_seed % 401) / 1000.0),
+        )
         retry_delay_seconds = max(
             retry_delay_seconds,
             min(300.0, max(0.0, float(entry.retry_after_seconds))),
         )
-        status = self.repo.fail_inbox_alert(
-            entry.alert.alert_id,
-            entry.error or entry.reason,
-            retry_delay_ms=int(retry_delay_seconds * 1000),
-        )
+        if entry.reason == "non_retryable":
+            status = (
+                "dead_letter"
+                if self.repo.dead_letter_inbox_alert(
+                    entry.alert.alert_id,
+                    entry.error or entry.reason,
+                )
+                else None
+            )
+        else:
+            status = self.repo.fail_inbox_alert(
+                entry.alert.alert_id,
+                entry.error or entry.reason,
+                retry_delay_ms=int(retry_delay_seconds * 1000),
+            )
         if status == "dead_letter":
             self.repo.insert_audit(
                 new_id("audit"),
@@ -1037,8 +1107,78 @@ class GatewayState:
             alert = self.alert_from_payload(routed.payload, routed.profile_id)
         self.submit_alert(alert)
 
+    def _storage_stats(self) -> dict:
+        database_path = Path(self.repo.path)
+        usage = shutil.disk_usage(database_path.parent)
+        wal_path = Path(f"{database_path}-wal")
+        return {
+            "database_bytes": database_path.stat().st_size if database_path.exists() else 0,
+            "wal_bytes": wal_path.stat().st_size if wal_path.exists() else 0,
+            "disk_total_bytes": int(usage.total),
+            "disk_used_bytes": int(usage.used),
+            "disk_free_bytes": int(usage.free),
+            "min_free_bytes": int(self.config.processing.min_free_bytes),
+        }
+
+    def _inbox_capacity_stats(self) -> dict:
+        processing_config = getattr(getattr(self, "config", None), "processing", None)
+        capacity_fn = getattr(self.repo, "inbox_capacity_stats", None)
+        capacity = (
+            capacity_fn()
+            if callable(capacity_fn)
+            else {
+                "unfinished_count": sum(
+                    int(value)
+                    for key, value in self.repo.inbox_stats().items()
+                    if key in {"pending", "retry", "deferred", "processing"}
+                ),
+                "unfinished_bytes": 0,
+                "oldest_age_ms": 0,
+            }
+        )
+        try:
+            storage = self._storage_stats()
+        except (AttributeError, OSError):
+            storage = {
+                "database_bytes": 0,
+                "wal_bytes": 0,
+                "disk_total_bytes": 0,
+                "disk_used_bytes": 0,
+                "disk_free_bytes": 0,
+                "min_free_bytes": int(
+                    getattr(processing_config, "min_free_bytes", 0)
+                ),
+            }
+        count_limit = int(
+            getattr(
+                processing_config,
+                "queue_max_size",
+                max(1, int(capacity["unfinished_count"]) + 1),
+            )
+        )
+        byte_limit = int(
+            getattr(processing_config, "queue_max_bytes", 1024 * 1024 * 1024)
+        )
+        free_ok = (
+            storage["disk_total_bytes"] == 0
+            or storage["disk_free_bytes"] >= storage["min_free_bytes"]
+        )
+        admission_ok = (
+            int(capacity["unfinished_count"]) < count_limit
+            and int(capacity["unfinished_bytes"]) < byte_limit
+            and free_ok
+        )
+        return {
+            **capacity,
+            **storage,
+            "count_limit": count_limit,
+            "byte_limit": byte_limit,
+            "admission_ok": admission_ok,
+        }
+
     def processing_stats(self) -> dict:
         inbox = self.repo.inbox_stats()
+        capacity = self._inbox_capacity_stats()
         deferred_stats = getattr(self.repo, "llm_deferred_inbox_stats", None)
         llm_deferred = (
             deferred_stats()
@@ -1067,6 +1207,7 @@ class GatewayState:
                 "deferred": durable_deferred,
                 "durable_inbox": inbox,
                 "llm_deferred": llm_deferred,
+                "capacity": capacity,
             }
         stats = self.alert_processor.stats().to_dict()
         executor_queued = int(stats.get("queued", 0))
@@ -1088,6 +1229,7 @@ class GatewayState:
         stats["deferred"] = durable_deferred
         stats["durable_inbox"] = inbox
         stats["llm_deferred"] = llm_deferred
+        stats["capacity"] = capacity
         return stats
 
     def readiness(self) -> dict:
@@ -1098,10 +1240,8 @@ class GatewayState:
             int(inbox.get(status, 0))
             for status in ("pending", "retry", "deferred", "processing")
         )
-        capacity_ok = (
-            not self.alert_processor
-            or backlog < self.config.processing.queue_max_size
-        )
+        capacity = self._inbox_capacity_stats()
+        capacity_ok = not self.alert_processor or bool(capacity["admission_ok"])
         processor_ok = (
             True if not self.alert_processor else self.alert_processor.is_healthy()
         )
@@ -1148,6 +1288,7 @@ class GatewayState:
                 "ok": capacity_ok,
                 "backlog": backlog,
                 "capacity": self.config.processing.queue_max_size,
+                **capacity,
             },
             "syslog": {
                 "ok": syslog_ok,
@@ -1156,17 +1297,30 @@ class GatewayState:
             },
         }
         return {
-            "ok": all(bool(check.get("ok")) for check in checks.values()),
+            # Capacity is an admission/backpressure signal, not a reason to
+            # remove the sole operator console and workers from the Service.
+            "ok": all(
+                bool(check.get("ok"))
+                for name, check in checks.items()
+                if name != "inbox_capacity"
+            ),
             "checks": checks,
         }
 
     def submit_alert(self, alert: RawAlert) -> dict:
         alert = _validate_raw_alert(alert)
         if self.alert_processor:
+            capacity = self._inbox_capacity_stats()
+            if (
+                not capacity["admission_ok"]
+                and not self.repo.get_inbox_alert(alert.alert_id)
+            ):
+                raise AlertQueueFull("durable alert inbox admission is paused")
             enqueue_status = self.repo.enqueue_alert_bounded(
                 alert,
                 max_attempts=self.config.processing.max_attempts,
                 capacity=self.config.processing.queue_max_size,
+                capacity_bytes=self.config.processing.queue_max_bytes,
             )
             if enqueue_status == "duplicate":
                 existing = self.repo.get_inbox_alert(alert.alert_id) or {}
@@ -1239,11 +1393,14 @@ class GatewayState:
             self.repo.complete_inbox_alert(alert.alert_id)
             return result.to_dict()
         except Exception as exc:
-            self.repo.fail_inbox_alert(
-                alert.alert_id,
-                repr(exc),
-                retry_delay_ms=int(self.config.processing.retry_base_seconds * 1000),
-            )
+            if isinstance(exc, AlertNonRetryableError):
+                self.repo.dead_letter_inbox_alert(alert.alert_id, repr(exc))
+            else:
+                self.repo.fail_inbox_alert(
+                    alert.alert_id,
+                    repr(exc),
+                    retry_delay_ms=int(self.config.processing.retry_base_seconds * 1000),
+                )
             raise
 
     def _seed_mapping_profiles(self) -> None:
@@ -2184,32 +2341,52 @@ class GatewayState:
 
     # ---- memory governance (Dashboard 记忆治理 module, architecture §8/§11) ----
 
+    @staticmethod
+    def _memory_query_options(filters: dict) -> dict:
+        include_expired = str(filters.get("include_expired", "")).lower() in {"1", "true", "yes"}
+        try:
+            limit = int(filters.get("limit", 100))
+        except (TypeError, ValueError):
+            limit = 100
+        try:
+            offset = int(filters.get("offset", 0))
+        except (TypeError, ValueError):
+            offset = 0
+        layer = str(filters.get("layer") or "").strip()
+        status = str(filters.get("status") or "").strip()
+        if layer and layer not in _MEMORY_LAYERS:
+            raise ValueError(f"unsupported memory layer: {layer}")
+        if status and status not in _MEMORY_STATUSES:
+            raise ValueError(f"unsupported memory status: {status}")
+        query = str(filters.get("q") or "").strip()
+        if len(query) > 200:
+            raise ValueError("memory query is too long")
+        return {
+            "layer": layer or None,
+            "namespace": filters.get("namespace") or None,
+            "status": status or None,
+            "retrieval_key": filters.get("retrieval_key") or None,
+            "query": query or None,
+            "limit": max(1, min(limit, 500)),
+            "offset": max(0, offset),
+            "include_expired": include_expired,
+        }
+
     def list_memory(self, filters: dict) -> list[dict]:
         with self.lock:
-            include_expired = str(filters.get("include_expired", "")).lower() in {"1", "true", "yes"}
-            try:
-                limit = int(filters.get("limit", 100))
-            except (TypeError, ValueError):
-                limit = 100
-            limit = max(1, min(limit, 500))
-            layer = str(filters.get("layer") or "").strip()
-            status = str(filters.get("status") or "").strip()
-            if layer and layer not in _MEMORY_LAYERS:
-                raise ValueError(f"unsupported memory layer: {layer}")
-            if status and status not in _MEMORY_STATUSES:
-                raise ValueError(f"unsupported memory status: {status}")
-            query = str(filters.get("q") or "").strip()
-            if len(query) > 200:
-                raise ValueError("memory query is too long")
-            return self.repo.query_memory(
-                layer=layer or None,
-                namespace=filters.get("namespace") or None,
-                status=status or None,
-                retrieval_key=filters.get("retrieval_key") or None,
-                query=query or None,
-                limit=limit,
-                include_expired=include_expired,
-            )
+            return self.repo.query_memory(**self._memory_query_options(filters))
+
+    def list_memory_page(self, filters: dict) -> dict:
+        with self.lock:
+            options = self._memory_query_options(filters)
+            count_options = {
+                key: value for key, value in options.items() if key not in {"limit", "offset"}
+            }
+            total = self.repo.count_memory(**count_options)
+            return {
+                "memories": self.repo.query_memory(**options),
+                "pagination": _pagination_payload(total, options["limit"], options["offset"]),
+            }
 
     def memory_summary(self) -> dict:
         with self.lock:
@@ -2251,21 +2428,40 @@ class GatewayState:
             }
             return detail
 
+    @staticmethod
+    def _memory_event_options(filters: dict) -> dict:
+        try:
+            limit = int(filters.get("limit", 100))
+        except (TypeError, ValueError):
+            limit = 100
+        try:
+            offset = int(filters.get("offset", 0))
+        except (TypeError, ValueError):
+            offset = 0
+        event_type = str(filters.get("event_type") or "").strip()
+        if len(event_type) > 100:
+            raise ValueError("memory event type is too long")
+        return {
+            "memory_id": filters.get("memory_id") or None,
+            "event_type": event_type or None,
+            "limit": max(1, min(limit, 500)),
+            "offset": max(0, offset),
+        }
+
     def list_memory_events(self, filters: dict) -> list[dict]:
         with self.lock:
-            try:
-                limit = int(filters.get("limit", 100))
-            except (TypeError, ValueError):
-                limit = 100
-            limit = max(1, min(limit, 500))
-            event_type = str(filters.get("event_type") or "").strip()
-            if len(event_type) > 100:
-                raise ValueError("memory event type is too long")
-            return self.repo.list_memory_events(
-                memory_id=filters.get("memory_id") or None,
-                event_type=event_type or None,
-                limit=limit,
+            return self.repo.list_memory_events(**self._memory_event_options(filters))
+
+    def list_memory_events_page(self, filters: dict) -> dict:
+        with self.lock:
+            options = self._memory_event_options(filters)
+            total = self.repo.count_memory_events(
+                memory_id=options["memory_id"], event_type=options["event_type"]
             )
+            return {
+                "events": self.repo.list_memory_events(**options),
+                "pagination": _pagination_payload(total, options["limit"], options["offset"]),
+            }
 
     def list_memory_matches(self, filters: dict) -> list[dict]:
         with self.lock:
@@ -2404,6 +2600,16 @@ class GatewayState:
                     _commit=False,
                 )
                 return {"ok": True, "case": updated}
+
+    def case_detail(self, case_id: str) -> dict | None:
+        with self.lock:
+            case = self.repo.get_case(case_id)
+            if not case:
+                return None
+            case["alert_clusters"] = self.memory.cluster_case_alerts(
+                case.get("linked_alerts") or []
+            )
+            return case
 
     def replay_case_alert_analysis(self, case_id: str, alert_id: str, actor: str) -> dict:
         """Re-map retained RASP evidence and replace the live Case assessment.
@@ -2802,6 +3008,147 @@ class GatewayState:
                 **outcome,
             }
 
+    def confirm_alert_cluster_false_positive(
+        self, case_id: str, cluster_id: str, body: dict
+    ) -> dict:
+        """Confirm one stable behavior cluster with one representative memory."""
+        with self.lock:
+            case = self.repo.get_case(case_id)
+            if not case:
+                raise KeyError("case not found")
+            clusters = self.memory.cluster_case_alerts(case.get("linked_alerts") or [])
+            cluster = next(
+                (item for item in clusters if item.get("cluster_id") == cluster_id),
+                None,
+            )
+            if not cluster:
+                raise KeyError("alert cluster not found")
+            representative = cluster.get("representative") or {}
+            representative_alert_id = str(
+                cluster.get("representative_alert_id") or ""
+            )
+            if not representative_alert_id:
+                raise ValueError("alert cluster has no representative alert")
+
+            analyst = str(body.get("analyst") or "soc-analyst").strip() or "soc-analyst"
+            reason = str(
+                body.get("reason")
+                or "人工确认该组重复告警符合业务场景下的误报模式"
+            ).strip()
+            if len(reason) > 1000:
+                raise ValueError("reason is too long")
+            expires_at_ms = (
+                self._future_expiry(body["expires_at_ms"])
+                if body.get("expires_at_ms")
+                else None
+            )
+            existing_confirmation = (
+                cluster.get("memory_confirmation")
+                or self.repo.get_confirmed_false_positive_memory(
+                    representative_alert_id, case_id
+                )
+            )
+            if existing_confirmation and cluster.get("confirmed"):
+                return {
+                    "ok": True,
+                    "case_id": case_id,
+                    "cluster_id": cluster_id,
+                    "representative_alert_id": representative_alert_id,
+                    "memory_id": existing_confirmation["memory_id"],
+                    "updated_count": int(cluster.get("count") or 0),
+                    "case_closed": case.get("status") == "false_positive",
+                }
+
+            cluster_metadata = {
+                "cluster_id": cluster_id,
+                "signature": cluster.get("signature") or {},
+                "support_count": int(cluster.get("count") or 0),
+                "first_seen": cluster.get("first_seen"),
+                "last_seen": cluster.get("last_seen"),
+                "representative_alert_id": representative_alert_id,
+                "sample_alert_ids": (cluster.get("alert_ids") or [])[:10],
+            }
+            with self.repo.transaction():
+                if existing_confirmation:
+                    outcome = {
+                        "memory_id": existing_confirmation["memory_id"],
+                        "features": self.memory.extract_false_positive_features(
+                            representative
+                        ),
+                    }
+                else:
+                    outcome = self.memory.confirm_business_false_positive(
+                        representative,
+                        analyst,
+                        reason,
+                        expires_at_ms,
+                        cluster=cluster_metadata,
+                    )
+                for pending in self.repo.query_case_memory(
+                    case_id,
+                    layer=LAYER_PRODUCT_LONG_TERM,
+                    statuses=(STATUS_PENDING,),
+                ):
+                    self.repo.update_memory(
+                        pending["memory_id"], status=STATUS_EXPIRED, _commit=False
+                    )
+                    self.repo.insert_memory_event(
+                        new_id("mev"),
+                        pending["memory_id"],
+                        LAYER_PRODUCT_LONG_TERM,
+                        "expired",
+                        analyst,
+                        {
+                            "reason": "covered_by_human_confirmed_alert_cluster",
+                            "case_id": case_id,
+                            "cluster_id": cluster_id,
+                            "active_memory_id": outcome["memory_id"],
+                        },
+                        _commit=False,
+                    )
+                disposition = self.repo.set_alert_dispositions(
+                    case_id,
+                    cluster.get("alert_ids") or [],
+                    "false_positive",
+                    analyst,
+                    reason,
+                    _commit=False,
+                )
+                if disposition["case_can_close_as_false_positive"]:
+                    self.repo.update_case_status(
+                        case_id, "false_positive", _commit=False
+                    )
+                self.repo.insert_audit(
+                    new_id("audit"),
+                    case_id,
+                    analyst,
+                    "confirm_alert_cluster_false_positive",
+                    {
+                        "case_id": case_id,
+                        "cluster_id": cluster_id,
+                        "representative_alert_id": representative_alert_id,
+                        "memory_id": outcome["memory_id"],
+                        "updated_count": disposition["updated_count"],
+                        "case_closed": bool(
+                            disposition["case_can_close_as_false_positive"]
+                        ),
+                        "reason": reason,
+                    },
+                    _commit=False,
+                )
+            return {
+                "ok": True,
+                "case_id": case_id,
+                "cluster_id": cluster_id,
+                "representative_alert_id": representative_alert_id,
+                "memory_id": outcome["memory_id"],
+                "features": outcome["features"],
+                "updated_count": disposition["updated_count"],
+                "case_closed": bool(
+                    disposition["case_can_close_as_false_positive"]
+                ),
+            }
+
 
 class GatewayHandler(BaseHTTPRequestHandler):
     state: GatewayState
@@ -3138,14 +3485,20 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if status and status not in allowed:
                 self._json(400, {"error": f"unsupported inbox status: {status}"})
                 return
+            limit = _query_int(query, "limit", 100, min_value=1, max_value=500)
+            offset = _query_int(query, "offset", 0, min_value=0)
+            total = self.state.repo.count_inbox_alerts(status=status)
             self._json(
                 200,
                 {
                     "stats": self.state.repo.inbox_stats(),
+                    "capacity": self.state._inbox_capacity_stats(),
                     "alerts": self.state.repo.list_inbox_alerts(
                         status=status,
-                        limit=_query_int(query, "limit", 100, min_value=1, max_value=500),
+                        limit=limit,
+                        offset=offset,
                     ),
+                    "pagination": _pagination_payload(total, limit, offset),
                 },
             )
             return
@@ -3174,18 +3527,26 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 return
             query = parse_qs(parsed.query)
             limit = _query_int(query, "limit", 50, min_value=1, max_value=500)
+            offset = _query_int(query, "offset", 0, min_value=0)
+            filters = {
+                "product": _query_first(query, "product") or None,
+                "severity": _query_first(query, "severity") or None,
+                "status": _query_first(query, "status") or None,
+                "active_only": _query_first(query, "active_only").lower() in {"1", "true", "yes"},
+                "terminal_only": _query_first(query, "terminal_only").lower() in {"1", "true", "yes"},
+                "created_from_ms": _query_optional_int(query, "created_from_ms"),
+                "created_to_ms": _query_optional_int(query, "created_to_ms"),
+            }
+            total = self.state.repo.count_cases(**filters)
             self._json(
                 200,
                 {
                     "cases": self.state.repo.list_cases(
                         limit=limit,
-                        product=_query_first(query, "product") or None,
-                        severity=_query_first(query, "severity") or None,
-                        status=_query_first(query, "status") or None,
-                        active_only=_query_first(query, "active_only").lower() in {"1", "true", "yes"},
-                        created_from_ms=_query_optional_int(query, "created_from_ms"),
-                        created_to_ms=_query_optional_int(query, "created_to_ms"),
-                    )
+                        offset=offset,
+                        **filters,
+                    ),
+                    "pagination": _pagination_payload(total, limit, offset),
                 },
             )
             return
@@ -3211,7 +3572,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if not self._require_roles(_ROLE_READ, _ROLE_ANALYST, _ROLE_APPROVER):
                 return
             case_id = unquote(parsed.path.rsplit("/", 1)[-1])
-            case_data = self.state.repo.get_case(case_id)
+            case_data = self.state.case_detail(case_id)
             if not case_data:
                 self._json(404, {"error": "case not found"})
                 return
@@ -3227,7 +3588,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 return
             query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
             try:
-                self._json(200, {"memories": self.state.list_memory(query)})
+                self._json(200, self.state.list_memory_page(query))
             except ValueError as exc:
                 self._client_error(exc)
             return
@@ -3236,7 +3597,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 return
             query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
             try:
-                self._json(200, {"events": self.state.list_memory_events(query)})
+                self._json(200, self.state.list_memory_events_page(query))
             except ValueError as exc:
                 self._client_error(exc)
             return
@@ -3278,6 +3639,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
             authorized = self._require_roles(_ROLE_ANALYST, _ROLE_CONFIG)
         elif parsed.path.startswith("/api/memory/"):
             authorized = self._require_roles(_ROLE_MEMORY)
+        elif (
+            parsed.path.startswith("/api/cases/")
+            and "/alert-clusters/" in parsed.path
+            and parsed.path.endswith("/confirm-false-positive")
+        ):
+            authorized = self._require_roles(_ROLE_ANALYST, _ROLE_MEMORY)
         elif parsed.path.startswith("/api/cases/"):
             authorized = self._require_roles(_ROLE_ANALYST)
         elif parsed.path.startswith("/api/approvals/"):
@@ -3432,6 +3799,37 @@ class GatewayHandler(BaseHTTPRequestHandler):
             except _PayloadTooLarge:
                 self._json(413, {"error": "request body too large"})
             except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                self._client_error(exc)
+            except Exception as exc:
+                self._server_error(exc)
+            return
+        if (
+            parsed.path.startswith("/api/cases/")
+            and "/alert-clusters/" in parsed.path
+            and parsed.path.endswith("/confirm-false-positive")
+        ):
+            parts = parsed.path.split("/")
+            if len(parts) != 7 or parts[4] != "alert-clusters":
+                self._json(404, {"error": "alert cluster endpoint not found"})
+                return
+            case_id = unquote(parts[3])
+            cluster_id = unquote(parts[5])
+            try:
+                self._json(
+                    200,
+                    self.state.confirm_alert_cluster_false_positive(
+                        case_id,
+                        cluster_id,
+                        self._governance_body(
+                            self._read_json(), actor_field="analyst"
+                        ),
+                    ),
+                )
+            except _PayloadTooLarge:
+                self._json(413, {"error": "request body too large"})
+            except KeyError:
+                self._json(404, {"error": "case or alert cluster not found"})
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
                 self._client_error(exc)
             except Exception as exc:
                 self._server_error(exc)

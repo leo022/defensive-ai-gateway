@@ -5,7 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light dark" />
     <meta name="theme-color" content="#f4f6f8" />
+    <meta name="application-name" content="安全运营研判中心" />
     <title>安全运营研判中心</title>
+    <link rel="icon" href="/logo-mark.svg" type="image/svg+xml" />
+    <link rel="icon" href="/favicon.ico" sizes="any" />
+    <link rel="icon" href="/favicon-32.png" type="image/png" sizes="32x32" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180" />
     <script src="/theme-init.js"></script>
     <link rel="stylesheet" href="/style.css" />
   </head>
@@ -13,7 +18,7 @@
     <div class="app-shell">
       <aside class="sidebar">
         <div class="brand-block">
-          <span class="brand-mark" aria-hidden="true">DG</span>
+          <img class="brand-mark" src="/logo-mark.svg" width="40" height="40" alt="" aria-hidden="true" />
           <div>
             <h1 data-i18n="appTitle">安全运营研判中心</h1>
             <p data-i18n="appSubtitle">多源告警处置与证据治理</p>
@@ -202,6 +207,7 @@
                 </div>
               </form>
               <div id="cases-list" class="case-list" aria-live="polite"></div>
+              <div id="cases-pagination" class="list-pagination-slot"></div>
             </section>
             </div>
 
@@ -260,6 +266,7 @@
                 </div>
               </form>
               <div id="processed-cases-list" class="case-list" aria-live="polite"></div>
+              <div id="processed-cases-pagination" class="list-pagination-slot"></div>
             </section>
             </div>
           </section>
@@ -334,6 +341,7 @@
                 </form>
                 <p id="memory-inventory-status" class="form-status" aria-live="polite"></p>
                 <div id="memory-list" class="memory-list" aria-live="polite"></div>
+                <div id="memory-pagination" class="list-pagination-slot"></div>
               </section>
 
               <section class="panel memory-detail-panel">
@@ -360,6 +368,7 @@
                 <button id="memory-audit-refresh" type="button" data-i18n="refresh">刷新</button>
               </div>
               <div id="memory-audit-list" class="memory-audit-list"></div>
+              <div id="memory-audit-pagination" class="list-pagination-slot"></div>
             </section>
             </div>
           </section>

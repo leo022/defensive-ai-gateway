@@ -237,8 +237,15 @@ class RaspEvidenceRetentionTest(unittest.TestCase):
         result = RaspAgent(_OverreachingReviewLlm(), policy).analyze("case-rasp-lab", event, [])
         self.assertEqual(result.classification, "suspicious")
         self.assertLessEqual(result.confidence, 0.85)
-        self.assertIn("执行结果审计", result.explanation["verdict"])
-        self.assertIn("尚未确认实际执行结果", result.summary)
+        self.assertIn("JNDI 注入", result.explanation["verdict"])
+        self.assertIn("外部来源命中", result.explanation["verdict"])
+        self.assertIn("疑似 JNDI 注入", result.summary)
+        self.assertIn("10.0.10.132", result.summary)
+        self.assertIn("example.test", result.summary)
+        self.assertNotIn("敏感调用已触达", result.summary)
+        self.assertNotIn("执行结果待确认", result.summary)
+        self.assertNotIn("关键实体", result.summary)
+        self.assertNotIn("业务影响", result.summary)
         missing = "\n".join(result.missing_evidence)
         self.assertIn("原始值已保留，非传输缺失", missing)
         self.assertNotIn("RASP 原始告警中被脱敏处理", missing)
@@ -247,6 +254,55 @@ class RaspEvidenceRetentionTest(unittest.TestCase):
             item for item in result.explanation["dimensions"] if item["title"] == "成功与危害"
         )
         self.assertEqual(success["status"], "review")
+
+    def test_ognl_case_title_leads_with_specific_risk_instead_of_report_dump(self):
+        raw_log = copy.deepcopy(self._cloudrasp_log())
+        raw_log["event"]["path"] = "/bastestground/expression/ognl/postBody"
+        raw_log["event"]["request_message"]["url"] = (
+            "http://example.test/bastestground/expression/ognl/postBody"
+        )
+        raw_log["items"][0].update(
+            {
+                "rule_id": "cloudrasp_ognl_103",
+                "rule_name": "OGNL 表达式判断",
+                "attack_type": "ognl",
+            }
+        )
+        policy = PolicyEngine(GatewayConfig().policy)
+        event = EventNormalizer(policy).normalize(
+            LogAdapter(EventNormalizer(policy)).adapt(
+                builtin_product_profile("rasp"), raw_log
+            )["raw_alert"]
+        )
+
+        class _OgnlLlm:
+            is_deterministic = False
+
+            def analyze(self, _prompt, _context):
+                return {
+                    "classification": "suspicious",
+                    "confidence": 0.91,
+                    "verdict": "【需人工复核】- 高危调用已触达，尚缺执行结果审计闭环",
+                    "analysis_dimensions": [
+                        {"title": "危险调用", "status": "risk", "evidence": "OGNL 解析调用已触达"},
+                    ],
+                    "reason": "研判结论：【需人工复核】- 高危调用已触达",
+                    "recommended_next_steps": [],
+                    "missing_evidence": [],
+                    "business_impact": "尚未确认实际执行结果或影响范围",
+                }
+
+        result = RaspAgent(_OgnlLlm(), policy).analyze("case-rasp-ognl", event, [])
+
+        self.assertEqual(
+            result.summary,
+            "疑似 OGNL 表达式注入｜POST /expression/ognl/postBody｜10.0.10.132 → example.test",
+        )
+        self.assertIn("OGNL 表达式注入，外部来源命中", result.explanation["verdict"])
+        self.assertNotIn("高危调用", result.summary)
+        self.assertNotIn("敏感调用已触达", result.summary)
+        self.assertNotIn("关键实体", result.summary)
+        self.assertNotIn("业务影响", result.summary)
 
     def test_test_environment_context_is_dimension_only_not_a_verdict_or_summary_reason(self):
         raw_log = copy.deepcopy(self._cloudrasp_log())

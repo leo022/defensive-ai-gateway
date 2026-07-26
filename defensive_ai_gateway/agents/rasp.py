@@ -1,4 +1,5 @@
 from typing import Any
+from urllib.parse import urlsplit
 
 from ..models import NormalizedEvent
 from .base import SecurityAgent
@@ -7,7 +8,7 @@ from .base import SecurityAgent
 class RaspAgent(SecurityAgent):
     name = "rasp-agent"
     product = "rasp"
-    prompt_version = "rasp-v8"
+    prompt_version = "rasp-v10"
 
     _LAB_TARGET_MARKERS = (
         "cloudrasp-vulns",
@@ -65,7 +66,7 @@ RASP 证据边界（必须遵守）：
 - 在上述场景中，即使 hook_data 与危险 sink 已证明调用到达，只要没有可信的来源身份/授权记录或执行副作用审计证据，就必须使用 suspicious / 【需人工复核】，不得仅因 ProcessBuilder、JDBC 等 sink 命中直接输出 malicious / 【真实攻击】。
 - 不得把测试环境标识当作误报证据；确认授权前也不得输出 benign 或宽泛白名单。
 - 测试环境分析只能写入 analysis_dimensions 中标题为“环境与授权线索”的一项，且只写一次。该项必须明确使用“疑似靶场线索”措辞，逐项写出实际命中的字段与可核验标识，例如“请求 URL/路径命中 `bastestground`”或“调用栈/业务类名命中 `cn.rasp.vuln`”；不得只写“命中已知测试环境标识”等笼统结论，也不得虚构输入中不存在的线索。不得在 verdict、reason 的“研判结论”首行、business_impact、missing_evidence 或 recommended_next_steps 中出现靶场、测试环境、测试目标、测试工单、授权工单或受控测试等环境判断。
-- 当上述环境线索影响分类时，verdict 只说明当前安全事实和证据缺口，例如“【需人工复核】- 高危调用已触达，尚缺执行结果审计闭环”；不得把环境判断写成结论理由。
+- 当上述环境线索影响分类时，verdict 必须先写具体风险类型，再写来源、目标或请求入口中的一个关键事实，例如“【需人工复核】- OGNL 表达式注入，外部来源命中 /expression/ognl/postBody”；不得使用“高危调用”“敏感调用已触达，执行结果待确认”等泛化表述，也不得把环境判断写成结论理由。
 
 reason 字段必须按以下结构输出：
 研判结论：【真实攻击】- [攻击类型] / 【误报】- [误报原因] / 【需人工复核】- [不确定性描述]
@@ -172,7 +173,7 @@ reason 字段必须按以下结构输出：
         corrected["confidence"] = min(
             self._normalize_confidence(corrected.get("confidence", 0.85)), 0.85
         )
-        corrected["verdict"] = "【需人工复核】- 高危调用已触达，尚缺执行结果审计闭环"
+        corrected["verdict"] = self._review_verdict(event)
         corrected["business_impact"] = (
             "尚未确认实际执行结果或影响范围；需结合应用和主机审计核实。"
         )
@@ -320,14 +321,87 @@ reason 字段必须按以下结构输出：
         explanation: dict[str, Any],
     ) -> str:
         """Keep environment-boundary reasoning in the detailed dimensions only."""
-        compact_explanation = dict(explanation)
-        compact_explanation["dimensions"] = [
-            item
-            for item in explanation.get("dimensions", []) or []
-            if isinstance(item, dict)
-            and str(item.get("title") or "") != self._ENVIRONMENT_DIMENSION
-            and not self._contains_environment_reference(item.get("evidence"))
-        ]
-        return super()._summary(
-            event, classification, confidence, llm_result, compact_explanation
+        risk = self._risk_label(event)
+        if classification == "malicious":
+            finding = f"确认{risk}"
+        elif classification == "benign":
+            finding = f"{risk}误报"
+        elif classification == "suspicious":
+            finding = f"疑似 {risk}" if risk[:1].isascii() else f"疑似{risk}"
+        else:
+            finding = f"{risk}证据不足"
+        feature, route = self._request_feature(event)
+        source = self._entity_text(event, "src_ip")
+        target = self._request_target(event) or self._entity_text(event, "host")
+        route_part = " ".join(value for value in (feature, route) if value)
+        flow_part = " → ".join(value for value in (source, target) if value)
+        title = "｜".join(value for value in (finding, route_part, flow_part) if value)
+        return self._bounded_title(title)
+
+    def _review_verdict(self, event: NormalizedEvent) -> str:
+        risk = self._risk_label(event)
+        feature, route = self._request_feature(event)
+        request = " ".join(value for value in (feature, route) if value)
+        fact = f"外部来源命中 {request}" if request else "来源与请求意图待核实"
+        return f"【需人工复核】- {risk}，{fact}"
+
+    @staticmethod
+    def _entity_text(event: NormalizedEvent, key: str) -> str:
+        value = str(event.entities.get(key) or "").strip()
+        return value if value and value.casefold() not in {"none", "null", "unknown", "-"} else ""
+
+    @classmethod
+    def _request_feature(cls, event: NormalizedEvent) -> tuple[str, str]:
+        method = cls._entity_text(event, "method").upper()
+        raw_url = cls._entity_text(event, "url")
+        path = urlsplit(raw_url).path if raw_url else ""
+        segments = [segment for segment in path.split("/") if segment]
+        if len(segments) > 3:
+            segments = segments[-3:]
+        compact_path = f"/{'/'.join(segments)}" if segments else ""
+        if len(compact_path) > 40:
+            compact_path = f"…{compact_path[-39:]}"
+        return method, compact_path
+
+    @classmethod
+    def _request_target(cls, event: NormalizedEvent) -> str:
+        raw_url = cls._entity_text(event, "url")
+        if not raw_url:
+            return ""
+        parsed = urlsplit(raw_url)
+        return parsed.netloc.split("@", 1)[-1]
+
+    @staticmethod
+    def _bounded_title(value: str, limit: int = 120) -> str:
+        title = " ".join(str(value or "").split())
+        if len(title) <= limit:
+            return title
+        return title[: limit - 1].rstrip("，,；;：:、｜ ") + "…"
+
+    @classmethod
+    def _risk_label(cls, event: NormalizedEvent) -> str:
+        values = " ".join(
+            str(value).casefold() for value in event.entities.values() if value is not None
         )
+        markers = (
+            (("ognl",), "OGNL 表达式注入"),
+            (("spel",), "SpEL 表达式注入"),
+            (("jexl",), "JEXL 表达式注入"),
+            (("mvel",), "MVEL 表达式注入"),
+            (("aviator",), "Aviator 表达式注入"),
+            (("jdbc", "sql_connection"), "JDBC 连接"),
+            (("jndi",), "JNDI 注入"),
+            (("deserial", "fastjson"), "反序列化攻击"),
+            (("process_builder", "processbuilder", "cloudrasp_cmd", "command_execution"), "命令执行"),
+            (("classloader", "class_loader"), "恶意类加载"),
+            (("file_input_stream", "file_read"), "任意文件读取"),
+            (("file_write", "file_output_stream"), "任意文件写入"),
+            (("ssrf",), "服务端请求伪造"),
+            (("xxe",), "XML 实体注入"),
+            (("sql_injection",), "SQL 注入"),
+        )
+        for needles, label in markers:
+            if any(needle in values for needle in needles):
+                return label
+        event_type = str(event.event_type or "").strip()
+        return event_type if event_type and event_type != "敏感方法调用" else "敏感方法调用"

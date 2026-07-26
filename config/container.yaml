@@ -35,6 +35,8 @@ auth:
 processing:
   async_enabled: true
   queue_max_size: 20000
+  queue_max_bytes: 1073741824
+  min_free_bytes: 536870912
   workers: 4
   max_attempts: 12
   retry_base_seconds: 5

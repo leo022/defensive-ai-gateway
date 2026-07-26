@@ -4,7 +4,7 @@ from .base import SecurityAgent
 class NdrAgent(SecurityAgent):
     name = "ndr-agent"
     product = "ndr"
-    prompt_version = "ndr-v2"
+    prompt_version = "ndr-v3"
 
     def system_prompt(self) -> str:
         return """

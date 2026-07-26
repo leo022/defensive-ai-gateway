@@ -99,6 +99,8 @@ class ProcessingConfig:
 
     async_enabled: bool = True
     queue_max_size: int = 5000
+    queue_max_bytes: int = 1024 * 1024 * 1024
+    min_free_bytes: int = 512 * 1024 * 1024
     workers: int = 4
     max_attempts: int = 3
     retry_base_seconds: float = 1.0
@@ -373,6 +375,24 @@ def load_config(path: str | None = None) -> GatewayConfig:
             )
             in {"1", "true", "True", "yes"},
             queue_max_size=int(os.getenv("DEFENSIVE_AI_QUEUE_MAX_SIZE", processing.get("queue_max_size", 5000))),
+            queue_max_bytes=max(
+                1024 * 1024,
+                int(
+                    os.getenv(
+                        "DEFENSIVE_AI_QUEUE_MAX_BYTES",
+                        processing.get("queue_max_bytes", 1024 * 1024 * 1024),
+                    )
+                ),
+            ),
+            min_free_bytes=max(
+                0,
+                int(
+                    os.getenv(
+                        "DEFENSIVE_AI_MIN_FREE_BYTES",
+                        processing.get("min_free_bytes", 512 * 1024 * 1024),
+                    )
+                ),
+            ),
             workers=int(os.getenv("DEFENSIVE_AI_WORKERS", processing.get("workers", 4))),
             max_attempts=max(1, min(int(processing.get("max_attempts", 3)), 20)),
             retry_base_seconds=max(0.1, min(float(processing.get("retry_base_seconds", 1.0)), 300.0)),

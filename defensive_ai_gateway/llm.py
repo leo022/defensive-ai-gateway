@@ -23,12 +23,13 @@ from .agents.evidence_helpers import (
 )
 from .json_safety import loads_bounded_json
 from .network_safety import EndpointPin, pinned_endpoint_handlers, resolve_http_endpoint_pin
+from .processing import AlertNonRetryableError
 
 
 MAX_LLM_RESPONSE_BYTES = 2_000_000
 MAX_LLM_ERROR_BYTES = 4096
 MAX_LLM_ATTEMPTS = 2
-_RETRYABLE_HTTP_CODES = {429, 502, 503, 504}
+_RETRYABLE_HTTP_CODES = {408, 425, 429, 500, 502, 503, 504}
 ANTHROPIC_VERSION = "2023-06-01"
 ANTHROPIC_MAX_TOKENS = 4096
 GATEWAY_USER_AGENT = "defensive-ai-gateway/1.0"
@@ -39,8 +40,12 @@ WEBSOCKET_ENDPOINT_GUIDANCE = (
 )
 
 
-class LLMEndpointConfigurationError(RuntimeError):
+class LLMEndpointConfigurationError(AlertNonRetryableError):
     """A remote-model endpoint cannot be used by the HTTP request client."""
+
+
+class LLMResponseContractError(AlertNonRetryableError):
+    """A successful response cannot satisfy the configured JSON contract."""
 
 
 def is_websocket_endpoint(endpoint: str) -> bool:
@@ -96,6 +101,8 @@ def _validate_http_endpoint(
             resolver=socket.getaddrinfo,
         )
     except ValueError as exc:
+        if backend == "LLM gateway":
+            raise LLMEndpointConfigurationError(str(exc)) from exc
         raise RuntimeError(str(exc)) from exc
 
 
@@ -865,6 +872,8 @@ class GatewayLLM(LLMClient):
         self._circuit.before_request()
         try:
             result = self._analyze(prompt, context)
+        except AlertNonRetryableError:
+            raise
         except Exception:
             self._circuit.failure()
             raise
@@ -873,7 +882,7 @@ class GatewayLLM(LLMClient):
 
     def _analyze(self, prompt: str, context: dict[str, Any]) -> dict[str, Any]:
         if not self.config.endpoint:
-            raise RuntimeError("LLM endpoint is not configured")
+            raise LLMEndpointConfigurationError("LLM endpoint is not configured")
         endpoint_pin = _validate_http_endpoint(
             self.config.endpoint,
             backend="LLM gateway",
@@ -886,9 +895,9 @@ class GatewayLLM(LLMClient):
         )
         if not api_key:
             # Do not send an analysis prompt to a remote endpoint that cannot
-            # authenticate it. The orchestrator records this as a durable
-            # retry so an operator can add the deployment secret and resume.
-            raise RuntimeError("LLM gateway API key is not configured")
+            # authenticate it. This is an operator-owned terminal configuration
+            # error; retaining it in deferred would indefinitely consume capacity.
+            raise LLMEndpointConfigurationError("LLM gateway API key is not configured")
         # ``context`` is already redacted + size-bounded by SecurityAgent.analyze.
         # Anthropic receives it inside ``prompt``; generic gateways retain the
         # separate context field used by the original enterprise contract.
@@ -908,6 +917,10 @@ class GatewayLLM(LLMClient):
                 endpoint_pin=endpoint_pin,
             ) as resp:
                 if resp.status >= 400:
+                    if resp.status < 500 and resp.status not in _RETRYABLE_HTTP_CODES:
+                        raise LLMEndpointConfigurationError(
+                            f"LLM gateway rejected the request with HTTP {resp.status}"
+                        )
                     raise RuntimeError(f"LLM gateway returned HTTP {resp.status}")
                 limit = max(65_536, min(int(self.config.max_response_bytes), 10_000_000))
                 body = _read_limited_response(resp, limit).decode("utf-8")
@@ -915,6 +928,10 @@ class GatewayLLM(LLMClient):
             body = _read_error_body(exc)
             if is_websocket_upgrade_required(exc.code, body):
                 raise LLMEndpointConfigurationError(WEBSOCKET_ENDPOINT_GUIDANCE) from exc
+            if exc.code < 500 and exc.code not in _RETRYABLE_HTTP_CODES:
+                raise LLMEndpointConfigurationError(
+                    f"LLM gateway rejected the request with HTTP {exc.code}"
+                ) from exc
             raise RuntimeError(f"LLM gateway HTTP {exc.code}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"LLM gateway unreachable: {exc.reason}") from exc
@@ -923,8 +940,15 @@ class GatewayLLM(LLMClient):
         try:
             parsed = loads_bounded_json(body)
         except ValueError as exc:
-            raise RuntimeError(f"LLM gateway returned invalid JSON response: {body[:200]}") from exc
-        return parse_gateway_response(parsed, self.config.model)
+            raise LLMResponseContractError(
+                f"LLM gateway returned invalid JSON response: {body[:200]}"
+            ) from exc
+        try:
+            return parse_gateway_response(parsed, self.config.model)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise LLMResponseContractError(
+                f"LLM gateway response does not match the analysis contract: {exc}"
+            ) from exc
 
 
 def _validate_result_shape(parsed: Any, model: str) -> dict[str, Any]:

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import threading
 from dataclasses import dataclass
 from functools import wraps
 from typing import Any
+from urllib.parse import urlsplit
 
 from .database import Repository
 from .models import AgentResult, new_id, now_ms
@@ -242,12 +245,73 @@ class MemoryManager:
         Public ``propose_long_term`` wraps this in its own transaction for callers
         that propose outside ``record_case_summary``.
         """
+        namespace = self.product_namespace(product)
+        existing = self.repo.query_case_memory(
+            result.case_id,
+            layer=LAYER_PRODUCT_LONG_TERM,
+            statuses=(STATUS_ACTIVE, STATUS_PENDING),
+            limit=500,
+        )
+        active = next((item for item in existing if item.get("status") == STATUS_ACTIVE), None)
+        if active:
+            self.repo.insert_memory_event(
+                new_id("mev"),
+                active["memory_id"],
+                LAYER_PRODUCT_LONG_TERM,
+                "support_observed",
+                "memory_manager",
+                {"case_id": result.case_id, "product": product, "asset_id": asset_id},
+                _commit=False,
+            )
+            return str(active["memory_id"])
+
+        pending = [item for item in existing if item.get("status") == STATUS_PENDING]
+        if pending:
+            retained = pending[0]
+            self.repo.update_memory(
+                retained["memory_id"],
+                content=self._long_term_candidate_content(product, result, asset_id),
+                _commit=False,
+            )
+            self.repo.insert_memory_event(
+                new_id("mev"),
+                retained["memory_id"],
+                LAYER_PRODUCT_LONG_TERM,
+                "proposal_refreshed",
+                "memory_manager",
+                {
+                    "case_id": result.case_id,
+                    "product": product,
+                    "asset_id": asset_id,
+                    "superseded_candidates": max(0, len(pending) - 1),
+                },
+                _commit=False,
+            )
+            for duplicate in pending[1:]:
+                self.repo.update_memory(
+                    duplicate["memory_id"], status=STATUS_EXPIRED, _commit=False
+                )
+                self.repo.insert_memory_event(
+                    new_id("mev"),
+                    duplicate["memory_id"],
+                    LAYER_PRODUCT_LONG_TERM,
+                    "expired",
+                    "memory_manager",
+                    {
+                        "reason": "superseded_by_case_candidate",
+                        "retained_memory_id": retained["memory_id"],
+                        "case_id": result.case_id,
+                    },
+                    _commit=False,
+                )
+            return str(retained["memory_id"])
+
         memory_id = new_id("mem")
         self.repo.save_memory(
             {
                 "memory_id": memory_id,
                 "layer": LAYER_PRODUCT_LONG_TERM,
-                "namespace": self.product_namespace(product),
+                "namespace": namespace,
                 "retrieval_key": result.case_id,
                 "content": self._long_term_candidate_content(product, result, asset_id),
                 "source_case_id": result.case_id,
@@ -370,6 +434,7 @@ class MemoryManager:
         analyst: str,
         reason: str,
         expires_at_ms: int | None = None,
+        cluster: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         raw = linked_alert.get("raw_alert") or {}
         normalized = linked_alert.get("normalized_event") or {}
@@ -391,6 +456,7 @@ class MemoryManager:
                 "event_type": raw.get("event_type") or normalized.get("event_type"),
                 "features": features,
                 "similarity_features": features["similarity_features"],
+                "alert_cluster": cluster or None,
                 "match_policy": {
                     "must_match_any": ["product", "event_type", "rule_id"],
                     "high_similarity_threshold": 0.78,
@@ -435,10 +501,140 @@ class MemoryManager:
                     "case_id": linked_alert.get("case_id"),
                     "reason": reason,
                     "features": features,
+                    "alert_cluster": cluster or None,
                 },
                 _commit=False,
             )
         return {"memory_id": memory_id, "features": features}
+
+    @staticmethod
+    def _cluster_uri(value: object) -> str:
+        raw = str(value or "").strip().lower()
+        if not raw:
+            return ""
+        try:
+            path = urlsplit(raw).path if "://" in raw else raw.split("?", 1)[0]
+        except ValueError:
+            path = raw.split("?", 1)[0]
+        path = re.sub(
+            r"/(?:[0-9a-f]{8}-[0-9a-f-]{27,}|[0-9a-f]{16,}|\d+)(?=/|$)",
+            "/{id}",
+            path,
+            flags=re.IGNORECASE,
+        )
+        return re.sub(r"/+", "/", path).rstrip("/") or "/"
+
+    @staticmethod
+    def _parameter_keys(value: object, prefix: str = "") -> list[str]:
+        if not isinstance(value, dict):
+            return []
+        keys: list[str] = []
+        for key, nested in sorted(value.items(), key=lambda item: str(item[0])):
+            current = f"{prefix}.{key}" if prefix else str(key)
+            keys.append(current.lower())
+            if isinstance(nested, dict):
+                keys.extend(MemoryManager._parameter_keys(nested, current))
+        return keys
+
+    def alert_cluster_signature(self, linked_alert: dict[str, Any]) -> dict[str, Any]:
+        """Return stable behavior features for grouping repeated alerts in one Case.
+
+        Volatile source IPs and parameter values are intentionally excluded. Target,
+        rule, route and execution features remain part of the boundary so one
+        confirmation cannot silently cover a materially different behavior.
+        """
+        features = self.extract_false_positive_features(linked_alert)
+        user_agent = re.sub(r"\d+(?:\.\d+)+", "{version}", str(features.get("user_agent") or "").lower())
+        return {
+            "product": str(features.get("product") or "").lower(),
+            "event_type": str(features.get("event_type") or "").lower(),
+            "rule_id": str(features.get("rule_id") or "").lower(),
+            "rule_name": str(features.get("rule_name") or "").lower(),
+            "app": str(features.get("app") or "").lower(),
+            "target": str(features.get("host") or features.get("dst_ip") or "").lower(),
+            "method": str(features.get("method") or "").upper(),
+            "uri_template": self._cluster_uri(features.get("uri")),
+            "route_template": self._cluster_uri(features.get("route")),
+            "parameter_keys": self._parameter_keys(features.get("matched_parameters")),
+            "process_name": str(features.get("process_name") or "").lower(),
+            "parent_process": str(features.get("parent_process") or "").lower(),
+            "signature_status": str(features.get("signature_status") or "").lower(),
+            "sni": str(features.get("sni") or "").lower(),
+            "protocol": str(features.get("protocol") or "").lower(),
+            "dst_port": str(features.get("dst_port") or ""),
+            "user_agent_family": user_agent,
+            "mitre_tactic": str(features.get("mitre_tactic") or "").lower(),
+        }
+
+    def alert_cluster_id(self, linked_alert: dict[str, Any]) -> str:
+        encoded = json.dumps(
+            self.alert_cluster_signature(linked_alert),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return f"ac_{hashlib.sha256(encoded.encode('utf-8')).hexdigest()[:20]}"
+
+    def cluster_case_alerts(self, linked_alerts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for linked in linked_alerts:
+            if not linked.get("raw_alert"):
+                continue
+            grouped.setdefault(self.alert_cluster_id(linked), []).append(linked)
+
+        clusters: list[dict[str, Any]] = []
+        for cluster_id, members in grouped.items():
+            ordered = sorted(
+                members,
+                key=lambda item: (
+                    str((item.get("raw_alert") or {}).get("timestamp") or ""),
+                    str(item.get("alert_id") or ""),
+                ),
+            )
+            representative = max(
+                ordered,
+                key=lambda item: (
+                    sum(
+                        bool(value)
+                        for value in self.alert_cluster_signature(item).values()
+                    ),
+                    len((item.get("normalized_event") or {}).get("evidence") or []),
+                    -ordered.index(item),
+                ),
+            )
+            signature = self.alert_cluster_signature(representative)
+            memory_confirmation = next(
+                (
+                    (member.get("disposition") or {}).get("memory_confirmation")
+                    for member in members
+                    if (member.get("disposition") or {}).get("memory_confirmation")
+                ),
+                None,
+            )
+            dispositions = [
+                str((member.get("disposition") or {}).get("status") or "open")
+                for member in members
+            ]
+            clusters.append(
+                {
+                    "cluster_id": cluster_id,
+                    "signature": signature,
+                    "representative_alert_id": representative.get("alert_id"),
+                    "representative": representative,
+                    "alert_ids": [str(item.get("alert_id") or "") for item in ordered],
+                    "count": len(ordered),
+                    "first_seen": (ordered[0].get("raw_alert") or {}).get("timestamp"),
+                    "last_seen": (ordered[-1].get("raw_alert") or {}).get("timestamp"),
+                    "false_positive_count": sum(item == "false_positive" for item in dispositions),
+                    "confirmed": bool(dispositions) and all(item == "false_positive" for item in dispositions),
+                    "memory_confirmation": memory_confirmation,
+                }
+            )
+        return sorted(
+            clusters,
+            key=lambda item: (str(item.get("last_seen") or ""), item["cluster_id"]),
+            reverse=True,
+        )
 
     def extract_false_positive_features(self, linked_alert: dict[str, Any]) -> dict[str, Any]:
         raw = linked_alert.get("raw_alert") or {}

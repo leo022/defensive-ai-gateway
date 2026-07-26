@@ -326,14 +326,16 @@ class MemoryMatcher:
         verdict = str(result.explanation.get("verdict") or "")
         if effect == "downgraded_to_benign":
             result.explanation["verdict"] = "【误报】- 与人工批准的长期记忆高度相似，保留偏离基线复核"
-            result.summary = f"【误报记忆关联】{result.summary}"
+            result.summary = f"【长期记忆命中】{result.summary}"
         elif effect == "classification_reinforced":
             result.explanation["verdict"] = f"{verdict}；人工批准的长期记忆进一步支持当前误报结论"
-            result.summary = f"【误报记忆关联】{result.summary}"
+            result.summary = f"【长期记忆命中】{result.summary}"
         elif effect == "attack_signal_veto":
             result.explanation["verdict"] = f"{verdict}；相似误报记忆不覆盖当前攻击证据"
+            result.summary = f"【长期记忆命中】{result.summary}"
         else:
             result.explanation["verdict"] = f"{verdict}；命中相似长期记忆，建议人工复核"
+            result.summary = f"【长期记忆命中】{result.summary}"
         result.dashboard_cards.append({"title": "记忆关联", "body": f"{best.memory_id} / {score:.2f} / {effect}"})
         if not any("长期记忆" in action.action for action in result.recommended_actions):
             result.recommended_actions.append(

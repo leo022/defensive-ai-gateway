@@ -26,7 +26,7 @@ python3 -m defensive_ai_gateway --config config/dev.yaml
 - 健康检查: `GET /api/health`
 - 提交告警: `POST /api/alerts`
 - 查看 Case: `GET /api/cases`
-- 查询接入队列/DLQ: `GET /api/alerts/inbox?status=deferred` 或 `GET /api/alerts/inbox?status=dead_letter`
+- 查询接入队列/DLQ: `GET /api/alerts/inbox?status=deferred&limit=100&offset=0` 或 `GET /api/alerts/inbox?status=dead_letter&limit=100&offset=0`
 
 Dashboard 的“模型服务 -> 内网 Gateway”可接入 kkcoder 的 OpenAI 兼容 API：
 
@@ -69,6 +69,13 @@ WAF XSS 提示注入样本，预期触发 Validator `review` 且不生成审批�
 进入 `completed` 或 `dead_letter` 后再退出；只需提交、不等待时使用
 `--wait-seconds 0`。`clean_alerts_and_memory.py` 会同步清理 durable inbox，并在仍有
 `pending/retry/deferred/processing` 任务时拒绝执行，避免处理中的事实记录被删除。
+
+生产环境的持久队列同时受 `processing.queue_max_size`（未完成条数）、
+`processing.queue_max_bytes`（未完成原始告警 JSON 字节数）和
+`processing.min_free_bytes`（数据库文件系统保留空间）约束。环境变量分别为
+`DEFENSIVE_AI_QUEUE_MAX_SIZE`、`DEFENSIVE_AI_QUEUE_MAX_BYTES` 和
+`DEFENSIVE_AI_MIN_FREE_BYTES`。容量水位只暂停新告警接入，不会让唯一 Gateway
+退出 readiness；具体使用量、最老积压时间与磁盘水位见 `GET /api/health`。
 
 对于该类 Case，分析师可在“处置台 → 研判与处置”的验证门禁中核对原始日志和证据后，选择
 “复核通过并转入审批”。该操作必须填写复核依据，原始验证仍保持 `review`，自动记忆写入仍被

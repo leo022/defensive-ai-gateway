@@ -270,7 +270,7 @@ class MemoryMatcherIntegrationTest(unittest.TestCase):
             result = orchestrator.handle_alert(self._alert())
 
             self.assertEqual(result.classification, "benign")
-            self.assertIn("误报记忆关联", result.summary)
+            self.assertIn("长期记忆命中", result.summary)
             self.assertEqual(result.explanation["memory_association"]["final_effect"], "downgraded_to_benign")
             self.assertEqual(len(llm.context["memory"]["product_long_term"]), 1)
             self.assertEqual(llm.context["memory"]["memory_association"]["best_memory_id"], "mem-approved-waf")

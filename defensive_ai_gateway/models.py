@@ -49,6 +49,7 @@ class RecommendedAction:
     mode: str
     rationale: str
     rollback: str = ""
+    stage: str = ""
 
 
 @dataclass
@@ -130,6 +131,7 @@ class ApprovalRequest:
     action: str
     rationale: str
     rollback: str
+    stage: str = ""
     mode: str = "approve_required"
     status: str = "pending"
     requested_by: str = "response-advisor"
@@ -170,6 +172,7 @@ class AgentResult:
                 mode=str(item.get("mode", "observe")),
                 rationale=str(item.get("rationale", "")),
                 rollback=str(item.get("rollback", "")),
+                stage=str(item.get("stage", "")),
             )
             for item in payload.get("recommended_actions", [])
             if isinstance(item, (RecommendedAction, dict))

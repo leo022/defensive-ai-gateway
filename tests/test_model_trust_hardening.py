@@ -20,6 +20,7 @@ from defensive_ai_gateway.llm import (
     MAX_LLM_RESPONSE_BYTES,
     GatewayLLM,
     LLMClient,
+    LLMEndpointConfigurationError,
     LocalHeuristicLLM,
     OllamaLLM,
     _open_no_redirect,
@@ -339,6 +340,37 @@ class ModelTransportBoundaryTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "API key is not configured"):
                 llm.analyze("sensitive security prompt", {})
         open_endpoint.assert_not_called()
+
+    def test_gateway_http_403_is_terminal_and_does_not_open_circuit(self):
+        config = LLMConfig(
+            provider="gateway",
+            endpoint="https://gateway.ai-platform.svc/analyze",
+            allowed_hosts=["gateway.ai-platform.svc"],
+            api_key="invalid-test-key",
+        )
+        llm = GatewayLLM(config)
+        resolution = [(None, None, None, None, ("10.42.0.17", 443))]
+        forbidden = urllib.error.HTTPError(
+            config.endpoint,
+            403,
+            "Forbidden",
+            {},
+            _RecordingErrorBody(b'{"error":"invalid credential"}'),
+        )
+        with patch("defensive_ai_gateway.llm.socket.getaddrinfo", return_value=resolution):
+            with patch(
+                "defensive_ai_gateway.llm._open_no_redirect",
+                side_effect=forbidden,
+            ):
+                with self.assertRaisesRegex(
+                    LLMEndpointConfigurationError,
+                    "HTTP 403",
+                ):
+                    llm.analyze("prompt", {})
+        self.assertEqual(
+            llm.runtime_metadata["circuit"]["consecutive_failures"],
+            0,
+        )
 
     def test_ollama_rejects_non_allowlisted_remote_endpoint_before_network(self):
         llm = OllamaLLM(LLMConfig(provider="ollama", endpoint="http://10.0.0.7:11434/api/generate"))

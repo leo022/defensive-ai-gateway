@@ -41,7 +41,13 @@ def _waf_alert() -> RawAlert:
     )
 
 
-def _business_false_positive_alert(alert_id: str, timestamp: str) -> RawAlert:
+def _business_false_positive_alert(
+    alert_id: str,
+    timestamp: str,
+    *,
+    src_ip: str = "10.40.8.12",
+    matched_parameters: dict | None = None,
+) -> RawAlert:
     return RawAlert(
         source="test",
         product="waf",
@@ -52,9 +58,15 @@ def _business_false_positive_alert(alert_id: str, timestamp: str) -> RawAlert:
             "rule_id": "WAF-PARTNER-DUPLICATE-HEADER",
             "app": "settlement-api",
             "host": "settlement-api-01",
-            "src_ip": "10.40.8.12",
+            "src_ip": src_ip,
             "uri": "/partner/settlement/upload",
             "headers": {"user-agent": "bank-partner-batch-client/2.4"},
+            "matched_parameters": matched_parameters
+            or {
+                "partner": "clearing-bank-a",
+                "batch_type": "daily",
+                "sequence": "1001",
+            },
             "payload_category": "known partner client sends duplicate header during settlement batch",
         },
         alert_id=alert_id,
@@ -127,6 +139,33 @@ class MultiLayerMemoryTest(unittest.TestCase):
             for ref in ctx["evidence_refs"]:
                 self.assertIn("ref", ref)
                 self.assertIn("summary", ref)
+
+    def test_repeated_analysis_refreshes_one_pending_candidate_per_case(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _policy, memory, orchestrator = _build(Path(tmp))
+            first = _memory_candidate_alert("alert-memory-dedupe-001")
+            second = _memory_candidate_alert("alert-memory-dedupe-002")
+            second.timestamp = "2026-01-02T00:05:00Z"
+
+            first_result = orchestrator.handle_alert(first)
+            second_result = orchestrator.handle_alert(second)
+            self.assertEqual(first_result.case_id, second_result.case_id)
+
+            pending = [
+                item
+                for item in repo.query_memory(
+                    layer=LAYER_PRODUCT_LONG_TERM,
+                    namespace=memory.product_namespace("waf"),
+                    status=STATUS_PENDING,
+                    limit=100,
+                )
+                if item["source_case_id"] == first_result.case_id
+            ]
+            self.assertEqual(len(pending), 1)
+            events = repo.list_memory_events(memory_id=pending[0]["memory_id"])
+            self.assertTrue(
+                any(item["event_type"] == "proposal_refreshed" for item in events)
+            )
 
     def test_active_product_memory_is_loaded_before_pending_candidates(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -454,6 +493,19 @@ class MemoryGovernanceAPITest(unittest.TestCase):
             events = state.list_memory_events({"memory_id": mem_id})
             self.assertTrue(any(e["event_type"] == "rejected" for e in events))
 
+            inventory_page = state.list_memory_page(
+                {"include_expired": "true", "limit": "2", "offset": "2"}
+            )
+            self.assertEqual(len(inventory_page["memories"]), 2)
+            self.assertGreaterEqual(inventory_page["pagination"]["total"], 4)
+            self.assertEqual(inventory_page["pagination"]["page"], 2)
+            self.assertEqual(inventory_page["pagination"]["limit"], 2)
+
+            audit_page = state.list_memory_events_page({"limit": "1", "offset": "1"})
+            self.assertEqual(len(audit_page["events"]), 1)
+            self.assertGreaterEqual(audit_page["pagination"]["total"], 2)
+            self.assertEqual(audit_page["pagination"]["page"], 2)
+
     def test_memory_governance_summary_search_and_detail(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = GatewayConfig()
@@ -617,6 +669,94 @@ class MemoryGovernanceAPITest(unittest.TestCase):
             finally:
                 state.stop()
 
+    def test_approved_long_term_memory_is_visible_across_time_ip_and_small_parameter_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            config.database.path = str(Path(tmp) / "gateway.db")
+            config.processing.async_enabled = False
+            config.syslog.embedded_listeners_enabled = False
+            state = GatewayState(config)
+            try:
+                first = state.orchestrator.handle_alert(
+                    _business_false_positive_alert(
+                        "waf-memory-source-001",
+                        "2026-07-24T09:00:00+08:00",
+                    )
+                )
+                approved = state.confirm_alert_false_positive(
+                    "waf-memory-source-001",
+                    {"analyst": "analyst-lee", "reason": "已批准合作方批处理客户端"},
+                )
+
+                scenarios = [
+                    (
+                        "same_request_after_one_hour",
+                        _business_false_positive_alert(
+                            "waf-memory-repeat-002",
+                            "2026-07-24T10:01:01+08:00",
+                        ),
+                    ),
+                    (
+                        "changed_source_ip",
+                        _business_false_positive_alert(
+                            "waf-memory-repeat-003",
+                            "2026-07-24T11:02:02+08:00",
+                            src_ip="10.40.9.99",
+                        ),
+                    ),
+                    (
+                        "changed_source_ip_and_small_parameter_delta",
+                        _business_false_positive_alert(
+                            "waf-memory-repeat-004",
+                            "2026-07-24T12:03:03+08:00",
+                            src_ip="10.40.10.77",
+                            matched_parameters={
+                                "partner": "clearing-bank-a",
+                                "batch_type": "daily-retry",
+                                "sequence": "1002",
+                            },
+                        ),
+                    ),
+                ]
+
+                previous_case_id = first.case_id
+                for name, alert in scenarios:
+                    with self.subTest(name=name):
+                        result = state.orchestrator.handle_alert(alert)
+                        self.assertNotEqual(result.case_id, previous_case_id)
+                        previous_case_id = result.case_id
+
+                        association = result.explanation["memory_association"]
+                        self.assertEqual(
+                            association["best_memory_id"],
+                            approved["memory_id"],
+                        )
+                        self.assertGreaterEqual(
+                            association["matches"][0]["overall_score"],
+                            association["review_threshold"],
+                        )
+                        self.assertIn("【长期记忆命中】", result.summary)
+                        self.assertIn("长期记忆", result.explanation["verdict"])
+                        history = [
+                            item
+                            for item in result.explanation["dimensions"]
+                            if item.get("title") == "历史误报"
+                        ]
+                        self.assertEqual(len(history), 1)
+                        self.assertIn(
+                            f"命中长期记忆 {approved['memory_id']}",
+                            history[0]["evidence"],
+                        )
+                        self.assertTrue(
+                            any(
+                                card.get("title") == "记忆关联"
+                                and approved["memory_id"] in card.get("body", "")
+                                for card in result.dashboard_cards
+                            )
+                        )
+            finally:
+                state.stop()
+
     def test_confirm_alert_false_positive_is_idempotent_for_retries(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = GatewayConfig()
@@ -652,6 +792,164 @@ class MemoryGovernanceAPITest(unittest.TestCase):
                 (result.case_id,),
             ).fetchone()[0]
             self.assertEqual(audit_count, 1)
+
+    def test_repeated_case_alerts_are_confirmed_as_one_cluster_and_one_memory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            config.database.path = str(Path(tmp) / "gateway.db")
+            config.processing.async_enabled = False
+            config.syslog.embedded_listeners_enabled = False
+            state = GatewayState(config)
+            try:
+                alerts = [
+                    _business_false_positive_alert(
+                        "waf-cluster-001",
+                        "2026-07-24T09:00:00+08:00",
+                    ),
+                    _business_false_positive_alert(
+                        "waf-cluster-002",
+                        "2026-07-24T09:05:00+08:00",
+                        src_ip="10.40.9.99",
+                    ),
+                    _business_false_positive_alert(
+                        "waf-cluster-003",
+                        "2026-07-24T09:10:00+08:00",
+                        src_ip="10.40.10.77",
+                        matched_parameters={
+                            "partner": "clearing-bank-a",
+                            "batch_type": "daily-retry",
+                            "sequence": "1002",
+                        },
+                    ),
+                ]
+                results = [state.orchestrator.handle_alert(alert) for alert in alerts]
+                self.assertEqual(len({result.case_id for result in results}), 1)
+                case_id = results[0].case_id
+
+                detail = state.case_detail(case_id)
+                self.assertEqual(len(detail["alert_clusters"]), 1)
+                cluster = detail["alert_clusters"][0]
+                self.assertEqual(cluster["count"], 3)
+
+                outcome = state.confirm_alert_cluster_false_positive(
+                    case_id,
+                    cluster["cluster_id"],
+                    {
+                        "analyst": "analyst-lee",
+                        "reason": "合作方结算批处理的重复报文已复核",
+                    },
+                )
+                self.assertEqual(outcome["updated_count"], 3)
+                self.assertTrue(outcome["case_closed"])
+                self.assertEqual(state.repo.get_case(case_id)["status"], "false_positive")
+                self.assertTrue(
+                    all(
+                        state.repo.get_alert_disposition(alert.alert_id)["disposition"]
+                        == "false_positive"
+                        for alert in alerts
+                    )
+                )
+
+                active = state.repo.query_memory(
+                    layer=LAYER_PRODUCT_LONG_TERM,
+                    namespace=state.memory.product_namespace("waf"),
+                    status=STATUS_ACTIVE,
+                    limit=100,
+                )
+                confirmations = [
+                    item
+                    for item in active
+                    if json.loads(item["content"]).get("confirmation_type")
+                    == "business_false_positive"
+                ]
+                self.assertEqual(
+                    [item["memory_id"] for item in confirmations],
+                    [outcome["memory_id"]],
+                )
+                self.assertEqual(
+                    state.repo.query_memory(
+                        layer=LAYER_PRODUCT_LONG_TERM,
+                        namespace=state.memory.product_namespace("waf"),
+                        status=STATUS_PENDING,
+                        limit=100,
+                    ),
+                    [],
+                )
+                content = json.loads(confirmations[0]["content"])
+                self.assertEqual(content["alert_cluster"]["support_count"], 3)
+                self.assertEqual(
+                    content["alert_cluster"]["cluster_id"], cluster["cluster_id"]
+                )
+
+                retry = state.confirm_alert_cluster_false_positive(
+                    case_id,
+                    cluster["cluster_id"],
+                    {
+                        "analyst": "analyst-lee",
+                        "reason": "合作方结算批处理的重复报文已复核",
+                    },
+                )
+                self.assertEqual(retry["memory_id"], outcome["memory_id"])
+                audit_count = state.repo.conn.execute(
+                    """
+                    SELECT COUNT(*) FROM audit_log
+                    WHERE case_id = ? AND action = 'confirm_alert_cluster_false_positive'
+                    """,
+                    (case_id,),
+                ).fetchone()[0]
+                self.assertEqual(audit_count, 1)
+            finally:
+                state.stop()
+
+    def test_materially_different_route_remains_a_separate_alert_cluster(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            config.database.path = str(Path(tmp) / "gateway.db")
+            config.processing.async_enabled = False
+            config.syslog.embedded_listeners_enabled = False
+            state = GatewayState(config)
+            try:
+                first_alert = _business_false_positive_alert(
+                    "waf-cluster-route-001",
+                    "2026-07-24T09:00:00+08:00",
+                )
+                second_alert = _business_false_positive_alert(
+                    "waf-cluster-route-002",
+                    "2026-07-24T09:05:00+08:00",
+                )
+                second_alert.payload["uri"] = "/partner/settlement/admin/export"
+                first = state.orchestrator.handle_alert(first_alert)
+                second = state.orchestrator.handle_alert(second_alert)
+                self.assertEqual(first.case_id, second.case_id)
+
+                detail = state.case_detail(first.case_id)
+                self.assertEqual(len(detail["alert_clusters"]), 2)
+                selected = next(
+                    cluster
+                    for cluster in detail["alert_clusters"]
+                    if cluster["representative_alert_id"] == first_alert.alert_id
+                )
+                outcome = state.confirm_alert_cluster_false_positive(
+                    first.case_id,
+                    selected["cluster_id"],
+                    {
+                        "analyst": "analyst-lee",
+                        "reason": "仅确认结算上传路径为业务误报",
+                    },
+                )
+                self.assertEqual(outcome["updated_count"], 1)
+                self.assertFalse(outcome["case_closed"])
+                self.assertEqual(
+                    state.repo.get_alert_disposition(first_alert.alert_id)[
+                        "disposition"
+                    ],
+                    "false_positive",
+                )
+                self.assertIsNone(
+                    state.repo.get_alert_disposition(second_alert.alert_id)
+                )
+            finally:
+                state.stop()
 
     def test_confirm_alert_false_positive_rejects_past_expiry_atomically(self):
         with tempfile.TemporaryDirectory() as tmp:

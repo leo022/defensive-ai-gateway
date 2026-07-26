@@ -448,6 +448,44 @@ class PipelineTest(unittest.TestCase):
                 ["case_active"],
             )
 
+    def test_case_lists_have_stable_server_side_pagination_and_totals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repository(str(Path(tmp) / "gateway.db"))
+
+            def result(case_id: str, created_at_ms: int) -> AgentResult:
+                return AgentResult(
+                    case_id=case_id,
+                    agent="test-agent",
+                    classification="suspicious",
+                    confidence=0.8,
+                    severity="high",
+                    summary=f"{case_id} summary",
+                    evidence=[],
+                    missing_evidence=[],
+                    recommended_actions=[],
+                    dashboard_cards=[],
+                    created_at_ms=created_at_ms,
+                )
+
+            base = 1_700_000_000_000
+            for index in range(6):
+                case_id = f"case_page_{index}"
+                repo.upsert_case(result(case_id, base + index), "rasp")
+                if index >= 4:
+                    repo.update_case_status(case_id, "closed")
+
+            self.assertEqual(repo.count_cases(product="rasp"), 6)
+            self.assertEqual(repo.count_cases(active_only=True), 4)
+            self.assertEqual(repo.count_cases(terminal_only=True), 2)
+            self.assertEqual(
+                [item["case_id"] for item in repo.list_cases(limit=2, offset=2, active_only=True)],
+                ["case_page_1", "case_page_0"],
+            )
+            self.assertEqual(
+                [item["case_id"] for item in repo.list_cases(limit=10, terminal_only=True)],
+                ["case_page_5", "case_page_4"],
+            )
+
     def test_llm_config_update_hides_key_and_rebuilds_client(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = GatewayConfig()
@@ -608,7 +646,7 @@ class PipelineTest(unittest.TestCase):
             )
             result = orchestrator.handle_alert(alert)
             self.assertEqual(result.classification, "benign")
-            self.assertIn("误报记忆", result.summary)
+            self.assertIn("长期记忆命中", result.summary)
             self.assertTrue(any(item.get("title") == "历史误报" for item in result.explanation.get("dimensions", [])))
             self.assertTrue(any("复核" in action.action for action in result.recommended_actions))
 

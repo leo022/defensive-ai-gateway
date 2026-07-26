@@ -10,6 +10,7 @@ const COLLAPSIBLE_TEXT_LINE_LIMIT = 8;
 const DASHBOARD_REFRESH_MS = 5000;
 const OLLAMA_MODEL_REFRESH_MS = 15000;
 const REQUEST_TIMEOUT_MS = 30_000;
+const PAGE_SIZE_OPTIONS = [10, 20, 50, 100];
 const LOG_PRODUCT_OPTIONS = [
   { product: "waf", label: "WAF" },
   { product: "hips", label: "HIPS" },
@@ -128,6 +129,11 @@ const STRINGS = {
     triageBackHistory: "返回处理记录",
     triageSelectPrompt: "从待处理队列选择一条 Case，开始研判与处置。",
     triageResultCount: "显示 {shown} / {total} 条",
+    paginationRange: "第 {start}-{end} 条，共 {total} 条",
+    paginationPage: "第 {page} / {pages} 页",
+    paginationSize: "每页",
+    paginationPrevious: "上一页",
+    paginationNext: "下一页",
     triageNoResults: "当前没有待处理 Case。",
     processedNoResults: "当前没有符合条件的处理记录。",
     viewCase: "进入 Case {id} 的研判与处置",
@@ -357,6 +363,16 @@ const STRINGS = {
     confirmFalsePositive: "确认误报并写入长期记忆",
     falsePositiveConfirmed: "已确认误报，相关特征已写入产品长期记忆",
     memoryWriteHint: "确认后会抽取告警特征并写入产品长期记忆，后续同类高相似告警将降低置信度。",
+    alertClusters: "重复告警分组",
+    alertClusterCount: "{count} 个行为组",
+    clusterRepeatedAlerts: "同类重复 {count} 条",
+    clusterRepresentative: "代表告警",
+    clusterFirstSeen: "首次出现",
+    clusterLastSeen: "最近出现",
+    clusterBasis: "分组依据",
+    confirmClusterFalsePositive: "确认该组为误报并写入一条长期记忆",
+    clusterFalsePositiveConfirmed: "该组 {count} 条告警已确认误报，由一条长期记忆覆盖",
+    clusterMemoryWriteHint: "一次确认将批量处置该组告警，并只写入代表性长期记忆；不同规则、路径或行为不会被合并。",
     caseDisposition: "Case 处置",
     caseStatusOpen: "待处置",
     caseStatusUnderReview: "人工复核",
@@ -406,6 +422,17 @@ const STRINGS = {
     manualReviewNoApprovals: "人工复核已记录；当前结论没有可审批的高影响动作。",
     manualReviewFailed: "人工复核续转失败：{message}",
     approvalQueue: "处置审批",
+    currentApprovalPlan: "当前审批方案",
+    currentApprovalPlanCount: "{count} 项处置动作",
+    approvalHistory: "历史审批记录",
+    approvalHistorySummary: "{rounds} 轮 · {count} 项，默认收起以减少干扰",
+    approvalHistoryEmpty: "暂无历史审批记录",
+    actionStageVerify: "研判确认",
+    actionStageCoordinate: "协同响应",
+    actionStageContain: "遏制风险",
+    actionStageEradicate: "修复加固",
+    actionStageRecover: "恢复业务",
+    actionStageMonitor: "持续监测",
     approvalPending: "待审批",
     approvalApproved: "已批准",
     approvalRejected: "已拒绝",
@@ -446,8 +473,11 @@ const STRINGS = {
     loadingDetail: "加载关联告警与 AI 分析...",
     detailLoadFailed: "加载详情失败：{message}",
     extractingMemory: "正在抽取特征并写入记忆层...",
+    extractingClusterMemory: "正在批量处置该组告警并写入一条代表性记忆...",
     falsePositiveReason: "Dashboard 人工确认：该告警符合业务场景下的误报模式",
+    clusterFalsePositiveReason: "Dashboard 人工确认：该组同类重复告警符合业务场景下的误报模式",
     memoryWritten: "已写入产品长期记忆：{id}，后续同类高相似告警会降低置信。",
+    clusterMemoryWritten: "已处置该组 {count} 条告警，并写入一条产品长期记忆：{id}",
     falsePositiveDone: "已确认业务误报，并写入记忆层：{id}",
     confirmFailed: "确认失败：{message}",
     noCases: "暂无 Case。",
@@ -603,6 +633,11 @@ const STRINGS = {
     triageBackHistory: "Back to disposition history",
     triageSelectPrompt: "Select a case from the active queue to begin triage and disposition.",
     triageResultCount: "Showing {shown} of {total}",
+    paginationRange: "{start}-{end} of {total}",
+    paginationPage: "Page {page} of {pages}",
+    paginationSize: "Per page",
+    paginationPrevious: "Previous page",
+    paginationNext: "Next page",
     triageNoResults: "There are no active cases.",
     processedNoResults: "There are no disposition records matching the current filters.",
     viewCase: "Open triage and disposition for case {id}",
@@ -832,6 +867,16 @@ const STRINGS = {
     confirmFalsePositive: "Confirm false positive & write long-term memory",
     falsePositiveConfirmed: "False positive confirmed; features were written to product long-term memory",
     memoryWriteHint: "Confirmation extracts alert features into product long-term memory so similar future alerts receive lower confidence.",
+    alertClusters: "Repeated alert groups",
+    alertClusterCount: "{count} behavior group(s)",
+    clusterRepeatedAlerts: "{count} similar repeated alert(s)",
+    clusterRepresentative: "Representative alert",
+    clusterFirstSeen: "First seen",
+    clusterLastSeen: "Last seen",
+    clusterBasis: "Grouping basis",
+    confirmClusterFalsePositive: "Confirm group as false positive & write one long-term memory",
+    clusterFalsePositiveConfirmed: "All {count} alerts in this group are covered by one approved long-term memory",
+    clusterMemoryWriteHint: "One confirmation disposes the group and writes one representative memory. Different rules, routes, or behaviors remain separate.",
     caseDisposition: "Case disposition",
     caseStatusOpen: "Open",
     caseStatusUnderReview: "Under review",
@@ -881,6 +926,17 @@ const STRINGS = {
     manualReviewNoApprovals: "Human review recorded; this result has no high-impact action to approve.",
     manualReviewFailed: "Human-review routing failed: {message}",
     approvalQueue: "Response approvals",
+    currentApprovalPlan: "Current approval plan",
+    currentApprovalPlanCount: "{count} response action(s)",
+    approvalHistory: "Approval history",
+    approvalHistorySummary: "{rounds} round(s) · {count} item(s), collapsed by default",
+    approvalHistoryEmpty: "No previous approval records",
+    actionStageVerify: "Verify",
+    actionStageCoordinate: "Coordinate",
+    actionStageContain: "Contain",
+    actionStageEradicate: "Eradicate",
+    actionStageRecover: "Recover",
+    actionStageMonitor: "Monitor",
     approvalPending: "Pending",
     approvalApproved: "Approved",
     approvalRejected: "Rejected",
@@ -921,8 +977,11 @@ const STRINGS = {
     loadingDetail: "Loading linked alerts and AI analysis...",
     detailLoadFailed: "Failed to load detail: {message}",
     extractingMemory: "Extracting features and writing to memory...",
+    extractingClusterMemory: "Disposing this alert group and writing one representative memory...",
     falsePositiveReason: "Dashboard analyst confirmation: this alert matches a business false-positive pattern",
+    clusterFalsePositiveReason: "Dashboard analyst confirmed this repeated alert group matches a business false-positive pattern",
     memoryWritten: "Written to product long-term memory: {id}. Similar future alerts will reduce confidence.",
+    clusterMemoryWritten: "Disposed {count} alert(s) and wrote one product long-term memory: {id}",
     falsePositiveDone: "Business false positive confirmed and written to memory: {id}",
     confirmFailed: "Confirmation failed: {message}",
     noCases: "No cases.",
@@ -991,10 +1050,16 @@ let refreshPaused = false;
 let dashboardRefreshTimer = null;
 let memoryItems = [];
 let memoryAuditEvents = [];
+let memoryPagination = { page: 1, size: 20, total: 0, totalPages: 1 };
+let memoryAuditPagination = { page: 1, size: 20, total: 0, totalPages: 1 };
 let selectedMemoryId = "";
 let selectedMemoryDetail = null;
 let memorySelectionRequestId = 0;
 let queueCases = [];
+const casePagination = {
+  pending: { page: 1, size: 20, total: 0, totalPages: 1 },
+  history: { page: 1, size: 20, total: 0, totalPages: 1 },
+};
 let activeDashboardSection = "pending";
 let selectedCaseId = "";
 let caseSelectionRequestId = 0;
@@ -1199,16 +1264,66 @@ function datetimeLocalMs(value) {
   return Number.isFinite(ms) ? ms : null;
 }
 
+function applyPaginationPayload(state, payload = {}) {
+  state.total = Math.max(0, Number(payload.total || 0));
+  state.size = PAGE_SIZE_OPTIONS.includes(Number(payload.limit)) ? Number(payload.limit) : state.size;
+  state.page = Math.max(1, Number(payload.page || state.page || 1));
+  state.totalPages = Math.max(1, Number(payload.total_pages || 1));
+  return state;
+}
+
+function paginationState(key) {
+  if (key === "cases-pending") return casePagination.pending;
+  if (key === "cases-history") return casePagination.history;
+  if (key === "memory-inventory") return memoryPagination;
+  if (key === "memory-audit") return memoryAuditPagination;
+  return null;
+}
+
+function renderPagination(containerSelector, state, key) {
+  const container = document.querySelector(containerSelector);
+  if (!container) return;
+  const start = state.total ? (state.page - 1) * state.size + 1 : 0;
+  const end = Math.min(state.total, state.page * state.size);
+  container.innerHTML = `
+    <nav class="list-pagination" aria-label="${escapeHtml(tr("paginationPage", { page: state.page, pages: state.totalPages }))}">
+      <span class="pagination-range">${escapeHtml(tr("paginationRange", { start, end, total: state.total }))}</span>
+      <label class="pagination-size">
+        <span>${escapeHtml(tr("paginationSize"))}</span>
+        <select data-pagination-size="${escapeHtml(key)}">
+          ${PAGE_SIZE_OPTIONS.map((size) => `<option value="${size}" ${size === state.size ? "selected" : ""}>${size}</option>`).join("")}
+        </select>
+      </label>
+      <span class="pagination-actions">
+        <button type="button" data-pagination-action="previous" data-pagination-key="${escapeHtml(key)}" aria-label="${escapeHtml(tr("paginationPrevious"))}" title="${escapeHtml(tr("paginationPrevious"))}" ${state.page <= 1 ? "disabled" : ""}>←</button>
+        <strong>${escapeHtml(tr("paginationPage", { page: state.page, pages: state.totalPages }))}</strong>
+        <button type="button" data-pagination-action="next" data-pagination-key="${escapeHtml(key)}" aria-label="${escapeHtml(tr("paginationNext"))}" title="${escapeHtml(tr("paginationNext"))}" ${state.page >= state.totalPages ? "disabled" : ""}>→</button>
+      </span>
+    </nav>
+  `;
+}
+
+function reloadPagination(key) {
+  if (key === "cases-pending") return loadCases({ quiet: true, section: "pending" });
+  if (key === "cases-history") return loadCases({ quiet: true, section: "history" });
+  if (key === "memory-inventory") return loadMemoryInventory({ quiet: true });
+  if (key === "memory-audit") return loadMemoryAudit({ quiet: true });
+  return Promise.resolve();
+}
+
 function caseSearchQuery(section = activeDashboardSection) {
   const form = document.querySelector(`form[data-case-search-section="${section}"]`);
-  if (!form) return new URLSearchParams({ limit: "50" }).toString();
+  const pagination = casePagination[section] || casePagination.pending;
+  if (!form) return new URLSearchParams({ limit: String(pagination.size), offset: String((pagination.page - 1) * pagination.size) }).toString();
 
-  // Keep the active queue compact while allowing the history view to search
-  // farther back for retrospective review.
-  const params = new URLSearchParams({ limit: section === "history" ? "500" : "50" });
+  const params = new URLSearchParams({
+    limit: String(pagination.size),
+    offset: String((pagination.page - 1) * pagination.size),
+  });
   // Let the API remove terminal Cases before it applies the limit.  Client-side
   // filtering after a mixed-status query can hide older active Cases entirely.
   if (section === "pending") params.set("active_only", "1");
+  else params.set("terminal_only", "1");
   const value = (name) => String(form.elements.namedItem(name)?.value || "").trim();
   const product = value("product");
   const severity = value("severity");
@@ -2085,13 +2200,27 @@ function actionRows(actions) {
     .map(
       (item) => `
         <li>
-          <strong>${escapeHtml(item.mode || "observe")}</strong>
-          <span>${escapeHtml(item.action)}</span>
+          <div class="action-step-head">
+            <strong>${escapeHtml(actionStageLabel(item.stage))}</strong>
+            <span>${escapeHtml(item.action)}</span>
+          </div>
           <small>${escapeHtml(item.rationale || "")}</small>
         </li>
       `,
     )
     .join("");
+}
+
+function actionStageLabel(stage) {
+  const key = {
+    verify: "actionStageVerify",
+    coordinate: "actionStageCoordinate",
+    contain: "actionStageContain",
+    eradicate: "actionStageEradicate",
+    recover: "actionStageRecover",
+    monitor: "actionStageMonitor",
+  }[stage || "verify"];
+  return tr(key || "actionStageVerify");
 }
 
 function caseStatusLabel(status) {
@@ -2237,7 +2366,7 @@ function reviewTools(raw, disposition = null) {
   `;
 }
 
-function linkedAlertReviewCard(link) {
+function linkedAlertReviewCard(link, includeReview = true) {
   const raw = link?.raw_alert || {};
   const alertId = raw.alert_id || link?.alert_id || "";
   if (!alertId) return "";
@@ -2260,18 +2389,73 @@ function linkedAlertReviewCard(link) {
         <dt>${escapeHtml(tr("time"))}</dt><dd>${escapeHtml(raw.timestamp)}</dd>
         <dt>${escapeHtml(tr("adapterProfile"))}</dt><dd>${escapeHtml(adapter.profile_id ? `${adapter.profile_id} / ${adapter.profile_version}` : "direct")}</dd>
       </dl>
-      ${reviewTools(raw, disposition)}
+      ${includeReview ? reviewTools(raw, disposition) : ""}
     </article>
   `;
 }
 
-function linkedAlertsBlock(linked) {
-  const cards = (linked || []).map(linkedAlertReviewCard).filter(Boolean);
+function alertClusterBasis(signature = {}) {
+  return [
+    signature.rule_id || signature.event_type,
+    signature.app,
+    signature.target,
+    [signature.method, signature.uri_template || signature.route_template].filter(Boolean).join(" "),
+    signature.process_name,
+  ].filter(Boolean).join(" · ") || "-";
+}
+
+function alertClusterReviewTools(cluster) {
+  const clusterId = cluster?.cluster_id || "";
+  const confirmed = Boolean(cluster?.confirmed && cluster?.memory_confirmation?.memory_id);
+  const allowed = hasAnyRole("analyst", "memory");
+  return `
+    <div class="review-tools cluster-review-tools">
+      ${confirmed
+        ? `<p class="review-status confirmed" data-alert-cluster-status="${escapeHtml(clusterId)}">${escapeHtml(tr("clusterFalsePositiveConfirmed", { count: cluster.count || 0 }))}</p>`
+        : `<button class="review-button cluster-review-button" type="button" data-cluster-id="${escapeHtml(clusterId)}" ${allowed ? "" : `disabled title="${escapeHtml(tr("permissionDenied"))}"`}>
+            ${escapeHtml(tr("confirmClusterFalsePositive"))}
+          </button>
+          <p class="review-status" data-alert-cluster-status="${escapeHtml(clusterId)}">${escapeHtml(tr("clusterMemoryWriteHint"))}</p>`}
+    </div>
+  `;
+}
+
+function alertClusterReviewCard(cluster) {
+  const representative = cluster?.representative || {};
+  const raw = representative.raw_alert || {};
+  return `
+    <article class="linked-alert-item alert-cluster-item">
+      <div class="section-title">
+        <div class="linked-alert-heading">
+          <strong>${escapeHtml(tr("clusterRepeatedAlerts", { count: cluster.count || 0 }))}</strong>
+          <span>${escapeHtml(alertClusterBasis(cluster.signature))}</span>
+        </div>
+        <span class="case-status ${escapeHtml(caseStatusClass(cluster.confirmed ? "false_positive" : "open"))}">${escapeHtml(alertDispositionLabel({ status: cluster.confirmed ? "false_positive" : "open" }))}</span>
+      </div>
+      <dl class="kv alert-cluster-summary">
+        <dt>${escapeHtml(tr("clusterRepresentative"))}</dt><dd>${escapeHtml(cluster.representative_alert_id || "-")}</dd>
+        <dt>${escapeHtml(tr("clusterFirstSeen"))}</dt><dd>${escapeHtml(cluster.first_seen || "-")}</dd>
+        <dt>${escapeHtml(tr("clusterLastSeen"))}</dt><dd>${escapeHtml(cluster.last_seen || "-")}</dd>
+        <dt>${escapeHtml(tr("clusterBasis"))}</dt><dd>${escapeHtml(alertClusterBasis(cluster.signature))}</dd>
+      </dl>
+      <details class="cluster-representative-detail">
+        <summary>${escapeHtml(tr("clusterRepresentative"))} · ${escapeHtml(raw.alert_id || cluster.representative_alert_id || "-")}</summary>
+        ${linkedAlertReviewCard(representative, false)}
+      </details>
+      ${alertClusterReviewTools(cluster)}
+    </article>
+  `;
+}
+
+function linkedAlertsBlock(linked, clusters = []) {
+  const cards = (clusters || []).length
+    ? clusters.map(alertClusterReviewCard).filter(Boolean)
+    : (linked || []).map(linkedAlertReviewCard).filter(Boolean);
   return `
     <section class="detail-card linked-alerts-card">
       <div class="section-title">
-        <h3>${escapeHtml(tr("linkedRawAlerts"))}</h3>
-        <span>${escapeHtml(tr("alertCount", { count: linked?.length || 0 }))}</span>
+        <h3>${escapeHtml(tr("alertClusters"))}</h3>
+        <span>${escapeHtml(tr("alertClusterCount", { count: clusters?.length || cards.length }))} · ${escapeHtml(tr("alertCount", { count: linked?.length || 0 }))}</span>
       </div>
       ${cards.length
         ? `<div class="linked-alert-list">${cards.join("")}</div>`
@@ -2424,42 +2608,55 @@ function approvalDecisionMessage(approval) {
   return tr("approvalSaved", { status: approvalStatusLabel(approval.status) });
 }
 
-function approvalBlock(approvals, caseId) {
+function approvalBlock(approvals, caseId, latestEventId = "") {
+  const records = approvals || [];
+  const currentEventId = latestEventId || records[0]?.event_id || "";
+  const current = currentEventId ? records.filter((item) => item.event_id === currentEventId) : [];
+  const history = currentEventId ? records.filter((item) => item.event_id !== currentEventId) : [];
+  const historyRounds = new Set(history.map((item) => item.event_id).filter(Boolean)).size;
+  const approvalItem = (item, compact = false) => `
+    <article class="approval-item ${compact ? "compact" : ""} ${escapeHtml(item.status)}">
+      <div class="case-disposition-head">
+        <strong>${escapeHtml(approvalStatusLabel(item.status))}</strong>
+        <span>${escapeHtml(item.action?.stage ? actionStageLabel(item.action.stage) : tr("executionNotRun"))}</span>
+      </div>
+      <p>${escapeHtml(item.action?.action || "")}</p>
+      ${compact ? "" : `<small>${escapeHtml(item.action?.rationale || "")}</small>`}
+      ${!compact && approvalProgressText(item) ? `<small class="approval-progress">${escapeHtml(approvalProgressText(item))}</small>` : ""}
+      ${compact ? `<small>${escapeHtml(fmtTime(item.created_at_ms))} · ${escapeHtml(tr("executionNotRun"))}</small>` : `<dl class="kv"><dt>${escapeHtml(tr("rollbackCondition"))}</dt><dd>${escapeHtml(item.action?.rollback || "-")}</dd></dl>`}
+      ${!compact && item.status === "pending" ? `
+        <div class="approval-actions">
+          <button type="button" class="approval-decision" data-case-id="${escapeHtml(caseId)}" data-approval-id="${escapeHtml(item.approval_id)}" data-decision="approved" ${hasAnyRole("approver") ? "" : `disabled title="${escapeHtml(tr("permissionDenied"))}"`}>${escapeHtml(tr("approveAction"))}</button>
+          <button type="button" class="approval-decision" data-case-id="${escapeHtml(caseId)}" data-approval-id="${escapeHtml(item.approval_id)}" data-decision="rejected" ${hasAnyRole("approver") ? "" : `disabled title="${escapeHtml(tr("permissionDenied"))}"`}>${escapeHtml(tr("rejectAction"))}</button>
+        </div>
+      ` : ""}
+    </article>
+  `;
   return `
     <div class="approval-queue">
       <h4>${escapeHtml(tr("approvalQueue"))}</h4>
-      ${(approvals || []).length
-        ? approvals.map((item) => `
-            <article class="approval-item ${escapeHtml(item.status)}">
-              <div class="case-disposition-head">
-                <strong>${escapeHtml(approvalStatusLabel(item.status))}</strong>
-                <span>${escapeHtml(tr("executionNotRun"))}</span>
-              </div>
-              <p>${escapeHtml(item.action?.action || "")}</p>
-              <small>${escapeHtml(item.action?.rationale || "")}</small>
-              ${approvalProgressText(item) ? `<small class="approval-progress">${escapeHtml(approvalProgressText(item))}</small>` : ""}
-              <dl class="kv"><dt>${escapeHtml(tr("rollbackCondition"))}</dt><dd>${escapeHtml(item.action?.rollback || "-")}</dd></dl>
-              ${item.status === "pending" ? `
-                <div class="approval-actions">
-                  <button type="button" class="approval-decision" data-case-id="${escapeHtml(caseId)}" data-approval-id="${escapeHtml(item.approval_id)}" data-decision="approved" ${hasAnyRole("approver") ? "" : `disabled title="${escapeHtml(tr("permissionDenied"))}"`}>${escapeHtml(tr("approveAction"))}</button>
-                  <button type="button" class="approval-decision" data-case-id="${escapeHtml(caseId)}" data-approval-id="${escapeHtml(item.approval_id)}" data-decision="rejected" ${hasAnyRole("approver") ? "" : `disabled title="${escapeHtml(tr("permissionDenied"))}"`}>${escapeHtml(tr("rejectAction"))}</button>
-                </div>
-              ` : ""}
-            </article>
-          `).join("")
+      ${current.length
+        ? `<div class="approval-current-head"><strong>${escapeHtml(tr("currentApprovalPlan"))}</strong><span>${escapeHtml(tr("currentApprovalPlanCount", { count: current.length }))}</span></div>${current.map((item) => approvalItem(item)).join("")}`
         : `<p class="empty">${escapeHtml(tr("noApprovals"))}</p>`}
+      ${history.length ? `
+        <details class="approval-history">
+          <summary><strong>${escapeHtml(tr("approvalHistory"))}</strong><span>${escapeHtml(tr("approvalHistorySummary", { rounds: historyRounds, count: history.length }))}</span></summary>
+          <div class="approval-history-list">${history.map((item) => approvalItem(item, true)).join("")}</div>
+        </details>
+      ` : ""}
       <p class="approval-status" data-approval-status="${escapeHtml(caseId)}"></p>
     </div>
   `;
 }
 
 function renderDetail(detail) {
-  const latestRun = detail.agent_runs?.[0]?.result || {};
+  const latestRunRecord = detail.agent_runs?.[0] || {};
+  const latestRun = latestRunRecord.result || {};
   const linked = detail.linked_alerts || [];
   const missing = latestRun.missing_evidence || [];
   const validation = detail.validation_runs?.[0] || latestRun.explanation?.validation;
   const confidence = Math.round((detail.confidence || 0) * 100);
-  const headline = latestRun.explanation?.verdict || detail.summary || detail.case_id;
+  const headline = caseFocusSummary(detail);
 
   return `
     <div class="detail-stack">
@@ -2495,7 +2692,7 @@ function renderDetail(detail) {
         </div>
         ${caseDispositionControls(detail)}
         ${validationBlock(validation, detail.case_id)}
-        ${approvalBlock(detail.approvals || [], detail.case_id)}
+        ${approvalBlock(detail.approvals || [], detail.case_id, latestRunRecord.event_id || "")}
       </section>
 
       <section class="detail-card">
@@ -2505,7 +2702,7 @@ function renderDetail(detail) {
         </div>
         ${explanationBlock(latestRun.explanation)}
         <h4>${escapeHtml(tr("recommendedActions"))}</h4>
-        <ul class="action-list">${actionRows(latestRun.recommended_actions)}</ul>
+        <ol class="action-list">${actionRows(latestRun.recommended_actions)}</ol>
         <h4>${escapeHtml(tr("missingEvidence"))}</h4>
         <ul class="plain-list">
           ${
@@ -2516,7 +2713,7 @@ function renderDetail(detail) {
         </ul>
       </section>
 
-      ${linkedAlertsBlock(linked)}
+      ${linkedAlertsBlock(linked, detail.alert_clusters || [])}
 
       <section class="detail-card detailed-information">
         <div class="section-title">
@@ -2570,11 +2767,13 @@ function renderCaseList(cases, section, emptyKey) {
   list.innerHTML = "";
   if (!visible.length) {
     list.innerHTML = `<div class="empty-state">${escapeHtml(tr(emptyKey))}</div>`;
-    return;
+  } else {
+    for (const item of visible) {
+      list.appendChild(renderCase(item));
+    }
   }
-  for (const item of visible) {
-    list.appendChild(renderCase(item));
-  }
+  const paginationSelector = section === "history" ? "#processed-cases-pagination" : "#cases-pagination";
+  renderPagination(paginationSelector, casePagination[section], `cases-${section}`);
 }
 
 function renderQueueList(cases = pendingQueueCases()) {
@@ -2603,7 +2802,7 @@ function renderCase(item) {
         </span>
         <span class="case-status ${escapeHtml(caseStatusClass(item.status))}">${escapeHtml(caseStatusLabel(item.status))}</span>
       </span>
-      <span class="case-summary">${escapeHtml(item.summary)}</span>
+      <span class="case-summary">${escapeHtml(caseFocusSummary(item))}</span>
       <span class="case-card-meta">
         <span class="linked-count">${escapeHtml(tr("alertCountLong", { count: item.alert_count || 0 }))}</span>
         <small class="case-time">${escapeHtml(fmtTime(item.created_at_ms))}</small>
@@ -2614,6 +2813,62 @@ function renderCase(item) {
     openCaseTriage(item.case_id).catch((err) => showToast(tr("detailLoadFailed", { message: err.message || String(err) }), "error"));
   });
   return wrapper;
+}
+
+const RASP_RISK_LABELS = [
+  [["ognl"], "OGNL 表达式注入"],
+  [["spel"], "SpEL 表达式注入"],
+  [["jexl"], "JEXL 表达式注入"],
+  [["mvel"], "MVEL 表达式注入"],
+  [["aviator"], "Aviator 表达式注入"],
+  [["jdbc", "sql_connection"], "JDBC 连接"],
+  [["jndi"], "JNDI 注入"],
+  [["deserial", "fastjson"], "反序列化攻击"],
+  [["process_builder", "processbuilder", "cloudrasp_cmd", "command_execution"], "命令执行"],
+  [["classloader", "class_loader"], "恶意类加载"],
+  [["file_input_stream", "file_read"], "任意文件读取"],
+  [["file_write", "file_output_stream"], "任意文件写入"],
+  [["ssrf"], "服务端请求伪造"],
+  [["xxe"], "XML 实体注入"],
+  [["sql_injection"], "SQL 注入"],
+];
+
+function caseFocusSummary(item = {}) {
+  const summary = text(item.summary).trim();
+  if (!summary) return text(item.case_id);
+  if (text(item.product).toLowerCase() === "rasp" && /关键实体：|核心依据：|业务影响：/.test(summary)) {
+    const normalized = summary.toLowerCase();
+    const risk = RASP_RISK_LABELS.find(([needles]) => needles.some((needle) => normalized.includes(needle)))?.[1]
+      || "敏感方法调用";
+    const classification = text(item.classification).toLowerCase();
+    const finding = classification === "malicious"
+      ? `确认${risk}`
+      : classification === "benign"
+        ? `${risk}误报`
+        : classification === "suspicious"
+          ? `${/^[A-Za-z]/.test(risk) ? "疑似 " : "疑似"}${risk}`
+          : `${risk}证据不足`;
+    const entityBlock = summary.match(/关键实体：([\s\S]*?)(?:。核心依据：|。业务影响：|$)/)?.[1] || "";
+    const entity = (name) => entityBlock.match(new RegExp(`(?:^|,\\s*)${name}=([^,。]+)`))?.[1]?.trim() || "";
+    const rawUrl = entity("url");
+    let target = entity("host");
+    let route = "";
+    if (rawUrl) {
+      try {
+        const parsed = new URL(rawUrl);
+        target = parsed.host || target;
+        const segments = parsed.pathname.split("/").filter(Boolean).slice(-3);
+        route = segments.length ? `/${segments.join("/")}` : "";
+      } catch (_error) {
+        route = rawUrl.startsWith("/") ? rawUrl : "";
+      }
+    }
+    const request = [entity("method").toUpperCase(), route].filter(Boolean).join(" ");
+    const flow = [entity("src_ip"), target].filter(Boolean).join(" → ");
+    return [finding, request, flow].filter(Boolean).join("｜");
+  }
+  const firstLine = summary.replace(/^研判结论[：:]\s*/, "").split(/[。\n]/, 1)[0].trim();
+  return firstLine.length > 120 ? `${firstLine.slice(0, 119).replace(/[，,；;：:、｜\s]+$/u, "")}…` : firstLine;
 }
 
 function renderSelectedCaseDetail(detail, caseId) {
@@ -2657,8 +2912,11 @@ function bindDetailActions(panel, caseId) {
   panel.querySelectorAll(".case-disposition-button").forEach((button) => {
     button.addEventListener("click", () => updateCaseDisposition(button, caseId));
   });
-  panel.querySelectorAll(".review-button").forEach((button) => {
+  panel.querySelectorAll(".review-button:not(.cluster-review-button)").forEach((button) => {
     button.addEventListener("click", () => confirmBusinessFalsePositive(button, caseId));
+  });
+  panel.querySelectorAll(".cluster-review-button").forEach((button) => {
+    button.addEventListener("click", () => confirmAlertClusterFalsePositive(button, caseId));
   });
   panel.querySelectorAll(".validation-review-continue").forEach((button) => {
     button.addEventListener("click", () => continueValidationReview(button, panel, caseId));
@@ -2820,6 +3078,41 @@ async function confirmBusinessFalsePositive(button, caseId) {
   }
 }
 
+async function confirmAlertClusterFalsePositive(button, caseId) {
+  const clusterId = button.dataset.clusterId;
+  const status = document.querySelector(`[data-alert-cluster-status="${CSS.escape(clusterId)}"]`);
+  button.disabled = true;
+  if (status) status.textContent = tr("extractingClusterMemory");
+  try {
+    const result = await json(
+      `/api/cases/${encodeURIComponent(caseId)}/alert-clusters/${encodeURIComponent(clusterId)}/confirm-false-positive`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: tr("clusterFalsePositiveReason") }),
+      },
+    );
+    detailCache.delete(caseId);
+    if (status) {
+      status.textContent = tr("clusterMemoryWritten", {
+        count: result.updated_count,
+        id: result.memory_id,
+      });
+    }
+    await loadCases();
+    await loadTriageCase(caseId);
+    showToast(tr("clusterMemoryWritten", {
+      count: result.updated_count,
+      id: result.memory_id,
+    }));
+  } catch (err) {
+    button.disabled = false;
+    const message = err.message || String(err);
+    if (status) status.textContent = message;
+    showToast(tr("confirmFailed", { message }), "error");
+  }
+}
+
 function toggleCollapsibleText(button) {
   const wrapper = button.closest(".collapsible-text");
   if (!wrapper) return;
@@ -2886,7 +3179,11 @@ function memoryContentSummary(memory) {
 }
 
 function memoryFilterQuery() {
-  const params = new URLSearchParams({ include_expired: "true", limit: "500" });
+  const params = new URLSearchParams({
+    include_expired: "true",
+    limit: String(memoryPagination.size),
+    offset: String((memoryPagination.page - 1) * memoryPagination.size),
+  });
   const values = {
     q: document.querySelector("#memory-filter-query")?.value.trim(),
     layer: document.querySelector("#memory-filter-layer")?.value,
@@ -2919,10 +3216,13 @@ function renderMemoryList() {
   if (!list) return;
   if (!memoryItems.length) {
     list.innerHTML = `<p class="empty-state">${escapeHtml(tr("memoryNoResults"))}</p>`;
+    renderPagination("#memory-pagination", memoryPagination, "memory-inventory");
     return;
   }
+  const start = (memoryPagination.page - 1) * memoryPagination.size + 1;
+  const end = Math.min(memoryPagination.total, memoryPagination.page * memoryPagination.size);
   list.innerHTML = `
-    <div class="memory-list-count">${escapeHtml(tr("memoryCount", { count: memoryItems.length }))}</div>
+    <div class="memory-list-count">${escapeHtml(tr("paginationRange", { start, end, total: memoryPagination.total }))}</div>
     ${memoryItems.map((memory) => `
       <button
         type="button"
@@ -2944,6 +3244,7 @@ function renderMemoryList() {
   list.querySelectorAll(".memory-row").forEach((button) => {
     button.addEventListener("click", () => selectMemory(button.dataset.memoryId));
   });
+  renderPagination("#memory-pagination", memoryPagination, "memory-inventory");
 }
 
 function memoryGateRows(gates) {
@@ -3119,6 +3420,9 @@ function renderMemoryAudit(events, selector, interactive = true) {
   if (!container) return;
   if (!events.length) {
     container.innerHTML = `<p class="empty-state">${escapeHtml(tr("memoryAuditEmpty"))}</p>`;
+    if (selector === "#memory-audit-list") {
+      renderPagination("#memory-audit-pagination", memoryAuditPagination, "memory-audit");
+    }
     return;
   }
   container.innerHTML = events.map((event) => `
@@ -3140,6 +3444,7 @@ function renderMemoryAudit(events, selector, interactive = true) {
         document.querySelector("#memory-filter-form")?.reset();
         const query = document.querySelector("#memory-filter-query");
         if (query) query.value = memoryId;
+        memoryPagination.page = 1;
         selectedMemoryId = memoryId;
         memoryItems = [];
         try {
@@ -3150,6 +3455,9 @@ function renderMemoryAudit(events, selector, interactive = true) {
         }
       });
     });
+  }
+  if (selector === "#memory-audit-list") {
+    renderPagination("#memory-audit-pagination", memoryAuditPagination, "memory-audit");
   }
 }
 
@@ -3201,6 +3509,7 @@ async function loadMemoryInventory(options = {}) {
   }
 
   memoryItems = inventoryResult.value.memories || [];
+  applyPaginationPayload(memoryPagination, inventoryResult.value.pagination);
   if (selectedMemoryId && !memoryItems.some((item) => item.memory_id === selectedMemoryId)) {
     selectedMemoryId = "";
     selectedMemoryDetail = null;
@@ -3229,8 +3538,13 @@ async function loadMemoryAudit(options = {}) {
   const list = document.querySelector("#memory-audit-list");
   if (list && !options.quiet) list.innerHTML = `<p class="empty-state">${escapeHtml(tr("memoryLoading"))}</p>`;
   try {
-    const audit = await json("/api/memory/events?limit=200");
+    const params = new URLSearchParams({
+      limit: String(memoryAuditPagination.size),
+      offset: String((memoryAuditPagination.page - 1) * memoryAuditPagination.size),
+    });
+    const audit = await json(`/api/memory/events?${params}`);
     memoryAuditEvents = audit.events || [];
+    applyPaginationPayload(memoryAuditPagination, audit.pagination);
     renderMemoryAudit(memoryAuditEvents, "#memory-audit-list");
     return { errors: [] };
   } catch (err) {
@@ -3412,10 +3726,10 @@ function refreshCurrentView() {
   return loadViewData(active);
 }
 
-async function loadDashboardRuntime() {
+async function loadDashboardRuntime(section = activeDashboardSection) {
   const llmFallback = { provider: "unavailable", model: "-", endpoint: "", unavailable: true };
   const syslogFallback = { configs: syslogConfigs, listeners: [], unavailable: true };
-  const caseQuery = caseSearchQuery();
+  const caseQuery = caseSearchQuery(section);
   const [health, casesData, llmConfig, syslogPayload] = await Promise.all([
     json("/api/health", { acceptStatuses: [503] }),
     canReadCases() ? json(`/api/cases?${caseQuery}`) : Promise.resolve({ cases: [] }),
@@ -3426,7 +3740,13 @@ async function loadDashboardRuntime() {
       ? json("/api/config/syslog").catch(() => syslogFallback)
       : Promise.resolve(syslogFallback),
   ]);
-  return { health, cases: casesData.cases || [], llmConfig, syslogPayload };
+  return {
+    health,
+    cases: casesData.cases || [],
+    pagination: casesData.pagination || {},
+    llmConfig,
+    syslogPayload,
+  };
 }
 
 async function loadCases(options = {}) {
@@ -3434,10 +3754,11 @@ async function loadCases(options = {}) {
   activeDashboardSection = section;
   const list = document.querySelector(dashboardCaseListId(section));
   try {
-    const { health, cases, llmConfig, syslogPayload } = await loadDashboardRuntime();
+    const { health, cases, pagination, llmConfig, syslogPayload } = await loadDashboardRuntime(section);
     renderDashboard(health, cases, llmConfig, syslogPayload);
     detailCache.clear();
     queueCases = cases;
+    applyPaginationPayload(casePagination[section], pagination);
     if (section === "history") renderProcessedList(processedQueueCases(queueCases));
     else renderQueueList(pendingQueueCases(queueCases));
   } catch (err) {
@@ -3966,6 +4287,7 @@ document.querySelectorAll(".case-search-form").forEach((form) => {
   const section = form.dataset.caseSearchSection === "history" ? "history" : "pending";
   form.addEventListener("submit", (event) => {
     event.preventDefault();
+    casePagination[section].page = 1;
     activeDashboardSection = section;
     setView("dashboard");
     setSecondaryView("dashboard", section);
@@ -3973,6 +4295,7 @@ document.querySelectorAll(".case-search-form").forEach((form) => {
   });
   form.querySelector("button[type=button]")?.addEventListener("click", () => {
     form.reset();
+    casePagination[section].page = 1;
     activeDashboardSection = section;
     setView("dashboard");
     setSecondaryView("dashboard", section);
@@ -3981,16 +4304,42 @@ document.querySelectorAll(".case-search-form").forEach((form) => {
 });
 document.querySelector("#memory-filter-form").addEventListener("submit", (event) => {
   event.preventDefault();
-  loadMemoryGovernance().catch((err) => showToast(tr("memoryActionFailed", { message: err.message || String(err) }), "error"));
+  memoryPagination.page = 1;
+  loadMemoryInventory().catch((err) => showToast(tr("memoryActionFailed", { message: err.message || String(err) }), "error"));
 });
 document.querySelector("#memory-filter-reset").addEventListener("click", () => {
   document.querySelector("#memory-filter-form").reset();
-  loadMemoryGovernance().catch((err) => showToast(tr("memoryActionFailed", { message: err.message || String(err) }), "error"));
+  memoryPagination.page = 1;
+  loadMemoryInventory().catch((err) => showToast(tr("memoryActionFailed", { message: err.message || String(err) }), "error"));
 });
 document.querySelector("#memory-sweep").addEventListener("click", sweepMemory);
 document.querySelector("#memory-audit-refresh").addEventListener("click", () => {
   loadMemoryAudit({ quiet: true }).catch((err) =>
     showToast(tr("memoryActionFailed", { message: err.message || String(err) }), "error"),
+  );
+});
+document.addEventListener("change", (event) => {
+  const select = event.target.closest("[data-pagination-size]");
+  if (!select) return;
+  const state = paginationState(select.dataset.paginationSize);
+  const size = Number(select.value);
+  if (!state || !PAGE_SIZE_OPTIONS.includes(size)) return;
+  state.size = size;
+  state.page = 1;
+  reloadPagination(select.dataset.paginationSize).catch((err) =>
+    showToast(tr("refreshFailed", { message: err.message || String(err) }), "error"),
+  );
+});
+document.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-pagination-action]");
+  if (!button || button.disabled) return;
+  const key = button.dataset.paginationKey;
+  const state = paginationState(key);
+  if (!state) return;
+  const direction = button.dataset.paginationAction === "next" ? 1 : -1;
+  state.page = Math.min(state.totalPages, Math.max(1, state.page + direction));
+  reloadPagination(key).catch((err) =>
+    showToast(tr("refreshFailed", { message: err.message || String(err) }), "error"),
   );
 });
 document.querySelector("#refresh-mode-toggle").addEventListener("click", () => {

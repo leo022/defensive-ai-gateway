@@ -20,7 +20,13 @@ from defensive_ai_gateway.models import RawAlert
 from defensive_ai_gateway.normalizer import EventNormalizer
 from defensive_ai_gateway.orchestrator import Orchestrator
 from defensive_ai_gateway.policy import PolicyEngine
-from defensive_ai_gateway.processing import AlertProcessor, AlertRetryableError, DeadLetter
+from defensive_ai_gateway.processing import (
+    AlertNonRetryableError,
+    AlertProcessor,
+    AlertQueueFull,
+    AlertRetryableError,
+    DeadLetter,
+)
 from defensive_ai_gateway.syslog_receiver import (
     SyslogFrameDecoder,
     SyslogFrameError,
@@ -125,6 +131,31 @@ class AlertProcessorReliabilityTest(unittest.TestCase):
         self.assertEqual(len(delivered), 1)
         self.assertEqual(delivered[0].retry_after_seconds, 12)
         self.assertEqual(delivered[0].to_dict()["retry_after_seconds"], 12)
+        self.assertTrue(processor.stop(timeout=1))
+
+    def test_permanent_failure_enters_dlq_without_in_memory_retry(self):
+        delivered: list[DeadLetter] = []
+        calls = 0
+
+        def handler(_alert: RawAlert) -> None:
+            nonlocal calls
+            calls += 1
+            raise AlertNonRetryableError("invalid credential")
+
+        processor = AlertProcessor(
+            handler,
+            workers=1,
+            max_attempts=5,
+            retry_base_delay=0,
+            dead_letter_handler=delivered.append,
+        )
+        processor.start()
+        processor.submit(_alert("permanent-001"))
+
+        self.assertTrue(processor.wait_for_idle(timeout=1))
+        self.assertEqual(calls, 1)
+        self.assertEqual(processor.stats().retried, 0)
+        self.assertEqual(delivered[0].reason, "non_retryable")
         self.assertTrue(processor.stop(timeout=1))
 
     def test_shutdown_deadline_moves_not_started_alert_to_dlq(self):
@@ -332,6 +363,41 @@ class RemoteLLMDeferralTest(unittest.TestCase):
             self.assertIsNotNone(failed)
             self.assertIn('"fallback": "not_used"', failed["detail_json"])
 
+    def test_async_terminal_remote_error_enters_durable_dlq_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            config.database.path = str(Path(tmp) / "gateway.db")
+            config.processing.async_enabled = True
+            config.processing.workers = 1
+            config.processing.max_attempts = 12
+            config.syslog.embedded_listeners_enabled = False
+            state = GatewayState(config)
+            try:
+                terminal = self._WebSocketEndpointLLM()
+                state.llm = terminal
+                state.orchestrator.llm = terminal
+                alert = _alert("terminal-remote-dlq-001")
+                state.submit_alert(alert)
+                self.assertTrue(
+                    self._wait_until(
+                        lambda: bool(
+                            (record := state.repo.get_inbox_alert(alert.alert_id))
+                            and record["status"] == "dead_letter"
+                        )
+                    )
+                )
+                record = state.repo.get_inbox_alert(alert.alert_id)
+                self.assertEqual(record["attempts"], 1)
+                self.assertEqual(
+                    state.repo.conn.execute(
+                        "SELECT COUNT(*) FROM audit_log "
+                        "WHERE action = 'analysis_deferred'"
+                    ).fetchone()[0],
+                    0,
+                )
+            finally:
+                state.stop()
+
     def test_gateway_replays_deferred_alert_once_after_manual_remote_recovery(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = GatewayConfig()
@@ -420,6 +486,26 @@ class RemoteLLMDeferralTest(unittest.TestCase):
             self.assertEqual(manual["dead_letter_recovered"], 1)
             self.assertEqual(repo.get_inbox_alert(alert.alert_id)["status"], "retry")
 
+    def test_terminal_llm_dead_letter_requires_manual_recovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repository(str(Path(tmp) / "gateway.db"))
+            alert = _alert("terminal-llm-manual-recovery-001")
+            repo.enqueue_alert(alert, max_attempts=12)
+            repo.claim_inbox_alert(alert.alert_id)
+            repo.dead_letter_inbox_alert(
+                alert.alert_id,
+                "LLMEndpointConfigurationError('LLM gateway rejected the request with HTTP 403')",
+            )
+
+            self.assertEqual(
+                repo.release_llm_deferred_alerts(limit=10, force=False)["released"],
+                0,
+            )
+            manual = repo.release_llm_deferred_alerts(limit=10, force=True)
+            self.assertEqual(manual["released"], 1)
+            self.assertEqual(manual["dead_letter_recovered"], 1)
+            self.assertEqual(repo.get_inbox_alert(alert.alert_id)["status"], "retry")
+
     def test_due_deferred_alert_is_not_claimed_until_recovery_releases_it(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Repository(str(Path(tmp) / "gateway.db"))
@@ -489,6 +575,121 @@ class RemoteLLMDeferralTest(unittest.TestCase):
                 )
             finally:
                 state.stop()
+
+
+class DurableInboxProductionControlTest(unittest.TestCase):
+    def test_byte_capacity_is_released_when_work_completes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repository(str(Path(tmp) / "gateway.db"))
+            first = _alert("byte-capacity-001")
+            first.payload = {"body": "x" * 400}
+            second = _alert("byte-capacity-002")
+            second.payload = {"body": "y" * 400}
+
+            self.assertEqual(
+                repo.enqueue_alert_bounded(
+                    first,
+                    max_attempts=3,
+                    capacity=10,
+                    capacity_bytes=10_000,
+                ),
+                "inserted",
+            )
+            used = repo.inbox_capacity_stats()["unfinished_bytes"]
+            self.assertGreater(used, 400)
+            self.assertEqual(
+                repo.enqueue_alert_bounded(
+                    second,
+                    max_attempts=3,
+                    capacity=10,
+                    capacity_bytes=used,
+                ),
+                "full",
+            )
+            repo.claim_inbox_alert(first.alert_id)
+            repo.complete_inbox_alert(first.alert_id)
+            self.assertEqual(repo.inbox_capacity_stats()["unfinished_bytes"], 0)
+            self.assertEqual(
+                repo.enqueue_alert_bounded(
+                    second,
+                    max_attempts=3,
+                    capacity=10,
+                    capacity_bytes=used,
+                ),
+                "inserted",
+            )
+
+    def test_dispatch_prefers_severity_then_rotating_product(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repository(str(Path(tmp) / "gateway.db"))
+            low = _alert("dispatch-low-waf")
+            low.severity = "low"
+            critical = _alert("dispatch-critical-rasp")
+            critical.product = "rasp"
+            critical.severity = "critical"
+            high_waf = _alert("dispatch-high-waf")
+            high_waf.severity = "high"
+            high_hips = _alert("dispatch-high-hips")
+            high_hips.product = "hips"
+            high_hips.severity = "high"
+            for alert in (low, high_waf, high_hips, critical):
+                repo.enqueue_alert(alert)
+
+            claimed = repo.claim_inbox_alert(preferred_product="hips")
+            self.assertEqual(claimed["alert_id"], critical.alert_id)
+            repo.complete_inbox_alert(critical.alert_id)
+            claimed = repo.claim_inbox_alert(preferred_product="hips")
+            self.assertEqual(claimed["alert_id"], high_hips.alert_id)
+
+    def test_claim_lease_can_be_renewed_and_execution_queue_is_worker_bounded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            config.database.path = str(Path(tmp) / "gateway.db")
+            config.processing.async_enabled = True
+            config.processing.workers = 2
+            config.syslog.embedded_listeners_enabled = False
+            state = GatewayState(config)
+            try:
+                self.assertEqual(state.alert_processor.stats().queue_max_size, 2)
+                alert = _alert("lease-renewal-001")
+                state.repo.enqueue_alert(alert)
+                claimed = state.repo.claim_inbox_alert(alert.alert_id)
+                before = claimed["claimed_at_ms"]
+                time.sleep(0.002)
+                self.assertTrue(state.repo.renew_inbox_claim(alert.alert_id))
+                self.assertGreaterEqual(
+                    state.repo.get_inbox_alert(alert.alert_id)["claimed_at_ms"],
+                    before,
+                )
+            finally:
+                state.stop()
+
+    def test_capacity_pauses_admission_without_removing_readiness(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            config.database.path = str(Path(tmp) / "gateway.db")
+            config.processing.async_enabled = True
+            config.processing.workers = 1
+            config.processing.queue_max_size = 0
+            config.syslog.embedded_listeners_enabled = False
+            state = GatewayState(config)
+            try:
+                readiness = state.readiness()
+                self.assertFalse(readiness["checks"]["inbox_capacity"]["ok"])
+                self.assertTrue(readiness["ok"])
+                with self.assertRaisesRegex(AlertQueueFull, "admission is paused"):
+                    state.submit_alert(_alert("capacity-paused-001"))
+            finally:
+                state.stop()
+
+    def test_inbox_list_supports_offset_and_total_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repository(str(Path(tmp) / "gateway.db"))
+            for index in range(3):
+                repo.enqueue_alert(_alert(f"page-{index}"))
+            page = repo.list_inbox_alerts(limit=1, offset=1)
+            self.assertEqual(len(page), 1)
+            self.assertEqual(repo.count_inbox_alerts(), 3)
 
 
 class LLMRuntimeRestoreTest(unittest.TestCase):

@@ -223,6 +223,7 @@ CREATE TABLE IF NOT EXISTS durable_alert_inbox (
   raw_alert_json TEXT NOT NULL,
   source TEXT NOT NULL,
   product TEXT NOT NULL,
+  priority INTEGER NOT NULL DEFAULT 2,
   status TEXT NOT NULL DEFAULT 'pending',
   attempts INTEGER NOT NULL DEFAULT 0,
   max_attempts INTEGER NOT NULL DEFAULT 5,
@@ -234,6 +235,13 @@ CREATE TABLE IF NOT EXISTS durable_alert_inbox (
   updated_at_ms INTEGER NOT NULL,
   CHECK (status IN ('pending','processing','retry','deferred','completed','dead_letter'))
 );
+CREATE TABLE IF NOT EXISTS inbox_capacity_state (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  unfinished_count INTEGER NOT NULL DEFAULT 0,
+  unfinished_bytes INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO inbox_capacity_state(singleton, unfinished_count, unfinished_bytes)
+VALUES (1, 0, 0);
 CREATE INDEX IF NOT EXISTS idx_normalized_alert ON normalized_events(alert_id);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_case ON agent_runs(case_id);
 CREATE INDEX IF NOT EXISTS idx_case_links_alert ON case_alert_links(alert_id);
@@ -255,11 +263,51 @@ CREATE INDEX IF NOT EXISTS idx_approvals_status ON action_approvals(status, crea
 CREATE INDEX IF NOT EXISTS idx_approval_votes_approval ON approval_votes(approval_id, created_at_ms ASC);
 CREATE INDEX IF NOT EXISTS idx_alert_dispositions_case ON alert_dispositions(case_id, updated_at_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_inbox_claim ON durable_alert_inbox(status, available_at_ms, created_at_ms);
+CREATE INDEX IF NOT EXISTS idx_inbox_status_created ON durable_alert_inbox(status, created_at_ms);
+CREATE TRIGGER IF NOT EXISTS trg_inbox_capacity_insert
+AFTER INSERT ON durable_alert_inbox
+WHEN NEW.status IN ('pending','retry','deferred','processing')
+BEGIN
+  UPDATE inbox_capacity_state
+  SET unfinished_count = unfinished_count + 1,
+      unfinished_bytes = unfinished_bytes + length(CAST(NEW.raw_alert_json AS BLOB))
+  WHERE singleton = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_inbox_capacity_update
+AFTER UPDATE OF status, raw_alert_json ON durable_alert_inbox
+BEGIN
+  UPDATE inbox_capacity_state
+  SET unfinished_count = unfinished_count
+        - CASE WHEN OLD.status IN ('pending','retry','deferred','processing') THEN 1 ELSE 0 END
+        + CASE WHEN NEW.status IN ('pending','retry','deferred','processing') THEN 1 ELSE 0 END,
+      unfinished_bytes = unfinished_bytes
+        - CASE WHEN OLD.status IN ('pending','retry','deferred','processing')
+               THEN length(CAST(OLD.raw_alert_json AS BLOB)) ELSE 0 END
+        + CASE WHEN NEW.status IN ('pending','retry','deferred','processing')
+               THEN length(CAST(NEW.raw_alert_json AS BLOB)) ELSE 0 END
+  WHERE singleton = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_inbox_capacity_delete
+AFTER DELETE ON durable_alert_inbox
+WHEN OLD.status IN ('pending','retry','deferred','processing')
+BEGIN
+  UPDATE inbox_capacity_state
+  SET unfinished_count = MAX(0, unfinished_count - 1),
+      unfinished_bytes = MAX(
+        0,
+        unfinished_bytes - length(CAST(OLD.raw_alert_json AS BLOB))
+      )
+  WHERE singleton = 1;
+END;
 """
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 _LLM_DEFERRED_ERROR_PREFIX = "analysis_deferred:"
 _LEGACY_LLM_DEFERRED_ERROR_FRAGMENT = "remote LLM analysis deferred"
+_TERMINAL_LLM_ERROR_FRAGMENTS = (
+    "LLMEndpointConfigurationError",
+    "LLMResponseContractError",
+)
 
 
 class AlertIdentityConflict(ValueError):
@@ -741,6 +789,115 @@ class Repository:
                     (now_ms(),),
                 )
 
+            if current < 13:
+                # v13 adds priority/fair dispatch and constant-time byte/count
+                # admission accounting. Recreate triggers because the v12 table
+                # rebuild may have removed triggers created by the base schema.
+                inbox_columns = {
+                    row["name"]
+                    for row in self.conn.execute(
+                        "PRAGMA table_info(durable_alert_inbox)"
+                    ).fetchall()
+                }
+                if "priority" not in inbox_columns:
+                    self.conn.execute(
+                        "ALTER TABLE durable_alert_inbox "
+                        "ADD COLUMN priority INTEGER NOT NULL DEFAULT 2"
+                    )
+                priority_rows = self.conn.execute(
+                    "SELECT alert_id, raw_alert_json FROM durable_alert_inbox"
+                ).fetchall()
+                for inbox_row in priority_rows:
+                    try:
+                        raw_alert = json.loads(inbox_row["raw_alert_json"] or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        raw_alert = {}
+                    severity = str(raw_alert.get("severity") or "medium").lower()
+                    priority = {"critical": 0, "high": 1, "medium": 2}.get(severity, 3)
+                    self.conn.execute(
+                        "UPDATE durable_alert_inbox SET priority = ? WHERE alert_id = ?",
+                        (priority, inbox_row["alert_id"]),
+                    )
+                self.conn.execute("DROP INDEX IF EXISTS idx_inbox_claim")
+                self.conn.execute(
+                    "CREATE INDEX idx_inbox_claim ON durable_alert_inbox"
+                    "(status, priority, available_at_ms, created_at_ms)"
+                )
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_inbox_status_created "
+                    "ON durable_alert_inbox(status, created_at_ms)"
+                )
+                self.conn.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS inbox_capacity_state (
+                      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                      unfinished_count INTEGER NOT NULL DEFAULT 0,
+                      unfinished_bytes INTEGER NOT NULL DEFAULT 0
+                    );
+                    INSERT OR IGNORE INTO inbox_capacity_state
+                      (singleton, unfinished_count, unfinished_bytes)
+                    VALUES (1, 0, 0);
+                    DROP TRIGGER IF EXISTS trg_inbox_capacity_insert;
+                    DROP TRIGGER IF EXISTS trg_inbox_capacity_update;
+                    DROP TRIGGER IF EXISTS trg_inbox_capacity_delete;
+                    CREATE TRIGGER trg_inbox_capacity_insert
+                    AFTER INSERT ON durable_alert_inbox
+                    WHEN NEW.status IN ('pending','retry','deferred','processing')
+                    BEGIN
+                      UPDATE inbox_capacity_state
+                      SET unfinished_count = unfinished_count + 1,
+                          unfinished_bytes = unfinished_bytes
+                            + length(CAST(NEW.raw_alert_json AS BLOB))
+                      WHERE singleton = 1;
+                    END;
+                    CREATE TRIGGER trg_inbox_capacity_update
+                    AFTER UPDATE OF status, raw_alert_json ON durable_alert_inbox
+                    BEGIN
+                      UPDATE inbox_capacity_state
+                      SET unfinished_count = unfinished_count
+                            - CASE WHEN OLD.status IN ('pending','retry','deferred','processing') THEN 1 ELSE 0 END
+                            + CASE WHEN NEW.status IN ('pending','retry','deferred','processing') THEN 1 ELSE 0 END,
+                          unfinished_bytes = unfinished_bytes
+                            - CASE WHEN OLD.status IN ('pending','retry','deferred','processing')
+                                   THEN length(CAST(OLD.raw_alert_json AS BLOB)) ELSE 0 END
+                            + CASE WHEN NEW.status IN ('pending','retry','deferred','processing')
+                                   THEN length(CAST(NEW.raw_alert_json AS BLOB)) ELSE 0 END
+                      WHERE singleton = 1;
+                    END;
+                    CREATE TRIGGER trg_inbox_capacity_delete
+                    AFTER DELETE ON durable_alert_inbox
+                    WHEN OLD.status IN ('pending','retry','deferred','processing')
+                    BEGIN
+                      UPDATE inbox_capacity_state
+                      SET unfinished_count = MAX(0, unfinished_count - 1),
+                          unfinished_bytes = MAX(
+                            0,
+                            unfinished_bytes - length(CAST(OLD.raw_alert_json AS BLOB))
+                          )
+                      WHERE singleton = 1;
+                    END;
+                    """
+                )
+                self.conn.execute(
+                    """
+                    UPDATE inbox_capacity_state
+                    SET unfinished_count = (
+                          SELECT COUNT(*) FROM durable_alert_inbox
+                          WHERE status IN ('pending','retry','deferred','processing')
+                        ),
+                        unfinished_bytes = COALESCE((
+                          SELECT SUM(length(CAST(raw_alert_json AS BLOB)))
+                          FROM durable_alert_inbox
+                          WHERE status IN ('pending','retry','deferred','processing')
+                        ), 0)
+                    WHERE singleton = 1
+                    """
+                )
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO schema_version(version, applied_at_ms) VALUES (13, ?)",
+                    (now_ms(),),
+                )
+
             self.conn.commit()
 
     def readiness_check(self) -> dict[str, Any]:
@@ -1101,6 +1258,7 @@ class Repository:
                     "action": approval["action"],
                     "rationale": approval["rationale"],
                     "rollback": approval["rollback"],
+                    "stage": approval.get("stage", ""),
                     "mode": approval["mode"],
                 },
                 ensure_ascii=False,
@@ -1385,18 +1543,20 @@ class Repository:
                 self._alert_identity_json(payload),
             )
             created = now_ms()
+            priority = self._alert_priority(payload.get("severity"))
             cur = self.conn.execute(
                 """
                 INSERT OR IGNORE INTO durable_alert_inbox
-                (alert_id, raw_alert_json, source, product, status, attempts, max_attempts,
+                (alert_id, raw_alert_json, source, product, priority, status, attempts, max_attempts,
                  available_at_ms, claimed_at_ms, completed_at_ms, last_error, created_at_ms, updated_at_ms)
-                VALUES (?, ?, ?, ?, 'pending', 0, ?, ?, NULL, NULL, '', ?, ?)
+                VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?, NULL, NULL, '', ?, ?)
                 """,
                 (
                     alert_id,
                     json.dumps(payload, ensure_ascii=False, sort_keys=True),
                     str(payload.get("source") or "unknown"),
                     str(payload.get("product") or "unknown").lower(),
+                    priority,
                     max(1, int(max_attempts)),
                     created,
                     created,
@@ -1413,6 +1573,7 @@ class Repository:
         *,
         max_attempts: int = 5,
         capacity: int,
+        capacity_bytes: int | None = None,
     ) -> str:
         """Atomically enforce durable-inbox capacity and idempotency.
 
@@ -1444,13 +1605,20 @@ class Repository:
             )
             if existing and not recover_completed:
                 return "duplicate"
-            backlog = self.conn.execute(
-                """
-                SELECT COUNT(*) AS count FROM durable_alert_inbox
-                WHERE status IN ('pending', 'retry', 'deferred', 'processing')
-                """
-            ).fetchone()["count"]
-            if int(backlog) >= max(1, int(capacity)):
+            capacity_state = self.conn.execute(
+                "SELECT unfinished_count, unfinished_bytes FROM inbox_capacity_state "
+                "WHERE singleton = 1"
+            ).fetchone()
+            backlog = int(capacity_state["unfinished_count"] if capacity_state else 0)
+            backlog_bytes = int(capacity_state["unfinished_bytes"] if capacity_state else 0)
+            incoming_bytes = len(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            )
+            bytes_full = (
+                capacity_bytes is not None
+                and backlog_bytes + incoming_bytes > max(1, int(capacity_bytes))
+            )
+            if backlog >= max(1, int(capacity)) or bytes_full:
                 return "full"
             if recover_completed:
                 available = now_ms()
@@ -1472,6 +1640,14 @@ class Repository:
             )
             return "inserted" if inserted else "duplicate"
 
+    @staticmethod
+    def _alert_priority(severity: object) -> int:
+        return {
+            "critical": 0,
+            "high": 1,
+            "medium": 2,
+        }.get(str(severity or "medium").lower(), 3)
+
     def _completed_alert_result_exists(self, alert_id: str) -> bool:
         return bool(
             self.conn.execute(
@@ -1491,7 +1667,12 @@ class Repository:
             ).fetchone()
         )
 
-    def claim_inbox_alert(self, alert_id: str | None = None) -> dict[str, Any] | None:
+    def claim_inbox_alert(
+        self,
+        alert_id: str | None = None,
+        *,
+        preferred_product: str | None = None,
+    ) -> dict[str, Any] | None:
         """Atomically claim one due inbox item for a worker."""
         with self.transaction():
             now = now_ms()
@@ -1504,13 +1685,19 @@ class Repository:
                     (alert_id, now),
                 ).fetchone()
             else:
+                preferred = str(preferred_product or "").lower()
                 row = self.conn.execute(
                     """
                     SELECT * FROM durable_alert_inbox
                     WHERE status IN ('pending','retry') AND available_at_ms <= ?
-                    ORDER BY available_at_ms ASC, created_at_ms ASC LIMIT 1
+                    ORDER BY
+                      CASE WHEN created_at_ms <= ? THEN 0 ELSE priority END ASC,
+                      CASE WHEN product = ? THEN 0 ELSE 1 END ASC,
+                      available_at_ms ASC,
+                      created_at_ms ASC
+                    LIMIT 1
                     """,
-                    (now,),
+                    (now, now - 300_000, preferred),
                 ).fetchone()
             if not row:
                 return None
@@ -1529,6 +1716,44 @@ class Repository:
                 "SELECT * FROM durable_alert_inbox WHERE alert_id = ?", (row["alert_id"],)
             ).fetchone()
             return self._inbox_row(claimed)
+
+    def renew_inbox_claim(self, alert_id: str, _commit: bool = True) -> bool:
+        """Extend a processing lease while a worker is actively analyzing."""
+        with self._lock:
+            renewed_at = now_ms()
+            cur = self.conn.execute(
+                """
+                UPDATE durable_alert_inbox
+                SET claimed_at_ms = ?, updated_at_ms = ?
+                WHERE alert_id = ? AND status = 'processing'
+                """,
+                (renewed_at, renewed_at, alert_id),
+            )
+            if _commit:
+                self.conn.commit()
+            return cur.rowcount == 1
+
+    def dead_letter_inbox_alert(
+        self,
+        alert_id: str,
+        error: str,
+        _commit: bool = True,
+    ) -> bool:
+        """Move a permanent failure directly to the durable DLQ."""
+        with self._lock:
+            failed_at = now_ms()
+            cur = self.conn.execute(
+                """
+                UPDATE durable_alert_inbox
+                SET status = 'dead_letter', available_at_ms = ?, claimed_at_ms = NULL,
+                    last_error = ?, updated_at_ms = ?
+                WHERE alert_id = ? AND status = 'processing'
+                """,
+                (failed_at, str(error)[:2000], failed_at, alert_id),
+            )
+            if _commit:
+                self.conn.commit()
+            return cur.rowcount == 1
 
     def complete_inbox_alert(self, alert_id: str, _commit: bool = True) -> bool:
         with self._lock:
@@ -1639,7 +1864,13 @@ class Repository:
                 FROM durable_alert_inbox
                 WHERE (
                     (status = 'deferred' AND (last_error LIKE ? OR last_error LIKE ?))
-                    OR (status = 'dead_letter' AND (last_error LIKE ? OR last_error LIKE ?))
+                    OR (
+                      status = 'dead_letter'
+                      AND (
+                        last_error LIKE ? OR last_error LIKE ?
+                        OR last_error LIKE ? OR last_error LIKE ?
+                      )
+                    )
                 )
                   AND (? = 1 OR (status = 'deferred' AND available_at_ms <= ?))
                 ORDER BY CASE status WHEN 'dead_letter' THEN 0 ELSE 1 END,
@@ -1651,6 +1882,8 @@ class Repository:
                     f"%{_LEGACY_LLM_DEFERRED_ERROR_FRAGMENT}%",
                     f"{_LLM_DEFERRED_ERROR_PREFIX}%",
                     f"%{_LEGACY_LLM_DEFERRED_ERROR_FRAGMENT}%",
+                    f"%{_TERMINAL_LLM_ERROR_FRAGMENTS[0]}%",
+                    f"%{_TERMINAL_LLM_ERROR_FRAGMENTS[1]}%",
                     1 if force else 0,
                     released_at,
                     batch_size,
@@ -1706,19 +1939,64 @@ class Repository:
                 self.conn.commit()
             return cur.rowcount
 
-    def list_inbox_alerts(self, status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+    def list_inbox_alerts(
+        self,
+        status: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
         with self._lock:
             if status:
                 rows = self.conn.execute(
-                    "SELECT * FROM durable_alert_inbox WHERE status = ? ORDER BY created_at_ms DESC LIMIT ?",
-                    (status, max(1, min(int(limit), 500))),
+                    "SELECT * FROM durable_alert_inbox WHERE status = ? "
+                    "ORDER BY created_at_ms DESC LIMIT ? OFFSET ?",
+                    (
+                        status,
+                        max(1, min(int(limit), 500)),
+                        max(0, int(offset)),
+                    ),
                 ).fetchall()
             else:
                 rows = self.conn.execute(
-                    "SELECT * FROM durable_alert_inbox ORDER BY created_at_ms DESC LIMIT ?",
-                    (max(1, min(int(limit), 500)),),
+                    "SELECT * FROM durable_alert_inbox ORDER BY created_at_ms DESC "
+                    "LIMIT ? OFFSET ?",
+                    (max(1, min(int(limit), 500)), max(0, int(offset))),
                 ).fetchall()
             return [self._inbox_row(row) for row in rows]
+
+    def count_inbox_alerts(self, status: str | None = None) -> int:
+        with self._lock:
+            if status:
+                row = self.conn.execute(
+                    "SELECT COUNT(*) AS count FROM durable_alert_inbox WHERE status = ?",
+                    (status,),
+                ).fetchone()
+            else:
+                row = self.conn.execute(
+                    "SELECT COUNT(*) AS count FROM durable_alert_inbox"
+                ).fetchone()
+            return int(row["count"] if row else 0)
+
+    def inbox_capacity_stats(self) -> dict[str, int]:
+        """Return constant-time backlog usage plus oldest waiting age."""
+        with self._lock:
+            state = self.conn.execute(
+                "SELECT unfinished_count, unfinished_bytes FROM inbox_capacity_state "
+                "WHERE singleton = 1"
+            ).fetchone()
+            oldest = self.conn.execute(
+                """
+                SELECT MIN(created_at_ms) AS created_at_ms
+                FROM durable_alert_inbox
+                WHERE status IN ('pending','retry','deferred','processing')
+                """
+            ).fetchone()
+            oldest_created = int((oldest["created_at_ms"] if oldest else 0) or 0)
+            return {
+                "unfinished_count": int(state["unfinished_count"] if state else 0),
+                "unfinished_bytes": int(state["unfinished_bytes"] if state else 0),
+                "oldest_age_ms": max(0, now_ms() - oldest_created) if oldest_created else 0,
+            }
 
     def get_inbox_alert(self, alert_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -1750,12 +2028,17 @@ class Repository:
                     SELECT status, COUNT(*) AS count
                     FROM durable_alert_inbox
                     WHERE status IN ('deferred', 'dead_letter')
-                      AND (last_error LIKE ? OR last_error LIKE ?)
+                      AND (
+                        last_error LIKE ? OR last_error LIKE ?
+                        OR last_error LIKE ? OR last_error LIKE ?
+                      )
                     GROUP BY status
                     """,
                     (
                         f"{_LLM_DEFERRED_ERROR_PREFIX}%",
                         f"%{_LEGACY_LLM_DEFERRED_ERROR_FRAGMENT}%",
+                        f"%{_TERMINAL_LLM_ERROR_FRAGMENTS[0]}%",
+                        f"%{_TERMINAL_LLM_ERROR_FRAGMENTS[1]}%",
                     ),
                 ).fetchall()
             }
@@ -2445,6 +2728,77 @@ class Repository:
                 "updated_at_ms": updated,
             }
 
+    def set_alert_dispositions(
+        self,
+        case_id: str,
+        alert_ids: list[str],
+        disposition: str,
+        actor: str,
+        reason: str = "",
+        _commit: bool = True,
+    ) -> dict[str, Any]:
+        """Apply one reviewed decision to an explicitly resolved alert cluster."""
+        if disposition not in {"open", "closed", "false_positive"}:
+            raise ValueError(f"unsupported alert disposition: {disposition}")
+        unique_ids = list(dict.fromkeys(str(item) for item in alert_ids if item))
+        if not unique_ids:
+            raise ValueError("alert cluster is empty")
+        with self._lock:
+            placeholders = ",".join("?" for _ in unique_ids)
+            linked_rows = self.conn.execute(
+                f"""
+                SELECT alert_id FROM case_alert_links
+                WHERE case_id = ? AND alert_id IN ({placeholders})
+                """,
+                (case_id, *unique_ids),
+            ).fetchall()
+            linked_ids = {str(row["alert_id"]) for row in linked_rows}
+            if linked_ids != set(unique_ids):
+                raise ValueError("alert cluster contains alerts outside the Case")
+            updated = now_ms()
+            self.conn.executemany(
+                """
+                INSERT INTO alert_dispositions
+                (alert_id, case_id, disposition, actor, reason, created_at_ms, updated_at_ms)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(alert_id) DO UPDATE SET
+                  case_id = excluded.case_id,
+                  disposition = excluded.disposition,
+                  actor = excluded.actor,
+                  reason = excluded.reason,
+                  updated_at_ms = excluded.updated_at_ms
+                """,
+                [
+                    (alert_id, case_id, disposition, actor, reason, updated, updated)
+                    for alert_id in unique_ids
+                ],
+            )
+            aggregate = self.conn.execute(
+                """
+                SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN d.disposition = 'false_positive' THEN 1 ELSE 0 END) AS false_positives
+                FROM case_alert_links l
+                LEFT JOIN alert_dispositions d
+                  ON d.alert_id = l.alert_id AND d.case_id = l.case_id
+                WHERE l.case_id = ?
+                """,
+                (case_id,),
+            ).fetchone()
+            if _commit:
+                self.conn.commit()
+            total = int(aggregate["total"] or 0)
+            false_positives = int(aggregate["false_positives"] or 0)
+            return {
+                "case_id": case_id,
+                "alert_ids": unique_ids,
+                "updated_count": len(unique_ids),
+                "disposition": disposition,
+                "case_alert_count": total,
+                "case_false_positive_count": false_positives,
+                "case_can_close_as_false_positive": total > 0 and false_positives == total,
+                "updated_at_ms": updated,
+            }
+
     def get_alert_disposition(self, alert_id: str) -> dict[str, Any] | None:
         with self._lock:
             row = self.conn.execute(
@@ -2621,6 +2975,36 @@ class Repository:
             ).fetchone()
             return dict(row) if row else None
 
+    def query_case_memory(
+        self,
+        source_case_id: str,
+        *,
+        layer: str | None = None,
+        statuses: tuple[str, ...] = (),
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """Load memory owned by one Case without a broad namespace scan."""
+        with self._lock:
+            clauses = ["source_case_id = ?"]
+            params: list[Any] = [source_case_id]
+            if layer:
+                clauses.append("layer = ?")
+                params.append(layer)
+            if statuses:
+                placeholders = ",".join("?" for _ in statuses)
+                clauses.append(f"status IN ({placeholders})")
+                params.extend(statuses)
+            rows = self.conn.execute(
+                f"""
+                SELECT {self._MEMORY_COLUMNS} FROM memory_entries
+                WHERE {' AND '.join(clauses)}
+                ORDER BY updated_at_ms DESC, memory_id ASC
+                LIMIT ?
+                """,
+                (*params, max(1, min(int(limit), 500))),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
     def query_memory(
         self,
         layer: str | None = None,
@@ -2629,6 +3013,7 @@ class Repository:
         retrieval_key: str | None = None,
         query: str | None = None,
         limit: int = 50,
+        offset: int = 0,
         include_expired: bool = False,
     ) -> list[dict[str, Any]]:
         with self._lock:
@@ -2660,10 +3045,52 @@ class Repository:
                 params.extend([pattern] * 6)
             where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
             rows = self.conn.execute(
-                f"SELECT {self._MEMORY_COLUMNS} FROM memory_entries {where} ORDER BY created_at_ms DESC LIMIT ?",
-                (*params, limit),
+                f"SELECT {self._MEMORY_COLUMNS} FROM memory_entries {where} "
+                "ORDER BY created_at_ms DESC, memory_id ASC LIMIT ? OFFSET ?",
+                (*params, limit, max(0, int(offset))),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def count_memory(
+        self,
+        layer: str | None = None,
+        namespace: str | None = None,
+        status: str | None = None,
+        retrieval_key: str | None = None,
+        query: str | None = None,
+        include_expired: bool = False,
+    ) -> int:
+        with self._lock:
+            clauses: list[str] = []
+            params: list[Any] = []
+            if layer:
+                clauses.append("layer = ?")
+                params.append(layer)
+            if namespace:
+                clauses.append("namespace = ?")
+                params.append(namespace)
+            if retrieval_key:
+                clauses.append("retrieval_key = ?")
+                params.append(retrieval_key)
+            if status:
+                clauses.append("status = ?")
+                params.append(status)
+            elif not include_expired:
+                clauses.append("status IN ('active', 'pending_approval')")
+            if query:
+                escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                pattern = f"%{escaped}%"
+                clauses.append(
+                    "(memory_id LIKE ? ESCAPE '\\' OR namespace LIKE ? ESCAPE '\\' "
+                    "OR retrieval_key LIKE ? ESCAPE '\\' OR source_case_id LIKE ? ESCAPE '\\' "
+                    "OR scope LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\')"
+                )
+                params.extend([pattern] * 6)
+            where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            row = self.conn.execute(
+                f"SELECT COUNT(*) AS count FROM memory_entries {where}", params
+            ).fetchone()
+            return int(row["count"])
 
     def query_matchable_product_memory(
         self,
@@ -2879,7 +3306,11 @@ class Repository:
                 self.conn.commit()
 
     def list_memory_events(
-        self, memory_id: str | None = None, event_type: str | None = None, limit: int = 50
+        self,
+        memory_id: str | None = None,
+        event_type: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         with self._lock:
             clauses: list[str] = []
@@ -2894,9 +3325,10 @@ class Repository:
             rows = self.conn.execute(
                 f"""
                 SELECT event_id, memory_id, layer, event_type, actor, detail_json, created_at_ms
-                FROM memory_events {where} ORDER BY created_at_ms DESC LIMIT ?
+                FROM memory_events {where}
+                ORDER BY created_at_ms DESC, event_id ASC LIMIT ? OFFSET ?
                 """,
-                (*params, limit),
+                (*params, limit, max(0, int(offset))),
             ).fetchall()
             out = []
             for row in rows:
@@ -2904,6 +3336,24 @@ class Repository:
                 item["detail"] = json.loads(item.pop("detail_json"))
                 out.append(item)
             return out
+
+    def count_memory_events(
+        self, memory_id: str | None = None, event_type: str | None = None
+    ) -> int:
+        with self._lock:
+            clauses: list[str] = []
+            params: list[Any] = []
+            if memory_id:
+                clauses.append("memory_id = ?")
+                params.append(memory_id)
+            if event_type:
+                clauses.append("event_type = ?")
+                params.append(event_type)
+            where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            row = self.conn.execute(
+                f"SELECT COUNT(*) AS count FROM memory_events {where}", params
+            ).fetchone()
+            return int(row["count"])
 
     def load_evidence_refs(self, case_id: str) -> list[dict[str, Any]]:
         """Immutable evidence store: read-only, already-desensitized refs from normalized events."""
@@ -3005,10 +3455,12 @@ class Repository:
     def list_cases(
         self,
         limit: int = 50,
+        offset: int = 0,
         product: str | None = None,
         severity: str | None = None,
         status: str | None = None,
         active_only: bool = False,
+        terminal_only: bool = False,
         created_from_ms: int | None = None,
         created_to_ms: int | None = None,
     ) -> list[dict[str, Any]]:
@@ -3029,6 +3481,8 @@ class Repository:
                 # limited result set in the browser can incorrectly make the
                 # active queue appear empty when recent terminal Cases fill it.
                 clauses.append("c.status NOT IN ('closed', 'false_positive')")
+            if terminal_only:
+                clauses.append("c.status IN ('closed', 'false_positive')")
             if created_from_ms is not None:
                 clauses.append("c.created_at_ms >= ?")
                 params.append(created_from_ms)
@@ -3057,11 +3511,49 @@ class Repository:
                     ORDER BY l.created_at_ms DESC LIMIT 1
                   ) AS latest_alert_id
                 FROM cases c {where}
-                ORDER BY c.created_at_ms DESC, c.case_id ASC LIMIT ?
+                ORDER BY c.created_at_ms DESC, c.case_id ASC LIMIT ? OFFSET ?
                 """,
-                (*params, limit),
+                (*params, limit, max(0, int(offset))),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def count_cases(
+        self,
+        product: str | None = None,
+        severity: str | None = None,
+        status: str | None = None,
+        active_only: bool = False,
+        terminal_only: bool = False,
+        created_from_ms: int | None = None,
+        created_to_ms: int | None = None,
+    ) -> int:
+        with self._lock:
+            clauses: list[str] = []
+            params: list[Any] = []
+            if product:
+                clauses.append("c.product = ?")
+                params.append(product.lower())
+            if severity:
+                clauses.append("c.severity = ?")
+                params.append(severity.lower())
+            if status:
+                clauses.append("c.status = ?")
+                params.append(status.lower())
+            if active_only:
+                clauses.append("c.status NOT IN ('closed', 'false_positive')")
+            if terminal_only:
+                clauses.append("c.status IN ('closed', 'false_positive')")
+            if created_from_ms is not None:
+                clauses.append("c.created_at_ms >= ?")
+                params.append(created_from_ms)
+            if created_to_ms is not None:
+                clauses.append("c.created_at_ms <= ?")
+                params.append(created_to_ms)
+            where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            row = self.conn.execute(
+                f"SELECT COUNT(*) AS count FROM cases c {where}", params
+            ).fetchone()
+            return int(row["count"])
 
     def get_case(self, case_id: str) -> dict[str, Any] | None:
         with self._lock:

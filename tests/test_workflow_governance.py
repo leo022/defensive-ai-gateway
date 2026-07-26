@@ -322,6 +322,7 @@ class WorkflowGovernanceTest(unittest.TestCase):
             self.assertEqual(first.case_id, second.case_id)
             requests = repo.list_approvals(case_id=first.case_id)
             self.assertEqual({item["status"] for item in requests}, {"pending", "cancelled"})
+            self.assertTrue(all(item["action"]["stage"] for item in requests))
             repo.update_case_status(first.case_id, "closed")
             self.assertTrue(all(item["status"] == "cancelled" for item in repo.list_approvals(case_id=first.case_id)))
 

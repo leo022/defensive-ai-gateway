@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 
+from .action_plan import normalize_action_plan
 from .models import AgentResult, ApprovalRequest, RecommendedAction, ValidationResult
 from .policy import PolicyEngine
 
@@ -48,7 +49,7 @@ class ResponseAdvisor:
         # Copy actions so approval normalization never mutates the persisted agent
         # recommendation. The original and the approval request remain auditable.
         actions = [
-            RecommendedAction(action.action, action.mode, action.rationale, action.rollback)
+            RecommendedAction(action.action, action.mode, action.rationale, action.rollback, action.stage)
             for action in result.recommended_actions
         ]
         if result.classification == "malicious" and result.severity in {"critical", "high"} and result.confidence >= 0.75:
@@ -70,6 +71,7 @@ class ResponseAdvisor:
                         rollback=rollback,
                     )
                 )
+        actions = normalize_action_plan(actions)
         requests: list[ApprovalRequest] = []
         seen_actions: set[str] = set()
         for action in actions:
@@ -96,6 +98,7 @@ class ResponseAdvisor:
                     action=action.action,
                     rationale=action.rationale,
                     rollback=rollback,
+                    stage=action.stage,
                     required_approvals=max(
                         1, min(int(self.policy.config.approval_quorum), 5)
                     ),

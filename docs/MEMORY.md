@@ -18,10 +18,10 @@
 
 ## 2. 写入与检索
 
-- 每次 Agent 分析后，`record_case_summary()` 写入一条短期 Case 记忆（24h TTL），并对产品长期记忆提出一条 `pending_approval` 候选——**不自动晋升**。
+- 每次 Agent 分析后，`record_case_summary()` 写入一条短期 Case 记忆（24h TTL）；同一 Case 的产品长期记忆候选按 Case 收敛为一条 `pending_approval`，后续重复分析刷新该候选而不叠加审批项——**不自动晋升**。
 - `load_context(product, case_id, asset_id)` 返回结构化多层上下文：`{case_short_term, product_long_term, asset_profile, org_knowledge, evidence_refs}`，由 orchestrator 注入 Agent prompt。
 - `asset_id` 由事件实体（host/app/src_ip）派生，用于检索资产画像。
-- Dashboard 中“确认为业务误报”会调用 `/api/alerts/{alert_id}/confirm-false-positive`，从关联告警中抽取相似特征，写入一条可治理的长期误报记忆，并记录逐告警 disposition。多告警 Case 只有全部关联告警均被确认误报后才关闭。
+- Dashboard 按稳定行为特征对 Case 内告警分组：产品、规则、应用/目标、方法、URI 模板和进程等决定边界，来源 IP 与参数值的小幅变化不拆组。每组只展示一条代表告警；“确认该组为误报”会调用 `/api/cases/{case_id}/alert-clusters/{cluster_id}/confirm-false-positive`，只写入一条可治理的长期误报记忆并批量记录该组逐告警 disposition。不同规则、路径或行为仍需分别确认；所有告警组均完成误报确认后 Case 才关闭。原单告警接口保留用于兼容。
 - “晋升候选记忆”不会把任意历史结论变成误报规则；只有已激活、可信且具有 `benign` 误报语义的产品长期记忆可参与后续告警降噪。“确认为业务误报”路径会写入这种带结构化特征和匹配策略的记忆。
 
 ### 2.1 后续告警关联
@@ -98,6 +98,7 @@ overall = 0.68 * structured + 0.22 * semantic_vector + 0.10 * retrieval_key
 | POST | `/api/memory/{memory_id}/restore` | `{actor, reason, expires_at_ms?}` → 门禁通过则恢复生效，否则回到待审批 |
 | POST | `/api/memory/sweep` | `{products?}` → 到期扫描 + 冲突检测；未指定产品时扫描全部产品 |
 | POST | `/api/alerts/{alert_id}/confirm-false-positive` | Dashboard 人工确认误报，抽取特征并写入长期记忆 |
+| POST | `/api/cases/{case_id}/alert-clusters/{cluster_id}/confirm-false-positive` | 按稳定行为组批量确认重复告警，只写入一条代表性长期记忆 |
 
 Dashboard 的“记忆治理”工作台提供治理概览、关键词及层级/状态/命名空间组合筛选、结构化详情、五门禁可视化、晋升/撤销/隔离/恢复操作、全产品治理扫描、关联告警得分拆解，以及单条和全局审计时间线。操作人由 Bearer Token 对应的服务端身份写入，客户端提交的 actor 会被覆盖；撤销、隔离和恢复仍必须填写治理理由。
 

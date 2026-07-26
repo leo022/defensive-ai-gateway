@@ -12,6 +12,7 @@ CSS = (ROOT / "defensive_ai_gateway" / "static" / "style.css").read_text(encodin
 THEME_JS = (ROOT / "defensive_ai_gateway" / "static" / "theme-init.js").read_text(encoding="utf-8")
 DETAIL_HTML = (ROOT / "defensive_ai_gateway" / "static" / "case-details.html").read_text(encoding="utf-8")
 DETAIL_JS = (ROOT / "defensive_ai_gateway" / "static" / "case-details.js").read_text(encoding="utf-8")
+LOGO_SVG = (ROOT / "defensive_ai_gateway" / "static" / "logo-mark.svg").read_text(encoding="utf-8")
 
 
 class _ElementCollector(HTMLParser):
@@ -55,6 +56,17 @@ class DashboardQueueMetricTest(unittest.TestCase):
         self.assertEqual(JS.count("modelDeferredBacklog:"), 2)
 
 
+class ProductBrandingTest(unittest.TestCase):
+    def test_dashboard_and_detail_page_publish_consistent_favicons(self):
+        for document in (HTML, DETAIL_HTML):
+            self.assertIn('rel="icon" href="/logo-mark.svg" type="image/svg+xml"', document)
+            self.assertIn('rel="icon" href="/favicon.ico" sizes="any"', document)
+            self.assertIn('href="/apple-touch-icon.png"', document)
+        self.assertIn('class="brand-mark" src="/logo-mark.svg"', HTML)
+        self.assertIn('viewBox="0 0 96 96"', LOGO_SVG)
+        self.assertNotIn(">DG<", HTML)
+
+
 class DeferredLlmReplayRenderingTest(unittest.TestCase):
     def test_operator_can_resume_only_durable_remote_model_work(self):
         self.assertIn('id="resume-llm-deferred"', HTML)
@@ -84,14 +96,14 @@ class WhitelistRecommendationRenderingTest(unittest.TestCase):
 
 
 class FalsePositiveMemoryActionRenderingTest(unittest.TestCase):
-    def test_triage_detail_exposes_alert_level_memory_confirmation(self):
+    def test_triage_detail_groups_repeated_alerts_for_one_memory_confirmation(self):
         self.assertIn("function linkedAlertsBlock", JS)
-        self.assertIn("${linkedAlertsBlock(linked)}", JS)
-        self.assertIn("function linkedAlertReviewCard", JS)
-        self.assertIn("reviewTools(raw, disposition)", JS)
-        self.assertIn("/api/alerts/${encodeURIComponent(alertId)}/confirm-false-positive", JS)
-        self.assertIn("disposition?.memory_confirmation?.memory_id", JS)
-        self.assertIn("确认误报并写入长期记忆", JS)
+        self.assertIn("${linkedAlertsBlock(linked, detail.alert_clusters || [])}", JS)
+        self.assertIn("function alertClusterReviewCard", JS)
+        self.assertIn("function confirmAlertClusterFalsePositive", JS)
+        self.assertIn("/alert-clusters/${encodeURIComponent(clusterId)}/confirm-false-positive", JS)
+        self.assertIn("确认该组为误报并写入一条长期记忆", JS)
+        self.assertIn(".alert-cluster-item", CSS)
 
 
 class ManualValidationReviewRenderingTest(unittest.TestCase):
@@ -120,6 +132,20 @@ class ManualValidationReviewRenderingTest(unittest.TestCase):
         self.assertIn(".manual-review-continuation", CSS)
         self.assertIn(".manual-review-resolution", CSS)
         self.assertIn(".manual-review-dialog", CSS)
+
+
+class CaseApprovalPlanRenderingTest(unittest.TestCase):
+    def test_only_latest_approval_round_is_expanded_and_history_is_collapsed(self):
+        self.assertIn('function approvalBlock(approvals, caseId, latestEventId = "")', JS)
+        self.assertIn("item.event_id === currentEventId", JS)
+        self.assertIn("item.event_id !== currentEventId", JS)
+        self.assertIn('<details class="approval-history">', JS)
+        self.assertIn("approvalHistorySummary", JS)
+        self.assertIn("latestRunRecord.event_id", JS)
+        self.assertIn("function actionStageLabel", JS)
+        self.assertIn('<ol class="action-list">', JS)
+        self.assertIn(".approval-item.compact", CSS)
+        self.assertIn(".action-step-head", CSS)
 
 
 class PromptInjectionEvidenceRenderingTest(unittest.TestCase):
@@ -240,8 +266,10 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertIn(".syslog-deployment-targets", CSS)
 
     def test_frontend_operability_guards_are_present(self):
-        self.assertIn('return new URLSearchParams({ limit: "50" }).toString();', JS)
+        self.assertIn("const pagination = casePagination[section]", JS)
+        self.assertIn('offset: String((pagination.page - 1) * pagination.size)', JS)
         self.assertIn('if (section === "pending") params.set("active_only", "1");', JS)
+        self.assertIn('else params.set("terminal_only", "1");', JS)
         self.assertIn("case-filter-from", HTML)
         self.assertIn("history-case-filter-from", HTML)
         self.assertIn("async function loadMemoryInventory", JS)
@@ -273,7 +301,7 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertIn('return hasAnyRole("config")', JS)
         self.assertIn('return hasAnyRole("read", "config", "analyst")', JS)
 
-        dashboard = JS.split("async function loadDashboardRuntime()", 1)[1].split(
+        dashboard = JS.split("async function loadDashboardRuntime(section = activeDashboardSection)", 1)[1].split(
             "async function loadCases", 1
         )[0]
         self.assertIn("canReadCases() ? json(`/api/cases?${caseQuery}`)", dashboard)
@@ -321,6 +349,13 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertNotIn('class="queue-filter-tabs"', HTML)
         self.assertIn('id="case-search-form"', HTML)
         self.assertIn('id="case-history-search-form"', HTML)
+        for pagination_id in (
+            "cases-pagination",
+            "processed-cases-pagination",
+            "memory-pagination",
+            "memory-audit-pagination",
+        ):
+            self.assertIn(f'id="{pagination_id}"', HTML)
         self.assertIn('data-case-search-section="pending"', HTML)
         self.assertIn('data-case-search-section="history"', HTML)
         self.assertIn("function openCaseTriage", JS)
@@ -328,6 +363,19 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertIn("function pendingQueueCases", JS)
         self.assertIn("function processedQueueCases", JS)
         self.assertIn("function renderProcessedList", JS)
+        self.assertIn("function renderPagination", JS)
+        self.assertIn("PAGE_SIZE_OPTIONS = [10, 20, 50, 100]", JS)
+        self.assertIn('params.set("terminal_only", "1")', JS)
+        self.assertIn('data-pagination-size=', JS)
+        self.assertIn('data-pagination-action="previous"', JS)
+        self.assertIn('data-pagination-action="next"', JS)
+        self.assertIn("function caseFocusSummary", JS)
+        self.assertIn("RASP_RISK_LABELS", JS)
+        self.assertIn("OGNL 表达式注入", JS)
+        self.assertIn('join(" → ")', JS)
+        self.assertNotIn("敏感调用已触达，执行结果待确认", JS)
+        self.assertIn("caseFocusSummary(item)", JS)
+        self.assertIn("caseFocusSummary(detail)", JS)
         self.assertIn("let activeDashboardSection =", JS)
         self.assertIn('setView("triage")', JS)
         self.assertIn('data-detail-section="${escapeHtml(section)}"', JS)
