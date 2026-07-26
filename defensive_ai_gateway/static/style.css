@@ -3311,6 +3311,27 @@ button.memory-audit-row:hover {
   margin-top: 0;
 }
 
+.case-details-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.case-details-pagination strong {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.case-details-pagination button {
+  min-height: 32px;
+  border-color: var(--line);
+  background: var(--surface);
+  color: var(--ink);
+  padding: 6px 12px;
+}
+
 @media (max-width: 1120px) {
   .app-shell {
     grid-template-columns: 1fr;

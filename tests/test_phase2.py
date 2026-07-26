@@ -267,7 +267,8 @@ class CaseDetailHTTPIntegrationTest(unittest.TestCase):
                 for section, record_type in expected_types.items():
                     with self.subTest(section=section):
                         with urllib.request.urlopen(
-                            f"{base}/api/cases/{analyzed['case_id']}/details/{section}", timeout=5
+                            f"{base}/api/cases/{analyzed['case_id']}/details/{section}?limit=1&offset=0",
+                            timeout=5,
                         ) as response:
                             payload = json.loads(response.read())
                         self.assertEqual(payload["section"], section)
@@ -275,6 +276,20 @@ class CaseDetailHTTPIntegrationTest(unittest.TestCase):
                         self.assertNotIn("linked_alerts", payload)
                         self.assertTrue(payload["items"])
                         self.assertEqual(payload["items"][0]["record_type"], record_type)
+                        self.assertEqual(payload["pagination"]["limit"], 1)
+                        self.assertEqual(payload["pagination"]["page"], 1)
+                        self.assertGreaterEqual(payload["pagination"]["total"], 1)
+
+                with urllib.request.urlopen(
+                    f"{base}/api/cases/{analyzed['case_id']}", timeout=5
+                ) as response:
+                    case_payload = json.loads(response.read())
+                self.assertIn("detail_counts", case_payload)
+                self.assertNotIn("memory_matches", case_payload)
+                self.assertLessEqual(len(case_payload["agent_runs"]), 1)
+                self.assertLessEqual(len(case_payload["validation_runs"]), 1)
+                linked_payload = case_payload["linked_alerts"][0]["raw_alert"]["payload"]
+                self.assertTrue(set(linked_payload).issubset({"adapter"}))
 
                 with self.assertRaises(urllib.error.HTTPError) as raised:
                     urllib.request.urlopen(

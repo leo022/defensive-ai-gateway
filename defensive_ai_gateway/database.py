@@ -247,6 +247,10 @@ CREATE INDEX IF NOT EXISTS idx_agent_runs_case ON agent_runs(case_id);
 CREATE INDEX IF NOT EXISTS idx_case_links_alert ON case_alert_links(alert_id);
 CREATE INDEX IF NOT EXISTS idx_case_links_case ON case_alert_links(case_id);
 CREATE INDEX IF NOT EXISTS idx_case_links_case_created ON case_alert_links(case_id, created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_cases_created ON cases(created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_cases_status_created ON cases(status, created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_cases_product_created ON cases(product, created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_cases_severity_created ON cases(severity, created_at_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_memory_lookup ON memory_entries(layer, namespace, status);
 CREATE INDEX IF NOT EXISTS idx_memory_lookup_created ON memory_entries(layer, namespace, status, created_at_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_memory_expiry ON memory_entries(status, expires_at_ms);
@@ -301,7 +305,7 @@ BEGIN
 END;
 """
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 _LLM_DEFERRED_ERROR_PREFIX = "analysis_deferred:"
 _LEGACY_LLM_DEFERRED_ERROR_FRAGMENT = "remote LLM analysis deferred"
 _TERMINAL_LLM_ERROR_FRAGMENTS = (
@@ -898,6 +902,30 @@ class Repository:
                     (now_ms(),),
                 )
 
+            if current < 14:
+                # v14 keeps the queue's time/status/product/severity searches on
+                # ordered indexes as the Case history grows.
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_cases_created "
+                    "ON cases(created_at_ms DESC)"
+                )
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_cases_status_created "
+                    "ON cases(status, created_at_ms DESC)"
+                )
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_cases_product_created "
+                    "ON cases(product, created_at_ms DESC)"
+                )
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_cases_severity_created "
+                    "ON cases(severity, created_at_ms DESC)"
+                )
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO schema_version(version, applied_at_ms) VALUES (14, ?)",
+                    (now_ms(),),
+                )
+
             self.conn.commit()
 
     def readiness_check(self) -> dict[str, Any]:
@@ -1376,21 +1404,52 @@ class Repository:
                 sql += " WHERE " + " AND ".join(clauses)
             sql += " ORDER BY created_at_ms DESC LIMIT ?"
             params.append(max(1, min(int(limit), 500)))
-            return [self._approval_row(row) for row in self.conn.execute(sql, params).fetchall()]
+            rows = self.conn.execute(sql, params).fetchall()
+            if not rows:
+                return []
+            approval_ids = [str(row["approval_id"]) for row in rows]
+            placeholders = ",".join("?" for _ in approval_ids)
+            votes_by_approval: dict[str, list[dict[str, Any]]] = {
+                approval_id: [] for approval_id in approval_ids
+            }
+            for vote in self.conn.execute(
+                f"""
+                SELECT approval_id, actor, decision, reason, created_at_ms
+                FROM approval_votes
+                WHERE approval_id IN ({placeholders})
+                ORDER BY created_at_ms ASC, actor ASC
+                """,
+                approval_ids,
+            ).fetchall():
+                vote_item = dict(vote)
+                approval_id = str(vote_item.pop("approval_id"))
+                votes_by_approval.setdefault(approval_id, []).append(vote_item)
+            return [
+                self._approval_row(
+                    row,
+                    votes=votes_by_approval.get(str(row["approval_id"]), []),
+                )
+                for row in rows
+            ]
 
-    def _approval_row(self, row: sqlite3.Row) -> dict[str, Any]:
+    def _approval_row(
+        self,
+        row: sqlite3.Row,
+        votes: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         payload = dict(row)
         payload["action"] = json.loads(payload.pop("action_json"))
-        votes = [
-            dict(vote)
-            for vote in self.conn.execute(
-                """
-                SELECT actor, decision, reason, created_at_ms FROM approval_votes
-                WHERE approval_id = ? ORDER BY created_at_ms ASC, actor ASC
-                """,
-                (payload["approval_id"],),
-            ).fetchall()
-        ]
+        if votes is None:
+            votes = [
+                dict(vote)
+                for vote in self.conn.execute(
+                    """
+                    SELECT actor, decision, reason, created_at_ms FROM approval_votes
+                    WHERE approval_id = ? ORDER BY created_at_ms ASC, actor ASC
+                    """,
+                    (payload["approval_id"],),
+                ).fetchall()
+            ]
         payload["votes"] = votes
         payload["vote_count"] = sum(1 for vote in votes if vote["decision"] == "approved")
         return payload
@@ -3554,6 +3613,232 @@ class Repository:
                 f"SELECT COUNT(*) AS count FROM cases c {where}", params
             ).fetchone()
             return int(row["count"])
+
+    def get_case_detail_page(
+        self,
+        case_id: str,
+        section: str,
+        *,
+        limit: int = 5,
+        offset: int = 0,
+    ) -> dict[str, Any] | None:
+        """Load only the requested Case detail records.
+
+        Dedicated detail pages must not deserialize the complete Case graph. RASP
+        payloads and analysis results can be large, so each section is queried and
+        paginated independently.
+        """
+        page_limit = max(1, min(int(limit), 50))
+        page_offset = max(0, int(offset))
+        with self._lock:
+            case_row = self.conn.execute(
+                """
+                SELECT case_id, product, status, severity, classification,
+                       confidence, summary, updated_at_ms
+                FROM cases WHERE case_id = ?
+                """,
+                (case_id,),
+            ).fetchone()
+            if not case_row:
+                return None
+            case_summary = dict(case_row)
+
+            if section == "raw-alerts":
+                total = int(
+                    self.conn.execute(
+                        """
+                        SELECT COUNT(*) AS count
+                        FROM case_alert_links l
+                        JOIN raw_alerts ra ON ra.alert_id = l.alert_id
+                        WHERE l.case_id = ?
+                        """,
+                        (case_id,),
+                    ).fetchone()["count"]
+                )
+                rows = self.conn.execute(
+                    """
+                    SELECT l.alert_id, l.event_id, l.created_at_ms AS linked_at_ms,
+                           ra.source, ra.product, ra.event_type, ra.severity,
+                           ra.timestamp, ra.payload_json, ra.created_at_ms,
+                           ad.disposition, ad.actor, ad.reason,
+                           ad.updated_at_ms AS disposition_updated_at_ms
+                    FROM case_alert_links l
+                    JOIN raw_alerts ra ON ra.alert_id = l.alert_id
+                    LEFT JOIN alert_dispositions ad
+                      ON ad.case_id = l.case_id AND ad.alert_id = l.alert_id
+                    WHERE l.case_id = ?
+                    ORDER BY l.created_at_ms DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (case_id, page_limit, page_offset),
+                ).fetchall()
+                items = []
+                for row in rows:
+                    disposition = None
+                    if row["disposition"]:
+                        disposition = {
+                            "case_id": case_id,
+                            "status": row["disposition"],
+                            "actor": row["actor"],
+                            "reason": row["reason"],
+                            "updated_at_ms": row["disposition_updated_at_ms"],
+                        }
+                    items.append(
+                        {
+                            "record_type": "raw_alert",
+                            "alert_id": row["alert_id"],
+                            "event_id": row["event_id"],
+                            "linked_at_ms": row["linked_at_ms"],
+                            "disposition": disposition,
+                            "data": {
+                                "alert_id": row["alert_id"],
+                                "source": row["source"],
+                                "product": row["product"],
+                                "event_type": row["event_type"],
+                                "severity": row["severity"],
+                                "timestamp": row["timestamp"],
+                                "payload": json.loads(row["payload_json"]),
+                                "created_at_ms": row["created_at_ms"],
+                            },
+                        }
+                    )
+            elif section == "normalized-evidence":
+                total = int(
+                    self.conn.execute(
+                        """
+                        SELECT COUNT(*) AS count
+                        FROM case_alert_links l
+                        JOIN normalized_events ne ON ne.event_id = l.event_id
+                        WHERE l.case_id = ?
+                        """,
+                        (case_id,),
+                    ).fetchone()["count"]
+                )
+                rows = self.conn.execute(
+                    """
+                    SELECT l.alert_id, l.event_id, l.created_at_ms AS linked_at_ms,
+                           ne.source, ne.product, ne.event_type, ne.severity,
+                           ne.timestamp, ne.entities_json, ne.evidence_json,
+                           ne.sensitivity_tags_json, ne.created_at_ms
+                    FROM case_alert_links l
+                    JOIN normalized_events ne ON ne.event_id = l.event_id
+                    WHERE l.case_id = ?
+                    ORDER BY l.created_at_ms DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (case_id, page_limit, page_offset),
+                ).fetchall()
+                items = [
+                    {
+                        "record_type": "normalized_evidence",
+                        "alert_id": row["alert_id"],
+                        "event_id": row["event_id"],
+                        "linked_at_ms": row["linked_at_ms"],
+                        "data": {
+                            "event_id": row["event_id"],
+                            "source": row["source"],
+                            "product": row["product"],
+                            "event_type": row["event_type"],
+                            "severity": row["severity"],
+                            "timestamp": row["timestamp"],
+                            "entities": json.loads(row["entities_json"]),
+                            "evidence": json.loads(row["evidence_json"]),
+                            "sensitivity_tags": json.loads(row["sensitivity_tags_json"]),
+                            "created_at_ms": row["created_at_ms"],
+                        },
+                    }
+                    for row in rows
+                ]
+            elif section == "analysis-runs":
+                total = int(
+                    self.conn.execute(
+                        """
+                        SELECT
+                          (SELECT COUNT(*) FROM agent_runs WHERE case_id = ?)
+                          + (SELECT COUNT(*) FROM validation_runs WHERE case_id = ?)
+                          AS count
+                        """,
+                        (case_id, case_id),
+                    ).fetchone()["count"]
+                )
+                rows = self.conn.execute(
+                    """
+                    SELECT record_type, record_id, event_id, actor, product,
+                           version, status, result_json, created_at_ms
+                    FROM (
+                      SELECT 'agent_run' AS record_type, run_id AS record_id,
+                             event_id, agent AS actor, product,
+                             prompt_version AS version, '' AS status,
+                             result_json, created_at_ms
+                      FROM agent_runs WHERE case_id = ?
+                      UNION ALL
+                      SELECT 'validation_run' AS record_type,
+                             validation_id AS record_id, event_id,
+                             validator AS actor, '' AS product,
+                             validator_version AS version, status,
+                             result_json, created_at_ms
+                      FROM validation_runs WHERE case_id = ?
+                    )
+                    ORDER BY created_at_ms DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (case_id, case_id, page_limit, page_offset),
+                ).fetchall()
+                validation_ids = [
+                    str(row["record_id"])
+                    for row in rows
+                    if row["record_type"] == "validation_run"
+                ]
+                resolutions: dict[str, dict[str, Any]] = {}
+                if validation_ids:
+                    placeholders = ",".join("?" for _ in validation_ids)
+                    for resolution in self.conn.execute(
+                        f"""
+                        SELECT validation_id, resolution_id, decision, actor,
+                               reason, created_at_ms
+                        FROM validation_review_resolutions
+                        WHERE validation_id IN ({placeholders})
+                        """,
+                        validation_ids,
+                    ).fetchall():
+                        item = dict(resolution)
+                        resolutions[str(item.pop("validation_id"))] = item
+                items = []
+                for row in rows:
+                    result = json.loads(row["result_json"])
+                    if row["record_type"] == "agent_run":
+                        data = {
+                            "run_id": row["record_id"],
+                            "case_id": case_id,
+                            "event_id": row["event_id"],
+                            "agent": row["actor"],
+                            "product": row["product"],
+                            "prompt_version": row["version"],
+                            "result": result,
+                            "created_at_ms": row["created_at_ms"],
+                        }
+                    else:
+                        data = result
+                        resolution = resolutions.get(str(row["record_id"]))
+                        if resolution:
+                            data["manual_review_resolution"] = resolution
+                    items.append({"record_type": row["record_type"], "data": data})
+            else:
+                raise ValueError("unsupported case detail section")
+
+            return {
+                "case": case_summary,
+                "section": section,
+                "count": total,
+                "items": items,
+                "pagination": {
+                    "limit": page_limit,
+                    "offset": page_offset,
+                    "page": page_offset // page_limit + 1,
+                    "total": total,
+                    "total_pages": max(1, (total + page_limit - 1) // page_limit),
+                },
+            }
 
     def get_case(self, case_id: str) -> dict[str, Any] | None:
         with self._lock:

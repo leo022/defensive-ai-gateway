@@ -1,6 +1,8 @@
 const API_TOKEN_KEY = "defensive-ai-api-token";
 const LANGUAGE_KEY = "dashboard-language";
 const DEFAULT_SECTION = "raw-alerts";
+const DETAIL_PAGE_SIZE = 5;
+let detailLoadRequestId = 0;
 
 const SECTION_COPY = {
   "raw-alerts": {
@@ -186,9 +188,8 @@ function promptInjectionCluesBlock(validation, copy) {
   `;
 }
 
-function renderRecord(record, copy) {
+function renderRecord(record, copy, index) {
   const data = record.data || {};
-  const payload = record.record_type === "agent_run" ? data.result : data;
   const injectionClues = record.record_type === "validation_run" ? promptInjectionCluesBlock(data, copy) : "";
   const disposition = record.disposition?.status
     ? `<span class="case-status">${escapeHtml(record.disposition.status)}</span>`
@@ -203,19 +204,34 @@ function renderRecord(record, copy) {
         ${disposition}
       </div>
       ${injectionClues}
-      <details class="json-details" open>
+      <details class="json-details" data-record-index="${index}">
         <summary>${escapeHtml(copy.payload)}</summary>
-        <pre class="json-block">${pretty(payload)}</pre>
+        <pre class="json-block" data-json-payload></pre>
       </details>
     </article>
   `;
+}
+
+function bindLazyRecordPayloads(records) {
+  document.querySelectorAll(".json-details[data-record-index]").forEach((details) => {
+    details.addEventListener("toggle", () => {
+      if (!details.open || details.dataset.loaded === "true") return;
+      const index = Number(details.dataset.recordIndex);
+      const record = records[index] || {};
+      const data = record.data || {};
+      const payload = record.record_type === "agent_run" ? data.result : data;
+      const block = details.querySelector("[data-json-payload]");
+      if (block) block.textContent = JSON.stringify(payload ?? {}, null, 2);
+      details.dataset.loaded = "true";
+    });
+  });
 }
 
 function displayError(message) {
   document.querySelector("#case-details-content").innerHTML = `<p class="case-details-empty">${escapeHtml(message)}</p>`;
 }
 
-async function requestDetails(caseId, section) {
+async function requestDetails(caseId, section, page) {
   let token = "";
   try {
     token = sessionStorage.getItem(API_TOKEN_KEY) || "";
@@ -223,8 +239,12 @@ async function requestDetails(caseId, section) {
     token = "";
   }
   const headers = token ? { Authorization: `Bearer ${token}` } : {};
+  const query = new URLSearchParams({
+    limit: String(DETAIL_PAGE_SIZE),
+    offset: String((page - 1) * DETAIL_PAGE_SIZE),
+  });
   const response = await fetch(
-    `/api/cases/${encodeURIComponent(caseId)}/details/${encodeURIComponent(section)}`,
+    `/api/cases/${encodeURIComponent(caseId)}/details/${encodeURIComponent(section)}?${query}`,
     { headers },
   );
   if (!response.ok) {
@@ -234,7 +254,8 @@ async function requestDetails(caseId, section) {
   return response.json();
 }
 
-async function loadPage() {
+async function loadPage(page = 1) {
+  const requestId = ++detailLoadRequestId;
   const params = new URLSearchParams(window.location.search);
   const caseId = params.get("case_id") || "";
   const section = params.get("section") || DEFAULT_SECTION;
@@ -251,9 +272,19 @@ async function loadPage() {
   document.querySelector("#case-details-back").textContent = copy.back;
 
   try {
-    const payload = await requestDetails(caseId, section);
+    const payload = await requestDetails(caseId, section, page);
+    if (requestId !== detailLoadRequestId) return;
     const records = Array.isArray(payload.items) ? payload.items : [];
     const caseInfo = payload.case || {};
+    const pagination = payload.pagination || {};
+    const currentPage = Math.max(1, Number(pagination.page || page));
+    const totalPages = Math.max(1, Number(pagination.total_pages || 1));
+    const total = Math.max(0, Number(pagination.total ?? payload.count ?? records.length));
+    const previousLabel = language() === "en" ? "Previous" : "上一页";
+    const nextLabel = language() === "en" ? "Next" : "下一页";
+    const pageLabel = language() === "en"
+      ? `Page ${currentPage} of ${totalPages} · ${total} records`
+      : `第 ${currentPage} / ${totalPages} 页 · 共 ${total} 条`;
     const overview = `
       <section class="case-details-overview">
         <strong>Case ID · ${escapeHtml(caseInfo.case_id || caseId)}</strong>
@@ -263,10 +294,25 @@ async function loadPage() {
       </section>
     `;
     const content = records.length
-      ? `<div class="case-details-list">${records.map((record) => renderRecord(record, copy)).join("")}</div>`
+      ? `<div class="case-details-list">${records.map((record, index) => renderRecord(record, copy, index)).join("")}</div>`
       : `<p class="case-details-empty">${escapeHtml(copy.empty)}</p>`;
-    document.querySelector("#case-details-content").innerHTML = overview + content;
+    const pager = totalPages > 1
+      ? `<nav class="case-details-pagination" aria-label="${escapeHtml(pageLabel)}">
+          <button id="case-details-previous" type="button" ${currentPage <= 1 ? "disabled" : ""}>${escapeHtml(previousLabel)}</button>
+          <strong>${escapeHtml(pageLabel)}</strong>
+          <button id="case-details-next" type="button" ${currentPage >= totalPages ? "disabled" : ""}>${escapeHtml(nextLabel)}</button>
+        </nav>`
+      : "";
+    document.querySelector("#case-details-content").innerHTML = overview + content + pager;
+    bindLazyRecordPayloads(records);
+    document.querySelector("#case-details-previous")?.addEventListener("click", () => {
+      loadPage(currentPage - 1);
+    });
+    document.querySelector("#case-details-next")?.addEventListener("click", () => {
+      loadPage(currentPage + 1);
+    });
   } catch (err) {
+    if (requestId !== detailLoadRequestId) return;
     displayError(language() === "en" ? `Unable to load details: ${err.message}` : `加载详细信息失败：${err.message}`);
   }
 }

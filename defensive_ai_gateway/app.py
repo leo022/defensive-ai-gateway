@@ -251,51 +251,76 @@ def _case_detail_summary(case_data: dict) -> dict:
     return {field: case_data.get(field) for field in fields}
 
 
-def _case_detail_section_payload(case_data: dict, section: str) -> dict:
-    """Build a narrowly scoped case-detail response for the dedicated detail page."""
-    linked_alerts = case_data.get("linked_alerts") or []
-    if section == "raw-alerts":
-        items = [
-            {
-                "record_type": "raw_alert",
-                "alert_id": link.get("alert_id"),
-                "event_id": link.get("event_id"),
-                "linked_at_ms": link.get("linked_at_ms"),
-                "disposition": link.get("disposition"),
-                "data": link.get("raw_alert"),
-            }
-            for link in linked_alerts
-            if link.get("raw_alert") is not None
-        ]
-    elif section == "normalized-evidence":
-        items = [
-            {
-                "record_type": "normalized_evidence",
-                "alert_id": link.get("alert_id"),
-                "event_id": link.get("event_id"),
-                "linked_at_ms": link.get("linked_at_ms"),
-                "data": link.get("normalized_event"),
-            }
-            for link in linked_alerts
-            if link.get("normalized_event") is not None
-        ]
-    elif section == "analysis-runs":
-        items = [
-            {"record_type": "agent_run", "data": run}
-            for run in case_data.get("agent_runs") or []
-        ]
-        items.extend(
-            {"record_type": "validation_run", "data": run}
-            for run in case_data.get("validation_runs") or []
-        )
-    else:  # The HTTP handler validates the section before calling this helper.
-        raise ValueError("unsupported case detail section")
+def _case_alert_summary(link: dict) -> dict:
+    """Keep only fields rendered by the Case workbench.
+
+    Raw payloads and normalized evidence remain available through their scoped
+    detail endpoints. Returning them again on the Case overview made large RASP
+    Cases transfer and render the same evidence multiple times.
+    """
+    raw = link.get("raw_alert") or {}
+    normalized = link.get("normalized_event") or {}
+    adapter = (raw.get("payload") or {}).get("adapter")
+    raw_summary = None
+    if raw:
+        raw_summary = {
+            "alert_id": raw.get("alert_id") or link.get("alert_id"),
+            "source": raw.get("source"),
+            "product": raw.get("product"),
+            "event_type": raw.get("event_type"),
+            "severity": raw.get("severity"),
+            "timestamp": raw.get("timestamp"),
+            "payload": {"adapter": adapter} if adapter else {},
+            "created_at_ms": raw.get("created_at_ms"),
+        }
+    normalized_summary = None
+    if normalized:
+        normalized_summary = {
+            "event_id": normalized.get("event_id") or link.get("event_id"),
+            "source": normalized.get("source"),
+            "product": normalized.get("product"),
+            "event_type": normalized.get("event_type"),
+            "severity": normalized.get("severity"),
+            "timestamp": normalized.get("timestamp"),
+            "created_at_ms": normalized.get("created_at_ms"),
+        }
     return {
-        "case": _case_detail_summary(case_data),
-        "section": section,
-        "count": len(items),
-        "items": items,
+        "case_id": link.get("case_id"),
+        "alert_id": link.get("alert_id"),
+        "event_id": link.get("event_id"),
+        "linked_at_ms": link.get("linked_at_ms"),
+        "disposition": link.get("disposition"),
+        "raw_alert": raw_summary,
+        "normalized_event": normalized_summary,
     }
+
+
+def _case_triage_payload(case_data: dict) -> dict:
+    """Return the compact Case workbench contract."""
+    payload = dict(case_data)
+    linked_alerts = list(case_data.get("linked_alerts") or [])
+    agent_runs = list(case_data.get("agent_runs") or [])
+    validation_runs = list(case_data.get("validation_runs") or [])
+    payload["detail_counts"] = {
+        "raw_alerts": sum(bool(link.get("raw_alert")) for link in linked_alerts),
+        "normalized_evidence": sum(
+            bool(link.get("normalized_event")) for link in linked_alerts
+        ),
+        "analysis_runs": len(agent_runs) + len(validation_runs),
+    }
+    payload["linked_alerts"] = [_case_alert_summary(link) for link in linked_alerts]
+    payload["agent_runs"] = agent_runs[:1]
+    payload["validation_runs"] = validation_runs[:1]
+    payload.pop("memory_matches", None)
+    compact_clusters = []
+    for cluster in case_data.get("alert_clusters") or []:
+        compact = dict(cluster)
+        compact["representative"] = _case_alert_summary(
+            cluster.get("representative") or {}
+        )
+        compact_clusters.append(compact)
+    payload["alert_clusters"] = compact_clusters
+    return payload
 
 _MEMORY_LAYERS = {
     "case_short_term", "product_long_term", "asset_profile", "org_knowledge", "evidence",
@@ -2611,6 +2636,10 @@ class GatewayState:
             )
             return case
 
+    def case_triage_detail(self, case_id: str) -> dict | None:
+        case = self.case_detail(case_id)
+        return _case_triage_payload(case) if case else None
+
     def replay_case_alert_analysis(self, case_id: str, alert_id: str, actor: str) -> dict:
         """Re-map retained RASP evidence and replace the live Case assessment.
 
@@ -3562,17 +3591,25 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if not case_id or section not in _CASE_DETAIL_SECTIONS:
                 self._json(404, {"error": "case detail endpoint not found"})
                 return
-            case_data = self.state.repo.get_case(case_id)
-            if not case_data:
+            query = parse_qs(parsed.query)
+            limit = _query_int(query, "limit", 5, min_value=1, max_value=50)
+            offset = _query_int(query, "offset", 0, min_value=0)
+            detail_page = self.state.repo.get_case_detail_page(
+                case_id,
+                section,
+                limit=limit,
+                offset=offset,
+            )
+            if not detail_page:
                 self._json(404, {"error": "case not found"})
                 return
-            self._json(200, _case_detail_section_payload(case_data, section))
+            self._json(200, detail_page)
             return
         if parsed.path.startswith("/api/cases/"):
             if not self._require_roles(_ROLE_READ, _ROLE_ANALYST, _ROLE_APPROVER):
                 return
             case_id = unquote(parsed.path.rsplit("/", 1)[-1])
-            case_data = self.state.case_detail(case_id)
+            case_data = self.state.case_triage_detail(case_id)
             if not case_data:
                 self._json(404, {"error": "case not found"})
                 return
@@ -4006,11 +4043,21 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if not resolved.is_relative_to(static_dir) or not resolved.is_file():
             self._json(404, {"error": "not found"})
             return
+        stat = resolved.stat()
+        etag = f'"{stat.st_mtime_ns:x}-{stat.st_size:x}"'
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "no-cache")
+            self._security_headers(static=True)
+            self.end_headers()
+            return
         content = resolved.read_bytes()
         mime = mimetypes.guess_type(str(resolved))[0] or "application/octet-stream"
         self.send_response(200)
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(content)))
+        self.send_header("ETag", etag)
         # Assets are not content-hashed, so force revalidation after upgrades
         # rather than letting a browser retain an incompatible JS/CSS version.
         self.send_header("Cache-Control", "no-cache")

@@ -2664,6 +2664,7 @@ function renderDetail(detail) {
   const latestRunRecord = detail.agent_runs?.[0] || {};
   const latestRun = latestRunRecord.result || {};
   const linked = detail.linked_alerts || [];
+  const detailCounts = detail.detail_counts || {};
   const missing = latestRun.missing_evidence || [];
   const validation = detail.validation_runs?.[0] || latestRun.explanation?.validation;
   const confidence = Math.round((detail.confidence || 0) * 100);
@@ -2734,9 +2735,9 @@ function renderDetail(detail) {
           </div>
         </div>
         <div class="detail-link-list">
-          ${detailLink(detail.case_id, "raw-alerts", tr("linkedRawAlerts"), tr("detailRawAlertsHint"), tr("alertCount", { count: linked.length }))}
-          ${detailLink(detail.case_id, "normalized-evidence", tr("normalizedEvidence"), tr("detailEvidenceHint"), tr("alertCount", { count: linked.length }))}
-          ${detailLink(detail.case_id, "analysis-runs", tr("agentRuns"), tr("detailRunsHint"), tr("runCount", { count: detail.agent_runs?.length || 0 }))}
+          ${detailLink(detail.case_id, "raw-alerts", tr("linkedRawAlerts"), tr("detailRawAlertsHint"), tr("alertCount", { count: detailCounts.raw_alerts ?? linked.length }))}
+          ${detailLink(detail.case_id, "normalized-evidence", tr("normalizedEvidence"), tr("detailEvidenceHint"), tr("alertCount", { count: detailCounts.normalized_evidence ?? linked.length }))}
+          ${detailLink(detail.case_id, "analysis-runs", tr("agentRuns"), tr("detailRunsHint"), tr("runCount", { count: detailCounts.analysis_runs ?? detail.agent_runs?.length ?? 0 }))}
         </div>
       </section>
     </div>

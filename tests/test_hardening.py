@@ -431,6 +431,16 @@ auth:
                     self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
                     self.assertIn("script-src 'self'", response.headers["Content-Security-Policy"])
                     self.assertEqual(response.headers["Cache-Control"], "no-cache")
+                    etag = response.headers["ETag"]
+                    self.assertTrue(etag)
+                conditional = urllib.request.Request(
+                    srv.base + "/",
+                    headers={"If-None-Match": etag},
+                )
+                with self.assertRaises(urllib.error.HTTPError) as unchanged:
+                    urllib.request.urlopen(conditional, timeout=5)
+                self.assertEqual(unchanged.exception.code, 304)
+                self.assertEqual(unchanged.exception.headers["ETag"], etag)
                 request = urllib.request.Request(srv.base + "/app.js", method="HEAD")
                 with urllib.request.urlopen(request, timeout=5) as response:
                     self.assertEqual(response.status, 200)

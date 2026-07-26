@@ -396,6 +396,12 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
             self.assertIn(section, DETAIL_JS)
         self.assertIn("/api/cases/${encodeURIComponent(caseId)}/details/${encodeURIComponent(section)}", DETAIL_JS)
         self.assertIn("sessionStorage.getItem(API_TOKEN_KEY)", DETAIL_JS)
+        self.assertIn("const DETAIL_PAGE_SIZE = 5;", DETAIL_JS)
+        self.assertIn("bindLazyRecordPayloads(records)", DETAIL_JS)
+        self.assertIn("data-json-payload", DETAIL_JS)
+        self.assertNotIn('class="json-details" open', DETAIL_JS)
+        self.assertIn("case-details-pagination", DETAIL_JS)
+        self.assertIn(".case-details-pagination", CSS)
 
     def test_ollama_model_picker_refreshes_current_model_list(self):
         self.assertNotIn("gemma3", HTML)
