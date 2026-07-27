@@ -29,6 +29,7 @@ auth:
   ingest_token: ""
   operator_token: ""
   approver_token: ""
+  responder_token: ""
   allow_loopback_no_token: true
   require_token_when_remote: true
   demo_mode: false

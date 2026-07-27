@@ -36,7 +36,7 @@ Options:
 Examples:
   bash install.sh
   sudo bash install.sh --systemd --enable --start
-  sudo DEFENSIVE_AI_API_TOKEN='<32+ chars>' DEFENSIVE_AI_APPROVER_TOKEN='<different 32+ chars>' bash install.sh --systemd
+  sudo DEFENSIVE_AI_API_TOKEN='<32+ chars>' DEFENSIVE_AI_APPROVER_TOKEN='<different 32+ chars>' DEFENSIVE_AI_RESPONDER_TOKEN='<different 32+ chars>' bash install.sh --systemd
 EOF
 }
 
@@ -71,7 +71,8 @@ load_protected_environment() {
     value="${line#*=}"
     case "$value" in *$'\r'*) die "environment values must be single-line" ;; esac
     case "$key" in
-      DEFENSIVE_AI_API_TOKEN|DEFENSIVE_AI_INGEST_TOKEN|DEFENSIVE_AI_OPERATOR_TOKEN|DEFENSIVE_AI_APPROVER_TOKEN|\
+      DEFENSIVE_AI_API_TOKEN|DEFENSIVE_AI_INGEST_TOKEN|DEFENSIVE_AI_OPERATOR_TOKEN|DEFENSIVE_AI_APPROVER_TOKEN|DEFENSIVE_AI_RESPONDER_TOKEN|\
+      DEFENSIVE_AI_RESPONSE_CONNECTOR_TOKEN|\
       DEFENSIVE_AI_AUTH_LOOPBACK|DEFENSIVE_AI_AUTH_REQUIRE_REMOTE_TOKEN|DEFENSIVE_AI_DEMO_MODE|\
       DEFENSIVE_AI_HOST|DEFENSIVE_AI_APPROVAL_QUORUM|DEFENSIVE_AI_LLM_PROVIDER|\
       DEFENSIVE_AI_LLM_ENDPOINT|DEFENSIVE_AI_LLM_MODEL|DEFENSIVE_AI_LLM_ALLOWED_HOSTS|\
@@ -86,16 +87,24 @@ load_protected_environment() {
 }
 
 validate_production_tokens() {
-  names=(API INGEST OPERATOR APPROVER)
+  names=(API INGEST OPERATOR APPROVER RESPONDER)
   tokens=(
     "${DEFENSIVE_AI_API_TOKEN:-}"
     "${DEFENSIVE_AI_INGEST_TOKEN:-}"
     "${DEFENSIVE_AI_OPERATOR_TOKEN:-}"
     "${DEFENSIVE_AI_APPROVER_TOKEN:-}"
+    "${DEFENSIVE_AI_RESPONDER_TOKEN:-}"
   )
   for i in "${!tokens[@]}"; do
     strong_secret "${tokens[$i]}" || die "DEFENSIVE_AI_${names[$i]}_TOKEN must be non-placeholder, at least 32 characters, and use the portable token alphabet"
   done
+  connector_token="${DEFENSIVE_AI_RESPONSE_CONNECTOR_TOKEN:-}"
+  if [ -n "$connector_token" ]; then
+    strong_secret "$connector_token" || die "DEFENSIVE_AI_RESPONSE_CONNECTOR_TOKEN must be non-placeholder, at least 32 characters, and use the portable token alphabet"
+    for token in "${tokens[@]}"; do
+      [ "$connector_token" != "$token" ] || die "response connector token must be distinct from role tokens"
+    done
+  fi
   for ((i = 0; i < ${#tokens[@]}; i++)); do
     for ((j = i + 1; j < ${#tokens[@]}; j++)); do
       [ "${tokens[$i]}" != "${tokens[$j]}" ] || die "production role tokens must be distinct"
@@ -232,6 +241,10 @@ CALLER_OPERATOR_TOKEN_SET="${DEFENSIVE_AI_OPERATOR_TOKEN+x}"
 CALLER_OPERATOR_TOKEN="${DEFENSIVE_AI_OPERATOR_TOKEN:-}"
 CALLER_APPROVER_TOKEN_SET="${DEFENSIVE_AI_APPROVER_TOKEN+x}"
 CALLER_APPROVER_TOKEN="${DEFENSIVE_AI_APPROVER_TOKEN:-}"
+CALLER_RESPONDER_TOKEN_SET="${DEFENSIVE_AI_RESPONDER_TOKEN+x}"
+CALLER_RESPONDER_TOKEN="${DEFENSIVE_AI_RESPONDER_TOKEN:-}"
+CALLER_RESPONSE_CONNECTOR_TOKEN_SET="${DEFENSIVE_AI_RESPONSE_CONNECTOR_TOKEN+x}"
+CALLER_RESPONSE_CONNECTOR_TOKEN="${DEFENSIVE_AI_RESPONSE_CONNECTOR_TOKEN:-}"
 
 if [ "$INSTALL_SYSTEMD" -eq 1 ] && [ -f "$ENV_FILE" ]; then
   mode="$(stat -c '%a' "$ENV_FILE" 2>/dev/null || stat -f '%Lp' "$ENV_FILE" 2>/dev/null || true)"
@@ -244,6 +257,8 @@ if [ "$INSTALL_SYSTEMD" -eq 1 ] && [ -f "$ENV_FILE" ]; then
   [ -z "$CALLER_INGEST_TOKEN_SET" ] || export DEFENSIVE_AI_INGEST_TOKEN="$CALLER_INGEST_TOKEN"
   [ -z "$CALLER_OPERATOR_TOKEN_SET" ] || export DEFENSIVE_AI_OPERATOR_TOKEN="$CALLER_OPERATOR_TOKEN"
   [ -z "$CALLER_APPROVER_TOKEN_SET" ] || export DEFENSIVE_AI_APPROVER_TOKEN="$CALLER_APPROVER_TOKEN"
+  [ -z "$CALLER_RESPONDER_TOKEN_SET" ] || export DEFENSIVE_AI_RESPONDER_TOKEN="$CALLER_RESPONDER_TOKEN"
+  [ -z "$CALLER_RESPONSE_CONNECTOR_TOKEN_SET" ] || export DEFENSIVE_AI_RESPONSE_CONNECTOR_TOKEN="$CALLER_RESPONSE_CONNECTOR_TOKEN"
 fi
 
 if [ "$DEMO_MODE" -eq 0 ]; then
@@ -457,6 +472,8 @@ DEFENSIVE_AI_API_TOKEN=${DEFENSIVE_AI_API_TOKEN:-}
 DEFENSIVE_AI_INGEST_TOKEN=${DEFENSIVE_AI_INGEST_TOKEN:-}
 DEFENSIVE_AI_OPERATOR_TOKEN=${DEFENSIVE_AI_OPERATOR_TOKEN:-}
 DEFENSIVE_AI_APPROVER_TOKEN=${DEFENSIVE_AI_APPROVER_TOKEN:-}
+DEFENSIVE_AI_RESPONDER_TOKEN=${DEFENSIVE_AI_RESPONDER_TOKEN:-}
+DEFENSIVE_AI_RESPONSE_CONNECTOR_TOKEN=${DEFENSIVE_AI_RESPONSE_CONNECTOR_TOKEN:-}
 DEFENSIVE_AI_AUTH_LOOPBACK=$([ "$DEMO_MODE" -eq 1 ] && printf 1 || printf 0)
 DEFENSIVE_AI_AUTH_REQUIRE_REMOTE_TOKEN=$([ "$DEMO_MODE" -eq 1 ] && printf 0 || printf 1)
 DEFENSIVE_AI_DEMO_MODE=$([ "$DEMO_MODE" -eq 1 ] && printf 1 || printf 0)

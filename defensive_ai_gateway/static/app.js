@@ -36,6 +36,7 @@ const STRINGS = {
     dashboardSubHistory: "处理记录",
     navMemory: "记忆治理",
     navAdapter: "日志接入",
+    navAutomation: "自动化处置",
     navSettings: "运行配置",
     memorySecondaryNav: "记忆治理二级目录",
     memorySubInventory: "记忆清单",
@@ -43,6 +44,10 @@ const STRINGS = {
     adapterSecondaryNav: "日志接入二级目录",
     adapterSubIntake: "告警接入",
     adapterSubConfig: "日志配置",
+    automationSecondaryNav: "自动化处置二级目录",
+    automationSubTasks: "执行任务",
+    automationSubConnectors: "连接器",
+    automationSubPolicy: "处置策略",
     authSession: "API 认证",
     authTitle: "API 认证",
     authToken: "访问 Token",
@@ -62,7 +67,77 @@ const STRINGS = {
     workspaceTitleTriage: "研判与处置",
     workspaceTitleMemory: "记忆治理工作台",
     workspaceTitleAdapter: "日志接入",
+    workspaceTitleAutomation: "自动化处置",
     workspaceTitleSettings: "运行配置",
+    automationTotal: "任务总量",
+    automationActive: "处理中",
+    automationVerified: "已生效",
+    automationFailed: "执行异常",
+    automationTasks: "执行任务",
+    automationTasksHint: "跟踪审批后的调度、设备核验、到期解封和回滚结果。",
+    automationStatus: "任务状态",
+    automationConnectorConfig: "连接器配置",
+    automationConnectorHint: "配置 WAF 或边界防火墙动作接口；凭据仅填写环境变量名。",
+    configuredConnectors: "已配置连接器",
+    configuredConnectorsHint: "真实执行前必须通过非破坏性健康检查。",
+    connectorName: "连接器名称",
+    connectorEndpoint: "API 地址",
+    connectorSecretEnv: "凭据环境变量",
+    connectorMode: "执行模式",
+    connectorModeShadow: "影子",
+    connectorModeManual: "手工调度",
+    connectorModeAuto: "审批后自动执行",
+    connectorMaxTtl: "最大封禁时长（秒）",
+    connectorTimeout: "调用超时（秒）",
+    connectorEnabled: "启用连接器",
+    connectorHealth: "健康状态",
+    connectorHealthUntested: "未检查",
+    connectorHealthHealthy: "连接正常",
+    connectorHealthError: "连接异常",
+    connectorCredentialReady: "凭据已配置",
+    connectorCredentialMissing: "凭据未配置",
+    connectorTest: "测试连接",
+    connectorEdit: "编辑",
+    connectorSaved: "连接器已保存",
+    connectorTested: "连接器检查结果：{status}",
+    automationPolicy: "处置策略",
+    automationPolicyHint: "设置全局执行开关、封禁时效和受保护网络对象。",
+    automationEnabled: "允许调度处置任务",
+    automationDefaultTtl: "默认封禁时长（秒）",
+    automationMaxTtl: "全局最大时长（秒）",
+    automationProtectedCidrs: "受保护 CIDR",
+    automationPolicySaved: "处置策略已保存",
+    responseWaitingConfiguration: "待配置",
+    responseWaitingDispatch: "待调度",
+    responsePaused: "已暂停",
+    responseQueued: "已入队",
+    responseRunning: "执行中",
+    responseRetryWait: "等待重试",
+    responseVerified: "已生效",
+    responseShadowed: "影子执行",
+    responseFailed: "执行失败",
+    responseCancelled: "已取消",
+    responseRollbackQueued: "等待回滚",
+    responseRollbackRunning: "回滚中",
+    responseRollbackRetry: "回滚重试",
+    responseRolledBack: "已回滚",
+    responseRollbackFailed: "回滚失败",
+    responseTaskEmpty: "暂无自动化处置任务。",
+    responseConnectorEmpty: "尚未配置处置连接器。",
+    responseTaskId: "任务 ID",
+    responseActionBlockSourceIp: "临时封禁源 IP",
+    responseObject: "处置对象",
+    responseScope: "作用范围",
+    responseMode: "执行模式",
+    responseRemoteRule: "远端规则",
+    responseExpires: "到期时间",
+    responseDispatch: "立即调度",
+    responseRollback: "回滚",
+    responseActionPlan: "自动化动作",
+    responseNoActionPlan: "该审批建议不会转换为自动执行动作。",
+    responseTaskCreated: "已创建处置任务：{status}",
+    responseActionDone: "任务状态已更新：{status}",
+    applyFilter: "应用筛选",
     dashboardEyebrow: "Realtime SOC Overview",
     dashboardTitle: "实时监控大屏",
     dashboardSubtitle: "集中监控告警趋势、处置压力、接入健康和模型运行状态。",
@@ -441,11 +516,11 @@ const STRINGS = {
     rollbackCondition: "回滚条件",
     approveAction: "批准",
     rejectAction: "拒绝",
-    approvalReasonPrompt: "请输入审批理由。批准仅表示授权给既有处置流程，本系统不会执行生产动作。",
+    approvalReasonPrompt: "请输入审批理由。自动模式将在最终审批通过后立即调用已配置的处置接口。",
     approvalDecisionDefault: "Dashboard 分析师已复核证据与回滚条件",
-    approvalSaved: "审批状态已更新：{status}（未执行）",
+    approvalSaved: "审批状态已更新：{status}",
     approvalProgress: "审批进度 {count}/{required}",
-    approvalVoteSaved: "审批意见已记录：{count}/{required}，当前状态为 {status}（未执行）",
+    approvalVoteSaved: "审批意见已记录：{count}/{required}，当前状态为 {status}",
     approvalFailed: "审批失败：{message}",
     noApprovals: "当前 Case 无可流转审批项",
     missingEvidence: "缺失证据",
@@ -540,6 +615,7 @@ const STRINGS = {
     dashboardSubHistory: "Disposition history",
     navMemory: "Memory Governance",
     navAdapter: "Log Intake",
+    navAutomation: "Automated Response",
     navSettings: "Runtime",
     memorySecondaryNav: "Memory governance sections",
     memorySubInventory: "Memory Inventory",
@@ -547,6 +623,10 @@ const STRINGS = {
     adapterSecondaryNav: "Log intake sections",
     adapterSubIntake: "Alert Intake",
     adapterSubConfig: "Log Configuration",
+    automationSecondaryNav: "Automated response sections",
+    automationSubTasks: "Execution Tasks",
+    automationSubConnectors: "Connectors",
+    automationSubPolicy: "Response Policy",
     authSession: "API Access",
     authTitle: "API Access",
     authToken: "Access token",
@@ -566,7 +646,77 @@ const STRINGS = {
     workspaceTitleTriage: "Triage and Disposition",
     workspaceTitleMemory: "Memory Governance",
     workspaceTitleAdapter: "Log Intake",
+    workspaceTitleAutomation: "Automated Response",
     workspaceTitleSettings: "Runtime Configuration",
+    automationTotal: "Total Tasks",
+    automationActive: "In Progress",
+    automationVerified: "Active",
+    automationFailed: "Failures",
+    automationTasks: "Execution Tasks",
+    automationTasksHint: "Track approved dispatches, device verification, expiry and rollback.",
+    automationStatus: "Task status",
+    automationConnectorConfig: "Connector Configuration",
+    automationConnectorHint: "Configure a WAF or edge firewall action API; enter only the credential environment variable name.",
+    configuredConnectors: "Configured Connectors",
+    configuredConnectorsHint: "A non-mutating health check is required before real execution.",
+    connectorName: "Connector name",
+    connectorEndpoint: "API endpoint",
+    connectorSecretEnv: "Credential environment variable",
+    connectorMode: "Execution mode",
+    connectorModeShadow: "Shadow",
+    connectorModeManual: "Manual dispatch",
+    connectorModeAuto: "Run after approval",
+    connectorMaxTtl: "Maximum block duration (seconds)",
+    connectorTimeout: "Request timeout (seconds)",
+    connectorEnabled: "Enable connector",
+    connectorHealth: "Health",
+    connectorHealthUntested: "Not tested",
+    connectorHealthHealthy: "Healthy",
+    connectorHealthError: "Connection error",
+    connectorCredentialReady: "Credential configured",
+    connectorCredentialMissing: "Credential missing",
+    connectorTest: "Test connection",
+    connectorEdit: "Edit",
+    connectorSaved: "Connector saved",
+    connectorTested: "Connector check: {status}",
+    automationPolicy: "Response Policy",
+    automationPolicyHint: "Set the global execution switch, block duration and protected networks.",
+    automationEnabled: "Allow response task dispatch",
+    automationDefaultTtl: "Default block duration (seconds)",
+    automationMaxTtl: "Global maximum duration (seconds)",
+    automationProtectedCidrs: "Protected CIDRs",
+    automationPolicySaved: "Response policy saved",
+    responseWaitingConfiguration: "Needs configuration",
+    responseWaitingDispatch: "Awaiting dispatch",
+    responsePaused: "Paused",
+    responseQueued: "Queued",
+    responseRunning: "Running",
+    responseRetryWait: "Retry pending",
+    responseVerified: "Active",
+    responseShadowed: "Shadowed",
+    responseFailed: "Failed",
+    responseCancelled: "Cancelled",
+    responseRollbackQueued: "Rollback queued",
+    responseRollbackRunning: "Rolling back",
+    responseRollbackRetry: "Rollback retry",
+    responseRolledBack: "Rolled back",
+    responseRollbackFailed: "Rollback failed",
+    responseTaskEmpty: "No automated response tasks.",
+    responseConnectorEmpty: "No response connector is configured.",
+    responseTaskId: "Task ID",
+    responseActionBlockSourceIp: "Temporarily block source IP",
+    responseObject: "Response object",
+    responseScope: "Scope",
+    responseMode: "Execution mode",
+    responseRemoteRule: "Remote rule",
+    responseExpires: "Expires",
+    responseDispatch: "Dispatch now",
+    responseRollback: "Rollback",
+    responseActionPlan: "Automated action",
+    responseNoActionPlan: "This recommendation will not be converted into an automated action.",
+    responseTaskCreated: "Response task created: {status}",
+    responseActionDone: "Task updated: {status}",
+    applyFilter: "Apply filter",
     dashboardEyebrow: "Realtime SOC Overview",
     dashboardTitle: "Realtime Monitoring",
     dashboardSubtitle: "Monitor alert trends, response pressure, intake health, and model runtime status.",
@@ -945,11 +1095,11 @@ const STRINGS = {
     rollbackCondition: "Rollback condition",
     approveAction: "Approve",
     rejectAction: "Reject",
-    approvalReasonPrompt: "Enter a decision reason. Approval only authorizes the existing response workflow; this gateway executes no production action.",
+    approvalReasonPrompt: "Enter a decision reason. Auto mode calls the configured response API immediately after final approval.",
     approvalDecisionDefault: "Dashboard analyst reviewed the evidence and rollback condition",
-    approvalSaved: "Approval updated: {status} (not executed)",
+    approvalSaved: "Approval updated: {status}",
     approvalProgress: "Approval progress {count}/{required}",
-    approvalVoteSaved: "Approval vote recorded: {count}/{required}; current status is {status} (not executed)",
+    approvalVoteSaved: "Approval vote recorded: {count}/{required}; current status is {status}",
     approvalFailed: "Approval failed: {message}",
     noApprovals: "No approval item can be routed for this case",
     missingEvidence: "Missing evidence",
@@ -1052,6 +1202,11 @@ let memoryItems = [];
 let memoryAuditEvents = [];
 let memoryPagination = { page: 1, size: 20, total: 0, totalPages: 1 };
 let memoryAuditPagination = { page: 1, size: 20, total: 0, totalPages: 1 };
+let responseTasks = [];
+let responseConnectors = [];
+let responsePolicy = {};
+let responseTaskStats = {};
+let responseTaskPagination = { page: 1, size: 20, total: 0, totalPages: 1 };
 let selectedMemoryId = "";
 let selectedMemoryDetail = null;
 let memorySelectionRequestId = 0;
@@ -1175,6 +1330,10 @@ function canReadRuntimeConfig() {
   return hasAnyRole("config");
 }
 
+function canReadAutomation() {
+  return hasAnyRole("read", "config", "responder");
+}
+
 function canReadMappingProfiles() {
   return hasAnyRole("read", "config", "analyst");
 }
@@ -1208,6 +1367,10 @@ function applySessionPermissions() {
   applyPermission(".case-disposition-button", ["analyst"]);
   applyPermission(".review-button", ["analyst", "memory"]);
   applyPermission(".approval-decision", ["approver"]);
+  applyPermission("#automation-connector-form input, #automation-connector-form select, #automation-connector-form button", ["config"]);
+  applyPermission("#automation-policy-form input, #automation-policy-form textarea, #automation-policy-form button", ["config"]);
+  applyPermission("[data-response-action]", ["responder"]);
+  applyPermission("[data-connector-action]", ["config"]);
   applyPermission("[data-memory-action]", ["memory"]);
   const authButton = document.querySelector("#auth-session");
   if (authButton) {
@@ -1288,6 +1451,7 @@ function paginationState(key) {
   if (key === "cases-history") return casePagination.history;
   if (key === "memory-inventory") return memoryPagination;
   if (key === "memory-audit") return memoryAuditPagination;
+  if (key === "automation-tasks") return responseTaskPagination;
   return null;
 }
 
@@ -1319,6 +1483,7 @@ function reloadPagination(key) {
   if (key === "cases-history") return loadCases({ quiet: true, section: "history" });
   if (key === "memory-inventory") return loadMemoryInventory({ quiet: true });
   if (key === "memory-audit") return loadMemoryAudit({ quiet: true });
+  if (key === "automation-tasks") return loadResponseTasks({ quiet: true });
   return Promise.resolve();
 }
 
@@ -1822,6 +1987,7 @@ function updateWorkspaceTitle(name) {
     triage: "workspaceTitleTriage",
     memory: "workspaceTitleMemory",
     adapter: "workspaceTitleAdapter",
+    automation: "workspaceTitleAutomation",
     settings: "workspaceTitleSettings",
   }[name] || "workspaceTitleMonitor";
   title.textContent = tr(key);
@@ -2610,13 +2776,38 @@ function approvalProgressText(approval) {
   return tr("approvalProgress", { count, required });
 }
 
-function approvalDecisionMessage(approval) {
+function approvalDecisionMessage(approval, responseTask = null) {
+  if (responseTask) {
+    return tr("responseTaskCreated", { status: responseStatusLabel(responseTask.status) });
+  }
   const count = Number(approval?.vote_count);
   const required = Number(approval?.required_approvals);
   if (Number.isInteger(count) && count >= 0 && Number.isInteger(required) && required > 0) {
     return tr("approvalVoteSaved", { count, required, status: approvalStatusLabel(approval.status) });
   }
   return tr("approvalSaved", { status: approvalStatusLabel(approval.status) });
+}
+
+function approvalAutomationPlan(approval, compact = false) {
+  const action = approval.action?.execution_action || {};
+  const task = approval.response_task || null;
+  if (!action.action_type) return compact ? "" : `<p class="approval-automation-empty">${escapeHtml(tr("responseNoActionPlan"))}</p>`;
+  const scope = action.scope || {};
+  const scopeText = [scope.product, scope.host, scope.path].filter(Boolean).join(" · ") || "-";
+  if (compact) {
+    return `<small>${escapeHtml(action.object || "-")} · ${escapeHtml(task ? responseStatusLabel(task.status) : tr("approvalPending"))}</small>`;
+  }
+  return `
+    <div class="approval-automation-plan">
+      <div><strong>${escapeHtml(tr("responseActionPlan"))}</strong><span class="field-status ${task && ["failed", "rollback_failed"].includes(task.status) ? "needs_review" : "mapped"}">${escapeHtml(task ? responseStatusLabel(task.status) : tr("approvalPending"))}</span></div>
+      <dl class="kv">
+        <dt>${escapeHtml(tr("responseObject"))}</dt><dd>${escapeHtml(action.object || "-")}</dd>
+        <dt>${escapeHtml(tr("responseScope"))}</dt><dd>${escapeHtml(scopeText)}</dd>
+        <dt>TTL</dt><dd>${escapeHtml(String(action.duration_seconds || "-"))}s</dd>
+      </dl>
+      ${task?.last_error ? `<p class="automation-task-error">${escapeHtml(task.last_error)}</p>` : ""}
+    </div>
+  `;
 }
 
 function approvalBlock(approvals, caseId, latestEventId = "") {
@@ -2629,10 +2820,11 @@ function approvalBlock(approvals, caseId, latestEventId = "") {
     <article class="approval-item ${compact ? "compact" : ""} ${escapeHtml(item.status)}">
       <div class="case-disposition-head">
         <strong>${escapeHtml(approvalStatusLabel(item.status))}</strong>
-        <span>${escapeHtml(item.action?.stage ? actionStageLabel(item.action.stage) : tr("executionNotRun"))}</span>
+        <span>${escapeHtml(item.response_task ? responseStatusLabel(item.response_task.status) : item.action?.stage ? actionStageLabel(item.action.stage) : tr("executionNotRun"))}</span>
       </div>
       <p>${escapeHtml(item.action?.action || "")}</p>
       ${compact ? "" : `<small>${escapeHtml(item.action?.rationale || "")}</small>`}
+      ${approvalAutomationPlan(item, compact)}
       ${!compact && approvalProgressText(item) ? `<small class="approval-progress">${escapeHtml(approvalProgressText(item))}</small>` : ""}
       ${compact ? `<small>${escapeHtml(fmtTime(item.created_at_ms))} · ${escapeHtml(tr("executionNotRun"))}</small>` : `<dl class="kv"><dt>${escapeHtml(tr("rollbackCondition"))}</dt><dd>${escapeHtml(item.action?.rollback || "-")}</dd></dl>`}
       ${!compact && item.status === "pending" ? `
@@ -3016,10 +3208,14 @@ async function decideApproval(button, panel, caseId) {
       body: JSON.stringify({ decision, reason: reason.trim() || tr("approvalDecisionDefault") }),
     });
     const detail = detailCache.get(caseId);
-    detail.approvals = (detail.approvals || []).map((item) => item.approval_id === result.approval.approval_id ? result.approval : item);
+    const updatedApproval = {
+      ...result.approval,
+      response_task: result.response_task || result.approval.response_task || null,
+    };
+    detail.approvals = (detail.approvals || []).map((item) => item.approval_id === updatedApproval.approval_id ? updatedApproval : item);
     panel.innerHTML = renderDetail(detail);
     bindDetailActions(panel, caseId);
-    const message = approvalDecisionMessage(result.approval);
+    const message = approvalDecisionMessage(updatedApproval, result.response_task);
     panel.querySelector(`[data-approval-status="${CSS.escape(caseId)}"]`).textContent = message;
     showToast(message);
   } catch (err) {
@@ -3573,6 +3769,238 @@ async function loadMemoryGovernance(options = {}) {
   return Promise.all(tasks);
 }
 
+function responseStatusLabel(status) {
+  const key = {
+    waiting_configuration: "responseWaitingConfiguration",
+    waiting_dispatch: "responseWaitingDispatch",
+    paused: "responsePaused",
+    queued: "responseQueued",
+    running: "responseRunning",
+    retry_wait: "responseRetryWait",
+    verified: "responseVerified",
+    shadowed: "responseShadowed",
+    failed: "responseFailed",
+    cancelled: "responseCancelled",
+    rollback_queued: "responseRollbackQueued",
+    rollback_running: "responseRollbackRunning",
+    rollback_retry: "responseRollbackRetry",
+    rolled_back: "responseRolledBack",
+    rollback_failed: "responseRollbackFailed",
+  }[status];
+  return tr(key || "responsePaused");
+}
+
+function responseModeLabel(mode) {
+  return tr({ shadow: "connectorModeShadow", manual: "connectorModeManual", auto: "connectorModeAuto" }[mode] || "connectorModeShadow");
+}
+
+function responseActionLabel(actionType) {
+  const key = { "network.block_ip": "responseActionBlockSourceIp" }[actionType];
+  return key ? tr(key) : String(actionType || "-");
+}
+
+function connectorHealthLabel(status) {
+  return tr({
+    untested: "connectorHealthUntested",
+    healthy: "connectorHealthHealthy",
+    error: "connectorHealthError",
+  }[status] || "connectorHealthUntested");
+}
+
+function updateResponseStats(stats = {}) {
+  responseTaskStats = stats;
+  const active = ["queued", "running", "retry_wait", "rollback_queued", "rollback_running", "rollback_retry"]
+    .reduce((total, status) => total + Number(stats[status] || 0), 0);
+  const failed = Number(stats.failed || 0) + Number(stats.rollback_failed || 0);
+  const values = {
+    "#automation-total": Number(stats.total || 0),
+    "#automation-active": active,
+    "#automation-verified": Number(stats.verified || 0),
+    "#automation-failed": failed,
+  };
+  Object.entries(values).forEach(([selector, value]) => {
+    const node = document.querySelector(selector);
+    if (node) node.textContent = String(value);
+  });
+}
+
+function renderResponseTasks() {
+  const list = document.querySelector("#automation-task-list");
+  if (!list) return;
+  if (!responseTasks.length) {
+    list.innerHTML = `<p class="empty-state">${escapeHtml(tr("responseTaskEmpty"))}</p>`;
+    renderPagination("#automation-pagination", responseTaskPagination, "automation-tasks");
+    return;
+  }
+  list.innerHTML = responseTasks.map((task) => {
+    const action = task.action || {};
+    const scope = action.scope || {};
+    const connector = task.connector_snapshot || {};
+    const canDispatch = ["waiting_configuration", "waiting_dispatch", "paused", "retry_wait"].includes(task.status);
+    const canRollback = ["verified", "shadowed", "rollback_failed"].includes(task.status)
+      || (task.status === "failed" && Boolean(task.remote_rule_id));
+    const scopeText = [scope.product, scope.host, scope.path].filter(Boolean).join(" · ") || "-";
+    return `
+      <article class="automation-task-item ${escapeHtml(task.status)}">
+        <div class="automation-task-head">
+          <div><strong class="automation-mono">${escapeHtml(action.object || "-")}</strong><span>${escapeHtml(responseActionLabel(task.action_type))}</span></div>
+          <span class="field-status ${["failed", "rollback_failed"].includes(task.status) ? "needs_review" : "mapped"}">${escapeHtml(responseStatusLabel(task.status))}</span>
+        </div>
+        <dl class="automation-task-meta">
+          <div><dt>${escapeHtml(tr("responseTaskId"))}</dt><dd class="automation-mono">${escapeHtml(task.task_id)}</dd></div>
+          <div><dt>Case</dt><dd class="automation-mono">${escapeHtml(task.case_id)}</dd></div>
+          <div><dt>${escapeHtml(tr("responseScope"))}</dt><dd>${escapeHtml(scopeText)}</dd></div>
+          <div><dt>${escapeHtml(tr("responseMode"))}</dt><dd>${escapeHtml(responseModeLabel(connector.execution_mode))}</dd></div>
+          <div><dt>${escapeHtml(tr("responseRemoteRule"))}</dt><dd class="automation-mono">${escapeHtml(task.remote_rule_id || "-")}</dd></div>
+          <div><dt>${escapeHtml(tr("responseExpires"))}</dt><dd>${escapeHtml(task.expires_at_ms ? fmtTime(task.expires_at_ms) : "-")}</dd></div>
+        </dl>
+        ${task.last_error ? `<p class="automation-task-error">${escapeHtml(task.last_error)}</p>` : ""}
+        ${(canDispatch || canRollback) ? `<div class="automation-task-actions">
+          ${canDispatch ? `<button type="button" data-response-action="dispatch" data-task-id="${escapeHtml(task.task_id)}" ${hasAnyRole("responder") ? "" : "disabled"}>${escapeHtml(tr("responseDispatch"))}</button>` : ""}
+          ${canRollback ? `<button type="button" data-response-action="rollback" data-task-id="${escapeHtml(task.task_id)}" ${hasAnyRole("responder") ? "" : "disabled"}>${escapeHtml(tr("responseRollback"))}</button>` : ""}
+        </div>` : ""}
+      </article>
+    `;
+  }).join("");
+  renderPagination("#automation-pagination", responseTaskPagination, "automation-tasks");
+  applySessionPermissions();
+}
+
+async function loadResponseTasks(options = {}) {
+  const list = document.querySelector("#automation-task-list");
+  if (list && !options.quiet) list.innerHTML = `<p class="empty-state">${escapeHtml(tr("runtimeChecking"))}</p>`;
+  const params = new URLSearchParams({
+    limit: String(responseTaskPagination.size),
+    offset: String((responseTaskPagination.page - 1) * responseTaskPagination.size),
+  });
+  const status = document.querySelector("#automation-status-filter")?.value || "";
+  if (status) params.set("status", status);
+  const payload = await json(`/api/automation/tasks?${params}`);
+  responseTasks = payload.tasks || [];
+  applyPaginationPayload(responseTaskPagination, payload.pagination);
+  updateResponseStats(payload.stats || {});
+  renderResponseTasks();
+  return payload;
+}
+
+function resetResponseConnectorForm() {
+  document.querySelector("#automation-connector-form")?.reset();
+  document.querySelector("#response-connector-id").value = "";
+  document.querySelector("#response-connector-mode").value = "shadow";
+  document.querySelector("#response-connector-max-ttl").value = "3600";
+  document.querySelector("#response-connector-timeout").value = "10";
+  document.querySelector("#automation-connector-status").textContent = "";
+}
+
+function renderResponseConnectors() {
+  const list = document.querySelector("#automation-connector-list");
+  if (!list) return;
+  if (!responseConnectors.length) {
+    list.innerHTML = `<p class="empty-state">${escapeHtml(tr("responseConnectorEmpty"))}</p>`;
+    return;
+  }
+  list.innerHTML = responseConnectors.map((connector) => `
+    <article class="automation-connector-item">
+      <div class="automation-task-head"><div><strong>${escapeHtml(connector.name)}</strong><span class="automation-mono">${escapeHtml(connector.endpoint)}</span></div><span class="field-status ${connector.health_status === "healthy" ? "mapped" : "needs_review"}">${escapeHtml(connectorHealthLabel(connector.health_status))}</span></div>
+      <div class="automation-connector-flags"><span>${escapeHtml(responseModeLabel(connector.execution_mode))}</span><span>${escapeHtml(connector.enabled ? tr("connectorEnabled") : tr("responsePaused"))}</span><span>${escapeHtml(connector.credential_configured || !connector.secret_env ? tr("connectorCredentialReady") : tr("connectorCredentialMissing"))}</span></div>
+      ${connector.last_error ? `<p class="automation-task-error">${escapeHtml(connector.last_error)}</p>` : ""}
+      <div class="automation-task-actions"><button type="button" data-connector-action="edit" data-connector-id="${escapeHtml(connector.connector_id)}">${escapeHtml(tr("connectorEdit"))}</button><button type="button" data-connector-action="test" data-connector-id="${escapeHtml(connector.connector_id)}">${escapeHtml(tr("connectorTest"))}</button></div>
+    </article>
+  `).join("");
+  applySessionPermissions();
+}
+
+function populateResponsePolicy() {
+  document.querySelector("#response-policy-enabled").checked = Boolean(responsePolicy.enabled);
+  document.querySelector("#response-policy-default-ttl").value = String(responsePolicy.default_ttl_seconds || 1800);
+  document.querySelector("#response-policy-max-ttl").value = String(responsePolicy.max_ttl_seconds || 86400);
+  document.querySelector("#response-policy-protected-cidrs").value = (responsePolicy.protected_cidrs || []).join("\n");
+}
+
+async function loadResponseSummary() {
+  const payload = await json("/api/automation/summary");
+  responsePolicy = payload.policy || {};
+  responseConnectors = payload.connectors || [];
+  updateResponseStats(payload.stats || {});
+  populateResponsePolicy();
+  renderResponseConnectors();
+  return payload;
+}
+
+function loadAutomation(section = "tasks") {
+  if (section === "tasks") return loadResponseTasks();
+  return loadResponseSummary();
+}
+
+async function saveResponseConnector(event) {
+  event.preventDefault();
+  const connectorId = document.querySelector("#response-connector-id").value;
+  const body = {
+    name: document.querySelector("#response-connector-name").value.trim(),
+    endpoint: document.querySelector("#response-connector-endpoint").value.trim(),
+    secret_env: document.querySelector("#response-connector-secret-env").value.trim(),
+    execution_mode: document.querySelector("#response-connector-mode").value,
+    max_ttl_seconds: Number(document.querySelector("#response-connector-max-ttl").value),
+    timeout_seconds: Number(document.querySelector("#response-connector-timeout").value),
+    enabled: document.querySelector("#response-connector-enabled").checked,
+  };
+  const path = connectorId ? `/api/automation/connectors/${encodeURIComponent(connectorId)}` : "/api/automation/connectors";
+  const payload = await json(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  document.querySelector("#automation-connector-status").textContent = tr("connectorSaved");
+  resetResponseConnectorForm();
+  await loadResponseSummary();
+  showToast(tr("connectorSaved"));
+  return payload;
+}
+
+function editResponseConnector(connectorId) {
+  const connector = responseConnectors.find((item) => item.connector_id === connectorId);
+  if (!connector) return;
+  document.querySelector("#response-connector-id").value = connector.connector_id;
+  document.querySelector("#response-connector-name").value = connector.name;
+  document.querySelector("#response-connector-endpoint").value = connector.endpoint;
+  document.querySelector("#response-connector-secret-env").value = connector.secret_env || "";
+  document.querySelector("#response-connector-mode").value = connector.execution_mode;
+  document.querySelector("#response-connector-max-ttl").value = String(connector.max_ttl_seconds);
+  document.querySelector("#response-connector-timeout").value = String(connector.timeout_seconds);
+  document.querySelector("#response-connector-enabled").checked = Boolean(connector.enabled);
+  document.querySelector("#response-connector-name").focus();
+}
+
+async function testResponseConnector(connectorId) {
+  const payload = await json(`/api/automation/connectors/${encodeURIComponent(connectorId)}/test`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+  await loadResponseSummary();
+  showToast(tr("connectorTested", { status: connectorHealthLabel(payload.connector?.health_status || "error") }), payload.ok ? "info" : "error");
+}
+
+async function saveResponsePolicy(event) {
+  event.preventDefault();
+  const payload = await json("/api/automation/policy", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      enabled: document.querySelector("#response-policy-enabled").checked,
+      default_ttl_seconds: Number(document.querySelector("#response-policy-default-ttl").value),
+      max_ttl_seconds: Number(document.querySelector("#response-policy-max-ttl").value),
+      protected_cidrs: document.querySelector("#response-policy-protected-cidrs").value,
+    }),
+  });
+  responsePolicy = payload.policy || {};
+  populateResponsePolicy();
+  document.querySelector("#automation-policy-status").textContent = tr("automationPolicySaved");
+  showToast(tr("automationPolicySaved"));
+}
+
+async function runResponseTaskAction(taskId, action) {
+  const payload = await json(`/api/automation/tasks/${encodeURIComponent(taskId)}/${action}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+  showToast(tr("responseActionDone", { status: responseStatusLabel(payload.task?.status) }));
+  await loadResponseTasks({ quiet: true });
+}
+
 async function governMemory(action, button) {
   const memoryId = button.dataset.memoryId;
   if (!memoryId) return;
@@ -3703,6 +4131,12 @@ function loadViewData(name) {
   if (name === "memory") {
     return loadMemoryGovernance({ section: activeSecondaryView("memory", "inventory") }).catch((err) =>
       showToast(tr("memoryActionFailed", { message: err.message || String(err) }), "error"),
+    );
+  }
+  if (name === "automation") {
+    if (!canReadAutomation()) return Promise.resolve();
+    return loadAutomation(activeSecondaryView("automation", "tasks")).catch((err) =>
+      showToast(err.message || String(err), "error"),
     );
   }
   if (name === "adapter") {
@@ -4331,6 +4765,47 @@ document.querySelector("#memory-audit-refresh").addEventListener("click", () => 
     showToast(tr("memoryActionFailed", { message: err.message || String(err) }), "error"),
   );
 });
+document.querySelector("#automation-refresh").addEventListener("click", () => {
+  loadResponseTasks({ quiet: true }).catch((err) => showToast(err.message || String(err), "error"));
+});
+document.querySelector("#automation-task-filter").addEventListener("submit", (event) => {
+  event.preventDefault();
+  responseTaskPagination.page = 1;
+  loadResponseTasks().catch((err) => showToast(err.message || String(err), "error"));
+});
+document.querySelector("#automation-connector-form").addEventListener("submit", (event) => {
+  saveResponseConnector(event).catch((err) => {
+    document.querySelector("#automation-connector-status").textContent = err.message || String(err);
+    showToast(err.message || String(err), "error");
+  });
+});
+document.querySelector("#response-connector-reset").addEventListener("click", resetResponseConnectorForm);
+document.querySelector("#automation-policy-form").addEventListener("submit", (event) => {
+  saveResponsePolicy(event).catch((err) => {
+    document.querySelector("#automation-policy-status").textContent = err.message || String(err);
+    showToast(err.message || String(err), "error");
+  });
+});
+document.addEventListener("click", (event) => {
+  const responseButton = event.target.closest("[data-response-action]");
+  if (responseButton && !responseButton.disabled) {
+    responseButton.disabled = true;
+    runResponseTaskAction(responseButton.dataset.taskId, responseButton.dataset.responseAction)
+      .catch((err) => showToast(err.message || String(err), "error"))
+      .finally(() => { responseButton.disabled = false; });
+    return;
+  }
+  const connectorButton = event.target.closest("[data-connector-action]");
+  if (!connectorButton || connectorButton.disabled) return;
+  if (connectorButton.dataset.connectorAction === "edit") {
+    editResponseConnector(connectorButton.dataset.connectorId);
+    return;
+  }
+  connectorButton.disabled = true;
+  testResponseConnector(connectorButton.dataset.connectorId)
+    .catch((err) => showToast(err.message || String(err), "error"))
+    .finally(() => { connectorButton.disabled = false; });
+});
 document.addEventListener("change", (event) => {
   const select = event.target.closest("[data-pagination-size]");
   if (!select) return;
@@ -4368,7 +4843,7 @@ document.querySelector("#theme-switch").addEventListener("click", (event) => {
 });
 document.querySelector("#language-switch").addEventListener("click", () => {
   toggleLanguage();
-  loadCases().catch((err) => showToast(err.message || String(err), "error"));
+  refreshCurrentView().catch((err) => showToast(err.message || String(err), "error"));
 });
 document.querySelector("#llm-form").addEventListener("submit", (event) => {
   saveLlmConfig(event).catch((err) => setConfigStatus(err.message || String(err), true));

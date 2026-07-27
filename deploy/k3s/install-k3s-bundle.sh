@@ -43,7 +43,8 @@ Options:
 
 Production environment:
   DEFENSIVE_AI_API_TOKEN, DEFENSIVE_AI_INGEST_TOKEN,
-  DEFENSIVE_AI_OPERATOR_TOKEN, DEFENSIVE_AI_APPROVER_TOKEN
+  DEFENSIVE_AI_OPERATOR_TOKEN, DEFENSIVE_AI_APPROVER_TOKEN,
+  DEFENSIVE_AI_RESPONDER_TOKEN
   DEFENSIVE_AI_PUBLIC_HOST, DEFENSIVE_AI_TLS_SECRET,
   DEFENSIVE_AI_ALLOWED_SOURCE_CIDRS
   DEFENSIVE_AI_LLM_PROVIDER, DEFENSIVE_AI_LLM_ENDPOINT,
@@ -144,16 +145,24 @@ validate_retention() {
 }
 
 validate_distinct_tokens() {
-  names=(API INGEST OPERATOR APPROVER)
+  names=(API INGEST OPERATOR APPROVER RESPONDER)
   tokens=(
     "${DEFENSIVE_AI_API_TOKEN:-}"
     "${DEFENSIVE_AI_INGEST_TOKEN:-}"
     "${DEFENSIVE_AI_OPERATOR_TOKEN:-}"
     "${DEFENSIVE_AI_APPROVER_TOKEN:-}"
+    "${DEFENSIVE_AI_RESPONDER_TOKEN:-}"
   )
   for i in "${!tokens[@]}"; do
     strong_secret "${tokens[$i]}" || die "DEFENSIVE_AI_${names[$i]}_TOKEN must be non-placeholder, at least 32 characters, and use the portable token alphabet"
   done
+  connector_token="${DEFENSIVE_AI_RESPONSE_CONNECTOR_TOKEN:-}"
+  if [ -n "$connector_token" ]; then
+    strong_secret "$connector_token" || die "DEFENSIVE_AI_RESPONSE_CONNECTOR_TOKEN must be non-placeholder, at least 32 characters, and use the portable token alphabet"
+    for token in "${tokens[@]}"; do
+      [ "$connector_token" != "$token" ] || die "response connector token must be distinct from role tokens"
+    done
+  fi
   for ((i = 0; i < ${#tokens[@]}; i++)); do
     for ((j = i + 1; j < ${#tokens[@]}; j++)); do
       [ "${tokens[$i]}" != "${tokens[$j]}" ] || die "production role tokens must be distinct"
@@ -434,6 +443,8 @@ copy_runtime_secret() {
     DEFENSIVE_AI_INGEST_TOKEN
     DEFENSIVE_AI_OPERATOR_TOKEN
     DEFENSIVE_AI_APPROVER_TOKEN
+    DEFENSIVE_AI_RESPONDER_TOKEN
+    DEFENSIVE_AI_RESPONSE_CONNECTOR_TOKEN
     DEFENSIVE_AI_AUTH_LOOPBACK
     DEFENSIVE_AI_AUTH_REQUIRE_REMOTE_TOKEN
     DEFENSIVE_AI_DEMO_MODE
@@ -904,6 +915,8 @@ DEFENSIVE_AI_API_TOKEN=${DEFENSIVE_AI_API_TOKEN:-}
 DEFENSIVE_AI_INGEST_TOKEN=${DEFENSIVE_AI_INGEST_TOKEN:-}
 DEFENSIVE_AI_OPERATOR_TOKEN=${DEFENSIVE_AI_OPERATOR_TOKEN:-}
 DEFENSIVE_AI_APPROVER_TOKEN=${DEFENSIVE_AI_APPROVER_TOKEN:-}
+DEFENSIVE_AI_RESPONDER_TOKEN=${DEFENSIVE_AI_RESPONDER_TOKEN:-}
+DEFENSIVE_AI_RESPONSE_CONNECTOR_TOKEN=${DEFENSIVE_AI_RESPONSE_CONNECTOR_TOKEN:-}
 DEFENSIVE_AI_AUTH_LOOPBACK=$([ "$DEMO_MODE" -eq 1 ] && printf 1 || printf 0)
 DEFENSIVE_AI_AUTH_REQUIRE_REMOTE_TOKEN=$([ "$DEMO_MODE" -eq 1 ] && printf 0 || printf 1)
 DEFENSIVE_AI_DEMO_MODE=$([ "$DEMO_MODE" -eq 1 ] && printf 1 || printf 0)

@@ -68,6 +68,10 @@ from .processing import (
     DeadLetter,
     DeferredAlert,
 )
+from .response_automation import (
+    RESPONSE_TASK_STATUSES,
+    ResponseAutomationService,
+)
 from .skills import SkillRegistry
 from .syslog_receiver import SyslogListenerSpec, SyslogReceiverManager
 from .syslog_router import SyslogPortRouter
@@ -95,7 +99,16 @@ _ROLE_ANALYST = "analyst"
 _ROLE_APPROVER = "approver"
 _ROLE_MEMORY = "memory"
 _ROLE_CONFIG = "config"
-_ALL_ROLES = {_ROLE_READ, _ROLE_INGEST, _ROLE_ANALYST, _ROLE_APPROVER, _ROLE_MEMORY, _ROLE_CONFIG}
+_ROLE_RESPONDER = "responder"
+_ALL_ROLES = {
+    _ROLE_READ,
+    _ROLE_INGEST,
+    _ROLE_ANALYST,
+    _ROLE_APPROVER,
+    _ROLE_MEMORY,
+    _ROLE_CONFIG,
+    _ROLE_RESPONDER,
+}
 _SYSLOG_PRODUCT_ORDER = ("waf", "hips", "ndr", "rasp", "siem")
 _SYSLOG_DEPLOYMENT_MAX_CIDRS = 64
 
@@ -445,8 +458,15 @@ def _validate_exposed_server_config(config: GatewayConfig) -> None:
         "ingest": str(auth.ingest_token or "").strip(),
         "operator": str(auth.operator_token or "").strip(),
         "approver": str(auth.approver_token or "").strip(),
+        "responder": str(auth.responder_token or "").strip(),
     }
-    fixed_actors = {"api-admin", "ingest-collector", "soc-operator", "soc-approver"}
+    fixed_actors = {
+        "api-admin",
+        "ingest-collector",
+        "soc-operator",
+        "soc-approver",
+        "soc-responder",
+    }
     named_actors: set[str] = set()
     named_approvers: set[str] = set()
     for principal in auth.principals:
@@ -645,6 +665,10 @@ class GatewayState:
         self.config_path = config_path
         self.lock = threading.RLock()
         self.repo = Repository(config.database.path)
+        self.response_automation = ResponseAutomationService(
+            self.repo,
+            allow_loopback_connectors=config.auth.demo_mode,
+        )
         self._syslog_deployment = {"collector_address": "", "source_cidrs": []}
         self._restore_runtime_settings()
         self.policy = PolicyEngine(config.policy)
@@ -712,6 +736,7 @@ class GatewayState:
             daemon=True,
         )
         self._maintenance_thread.start()
+        self.response_automation.start()
 
     def _restore_runtime_settings(self) -> None:
         saved_llm = self.repo.get_runtime_setting("llm")
@@ -1113,6 +1138,7 @@ class GatewayState:
             self.alert_processor.stop()
 
     def stop(self) -> None:
+        self.response_automation.stop()
         self.syslog_receiver.stop()
         self._maintenance_stop.set()
         if self._maintenance_thread:
@@ -2825,6 +2851,7 @@ class GatewayState:
                     result,
                     validation,
                     str(resolution["resolution_id"]),
+                    self.repo.get_normalized_event(validation.event_id),
                 )
                 approvals = []
                 for request in requests:
@@ -2919,7 +2946,40 @@ class GatewayState:
                     },
                     _commit=False,
                 )
-                return {"ok": True, "approval": updated}
+                response_task = None
+                if updated["status"] == "approved":
+                    try:
+                        response_task = self.response_automation.create_for_approval(
+                            updated, actor=actor
+                        )
+                    except (TypeError, ValueError) as exc:
+                        self.repo.insert_audit(
+                            new_id("audit"),
+                            str(updated["case_id"]),
+                            actor,
+                            "response_task_rejected",
+                            {
+                                "case_id": updated["case_id"],
+                                "approval_id": approval_id,
+                                "error": str(exc),
+                            },
+                            _commit=False,
+                        )
+                result = {
+                    "ok": True,
+                    "approval": updated,
+                    "response_task": response_task,
+                }
+            if response_task and response_task["status"] == "queued":
+                self.response_automation.wake()
+            return result
+
+    def response_automation_summary(self) -> dict:
+        return {
+            "policy": self.response_automation.policy(),
+            "connectors": self.response_automation.connectors(),
+            "stats": self.repo.response_task_stats(),
+        }
 
     def confirm_alert_false_positive(self, alert_id: str, body: dict) -> dict:
         with self.lock:
@@ -3241,6 +3301,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             auth.ingest_token,
             auth.operator_token,
             auth.approver_token,
+            auth.responder_token,
             *(principal.token for principal in auth.principals),
         ]
         header = self.headers.get("Authorization", "")
@@ -3250,6 +3311,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             (auth.ingest_token, "ingest-collector", {_ROLE_INGEST}),
             (auth.operator_token, "soc-operator", {_ROLE_READ, _ROLE_ANALYST, _ROLE_MEMORY}),
             (auth.approver_token, "soc-approver", {_ROLE_READ, _ROLE_APPROVER, _ROLE_MEMORY}),
+            (auth.responder_token, "soc-responder", {_ROLE_READ, _ROLE_RESPONDER}),
             *(
                 (
                     principal.token,
@@ -3312,6 +3374,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             auth.ingest_token,
             auth.operator_token,
             auth.approver_token,
+            auth.responder_token,
             *(principal.token for principal in auth.principals),
         )
         return bool(
@@ -3505,6 +3568,48 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if parsed.path == "/api/automation/summary":
+            if not self._require_roles(_ROLE_READ, _ROLE_CONFIG, _ROLE_RESPONDER):
+                return
+            self._json(200, self.state.response_automation_summary())
+            return
+        if parsed.path == "/api/automation/connectors":
+            if not self._require_roles(_ROLE_READ, _ROLE_CONFIG, _ROLE_RESPONDER):
+                return
+            self._json(200, {"connectors": self.state.response_automation.connectors()})
+            return
+        if parsed.path == "/api/automation/tasks":
+            if not self._require_roles(_ROLE_READ, _ROLE_RESPONDER):
+                return
+            query = parse_qs(parsed.query)
+            status = _query_first(query, "status") or None
+            if status and status not in RESPONSE_TASK_STATUSES:
+                self._json(400, {"error": f"unsupported response task status: {status}"})
+                return
+            limit = _query_int(query, "limit", 20, min_value=1, max_value=200)
+            offset = _query_int(query, "offset", 0, min_value=0)
+            total = self.state.repo.count_response_tasks(status=status)
+            self._json(
+                200,
+                {
+                    "tasks": self.state.repo.list_response_tasks(
+                        status=status, limit=limit, offset=offset
+                    ),
+                    "stats": self.state.repo.response_task_stats(),
+                    "pagination": _pagination_payload(total, limit, offset),
+                },
+            )
+            return
+        if parsed.path.startswith("/api/automation/tasks/"):
+            if not self._require_roles(_ROLE_READ, _ROLE_RESPONDER):
+                return
+            task_id = unquote(parsed.path.rsplit("/", 1)[-1])
+            task = self.state.repo.get_response_task(task_id)
+            if not task:
+                self._json(404, {"error": "response task not found"})
+            else:
+                self._json(200, {"task": task})
+            return
         if parsed.path == "/api/alerts/inbox":
             if not self._require_roles(_ROLE_READ):
                 return
@@ -3670,6 +3775,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
         if parsed.path.startswith("/api/config/"):
             authorized = self._require_roles(_ROLE_CONFIG)
+        elif parsed.path == "/api/automation/policy":
+            authorized = self._require_roles(_ROLE_CONFIG)
+        elif parsed.path == "/api/automation/connectors":
+            authorized = self._require_roles(_ROLE_CONFIG)
+        elif parsed.path.startswith("/api/automation/connectors/"):
+            authorized = self._require_roles(_ROLE_CONFIG)
+        elif parsed.path.startswith("/api/automation/tasks/"):
+            authorized = self._require_roles(_ROLE_RESPONDER)
         elif parsed.path == "/api/mapping-profiles":
             authorized = self._require_roles(_ROLE_CONFIG)
         elif parsed.path.startswith("/api/mapping-profiles/"):
@@ -3695,6 +3808,95 @@ class GatewayHandler(BaseHTTPRequestHandler):
         else:
             authorized = self._require_auth()
         if not authorized:
+            return
+        if parsed.path == "/api/automation/policy":
+            try:
+                body = self._governance_body(self._read_json())
+                policy = self.state.response_automation.save_policy(
+                    body, actor=body["_actor"]
+                )
+                self._json(200, {"ok": True, "policy": policy})
+            except _PayloadTooLarge:
+                self._json(413, {"error": "request body too large"})
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                self._client_error(exc)
+            except Exception as exc:
+                self._server_error(exc)
+            return
+        if parsed.path == "/api/automation/connectors":
+            try:
+                body = self._governance_body(self._read_json())
+                connector = self.state.response_automation.save_connector(
+                    body, actor=body["_actor"]
+                )
+                self._json(200, {"ok": True, "connector": connector})
+            except _PayloadTooLarge:
+                self._json(413, {"error": "request body too large"})
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                self._client_error(exc)
+            except Exception as exc:
+                self._server_error(exc)
+            return
+        if parsed.path.startswith("/api/automation/connectors/") and parsed.path.endswith("/test"):
+            connector_id = unquote(parsed.path.split("/")[-2])
+            try:
+                connector = self.state.response_automation.test_connector(
+                    connector_id, actor=self._authenticated_actor()
+                )
+                self._json(
+                    200,
+                    {
+                        "ok": connector["health_status"] == "healthy",
+                        "connector": connector,
+                    },
+                )
+            except KeyError:
+                self._json(404, {"error": "connector not found"})
+            except Exception as exc:
+                self._server_error(exc)
+            return
+        if parsed.path.startswith("/api/automation/connectors/"):
+            connector_id = unquote(parsed.path.rsplit("/", 1)[-1])
+            try:
+                body = self._governance_body(self._read_json())
+                connector = self.state.response_automation.save_connector(
+                    body, actor=body["_actor"], connector_id=connector_id
+                )
+                self._json(200, {"ok": True, "connector": connector})
+            except _PayloadTooLarge:
+                self._json(413, {"error": "request body too large"})
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                self._client_error(exc)
+            except Exception as exc:
+                self._server_error(exc)
+            return
+        if parsed.path.startswith("/api/automation/tasks/") and parsed.path.endswith("/dispatch"):
+            task_id = unquote(parsed.path.split("/")[-2])
+            try:
+                task = self.state.response_automation.dispatch(
+                    task_id, actor=self._authenticated_actor()
+                )
+                self._json(200, {"ok": True, "task": task})
+            except KeyError:
+                self._json(404, {"error": "response task not found"})
+            except ValueError as exc:
+                self._client_error(exc)
+            except Exception as exc:
+                self._server_error(exc)
+            return
+        if parsed.path.startswith("/api/automation/tasks/") and parsed.path.endswith("/rollback"):
+            task_id = unquote(parsed.path.split("/")[-2])
+            try:
+                task = self.state.response_automation.rollback(
+                    task_id, actor=self._authenticated_actor()
+                )
+                self._json(200, {"ok": True, "task": task})
+            except KeyError:
+                self._json(404, {"error": "response task not found"})
+            except ValueError as exc:
+                self._client_error(exc)
+            except Exception as exc:
+                self._server_error(exc)
             return
         if parsed.path == "/api/config/llm":
             try:

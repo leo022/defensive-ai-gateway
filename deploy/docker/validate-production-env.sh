@@ -67,10 +67,19 @@ tokens=(
   "${DEFENSIVE_AI_INGEST_TOKEN:-}"
   "${DEFENSIVE_AI_OPERATOR_TOKEN:-}"
   "${DEFENSIVE_AI_APPROVER_TOKEN:-}"
+  "${DEFENSIVE_AI_RESPONDER_TOKEN:-}"
 )
 for token in "${tokens[@]}"; do
   strong_secret "$token" || die "every role token must be non-placeholder, at least 32 characters, and use the portable token alphabet"
 done
+
+connector_token="${DEFENSIVE_AI_RESPONSE_CONNECTOR_TOKEN:-}"
+if [ -n "$connector_token" ]; then
+  strong_secret "$connector_token" || die "response connector token must be non-placeholder, at least 32 characters, and use the portable token alphabet"
+  for token in "${tokens[@]}"; do
+    [ "$connector_token" != "$token" ] || die "response connector token must be distinct from role tokens"
+  done
+fi
 for ((i = 0; i < ${#tokens[@]}; i++)); do
   for ((j = i + 1; j < ${#tokens[@]}; j++)); do
     [ "${tokens[$i]}" != "${tokens[$j]}" ] || die "role tokens must be distinct"

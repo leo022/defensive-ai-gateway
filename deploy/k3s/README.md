@@ -53,14 +53,18 @@ chmod 600 .env
 vi .env
 ```
 
-生产必须配置四个不同且不少于 32 字符的角色 Token：管理员、HTTP 告警接入、
-运营和审批。安装器拒绝 `change-me`、`replace-*` 等占位值。还必须设置：
+生产必须配置五个不同且不少于 32 字符的角色 Token：管理员、HTTP 告警接入、
+运营、审批和处置执行。安装器拒绝 `change-me`、`replace-*` 等占位值。还必须设置：
 
 - `DEFENSIVE_AI_PUBLIC_HOST`：生产 HTTPS 域名；
 - `DEFENSIVE_AI_TLS_SECRET`：已存在于 `defensive-ai-gateway` Namespace 的 TLS Secret；
 - `DEFENSIVE_AI_ALLOWED_SOURCE_CIDRS`：允许运营人员访问的内网 CIDR，拒绝全网段；
 - 模型 provider、endpoint、model 与 allowed hosts；
 - 数据、审计与记忆事件保留期。
+
+如需调用 WAF 或防火墙通用 Webhook，将独立凭据写入
+`DEFENSIVE_AI_RESPONSE_CONNECTOR_TOKEN`，控制台连接器的凭据变量名填写同名值。
+凭据不会写入数据库。处置协议和上线顺序见 `docs/AUTOMATED_RESPONSE.md`。
 
 先创建 TLS Secret（证书文件不能放进部署包）：
 

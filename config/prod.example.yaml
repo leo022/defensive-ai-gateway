@@ -24,13 +24,14 @@ policy:
   approval_quorum: 2
   redact_fields: [password, token, cookie, authorization, customer_id, id_card, phone, email, session]
 auth:
-  # Production should inject distinct admin, ingest, operator and approver tokens
+  # Production should inject distinct admin, ingest, operator, approver and responder tokens
   # through environment variables or a Secret, and front the gateway with mTLS
   # or a reverse proxy. Never put token values in this file.
   api_token: ""
   ingest_token: ""
   operator_token: ""
   approver_token: ""
+  responder_token: ""
   allow_loopback_no_token: false
   require_token_when_remote: true
   demo_mode: false

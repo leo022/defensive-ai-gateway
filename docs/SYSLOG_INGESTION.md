@@ -27,7 +27,7 @@ Security Product -> Syslog product ports -> Collector -> POST /api/alerts -> Def
 ```bash
 cp .env.example .env
 chmod 600 .env
-# 设置四个角色 Token、TLS/来源 CIDR，并至少设置：
+# 设置五个角色 Token、TLS/来源 CIDR，并至少设置：
 # DEFENSIVE_AI_SYSLOG_SOURCE_CIDRS=10.20.0.0/16
 bash install.sh --with-syslog
 ```
@@ -46,7 +46,7 @@ bash install.sh --with-syslog --syslog-console-config defensive-ai-syslog-consol
 
 控制台不会直接取得 Kubernetes 写权限，也不会保存或显示 ingest Token。
 
-`syslog-collector-vector` 从 `defensive-ai-gateway-secrets` 只挂载 `DEFENSIVE_AI_INGEST_TOKEN`，并在每个 HTTP sink 请求中发送该 Bearer Token。它不会取得管理员、运营或审批 Token。生产安装器要求四个角色 Token 都不同，避免 collector 被攻陷后获得配置或记忆治理权限。
+`syslog-collector-vector` 从 `defensive-ai-gateway-secrets` 只挂载 `DEFENSIVE_AI_INGEST_TOKEN`，并在每个 HTTP sink 请求中发送该 Bearer Token。它不会取得管理员、运营、审批或处置执行 Token。生产安装器要求五个角色 Token 都不同，避免 collector 被攻陷后获得配置、记忆治理或设备处置权限。
 
 安全设备侧配置：
 

@@ -3332,6 +3332,282 @@ button.memory-audit-row:hover {
   padding: 6px 12px;
 }
 
+.automation-kpis {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.automation-kpis > div {
+  min-width: 0;
+}
+
+.automation-filter-form {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-2);
+}
+
+.automation-filter-form label,
+.automation-form label {
+  display: grid;
+  gap: 6px;
+}
+
+.automation-filter-form label {
+  flex: 0 1 280px;
+  min-width: 220px;
+}
+
+.automation-filter-form span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.automation-filter-form select {
+  width: 100%;
+  min-height: 36px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink);
+  padding: 9px 10px;
+}
+
+.automation-task-list,
+.automation-connector-list {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+  padding: 16px;
+}
+
+.automation-task-panel {
+  overflow: hidden;
+}
+
+.automation-task-item,
+.automation-connector-item {
+  display: grid;
+  gap: 11px;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-2);
+  padding: 13px;
+}
+
+.automation-task-item.failed,
+.automation-task-item.rollback_failed {
+  border-left: 3px solid var(--risk);
+}
+
+.automation-task-head,
+.automation-task-actions,
+.automation-connector-flags {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.automation-task-head {
+  align-items: flex-start;
+  justify-content: space-between;
+}
+
+.automation-task-head > div {
+  display: grid;
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: 3px;
+}
+
+.automation-task-head > .field-status {
+  flex: 0 0 auto;
+  max-width: min(42%, 180px);
+  overflow-wrap: anywhere;
+  text-align: center;
+  white-space: normal;
+}
+
+.automation-task-head strong,
+.automation-task-head span {
+  overflow-wrap: anywhere;
+}
+
+.automation-task-head > div span,
+.automation-connector-flags {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.automation-task-meta {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 9px 14px;
+  margin: 0;
+}
+
+.automation-task-meta div {
+  min-width: 0;
+}
+
+.automation-task-meta dt {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.automation-task-meta dd {
+  min-width: 0;
+  margin: 3px 0 0;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.automation-mono {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.automation-task-error {
+  margin: 0;
+  border-left: 3px solid var(--risk);
+  background: color-mix(in srgb, var(--risk) 8%, transparent);
+  color: var(--ink);
+  padding: 7px 9px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.automation-config-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.automation-config-grid > .panel {
+  margin-top: 0;
+  overflow: hidden;
+}
+
+.automation-form {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.automation-form label,
+.automation-form input,
+.automation-form select,
+.automation-form textarea {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.automation-field-wide {
+  grid-column: 1 / -1;
+}
+
+.automation-form textarea,
+.automation-protected-field textarea {
+  min-height: 130px;
+}
+
+.automation-toggle {
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  min-height: 40px;
+  padding: 5px 0;
+}
+
+.automation-toggle input {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+}
+
+.automation-connector-flags {
+  flex-wrap: wrap;
+}
+
+.automation-connector-flags span {
+  max-width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  padding: 4px 7px;
+  overflow-wrap: anywhere;
+}
+
+.automation-policy-panel {
+  max-width: 1040px;
+  overflow: hidden;
+}
+
+.automation-protected-field,
+.automation-policy-panel .automation-toggle,
+.automation-policy-panel .form-actions,
+.automation-policy-panel .form-status,
+.automation-connector-item .automation-task-error {
+  grid-column: 1 / -1;
+}
+
+.automation-form .form-status {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.automation-task-actions {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.automation-task-actions button {
+  max-width: 100%;
+  white-space: normal;
+}
+
+.automation-task-panel .panel-heading > div,
+.automation-config-grid .panel-heading > div,
+.automation-policy-panel .panel-heading > div,
+.approval-automation-plan > div:first-child > :first-child {
+  min-width: 0;
+}
+
+.approval-automation-plan {
+  display: grid;
+  gap: 8px;
+  border-top: 1px solid var(--line);
+  padding-top: 9px;
+}
+
+.approval-automation-plan > div:first-child {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.approval-automation-plan > div:first-child .field-status {
+  flex: 0 0 auto;
+  max-width: 50%;
+  overflow-wrap: anywhere;
+  text-align: center;
+  white-space: normal;
+}
+
+.approval-automation-empty {
+  color: var(--muted);
+  font-size: 12px;
+}
+
 @media (max-width: 1120px) {
   .app-shell {
     grid-template-columns: 1fr;
@@ -3401,12 +3677,23 @@ button.memory-audit-row:hover {
     grid-template-columns: 1fr;
   }
 
+  .automation-config-grid {
+    grid-template-columns: 1fr;
+  }
+
   .memory-kpis {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
   .memory-list {
     max-height: 520px;
+  }
+}
+
+@media (max-width: 900px) {
+  .automation-kpis,
+  .automation-task-meta {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
@@ -3488,8 +3775,51 @@ button.memory-audit-row:hover {
   .stats,
   .dashboard-kpis,
   .memory-kpis,
+  .automation-kpis,
+  .automation-task-meta,
   .settings-form {
     grid-template-columns: 1fr;
+  }
+
+  .automation-filter-form,
+  .automation-task-head,
+  .automation-task-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .automation-filter-form select,
+  .automation-filter-form button,
+  .automation-task-actions button {
+    width: 100%;
+  }
+
+  .automation-filter-form label {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .automation-task-panel .panel-heading {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .automation-task-panel .panel-heading button {
+    width: 100%;
+  }
+
+  .automation-task-head > .field-status {
+    align-self: flex-start;
+    max-width: 100%;
+  }
+
+  .approval-automation-plan > div:first-child {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .approval-automation-plan > div:first-child .field-status {
+    max-width: 100%;
   }
 
   .field-mapping-table {

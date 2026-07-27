@@ -200,6 +200,91 @@ CREATE TABLE IF NOT EXISTS approval_votes (
   FOREIGN KEY (approval_id) REFERENCES action_approvals(approval_id) ON DELETE CASCADE,
   CHECK (decision IN ('approved','rejected','cancelled'))
 );
+CREATE TABLE IF NOT EXISTS response_connectors (
+  connector_id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  connector_type TEXT NOT NULL DEFAULT 'generic_webhook',
+  endpoint TEXT NOT NULL,
+  secret_env TEXT NOT NULL DEFAULT '',
+  execution_mode TEXT NOT NULL DEFAULT 'shadow',
+  enabled INTEGER NOT NULL DEFAULT 0,
+  max_ttl_seconds INTEGER NOT NULL DEFAULT 3600,
+  timeout_seconds INTEGER NOT NULL DEFAULT 10,
+  health_status TEXT NOT NULL DEFAULT 'untested',
+  last_error TEXT NOT NULL DEFAULT '',
+  last_test_at_ms INTEGER,
+  version INTEGER NOT NULL DEFAULT 1,
+  created_by TEXT NOT NULL,
+  updated_by TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  CHECK (connector_type = 'generic_webhook'),
+  CHECK (execution_mode IN ('shadow','manual','auto')),
+  CHECK (enabled IN (0,1)),
+  CHECK (health_status IN ('untested','healthy','error'))
+);
+CREATE TABLE IF NOT EXISTS response_policy (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  enabled INTEGER NOT NULL DEFAULT 0,
+  default_ttl_seconds INTEGER NOT NULL DEFAULT 1800,
+  max_ttl_seconds INTEGER NOT NULL DEFAULT 86400,
+  protected_cidrs_json TEXT NOT NULL DEFAULT '[]',
+  updated_by TEXT NOT NULL DEFAULT 'system',
+  updated_at_ms INTEGER NOT NULL DEFAULT 0,
+  CHECK (enabled IN (0,1))
+);
+INSERT OR IGNORE INTO response_policy(
+  singleton, enabled, default_ttl_seconds, max_ttl_seconds,
+  protected_cidrs_json, updated_by, updated_at_ms
+) VALUES (1, 0, 1800, 86400, '[]', 'system', 0);
+CREATE TABLE IF NOT EXISTS response_tasks (
+  task_id TEXT PRIMARY KEY,
+  approval_id TEXT NOT NULL UNIQUE,
+  case_id TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  action_type TEXT NOT NULL,
+  action_json TEXT NOT NULL,
+  connector_id TEXT,
+  connector_version INTEGER NOT NULL DEFAULT 0,
+  connector_snapshot_json TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL DEFAULT 5,
+  available_at_ms INTEGER NOT NULL,
+  claimed_at_ms INTEGER,
+  remote_rule_id TEXT NOT NULL DEFAULT '',
+  last_error TEXT NOT NULL DEFAULT '',
+  verified_at_ms INTEGER,
+  expires_at_ms INTEGER,
+  created_by TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  FOREIGN KEY (approval_id) REFERENCES action_approvals(approval_id),
+  FOREIGN KEY (case_id) REFERENCES cases(case_id),
+  FOREIGN KEY (event_id) REFERENCES normalized_events(event_id),
+  FOREIGN KEY (connector_id) REFERENCES response_connectors(connector_id),
+  CHECK (action_type = 'network.block_ip'),
+  CHECK (status IN (
+    'waiting_configuration','waiting_dispatch','paused','queued','running',
+    'retry_wait','verified','shadowed','failed','cancelled',
+    'rollback_queued','rollback_running','rollback_retry','rolled_back','rollback_failed'
+  ))
+);
+CREATE TABLE IF NOT EXISTS response_attempts (
+  attempt_id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  attempt_no INTEGER NOT NULL,
+  request_hash TEXT NOT NULL DEFAULT '',
+  http_status INTEGER,
+  outcome TEXT NOT NULL,
+  response_excerpt TEXT NOT NULL DEFAULT '',
+  error TEXT NOT NULL DEFAULT '',
+  created_at_ms INTEGER NOT NULL,
+  FOREIGN KEY (task_id) REFERENCES response_tasks(task_id) ON DELETE CASCADE,
+  CHECK (operation IN ('health_check','apply','verify','rollback'))
+);
 CREATE TABLE IF NOT EXISTS alert_dispositions (
   alert_id TEXT PRIMARY KEY,
   case_id TEXT NOT NULL,
@@ -265,6 +350,9 @@ CREATE INDEX IF NOT EXISTS idx_validation_review_case ON validation_review_resol
 CREATE INDEX IF NOT EXISTS idx_approvals_case ON action_approvals(case_id, created_at_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON action_approvals(status, created_at_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_approval_votes_approval ON approval_votes(approval_id, created_at_ms ASC);
+CREATE INDEX IF NOT EXISTS idx_response_tasks_status ON response_tasks(status, available_at_ms, created_at_ms);
+CREATE INDEX IF NOT EXISTS idx_response_tasks_case ON response_tasks(case_id, created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_response_attempts_task ON response_attempts(task_id, created_at_ms ASC);
 CREATE INDEX IF NOT EXISTS idx_alert_dispositions_case ON alert_dispositions(case_id, updated_at_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_inbox_claim ON durable_alert_inbox(status, available_at_ms, created_at_ms);
 CREATE INDEX IF NOT EXISTS idx_inbox_status_created ON durable_alert_inbox(status, created_at_ms);
@@ -305,7 +393,7 @@ BEGIN
 END;
 """
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 _LLM_DEFERRED_ERROR_PREFIX = "analysis_deferred:"
 _LEGACY_LLM_DEFERRED_ERROR_FRAGMENT = "remote LLM analysis deferred"
 _TERMINAL_LLM_ERROR_FRAGMENTS = (
@@ -926,6 +1014,26 @@ class Repository:
                     (now_ms(),),
                 )
 
+            if current < 15:
+                required_tables = {
+                    "response_connectors",
+                    "response_policy",
+                    "response_tasks",
+                    "response_attempts",
+                }
+                actual_tables = {
+                    row["name"]
+                    for row in self.conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    ).fetchall()
+                }
+                if not required_tables.issubset(actual_tables):
+                    raise RuntimeError("schema v15 response automation tables are incomplete")
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO schema_version(version, applied_at_ms) VALUES (15, ?)",
+                    (now_ms(),),
+                )
+
             self.conn.commit()
 
     def readiness_check(self) -> dict[str, Any]:
@@ -1288,6 +1396,7 @@ class Repository:
                     "rollback": approval["rollback"],
                     "stage": approval.get("stage", ""),
                     "mode": approval["mode"],
+                    "execution_action": approval.get("execution_action") or {},
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -1452,7 +1561,526 @@ class Repository:
             ]
         payload["votes"] = votes
         payload["vote_count"] = sum(1 for vote in votes if vote["decision"] == "approved")
+        task = self.conn.execute(
+            "SELECT * FROM response_tasks WHERE approval_id = ?",
+            (payload["approval_id"],),
+        ).fetchone()
+        payload["response_task"] = self._response_task_row(task) if task else None
         return payload
+
+    # ---- controlled response automation ---------------------------------
+
+    @staticmethod
+    def _response_connector_row(row: sqlite3.Row) -> dict[str, Any]:
+        payload = dict(row)
+        payload["enabled"] = bool(payload["enabled"])
+        return payload
+
+    def save_response_connector(
+        self, connector: dict[str, Any], *, actor: str, _commit: bool = True
+    ) -> dict[str, Any]:
+        with self._lock:
+            current = self.conn.execute(
+                "SELECT version, created_by, created_at_ms FROM response_connectors WHERE connector_id = ?",
+                (connector["connector_id"],),
+            ).fetchone()
+            timestamp = now_ms()
+            version = int(current["version"] if current else 0) + 1
+            created_by = str(current["created_by"] if current else actor)
+            created_at = int(current["created_at_ms"] if current else timestamp)
+            self.conn.execute(
+                """
+                INSERT INTO response_connectors(
+                  connector_id, name, connector_type, endpoint, secret_env,
+                  execution_mode, enabled, max_ttl_seconds, timeout_seconds,
+                  health_status, last_error, last_test_at_ms, version,
+                  created_by, updated_by, created_at_ms, updated_at_ms
+                ) VALUES (?, ?, 'generic_webhook', ?, ?, ?, ?, ?, ?, 'untested', '', NULL, ?, ?, ?, ?, ?)
+                ON CONFLICT(connector_id) DO UPDATE SET
+                  name = excluded.name,
+                  endpoint = excluded.endpoint,
+                  secret_env = excluded.secret_env,
+                  execution_mode = excluded.execution_mode,
+                  enabled = excluded.enabled,
+                  max_ttl_seconds = excluded.max_ttl_seconds,
+                  timeout_seconds = excluded.timeout_seconds,
+                  health_status = 'untested',
+                  last_error = '',
+                  last_test_at_ms = NULL,
+                  version = excluded.version,
+                  updated_by = excluded.updated_by,
+                  updated_at_ms = excluded.updated_at_ms
+                """,
+                (
+                    connector["connector_id"], connector["name"], connector["endpoint"],
+                    connector.get("secret_env", ""), connector["execution_mode"],
+                    1 if connector.get("enabled") else 0,
+                    int(connector["max_ttl_seconds"]), int(connector["timeout_seconds"]),
+                    version, created_by, actor, created_at, timestamp,
+                ),
+            )
+            if _commit:
+                self.conn.commit()
+            return self.get_response_connector(connector["connector_id"]) or {}
+
+    def get_response_connector(self, connector_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM response_connectors WHERE connector_id = ?", (connector_id,)
+            ).fetchone()
+            return self._response_connector_row(row) if row else None
+
+    def list_response_connectors(self, *, enabled_only: bool = False) -> list[dict[str, Any]]:
+        with self._lock:
+            where = "WHERE enabled = 1" if enabled_only else ""
+            rows = self.conn.execute(
+                f"SELECT * FROM response_connectors {where} ORDER BY updated_at_ms DESC, name ASC"
+            ).fetchall()
+            return [self._response_connector_row(row) for row in rows]
+
+    def update_response_connector_health(
+        self, connector_id: str, status: str, error: str = "", *, _commit: bool = True
+    ) -> dict[str, Any] | None:
+        if status not in {"healthy", "error"}:
+            raise ValueError("unsupported connector health status")
+        with self._lock:
+            timestamp = now_ms()
+            self.conn.execute(
+                """
+                UPDATE response_connectors
+                SET health_status = ?, last_error = ?, last_test_at_ms = ?, updated_at_ms = ?
+                WHERE connector_id = ?
+                """,
+                (status, str(error)[:1000], timestamp, timestamp, connector_id),
+            )
+            if _commit:
+                self.conn.commit()
+            return self.get_response_connector(connector_id)
+
+    def get_response_policy(self) -> dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM response_policy WHERE singleton = 1"
+            ).fetchone()
+            payload = dict(row) if row else {
+                "enabled": 0,
+                "default_ttl_seconds": 1800,
+                "max_ttl_seconds": 86400,
+                "protected_cidrs_json": "[]",
+                "updated_by": "system",
+                "updated_at_ms": 0,
+            }
+            payload["enabled"] = bool(payload["enabled"])
+            payload["protected_cidrs"] = json.loads(payload.pop("protected_cidrs_json"))
+            return payload
+
+    def save_response_policy(
+        self, policy: dict[str, Any], *, actor: str, _commit: bool = True
+    ) -> dict[str, Any]:
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO response_policy(
+                  singleton, enabled, default_ttl_seconds, max_ttl_seconds,
+                  protected_cidrs_json, updated_by, updated_at_ms
+                ) VALUES (1, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(singleton) DO UPDATE SET
+                  enabled = excluded.enabled,
+                  default_ttl_seconds = excluded.default_ttl_seconds,
+                  max_ttl_seconds = excluded.max_ttl_seconds,
+                  protected_cidrs_json = excluded.protected_cidrs_json,
+                  updated_by = excluded.updated_by,
+                  updated_at_ms = excluded.updated_at_ms
+                """,
+                (
+                    1 if policy.get("enabled") else 0,
+                    int(policy["default_ttl_seconds"]), int(policy["max_ttl_seconds"]),
+                    json.dumps(policy["protected_cidrs"], ensure_ascii=False, sort_keys=True),
+                    actor, now_ms(),
+                ),
+            )
+            if not policy.get("enabled"):
+                self.conn.execute(
+                    """
+                    UPDATE response_tasks
+                    SET status = 'paused', last_error = 'response policy is disabled',
+                        claimed_at_ms = NULL, updated_at_ms = ?
+                    WHERE status IN ('queued','retry_wait')
+                    """,
+                    (now_ms(),),
+                )
+            if _commit:
+                self.conn.commit()
+            return self.get_response_policy()
+
+    @staticmethod
+    def _response_task_row(row: sqlite3.Row) -> dict[str, Any]:
+        payload = dict(row)
+        payload["action"] = json.loads(payload.pop("action_json"))
+        payload["connector_snapshot"] = json.loads(
+            payload.pop("connector_snapshot_json") or "{}"
+        )
+        return payload
+
+    def create_response_task(
+        self, task: dict[str, Any], *, _commit: bool = True
+    ) -> tuple[dict[str, Any], bool]:
+        with self._lock:
+            cur = self.conn.execute(
+                """
+                INSERT OR IGNORE INTO response_tasks(
+                  task_id, approval_id, case_id, event_id, action_type, action_json,
+                  connector_id, connector_version, connector_snapshot_json,
+                  status, idempotency_key, attempts, max_attempts, available_at_ms,
+                  claimed_at_ms, remote_rule_id, last_error, verified_at_ms,
+                  expires_at_ms, created_by, created_at_ms, updated_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, '', '', NULL, NULL, ?, ?, ?)
+                """,
+                (
+                    task["task_id"], task["approval_id"], task["case_id"], task["event_id"],
+                    task["action_type"],
+                    json.dumps(task["action"], ensure_ascii=False, sort_keys=True),
+                    task.get("connector_id"), int(task.get("connector_version", 0)),
+                    json.dumps(task.get("connector_snapshot") or {}, ensure_ascii=False, sort_keys=True),
+                    task["status"], task["idempotency_key"], int(task.get("max_attempts", 5)),
+                    int(task.get("available_at_ms", now_ms())), task["created_by"],
+                    int(task["created_at_ms"]), int(task["created_at_ms"]),
+                ),
+            )
+            row = self.conn.execute(
+                "SELECT * FROM response_tasks WHERE approval_id = ?", (task["approval_id"],)
+            ).fetchone()
+            if _commit:
+                self.conn.commit()
+            if not row:
+                raise RuntimeError("response task was not persisted")
+            return self._response_task_row(row), cur.rowcount > 0
+
+    def get_response_task(self, task_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM response_tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if not row:
+                return None
+            payload = self._response_task_row(row)
+            payload["attempt_history"] = [
+                dict(item)
+                for item in self.conn.execute(
+                    "SELECT * FROM response_attempts WHERE task_id = ? ORDER BY created_at_ms ASC",
+                    (task_id,),
+                ).fetchall()
+            ]
+            return payload
+
+    def list_response_tasks(
+        self, *, status: str | None = None, limit: int = 20, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            where = "WHERE status = ?" if status else ""
+            params: list[Any] = [status] if status else []
+            params.extend([max(1, min(int(limit), 200)), max(0, int(offset))])
+            rows = self.conn.execute(
+                f"SELECT * FROM response_tasks {where} ORDER BY created_at_ms DESC LIMIT ? OFFSET ?",
+                params,
+            ).fetchall()
+            return [self._response_task_row(row) for row in rows]
+
+    def count_response_tasks(self, *, status: str | None = None) -> int:
+        with self._lock:
+            if status:
+                row = self.conn.execute(
+                    "SELECT COUNT(*) AS count FROM response_tasks WHERE status = ?", (status,)
+                ).fetchone()
+            else:
+                row = self.conn.execute("SELECT COUNT(*) AS count FROM response_tasks").fetchone()
+            return int(row["count"])
+
+    def response_task_stats(self) -> dict[str, int]:
+        with self._lock:
+            stats = {
+                str(row["status"]): int(row["count"])
+                for row in self.conn.execute(
+                    "SELECT status, COUNT(*) AS count FROM response_tasks GROUP BY status"
+                ).fetchall()
+            }
+            stats["total"] = sum(stats.values())
+            return stats
+
+    def response_task_preflight(self, task_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.conn.execute(
+                """
+                SELECT t.task_id, t.event_id, a.status AS approval_status,
+                       c.status AS case_status,
+                       (SELECT ar.event_id FROM agent_runs ar
+                        WHERE ar.case_id = t.case_id
+                        ORDER BY ar.created_at_ms DESC LIMIT 1) AS latest_event_id
+                FROM response_tasks t
+                JOIN action_approvals a ON a.approval_id = t.approval_id
+                JOIN cases c ON c.case_id = t.case_id
+                WHERE t.task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if not row:
+                return None
+            payload = dict(row)
+            payload["eligible"] = (
+                payload["approval_status"] == "approved"
+                and payload["case_status"] not in {"closed", "false_positive"}
+                and payload["event_id"] == payload["latest_event_id"]
+            )
+            return payload
+
+    def queue_response_task(
+        self, task_id: str, *, rollback: bool = False
+    ) -> dict[str, Any] | None:
+        allowed = (
+            {"verified", "shadowed", "failed", "rollback_failed"}
+            if rollback
+            else {"waiting_dispatch", "paused", "retry_wait"}
+        )
+        target = "rollback_queued" if rollback else "queued"
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT status, remote_rule_id FROM response_tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if not row or row["status"] not in allowed:
+                return None
+            if (
+                rollback
+                and row["status"] == "failed"
+                and not str(row["remote_rule_id"] or "")
+            ):
+                return None
+            timestamp = now_ms()
+            self.conn.execute(
+                """
+                UPDATE response_tasks
+                SET status = ?, available_at_ms = ?, claimed_at_ms = NULL,
+                    last_error = '', updated_at_ms = ?
+                WHERE task_id = ?
+                """,
+                (target, timestamp, timestamp, task_id),
+            )
+            self.conn.commit()
+            return self.get_response_task(task_id)
+
+    def bind_response_task_connector(
+        self, task_id: str, connector: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Freeze a connector snapshot onto a task approved before configuration."""
+        with self._lock:
+            timestamp = now_ms()
+            cur = self.conn.execute(
+                """
+                UPDATE response_tasks
+                SET connector_id = ?, connector_version = ?, connector_snapshot_json = ?,
+                    status = 'waiting_dispatch', last_error = '', updated_at_ms = ?
+                WHERE task_id = ? AND status = 'waiting_configuration'
+                  AND connector_snapshot_json = '{}'
+                """,
+                (
+                    connector["connector_id"],
+                    int(connector["version"]),
+                    json.dumps(connector, ensure_ascii=False, sort_keys=True),
+                    timestamp,
+                    task_id,
+                ),
+            )
+            self.conn.commit()
+            return self.get_response_task(task_id) if cur.rowcount else None
+
+    def resume_paused_response_tasks(self) -> int:
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT task_id, connector_snapshot_json FROM response_tasks
+                WHERE status = 'paused' AND connector_snapshot_json != '{}'
+                """
+            ).fetchall()
+            timestamp = now_ms()
+            resumed = 0
+            for row in rows:
+                snapshot = json.loads(row["connector_snapshot_json"] or "{}")
+                mode = str(snapshot.get("execution_mode") or "")
+                if mode not in {"shadow", "manual", "auto"}:
+                    continue
+                status = "waiting_dispatch" if mode == "manual" else "queued"
+                self.conn.execute(
+                    """
+                    UPDATE response_tasks
+                    SET status = ?, available_at_ms = ?, last_error = '', updated_at_ms = ?
+                    WHERE task_id = ? AND status = 'paused'
+                    """,
+                    (status, timestamp, timestamp, row["task_id"]),
+                )
+                resumed += 1
+            self.conn.commit()
+            return resumed
+
+    def claim_response_task(self) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.conn.execute(
+                """
+                SELECT task_id, status FROM response_tasks
+                WHERE status IN ('queued','retry_wait','rollback_queued','rollback_retry')
+                  AND available_at_ms <= ?
+                ORDER BY available_at_ms ASC, created_at_ms ASC LIMIT 1
+                """,
+                (now_ms(),),
+            ).fetchone()
+            if not row:
+                return None
+            target = "rollback_running" if str(row["status"]).startswith("rollback") else "running"
+            timestamp = now_ms()
+            cur = self.conn.execute(
+                """
+                UPDATE response_tasks
+                SET status = ?, attempts = attempts + 1, claimed_at_ms = ?, updated_at_ms = ?
+                WHERE task_id = ? AND status = ?
+                """,
+                (target, timestamp, timestamp, row["task_id"], row["status"]),
+            )
+            self.conn.commit()
+            return self.get_response_task(row["task_id"]) if cur.rowcount else None
+
+    def finish_response_task(
+        self,
+        task_id: str,
+        status: str,
+        *,
+        remote_rule_id: str = "",
+        error: str = "",
+        retry_delay_ms: int = 0,
+        _commit: bool = True,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            verified_at = now_ms() if status in {"verified", "shadowed", "rolled_back"} else None
+            expires_at = None
+            if status == "verified":
+                row = self.conn.execute(
+                    "SELECT action_json FROM response_tasks WHERE task_id = ?", (task_id,)
+                ).fetchone()
+                if row:
+                    duration = max(60, int(json.loads(row["action_json"]).get("duration_seconds") or 0))
+                    expires_at = int(verified_at or now_ms()) + duration * 1000
+            self.conn.execute(
+                """
+                UPDATE response_tasks
+                SET status = ?,
+                    remote_rule_id = CASE WHEN ? != '' THEN ? ELSE remote_rule_id END,
+                    last_error = ?, available_at_ms = ?, claimed_at_ms = NULL,
+                    verified_at_ms = COALESCE(?, verified_at_ms),
+                    expires_at_ms = COALESCE(?, expires_at_ms), updated_at_ms = ?
+                WHERE task_id = ?
+                """,
+                (
+                    status, remote_rule_id, remote_rule_id, str(error)[:2000],
+                    now_ms() + max(0, int(retry_delay_ms)), verified_at, expires_at,
+                    now_ms(), task_id,
+                ),
+            )
+            if _commit:
+                self.conn.commit()
+            return self.get_response_task(task_id)
+
+    def record_response_rule_id(
+        self, task_id: str, remote_rule_id: str, *, _commit: bool = True
+    ) -> None:
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE response_tasks SET remote_rule_id = ?, updated_at_ms = ?
+                WHERE task_id = ? AND status = 'running'
+                """,
+                (str(remote_rule_id)[:512], now_ms(), task_id),
+            )
+            if _commit:
+                self.conn.commit()
+
+    def insert_response_attempt(
+        self, attempt: dict[str, Any], *, _commit: bool = True
+    ) -> None:
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO response_attempts(
+                  attempt_id, task_id, operation, attempt_no, request_hash,
+                  http_status, outcome, response_excerpt, error, created_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    attempt["attempt_id"], attempt["task_id"], attempt["operation"],
+                    int(attempt.get("attempt_no", 0)), attempt.get("request_hash", ""),
+                    attempt.get("http_status"), attempt["outcome"],
+                    str(attempt.get("response_excerpt", ""))[:2000],
+                    str(attempt.get("error", ""))[:2000],
+                    int(attempt.get("created_at_ms", now_ms())),
+                ),
+            )
+            if _commit:
+                self.conn.commit()
+
+    def queue_expired_response_tasks(self) -> int:
+        with self._lock:
+            timestamp = now_ms()
+            cur = self.conn.execute(
+                """
+                UPDATE response_tasks
+                SET status = 'rollback_queued', available_at_ms = ?, updated_at_ms = ?
+                WHERE status = 'verified' AND expires_at_ms IS NOT NULL AND expires_at_ms <= ?
+                """,
+                (timestamp, timestamp, timestamp),
+            )
+            self.conn.commit()
+            return cur.rowcount
+
+    def recover_stale_response_tasks(self, stale_before_ms: int) -> int:
+        with self._lock:
+            timestamp = now_ms()
+            cur = self.conn.execute(
+                """
+                UPDATE response_tasks
+                SET status = CASE
+                      WHEN status = 'rollback_running' THEN 'rollback_retry'
+                      ELSE 'retry_wait'
+                    END,
+                    available_at_ms = ?, claimed_at_ms = NULL,
+                    last_error = 'stale execution lease recovered', updated_at_ms = ?
+                WHERE status IN ('running','rollback_running')
+                  AND claimed_at_ms IS NOT NULL AND claimed_at_ms < ?
+                """,
+                (timestamp, timestamp, int(stale_before_ms)),
+            )
+            self.conn.commit()
+            return cur.rowcount
+
+    def transition_case_response_tasks(self, case_id: str, *, _commit: bool = True) -> int:
+        with self._lock:
+            timestamp = now_ms()
+            cancelled = self.conn.execute(
+                """
+                UPDATE response_tasks
+                SET status = 'cancelled', last_error = 'case became terminal', updated_at_ms = ?
+                WHERE case_id = ? AND status IN (
+                  'waiting_configuration','waiting_dispatch','paused','queued','retry_wait'
+                )
+                """,
+                (timestamp, case_id),
+            ).rowcount
+            rollback = self.conn.execute(
+                """
+                UPDATE response_tasks
+                SET status = 'rollback_queued', available_at_ms = ?, updated_at_ms = ?
+                WHERE case_id = ? AND status = 'verified'
+                """,
+                (timestamp, timestamp, case_id),
+            ).rowcount
+            if _commit:
+                self.conn.commit()
+            return cancelled + rollback
 
     # ---- runtime settings / durable alert inbox ---------------------------
 
@@ -2149,6 +2777,8 @@ class Repository:
             "validations": 0,
             "validation_review_resolutions": 0,
             "approvals": 0,
+            "response_tasks": 0,
+            "response_attempts": 0,
             "memory_matches": 0,
             "audit_events": 0,
             "memory_events": 0,
@@ -2244,6 +2874,11 @@ class Repository:
                 SELECT c.case_id FROM cases c
                 WHERE c.status IN ('closed', 'false_positive')
                   AND COALESCE(c.closed_at_ms, c.updated_at_ms) < ?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM response_tasks t
+                    WHERE t.case_id = c.case_id
+                      AND t.status NOT IN ('shadowed','failed','cancelled','rolled_back')
+                  )
                 ORDER BY COALESCE(c.closed_at_ms, c.updated_at_ms) ASC
                 LIMIT ?
                 """,
@@ -2309,6 +2944,16 @@ class Repository:
                 alert_ids = {str(link["alert_id"]) for link in links}
                 event_ids = {str(link["event_id"]) for link in links}
 
+                cur = self.conn.execute(
+                    "DELETE FROM response_attempts WHERE task_id IN "
+                    "(SELECT task_id FROM response_tasks WHERE case_id = ?)",
+                    (case_id,),
+                )
+                counts["response_attempts"] += cur.rowcount
+                cur = self.conn.execute(
+                    "DELETE FROM response_tasks WHERE case_id = ?", (case_id,)
+                )
+                counts["response_tasks"] += cur.rowcount
                 self.conn.execute(
                     "DELETE FROM approval_votes WHERE approval_id IN "
                     "(SELECT approval_id FROM action_approvals WHERE case_id = ?)",
@@ -2604,6 +3249,7 @@ class Repository:
                     reason=f"Case transitioned to terminal status: {status}",
                     _commit=False,
                 )
+                self.transition_case_response_tasks(case_id, _commit=False)
                 self._archive_case_memory_locked(case_id, updated_at)
                 self._expire_unapproved_long_term_memory_locked(case_id, status, updated_at)
             if _commit:

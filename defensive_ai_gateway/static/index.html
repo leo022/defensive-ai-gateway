@@ -47,6 +47,14 @@
               <button id="adapter-tab-config" class="nav-subbutton" type="button" data-view="adapter" data-secondary-group="adapter" data-secondary-target="config" aria-controls="adapter-config-panel" data-i18n="adapterSubConfig">日志配置</button>
             </div>
           </div>
+          <div id="automation-nav-group" class="nav-group" data-view-group="automation">
+            <button id="automation-nav-parent" class="nav-button nav-parent" type="button" data-view="automation" data-secondary-group="automation" data-default-secondary="tasks"><span data-i18n="navAutomation">自动化处置</span></button>
+            <div id="automation-submenu" class="nav-submenu" role="group" data-i18n-aria-label="automationSecondaryNav">
+              <button id="automation-tab-tasks" class="nav-subbutton active" type="button" data-view="automation" data-secondary-group="automation" data-secondary-target="tasks" aria-controls="automation-tasks-panel" data-i18n="automationSubTasks">执行任务</button>
+              <button id="automation-tab-connectors" class="nav-subbutton" type="button" data-view="automation" data-secondary-group="automation" data-secondary-target="connectors" aria-controls="automation-connectors-panel" data-i18n="automationSubConnectors">连接器</button>
+              <button id="automation-tab-policy" class="nav-subbutton" type="button" data-view="automation" data-secondary-group="automation" data-secondary-target="policy" aria-controls="automation-policy-panel" data-i18n="automationSubPolicy">处置策略</button>
+            </div>
+          </div>
           <button class="nav-button" type="button" data-view="settings" data-i18n="navSettings">运行配置</button>
         </nav>
         <div class="sidebar-footer">
@@ -370,6 +378,64 @@
               <div id="memory-audit-list" class="memory-audit-list"></div>
               <div id="memory-audit-pagination" class="list-pagination-slot"></div>
             </section>
+            </div>
+          </section>
+          <section id="automation-view" class="view">
+            <div id="automation-tasks-panel" class="secondary-view active" aria-labelledby="automation-tab-tasks" data-secondary-panel="automation" data-secondary-name="tasks">
+              <section class="stats automation-kpis">
+                <div><span id="automation-total">0</span><label data-i18n="automationTotal">任务总量</label></div>
+                <div><span id="automation-active">0</span><label data-i18n="automationActive">处理中</label></div>
+                <div><span id="automation-verified">0</span><label data-i18n="automationVerified">已生效</label></div>
+                <div><span id="automation-failed">0</span><label data-i18n="automationFailed">执行异常</label></div>
+              </section>
+              <section class="panel automation-task-panel">
+                <div class="panel-heading">
+                  <div><h2 data-i18n="automationTasks">执行任务</h2><p data-i18n="automationTasksHint">跟踪审批后的调度、设备核验、到期解封和回滚结果。</p></div>
+                  <button id="automation-refresh" type="button" data-i18n="refresh">刷新</button>
+                </div>
+                <form id="automation-task-filter" class="automation-filter-form">
+                  <label><span data-i18n="automationStatus">任务状态</span><select id="automation-status-filter"><option value="" data-i18n="caseSearchAll">全部</option><option value="waiting_configuration" data-i18n="responseWaitingConfiguration">待配置</option><option value="waiting_dispatch" data-i18n="responseWaitingDispatch">待调度</option><option value="paused" data-i18n="responsePaused">已暂停</option><option value="queued" data-i18n="responseQueued">已入队</option><option value="verified" data-i18n="responseVerified">已生效</option><option value="shadowed" data-i18n="responseShadowed">影子执行</option><option value="failed" data-i18n="responseFailed">执行失败</option><option value="rolled_back" data-i18n="responseRolledBack">已回滚</option><option value="rollback_failed" data-i18n="responseRollbackFailed">回滚失败</option></select></label>
+                  <button type="submit" data-i18n="applyFilter">应用筛选</button>
+                </form>
+                <div id="automation-task-list" class="automation-task-list"></div>
+                <div id="automation-pagination" class="list-pagination-slot"></div>
+              </section>
+            </div>
+            <div id="automation-connectors-panel" class="secondary-view" aria-labelledby="automation-tab-connectors" data-secondary-panel="automation" data-secondary-name="connectors" hidden>
+              <section class="automation-config-grid">
+                <section class="panel automation-connector-config-panel">
+                  <div class="panel-heading"><div><h2 data-i18n="automationConnectorConfig">连接器配置</h2><p data-i18n="automationConnectorHint">配置 WAF 或边界防火墙动作接口；凭据仅填写环境变量名。</p></div></div>
+                  <form id="automation-connector-form" class="settings-form automation-form">
+                    <input id="response-connector-id" type="hidden" />
+                    <label class="automation-field-wide"><span data-i18n="connectorName">连接器名称</span><input id="response-connector-name" type="text" maxlength="100" required /></label>
+                    <label class="automation-field-wide"><span data-i18n="connectorEndpoint">API 地址</span><input id="response-connector-endpoint" type="url" placeholder="https://waf.example/api/actions" required /></label>
+                    <label class="automation-field-wide"><span data-i18n="connectorSecretEnv">凭据环境变量</span><input id="response-connector-secret-env" type="text" placeholder="DEFENSIVE_AI_RESPONSE_CONNECTOR_TOKEN" /></label>
+                    <label class="automation-field-wide"><span data-i18n="connectorMode">执行模式</span><select id="response-connector-mode"><option value="shadow" data-i18n="connectorModeShadow">影子</option><option value="manual" data-i18n="connectorModeManual">手工调度</option><option value="auto" data-i18n="connectorModeAuto">审批后自动执行</option></select></label>
+                    <label><span data-i18n="connectorMaxTtl">最大封禁时长（秒）</span><input id="response-connector-max-ttl" type="number" min="60" max="604800" value="3600" required /></label>
+                    <label><span data-i18n="connectorTimeout">调用超时（秒）</span><input id="response-connector-timeout" type="number" min="1" max="60" value="10" required /></label>
+                    <label class="automation-field-wide automation-toggle"><input id="response-connector-enabled" type="checkbox" /><span data-i18n="connectorEnabled">启用连接器</span></label>
+                    <div class="form-actions"><button type="submit" data-i18n="saveConfig">保存配置</button><button id="response-connector-reset" type="button" data-i18n="resetSyslogConfig">填入默认值</button></div>
+                    <p id="automation-connector-status" class="form-status" aria-live="polite"></p>
+                  </form>
+                </section>
+                <section class="panel automation-connector-list-panel">
+                  <div class="panel-heading"><div><h2 data-i18n="configuredConnectors">已配置连接器</h2><p data-i18n="configuredConnectorsHint">真实执行前必须通过非破坏性健康检查。</p></div></div>
+                  <div id="automation-connector-list" class="automation-connector-list"></div>
+                </section>
+              </section>
+            </div>
+            <div id="automation-policy-panel" class="secondary-view" aria-labelledby="automation-tab-policy" data-secondary-panel="automation" data-secondary-name="policy" hidden>
+              <section class="panel automation-policy-panel">
+                <div class="panel-heading"><div><h2 data-i18n="automationPolicy">处置策略</h2><p data-i18n="automationPolicyHint">设置全局执行开关、封禁时效和受保护网络对象。</p></div></div>
+                <form id="automation-policy-form" class="settings-form automation-form">
+                  <label class="automation-toggle"><input id="response-policy-enabled" type="checkbox" /><span data-i18n="automationEnabled">允许调度处置任务</span></label>
+                  <label><span data-i18n="automationDefaultTtl">默认封禁时长（秒）</span><input id="response-policy-default-ttl" type="number" min="60" max="604800" required /></label>
+                  <label><span data-i18n="automationMaxTtl">全局最大时长（秒）</span><input id="response-policy-max-ttl" type="number" min="60" max="604800" required /></label>
+                  <label class="automation-protected-field"><span data-i18n="automationProtectedCidrs">受保护 CIDR</span><textarea id="response-policy-protected-cidrs" rows="6" spellcheck="false" placeholder="10.0.0.0/8&#10;192.168.0.0/16"></textarea></label>
+                  <div class="form-actions"><button type="submit" data-i18n="saveConfig">保存配置</button></div>
+                  <p id="automation-policy-status" class="form-status" aria-live="polite"></p>
+                </form>
+              </section>
             </div>
           </section>
           <section id="settings-view" class="view">

@@ -152,6 +152,7 @@ export DEFENSIVE_AI_API_TOKEN='<32+ chars>'
 export DEFENSIVE_AI_INGEST_TOKEN='<different 32+ chars>'
 export DEFENSIVE_AI_OPERATOR_TOKEN='<different 32+ chars>'
 export DEFENSIVE_AI_APPROVER_TOKEN='<different 32+ chars>'
+export DEFENSIVE_AI_RESPONDER_TOKEN='<different 32+ chars>'
 bash install.sh
 python3 -m defensive_ai_gateway --config config/prod.yaml
 ```
@@ -159,7 +160,7 @@ python3 -m defensive_ai_gateway --config config/prod.yaml
 如需安装为 systemd 服务：
 
 ```bash
-sudo --preserve-env=DEFENSIVE_AI_API_TOKEN,DEFENSIVE_AI_INGEST_TOKEN,DEFENSIVE_AI_OPERATOR_TOKEN,DEFENSIVE_AI_APPROVER_TOKEN \
+sudo --preserve-env=DEFENSIVE_AI_API_TOKEN,DEFENSIVE_AI_INGEST_TOKEN,DEFENSIVE_AI_OPERATOR_TOKEN,DEFENSIVE_AI_APPROVER_TOKEN,DEFENSIVE_AI_RESPONDER_TOKEN \
   bash install.sh --systemd --enable --start
 ```
 
@@ -187,7 +188,7 @@ Demo 标志和单签全部切换为生产值。
 
 Docker 生产参考使用 `deploy/docker/compose.production.yaml`：应用仅绑定宿主回环，
 必须由同机 TLS/mTLS 反向代理对外提供服务；预检脚本会验证不可变镜像 digest、
-四个不同的强 Token 以及 local/Ollama/Gateway 模型参数：
+五个不同的强 Token 以及 local/Ollama/Gateway 模型参数：
 
 ```bash
 set -a
@@ -220,7 +221,7 @@ bash scripts/package_k3s_deploy.sh --include-vector
 脚本会基于当前源码重建镜像，并在成功后替换
 `dist/defensive-ai-gateway-k3s-deploy.tar.gz` 及其校验文件。部署包只包含内网运行
 所需的镜像、校验文件、k3s 清单和导入脚本，不包含源码与构建工具。目标服务器
-解压后通过权限为 `600` 的 `.env` 设置四个独立角色 Token、TLS Secret、生产域名、来源 CIDR 和模型参数。生产默认只创建 ClusterIP + TLS Ingress，拒绝 `latest`、脏工作区、空/弱凭据、全网段来源和缺失 TLS；升级前自动备份 SQLite，失败恢复旧镜像与数据库。仅隔离、临时展示可显式使用 `bash install.sh --demo-mode` 增加明文 hostPort。详细说明见 `deploy/k3s/README.md`。
+解压后通过权限为 `600` 的 `.env` 设置五个独立角色 Token、TLS Secret、生产域名、来源 CIDR 和模型参数。生产默认只创建 ClusterIP + TLS Ingress，拒绝 `latest`、脏工作区、空/弱凭据、全网段来源和缺失 TLS；升级前自动备份 SQLite，失败恢复旧镜像与数据库。仅隔离、临时展示可显式使用 `bash install.sh --demo-mode` 增加明文 hostPort。详细说明见 `deploy/k3s/README.md`。
 
 本地可以模拟五类设备分别通过不同 TCP 端口发送 syslog，并验证路由不会把安全系统识别错：
 
@@ -241,7 +242,8 @@ defensive_ai_gateway/
   orchestrator.py     Agent 路由与执行闭环
   skills.py           版本化 Skill 清单与权限边界
   validation.py       确定性证据/策略 Validator
-  response.py         只生成审批请求的 Response Advisor
+  response.py         生成审批请求与结构化处置建议的 Response Advisor
+  response_automation.py 审批后处置任务、连接器调用、核验与回滚
   llm.py              默认本地 LLM 适配器与企业网关接口
   policy.py           沙箱策略、脱敏、工具权限控制
   memory.py           多层记忆管理（短期Case/产品长期/资产画像/组织知识 + 证据库）
@@ -261,6 +263,7 @@ docs/
   OFFLINE_MIGRATION.md 离线迁移步骤
   HARNESS.md          回放评测说明
   PHASE2_DEFENSE_AGENT.md 第二阶段 Agent、验证与审批设计
+  AUTOMATED_RESPONSE.md 审批后自动化处置的控制、协议与运维说明
   MEMORY.md           多层记忆管理与治理
   SYSLOG_INGESTION.md syslog collector 接入说明
 ```
@@ -271,6 +274,7 @@ docs/
 - prompt 前字段脱敏，原始证据仅保留在数据库。
 - 每次 Agent Run、LLM 调用、策略拦截和输出都写审计记录。
 - 高影响动作只生成 `approve_required` 建议。
-- 只有 Validator `passed` 的建议可以进入审批队列；批准不等于执行，网关不提供生产动作执行接口。
+- 只有 Validator `passed` 的建议可以进入审批队列；仅明确的来源 IP 临时封禁可在策略开启、审批达标和连接器健康时进入受控执行，其他高影响建议仍保持只读。
+- 自动化处置默认关闭，支持影子、手工和自动模式；连接器凭据只从环境变量读取，规则必须经设备核验并在 TTL 到期、Case 关闭或误报确认后回滚。完整契约见 `docs/AUTOMATED_RESPONSE.md`。
 - 生产模板要求两个不同的服务端认证主体投票；本地 Demo 保持单签。
 - Demo 样本真值只在回环请求带 `X-Defensive-AI-Demo-Sample: 1` 时生效，普通告警不能用请求体自证结论。

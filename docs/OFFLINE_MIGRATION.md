@@ -41,7 +41,7 @@ bash install.sh --preflight-only
 bash install.sh
 ```
 
-生产默认要求四个不同且不少于 32 字符的角色 Token、已有的 TLS Secret、HTTPS
+生产默认要求五个不同且不少于 32 字符的角色 Token、已有的 TLS Secret、HTTPS
 域名以及受限来源 CIDR；还会把审批 quorum 固定为 2。缺少任一前提都会失败关闭。
 只有受信任、隔离且临时的展示环境可使用 `bash install.sh --demo-mode`。
 
@@ -65,4 +65,5 @@ curl --fail https://gateway.internal.example/api/ready
 ```
 
 首批业务验收至少包括：脱敏 WAF 告警、SIEM 聚合路由、LLM Gateway 断链、审计
-日志完整性、误报记忆写入，以及真实 RASP 日志 Mapping Profile dry-run。
+日志完整性、误报记忆写入、真实 RASP 日志 Mapping Profile dry-run，以及自动化处置的
+影子执行、手工调度、设备核验和到期回滚。

@@ -16,7 +16,7 @@
 - Dashboard：静态 HTML/CSS/JS，支持 Case 展开、日志适配 Profile 配置与 dry-run、LLM 配置、浅色/深色模式与误报确认写入记忆。
 - LLM：默认本地规则分析器，保留企业 LLM Gateway HTTP 适配器。
 - Demo LLM：外网开发可使用本地 Ollama `gemma3:4b` 或同等 4B 级别模型验证提示词、结构化输出和 agent 编排。
-- 安全动作：只读分析，处置动作只生成审批建议。
+- 安全动作：默认只读；明确的来源 IP 临时封禁可在 Validator、审批、全局开关、保护网段和连接器健康检查全部通过后进入受控处置，其他动作只生成审批建议。
 
 ### 阶段 B：企业 PoC
 
@@ -40,6 +40,7 @@
 - `log_adapter.py`：真实日志格式适配层，通过可配置 Mapping Profile 转换为内部稳定 `RawAlert`，并提供 dry-run 门禁。
 - `agents/`：HIPS、RASP、NDR、WAF、SIEM 专属 Agent。
 - `policy.py`：脱敏、只读策略、动作审批判定。
+- `response_automation.py`：审批后持久化处置任务、连接器调用、设备核验、有限重试与补偿回滚。
 - `memory.py`：多层记忆管理（短期 Case / 产品长期 / 资产画像 / 组织知识 + 不可改证据库），含晋升五门禁与去毒/过期/冲突治理，详见 `docs/MEMORY.md`。
 - `llm.py`：本地分析器与企业 LLM Gateway 适配器。
 - `database.py`：SQLite schema 与仓储。

@@ -176,6 +176,9 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
             "memory-tab-audit": ("memory", "audit", "memory-audit-panel", "memory-submenu"),
             "adapter-tab-intake": ("adapter", "intake", "adapter-intake-panel", "adapter-submenu"),
             "adapter-tab-config": ("adapter", "config", "adapter-config-panel", "adapter-submenu"),
+            "automation-tab-tasks": ("automation", "tasks", "automation-tasks-panel", "automation-submenu"),
+            "automation-tab-connectors": ("automation", "connectors", "automation-connectors-panel", "automation-submenu"),
+            "automation-tab-policy": ("automation", "policy", "automation-policy-panel", "automation-submenu"),
         }
         for tab_id, (group, target, panel_id, submenu_id) in expected_tabs.items():
             with self.subTest(tab=tab_id):
@@ -192,13 +195,18 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertEqual(self.elements["memory-submenu"]["attrs"]["role"], "group")
         self.assertEqual(self.elements["adapter-submenu"]["attrs"]["role"], "group")
         self.assertEqual(self.elements["dashboard-submenu"]["attrs"]["role"], "group")
+        self.assertEqual(self.elements["automation-submenu"]["attrs"]["role"], "group")
         self.assertEqual(self.elements["dashboard-nav-parent"]["attrs"]["data-default-secondary"], "pending")
         self.assertEqual(self.elements["memory-nav-parent"]["attrs"]["data-default-secondary"], "inventory")
         self.assertEqual(self.elements["adapter-nav-parent"]["attrs"]["data-default-secondary"], "intake")
+        self.assertEqual(self.elements["automation-nav-parent"]["attrs"]["data-default-secondary"], "tasks")
         self.assertNotIn("hidden", self.elements["memory-inventory-panel"]["attrs"])
         self.assertIn("hidden", self.elements["memory-audit-panel"]["attrs"])
         self.assertNotIn("hidden", self.elements["adapter-intake-panel"]["attrs"])
         self.assertIn("hidden", self.elements["adapter-config-panel"]["attrs"])
+        self.assertNotIn("hidden", self.elements["automation-tasks-panel"]["attrs"])
+        self.assertIn("hidden", self.elements["automation-connectors-panel"]["attrs"])
+        self.assertIn("hidden", self.elements["automation-policy-panel"]["attrs"])
         self.assertNotIn('class="secondary-nav"', HTML)
 
         containment = {
@@ -213,6 +221,9 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
             "syslog-deployment-targets": "adapter-intake-panel",
             "infer-form": "adapter-config-panel",
             "dry-run-form": "adapter-config-panel",
+            "automation-task-list": "automation-tasks-panel",
+            "automation-connector-form": "automation-connectors-panel",
+            "automation-policy-form": "automation-policy-panel",
         }
         for element_id, panel_id in containment.items():
             with self.subTest(element=element_id):
@@ -229,6 +240,10 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
             "adapterSecondaryNav",
             "adapterSubIntake",
             "adapterSubConfig",
+            "automationSecondaryNav",
+            "automationSubTasks",
+            "automationSubConnectors",
+            "automationSubPolicy",
         ):
             self.assertEqual(JS.count(f"{key}:"), 2)
         self.assertIn("function setSecondaryView", JS)
@@ -241,6 +256,44 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertIn('btn.setAttribute("aria-current", "page")', JS)
         self.assertIn(".nav-group.active .nav-subbutton.active", CSS)
         self.assertIn("grid-template-columns: repeat(2, minmax(0, 1fr))", CSS)
+
+    def test_response_workbench_keeps_secrets_out_of_forms_and_separates_roles(self):
+        self.assertIn('id="automation-view"', HTML)
+        self.assertIn('id="automation-pagination"', HTML)
+        self.assertIn('id="response-connector-secret-env"', HTML)
+        connector_panel = HTML.split('id="automation-connectors-panel"', 1)[1].split(
+            'id="automation-policy-panel"', 1
+        )[0]
+        self.assertNotIn('type="password"', connector_panel)
+        self.assertIn("async function saveResponseConnector", JS)
+        self.assertIn("async function runResponseTaskAction", JS)
+        self.assertIn('applyPermission("[data-response-action]", ["responder"])', JS)
+        self.assertIn('applyPermission("#automation-connector-form input', JS)
+        self.assertIn("approvalAutomationPlan", JS)
+        self.assertIn("result.response_task || result.approval.response_task", JS)
+        self.assertIn("refreshCurrentView().catch", JS)
+        self.assertIn(".approval-automation-plan", CSS)
+        self.assertIn(".automation-task-item", CSS)
+
+    def test_response_workbench_constrains_long_content_and_keeps_forms_aligned(self):
+        for field_id in (
+            "response-connector-name",
+            "response-connector-endpoint",
+            "response-connector-secret-env",
+            "response-connector-mode",
+        ):
+            with self.subTest(field=field_id):
+                label_markup = HTML.split(f'id="{field_id}"', 1)[0].rsplit("<label", 1)[-1]
+                self.assertIn('class="automation-field-wide"', label_markup)
+        self.assertIn(".automation-config-grid > .panel {\n  margin-top: 0;", CSS)
+        self.assertIn(".automation-task-head > .field-status {", CSS)
+        self.assertIn("max-width: min(42%, 180px);", CSS)
+        self.assertIn(".automation-mono {", CSS)
+        self.assertIn("word-break: break-word;", CSS)
+        self.assertIn("@media (max-width: 900px)", CSS)
+        self.assertIn("function connectorHealthLabel(status)", JS)
+        self.assertIn("function responseActionLabel(actionType)", JS)
+        self.assertIn('{ "network.block_ip": "responseActionBlockSourceIp" }', JS)
 
     def test_mapping_confirmation_uses_a_full_width_workspace_row(self):
         self.assertIn("mapping-result-panel", self.elements["field-mapping-table"]["ancestors"])

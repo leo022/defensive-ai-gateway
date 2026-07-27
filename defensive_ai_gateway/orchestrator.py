@@ -348,7 +348,7 @@ class Orchestrator:
         )
         analysis_skill = self.skills.for_product(event.product)
         validation = self.validator.validate(case_id, event, result, analysis_skill)
-        approvals = self.response_advisor.prepare(event.event_id, result, validation)
+        approvals = self.response_advisor.prepare(event.event_id, result, validation, event)
         result.explanation["skill"] = {
             "name": analysis_skill.name,
             "version": analysis_skill.version,

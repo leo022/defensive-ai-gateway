@@ -3,8 +3,9 @@ from __future__ import annotations
 import hashlib
 
 from .action_plan import normalize_action_plan
-from .models import AgentResult, ApprovalRequest, RecommendedAction, ValidationResult
+from .models import AgentResult, ApprovalRequest, NormalizedEvent, RecommendedAction, ValidationResult
 from .policy import PolicyEngine
+from .response_automation import compile_response_action
 
 
 class ResponseAdvisor:
@@ -14,13 +15,19 @@ class ResponseAdvisor:
     def __init__(self, policy: PolicyEngine):
         self.policy = policy
 
-    def prepare(self, event_id: str, result: AgentResult, validation: ValidationResult) -> list[ApprovalRequest]:
+    def prepare(
+        self,
+        event_id: str,
+        result: AgentResult,
+        validation: ValidationResult,
+        event: NormalizedEvent | None = None,
+    ) -> list[ApprovalRequest]:
         # Only a clean Validator pass may enter the approval queue. A review finding
         # (including prompt injection) remains visible on the Case but cannot be
         # turned into an authorization request until an analyst resolves it.
         if validation.status != "passed":
             return []
-        return self._prepare(event_id, result, validation)
+        return self._prepare(event_id, result, validation, event=event)
 
     def prepare_after_manual_review(
         self,
@@ -28,6 +35,7 @@ class ResponseAdvisor:
         result: AgentResult,
         validation: ValidationResult,
         review_resolution_id: str,
+        event: NormalizedEvent | None = None,
     ) -> list[ApprovalRequest]:
         """Create approval requests after a separately persisted human review.
 
@@ -37,7 +45,9 @@ class ResponseAdvisor:
         """
         if validation.status != "review" or not review_resolution_id:
             return []
-        return self._prepare(event_id, result, validation, review_resolution_id)
+        return self._prepare(
+            event_id, result, validation, review_resolution_id, event=event
+        )
 
     def _prepare(
         self,
@@ -45,6 +55,7 @@ class ResponseAdvisor:
         result: AgentResult,
         validation: ValidationResult,
         review_resolution_id: str = "",
+        event: NormalizedEvent | None = None,
     ) -> list[ApprovalRequest]:
         # Copy actions so approval normalization never mutates the persisted agent
         # recommendation. The original and the approval request remain auditable.
@@ -67,7 +78,7 @@ class ResponseAdvisor:
                     RecommendedAction(
                         action=action,
                         mode="approve_required",
-                        rationale="高风险真实攻击达到受控处置建议阈值；该建议仅创建审批，不执行生产动作。",
+                        rationale="高风险真实攻击达到受控处置建议阈值；是否执行由结构化动作、审批法定人数、处置策略和连接器模式共同决定。",
                         rollback=rollback,
                     )
                 )
@@ -104,6 +115,7 @@ class ResponseAdvisor:
                     ),
                     validation_id=validation.validation_id,
                     review_resolution_id=review_resolution_id,
+                    execution_action=compile_response_action(action.action, event),
                 )
             )
         return requests

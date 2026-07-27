@@ -70,6 +70,8 @@ class ContainerDefaultsTest(unittest.TestCase):
         )
         self.assertIn('127.0.0.1:${DEFENSIVE_AI_LOCAL_PORT:-8080}:8080', compose)
         self.assertIn("DEFENSIVE_AI_APPROVAL_QUORUM: \"2\"", compose)
+        self.assertIn("DEFENSIVE_AI_RESPONDER_TOKEN", compose)
+        self.assertIn("DEFENSIVE_AI_RESPONSE_CONNECTOR_TOKEN", compose)
         self.assertIn('DEFENSIVE_AI_DEMO_MODE: "0"', compose)
         self.assertIn("DEFENSIVE_AI_LLM_MODEL", compose)
         self.assertIn("DEFENSIVE_AI_LLM_ALLOWED_HOSTS", compose)
@@ -253,6 +255,7 @@ class K3sManifestTest(unittest.TestCase):
                         "DEFENSIVE_AI_INGEST_TOKEN=" + "b" * 32,
                         "DEFENSIVE_AI_OPERATOR_TOKEN=" + "c" * 32,
                         "DEFENSIVE_AI_APPROVER_TOKEN=" + "d" * 32,
+                        "DEFENSIVE_AI_RESPONDER_TOKEN=" + "e" * 32,
                         "DEFENSIVE_AI_PUBLIC_HOST=gateway.internal.example",
                         "DEFENSIVE_AI_TLS_SECRET=defensive-ai-gateway-tls",
                         "DEFENSIVE_AI_ALLOWED_SOURCE_CIDRS=10.0.0.0/8",
@@ -528,6 +531,7 @@ class K3sManifestTest(unittest.TestCase):
             "DEFENSIVE_AI_INGEST_TOKEN",
             "DEFENSIVE_AI_OPERATOR_TOKEN",
             "DEFENSIVE_AI_APPROVER_TOKEN",
+            "DEFENSIVE_AI_RESPONDER_TOKEN",
         ):
             self.assertIn(f"{name}=", env_example)
             self.assertIn(name, installer)
@@ -555,6 +559,7 @@ class K3sManifestTest(unittest.TestCase):
                     "DEFENSIVE_AI_INGEST_TOKEN": "b" * 32,
                     "DEFENSIVE_AI_OPERATOR_TOKEN": "c" * 32,
                     "DEFENSIVE_AI_APPROVER_TOKEN": "d" * 32,
+                    "DEFENSIVE_AI_RESPONDER_TOKEN": "e" * 32,
                     "DEFENSIVE_AI_PUBLIC_HOST": "gateway.internal.example",
                     "DEFENSIVE_AI_TLS_SECRET": "defensive-ai-gateway-tls",
                     "DEFENSIVE_AI_ALLOWED_SOURCE_CIDRS": "10.0.0.0/8",

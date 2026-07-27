@@ -150,3 +150,4 @@ docs/
 - Fields are redacted before prompts; raw evidence remains in the database.
 - Every Agent Run, LLM call, policy interception, and output is written to audit records.
 - High-impact actions only produce `approve_required` recommendations.
+- A narrowly compiled temporary source-IP block can enter controlled execution only after validation, approval quorum, an enabled response policy, and a healthy connector. Other high-impact recommendations remain read-only. See `docs/AUTOMATED_RESPONSE.md`.

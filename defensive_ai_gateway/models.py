@@ -138,6 +138,7 @@ class ApprovalRequest:
     required_approvals: int = 1
     validation_id: str = ""
     review_resolution_id: str = ""
+    execution_action: dict[str, Any] = field(default_factory=dict)
     created_at_ms: int = field(default_factory=now_ms)
 
     def to_dict(self) -> dict[str, Any]:

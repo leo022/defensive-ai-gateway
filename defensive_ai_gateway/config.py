@@ -77,6 +77,7 @@ class AuthConfig:
     ingest_token: str = ""
     operator_token: str = ""
     approver_token: str = ""
+    responder_token: str = ""
     # When True (default), requests originating from 127.0.0.1/::1 are accepted
     # even without a token — keeps local dev and the test harness working.
     allow_loopback_no_token: bool = True
@@ -355,6 +356,7 @@ def load_config(path: str | None = None) -> GatewayConfig:
             ingest_token=str(os.getenv("DEFENSIVE_AI_INGEST_TOKEN", auth.get("ingest_token", ""))),
             operator_token=str(os.getenv("DEFENSIVE_AI_OPERATOR_TOKEN", auth.get("operator_token", ""))),
             approver_token=str(os.getenv("DEFENSIVE_AI_APPROVER_TOKEN", auth.get("approver_token", ""))),
+            responder_token=str(os.getenv("DEFENSIVE_AI_RESPONDER_TOKEN", auth.get("responder_token", ""))),
             allow_loopback_no_token=str(
                 os.getenv("DEFENSIVE_AI_AUTH_LOOPBACK", "1" if auth.get("allow_loopback_no_token", True) else "0")
             )
