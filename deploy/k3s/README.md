@@ -138,6 +138,11 @@ bash install.sh --rollback 20260714t083000z-0042
 
 ## 5. Syslog collector
 
+Collector 的 TCP 失效探测使用 Kubernetes 1.29 起默认允许的安全 namespaced
+sysctl；启用 Syslog 前须确认 k3s/Kubernetes 版本不低于 1.29。正式安装会在备份和
+修改工作负载前查询 Server Version 并失败关闭；离线 `--preflight-only` 不连接集群，
+因此不能替代这项实时检查。
+
 `.env` 中设置设备来源网段，再部署：
 
 ```text

@@ -489,6 +489,21 @@ validate_rendered_manifests() {
   fi
 }
 
+validate_syslog_kubernetes_version() {
+  version_json="$(kubectl get --raw=/version 2>/dev/null)" \
+    || die "cannot query Kubernetes server version required by --with-syslog"
+  server_major="$(printf '%s' "$version_json" \
+    | sed -n 's/.*"major"[[:space:]]*:[[:space:]]*"\([0-9][0-9]*\)".*/\1/p')"
+  server_minor="$(printf '%s' "$version_json" \
+    | sed -n 's/.*"minor"[[:space:]]*:[[:space:]]*"\([0-9][0-9]*\)[^\"]*".*/\1/p')"
+  [ -n "$server_major" ] && [ -n "$server_minor" ] \
+    || die "cannot parse Kubernetes server version required by --with-syslog"
+  if [ "$server_major" -lt 1 ] \
+    || { [ "$server_major" -eq 1 ] && [ "$server_minor" -lt 29 ]; }; then
+    die "--with-syslog requires Kubernetes 1.29+ for safe TCP keepalive sysctls (server: ${server_major}.${server_minor})"
+  fi
+}
+
 prune_backups() {
   keep="$1"
   backups="$(kubectl -n "$NAMESPACE" get configmap -l defensive-ai-gateway-backup=true \
@@ -872,6 +887,10 @@ fi
 [ "$PREFLIGHT_ONLY" -eq 0 ] || { log "preflight passed"; exit 0; }
 
 command -v kubectl >/dev/null 2>&1 || die "kubectl not found"
+
+if [ "$WITH_SYSLOG" -eq 1 ]; then
+  validate_syslog_kubernetes_version
+fi
 
 validate_rendered_manifests
 [ -d "$IMAGE_DIR" ] || die "image directory not found: $IMAGE_DIR"

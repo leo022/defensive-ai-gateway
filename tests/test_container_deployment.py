@@ -97,6 +97,38 @@ class ContainerDefaultsTest(unittest.TestCase):
         self.assertIn('/vector:/etc/vector:ro', compose)
         self.assertIn('/vector:/var/lib/vector', compose)
 
+    def test_single_host_syslog_keepalive_bounds_stale_connection_detection(self):
+        sysctl_file = ROOT / "deploy" / "docker" / "99-z-defensive-ai-syslog-keepalive.conf"
+        values = {}
+        for raw_line in sysctl_file.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, value = (part.strip() for part in line.split("=", 1))
+            values[key] = int(value)
+
+        self.assertEqual(values["net.ipv4.tcp_keepalive_time"], 60)
+        self.assertEqual(values["net.ipv4.tcp_keepalive_intvl"], 15)
+        self.assertEqual(values["net.ipv4.tcp_keepalive_probes"], 4)
+        detection_bound = (
+            values["net.ipv4.tcp_keepalive_time"]
+            + values["net.ipv4.tcp_keepalive_intvl"]
+            * values["net.ipv4.tcp_keepalive_probes"]
+        )
+        self.assertLessEqual(detection_bound, 120)
+
+    def test_k3s_installer_requires_safe_sysctl_server_version_for_syslog(self):
+        installer = (ROOT / "deploy" / "k3s" / "install-k3s-bundle.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("validate_syslog_kubernetes_version", installer)
+        self.assertIn("kubectl get --raw=/version", installer)
+        self.assertIn("requires Kubernetes 1.29+", installer)
+        self.assertLess(
+            installer.index("validate_syslog_kubernetes_version\nfi"),
+            installer.index("validate_rendered_manifests\n"),
+        )
+
     def test_systemd_installer_never_writes_known_tokens_and_keeps_demo_loopback(self):
         installer = (ROOT / "install.sh").read_text(encoding="utf-8")
         service = (ROOT / "deploy" / "systemd" / "defensive-ai-gateway.service").read_text(

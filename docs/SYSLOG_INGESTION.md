@@ -46,6 +46,10 @@ bash install.sh --with-syslog --syslog-console-config defensive-ai-syslog-consol
 
 控制台不会直接取得 Kubernetes 写权限，也不会保存或显示 ingest Token。
 
+k3s Collector Pod 使用 Kubernetes 1.29+ 提供的安全 namespaced sysctl，将 TCP
+keepalive 探测间隔设为 15 秒、失败阈值设为 4 次。低于 1.29 的集群必须先升级；
+不要通过放开任意 unsafe sysctl 绕过该要求。
+
 `syslog-collector-vector` 从 `defensive-ai-gateway-secrets` 只挂载 `DEFENSIVE_AI_INGEST_TOKEN`，并在每个 HTTP sink 请求中发送该 Bearer Token。它不会取得管理员、运营、审批或处置执行 Token。生产安装器要求五个角色 Token 都不同，避免 collector 被攻陷后获得配置、记忆治理或设备处置权限。
 
 安全设备侧配置：
@@ -57,6 +61,23 @@ bash install.sh --with-syslog --syslog-console-config defensive-ai-syslog-consol
 - RASP TCP 帧上限：`2 MiB`。Vector 显式配置该上限，避免其默认 `100 KiB` 缓冲截断调用栈；超过上限的设备必须先经企业 Syslog relay 分流或缩短单条日志，不能依赖截断后的日志研判。UDP 受网络数据报大小与无确认语义限制，不能安全承载长 RASP 事件，必须完成 TCP 迁移。
 
 不建议第一版直接使用 `514`，因为低端口通常需要额外 Linux capability 或 root 权限。
+
+## 单机 Docker Collector 的 TCP 探测参数
+
+Vector 的 `keepalive.time_secs` 只控制空闲连接何时开始探测。Linux 默认仍会以
+75 秒间隔重试 9 次，最坏断链发现时间接近 12 分钟。单机 Docker 部署使用 host
+network，必须在 Collector 主机安装仓库内的 sysctl 配置：
+
+```bash
+sudo install -m 0644 \
+  deploy/docker/99-z-defensive-ai-syslog-keepalive.conf \
+  /etc/sysctl.d/99-z-defensive-ai-syslog-keepalive.conf
+sudo sysctl -p /etc/sysctl.d/99-z-defensive-ai-syslog-keepalive.conf
+```
+
+生效值为 60 秒空闲、15 秒探测间隔、4 次失败阈值，最坏断链发现时间约 120 秒。
+该配置会影响主机上所有启用了 TCP keepalive 的连接，部署前应按主机用途完成变更
+评审；专用 Collector/Gateway 主机可直接采用。
 
 ## 本地端口路由模拟
 
@@ -134,7 +155,7 @@ processing:
 ## 运维注意事项
 
 - RASP collector 以 TCP `15143` 为正式通道，并把实际 `protocol`、传输保证级别、原始 Syslog 指纹和解析后 RASP 日志指纹写入告警完整性摘要。为无中断迁移保留的 UDP `15143` 会标记为 `legacy_udp_best_effort`，应在观测到稳定 TCP 后移除。
-- 五个 TCP receiver 均以 60 秒启动 keepalive 探测。该设置用于提前发现被 NAT、防火墙或负载均衡静默回收的空闲连接，避免管理端把下一条告警写入失效连接后，一直等到后续告警才触发重连。修改后必须用部署镜像执行 `vector validate --config /etc/vector/vector.toml`，不能只检查 TOML 语法。
+- 五个 TCP receiver 均以 60 秒启动 keepalive 探测；k3s Pod 或单机主机同时把探测间隔/次数设为 15 秒/4 次，把最坏断链发现时间从 Linux 默认约 12 分钟压缩到约 120 秒。该设置用于提前发现被 NAT、防火墙或负载均衡静默回收的空闲连接，避免管理端把下一条告警写入失效连接后，一直等到后续告警才触发重连。修改后必须用部署镜像执行 `vector validate --config /etc/vector/vector.toml`，并核对运行网络命名空间中的三项 sysctl，不能只检查 TOML 语法。
 - 排查延迟时同时查看安全事件时间与 `_syslog_envelope.received_at`：前者来自安全产品，后者是 Collector 实际收到报文的时间。若两者相差很大且目标时间没有 Gateway `POST /api/alerts`，问题位于安全产品/管理端到 Collector 之间；若 Collector 已收到而 Gateway 未入库，再检查 Vector HTTP sink、磁盘 buffer 和 Gateway `429/4xx/5xx`。同一原始日志重投时仅接收时间发生变化会按幂等成功处理，原始日志或证据变化仍返回 `409 alert_id_conflict`。
 - TCP Syslog 仍没有设备到 Gateway 的业务级确认。Vector 对已接收事件使用磁盘 buffer，并对网络和服务端可重试故障使用高重试上限；Gateway 在持久 inbox 落库后才接受。当前生产 Vector `0.46.x` 将认证/格式类 `4xx` 视为不可重试，因此轮换 ingest Token 时必须先停止 collector、更新 Gateway 与同一份环境文件，再恢复 collector，避免认证窗口丢弃请求。必须监控 Vector 的丢弃/错误指标、磁盘 buffer 与 Gateway inbox/DLQ，不能把 TCP 当作绝对端到端投递证明。
 - k3s 单节点加 SQLite 时，网关 Deployment 保持 `replicas: 1`。

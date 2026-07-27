@@ -343,6 +343,16 @@ spec:
         runAsUser: 1000
         runAsGroup: 1000
         fsGroup: 1000
+        # Kubernetes 1.29+ classifies these network-namespace settings as safe.
+        # Together with Vector's 60-second TCP_KEEPIDLE, they bound stale peer
+        # detection to roughly 120 seconds instead of the Linux default ~12 min.
+        sysctls:
+          - name: net.ipv4.tcp_keepalive_time
+            value: "60"
+          - name: net.ipv4.tcp_keepalive_intvl
+            value: "15"
+          - name: net.ipv4.tcp_keepalive_probes
+            value: "4"
         seccompProfile:
           type: RuntimeDefault
       containers:
