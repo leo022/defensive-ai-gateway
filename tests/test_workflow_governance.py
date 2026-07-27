@@ -413,6 +413,57 @@ class OperationalPersistenceTest(unittest.TestCase):
             self.assertEqual(persisted["raw_alert"]["timestamp"], original.timestamp)
             self.assertEqual(persisted["raw_alert"]["payload"], original.payload)
 
+    def test_durable_inbox_accepts_syslog_retry_with_new_receipt_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repository(str(Path(tmp) / "gateway.db"))
+            original = _alert("syslog-retry-same-evidence", product="rasp")
+            original.payload.update(
+                {
+                    "original_log": {
+                        "request_id": original.alert_id,
+                        "hook_data": {"path": "/tmp/demo"},
+                    },
+                    "_syslog_envelope": {
+                        "collector": "vector",
+                        "source_ip": "154.8.176.35",
+                        "protocol": "tcp",
+                        "raw_message_sha256": "same-raw-log",
+                        "received_at": "2026-07-27T10:12:59Z",
+                    },
+                    "syslog_route": {
+                        "collector": "vector",
+                        "source_ip": "154.8.176.35",
+                        "received_at": "2026-07-27T10:12:59Z",
+                    },
+                    "syslog_received_at": "2026-07-27T10:12:59Z",
+                }
+            )
+            replay = RawAlert(
+                source=original.source,
+                product=original.product,
+                event_type=original.event_type,
+                severity=original.severity,
+                timestamp=original.timestamp,
+                payload=json.loads(json.dumps(original.payload)),
+                alert_id=original.alert_id,
+            )
+            replay.payload["_syslog_envelope"]["received_at"] = "2026-07-27T10:24:39Z"
+            replay.payload["syslog_route"]["received_at"] = "2026-07-27T10:24:39Z"
+            replay.payload["syslog_received_at"] = "2026-07-27T10:24:39Z"
+
+            self.assertEqual(
+                repo.enqueue_alert_bounded(original, capacity=10, max_attempts=2),
+                "inserted",
+            )
+            self.assertEqual(
+                repo.enqueue_alert_bounded(replay, capacity=10, max_attempts=2),
+                "duplicate",
+            )
+
+            replay.payload["_syslog_envelope"]["raw_message_sha256"] = "changed-raw-log"
+            with self.assertRaises(AlertIdentityConflict):
+                repo.enqueue_alert_bounded(replay, capacity=10, max_attempts=2)
+
     def test_runtime_settings_and_durable_inbox_retry_dlq(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Repository(str(Path(tmp) / "gateway.db"))

@@ -2164,8 +2164,35 @@ class Repository:
 
         ``trusted_sample`` is deliberately excluded: it controls local demo
         parsing, while the source evidence determines whether a retry is the
-        same alert occurrence.
+        same alert occurrence. Collector receipt timestamps are also excluded:
+        they describe a delivery attempt, not the immutable security event. A
+        Syslog retry otherwise changes ``received_at`` and is incorrectly
+        rejected as an alert-id collision even when its raw evidence is equal.
         """
+        evidence_payload = payload.get("payload", {})
+
+        def scrub_transport_receipts(value: Any) -> Any:
+            if isinstance(value, list):
+                return [scrub_transport_receipts(item) for item in value]
+            if not isinstance(value, dict):
+                return value
+            cleaned: dict[str, Any] = {}
+            for key, item in value.items():
+                if key == "syslog_received_at":
+                    continue
+                if (
+                    key in {"_syslog_envelope", "syslog_envelope", "syslog_route"}
+                    and isinstance(item, dict)
+                ):
+                    cleaned[key] = {
+                        nested_key: scrub_transport_receipts(nested_value)
+                        for nested_key, nested_value in item.items()
+                        if nested_key != "received_at"
+                    }
+                    continue
+                cleaned[key] = scrub_transport_receipts(item)
+            return cleaned
+
         return json.dumps(
             {
                 "source": str(payload.get("source") or "unknown"),
@@ -2173,7 +2200,7 @@ class Repository:
                 "event_type": str(payload.get("event_type") or "unknown"),
                 "severity": str(payload.get("severity") or "medium").lower(),
                 "timestamp": str(payload.get("timestamp") or ""),
-                "payload": payload.get("payload", {}),
+                "payload": scrub_transport_receipts(evidence_payload),
             },
             ensure_ascii=False,
             sort_keys=True,

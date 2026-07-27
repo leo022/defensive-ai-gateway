@@ -134,6 +134,8 @@ processing:
 ## 运维注意事项
 
 - RASP collector 以 TCP `15143` 为正式通道，并把实际 `protocol`、传输保证级别、原始 Syslog 指纹和解析后 RASP 日志指纹写入告警完整性摘要。为无中断迁移保留的 UDP `15143` 会标记为 `legacy_udp_best_effort`，应在观测到稳定 TCP 后移除。
+- 五个 TCP receiver 均以 60 秒启动 keepalive 探测。该设置用于提前发现被 NAT、防火墙或负载均衡静默回收的空闲连接，避免管理端把下一条告警写入失效连接后，一直等到后续告警才触发重连。修改后必须用部署镜像执行 `vector validate --config /etc/vector/vector.toml`，不能只检查 TOML 语法。
+- 排查延迟时同时查看安全事件时间与 `_syslog_envelope.received_at`：前者来自安全产品，后者是 Collector 实际收到报文的时间。若两者相差很大且目标时间没有 Gateway `POST /api/alerts`，问题位于安全产品/管理端到 Collector 之间；若 Collector 已收到而 Gateway 未入库，再检查 Vector HTTP sink、磁盘 buffer 和 Gateway `429/4xx/5xx`。同一原始日志重投时仅接收时间发生变化会按幂等成功处理，原始日志或证据变化仍返回 `409 alert_id_conflict`。
 - TCP Syslog 仍没有设备到 Gateway 的业务级确认。Vector 对已接收事件使用磁盘 buffer，并对网络和服务端可重试故障使用高重试上限；Gateway 在持久 inbox 落库后才接受。当前生产 Vector `0.46.x` 将认证/格式类 `4xx` 视为不可重试，因此轮换 ingest Token 时必须先停止 collector、更新 Gateway 与同一份环境文件，再恢复 collector，避免认证窗口丢弃请求。必须监控 Vector 的丢弃/错误指标、磁盘 buffer 与 Gateway inbox/DLQ，不能把 TCP 当作绝对端到端投递证明。
 - k3s 单节点加 SQLite 时，网关 Deployment 保持 `replicas: 1`。
 - Collector 默认使用 2 GiB PVC 和每个 sink 512 MiB 磁盘 buffer；监控 PVC 容量、HTTP 重试与网关 inbox/DLQ，不要只看 Pod 存活。

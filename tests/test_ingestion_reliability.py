@@ -1097,6 +1097,7 @@ class VectorCollectorManifestTest(unittest.TestCase):
         self.assertIn('[sources.syslog_rasp_udp]', manifest)
         self.assertIn('[sources.syslog_rasp_tcp]', manifest)
         self.assertGreaterEqual(manifest.count('max_length = 2_000_000'), 2)
+        self.assertEqual(manifest.count("keepalive.time_secs = 60"), 5)
         self.assertIn('inputs = ["syslog_rasp_udp"]', manifest)
         self.assertIn('inputs = ["syslog_rasp_tcp"]', manifest)
         self.assertIn('"transport_assurance": to_string(.transport_assurance) ?? ""', manifest)

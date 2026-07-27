@@ -20,6 +20,7 @@ data:
     type = "syslog"
     address = "0.0.0.0:15140"
     mode = "tcp"
+    keepalive.time_secs = 60
 
     [sources.syslog_hips_udp]
     type = "syslog"
@@ -30,6 +31,7 @@ data:
     type = "syslog"
     address = "0.0.0.0:15141"
     mode = "tcp"
+    keepalive.time_secs = 60
 
     [sources.syslog_ndr_udp]
     type = "syslog"
@@ -40,6 +42,7 @@ data:
     type = "syslog"
     address = "0.0.0.0:15142"
     mode = "tcp"
+    keepalive.time_secs = 60
 
     # Keep the existing UDP sender path during a controlled migration. UDP is
     # always labeled as legacy/best-effort below; new RASP consoles must use
@@ -54,6 +57,10 @@ data:
     type = "syslog"
     address = "0.0.0.0:15143"
     mode = "tcp"
+    # The RASP manager can keep a connection idle between alerts. Probe it
+    # before common NAT/firewall idle timeouts so the next alert does not enter
+    # a stale socket and wait for a later event to trigger a reconnect.
+    keepalive.time_secs = 60
     # Vector defaults to 100 KiB and truncates a larger syslog message. RASP
     # stack traces can be substantially larger, so this matches the gateway's
     # bounded RASP transport contract instead of silently cutting evidence.
@@ -69,6 +76,7 @@ data:
     type = "syslog"
     address = "0.0.0.0:15144"
     mode = "tcp"
+    keepalive.time_secs = 60
 
     [transforms.tag_waf_syslog]
     type = "remap"
