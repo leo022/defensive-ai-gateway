@@ -3341,9 +3341,9 @@ button.memory-audit-row:hover {
 }
 
 .automation-filter-form {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(220px, 280px) max-content;
   align-items: end;
-  flex-wrap: wrap;
   gap: 10px;
   padding: 14px 16px;
   border-bottom: 1px solid var(--line);
@@ -3357,8 +3357,7 @@ button.memory-audit-row:hover {
 }
 
 .automation-filter-form label {
-  flex: 0 1 280px;
-  min-width: 220px;
+  min-width: 0;
 }
 
 .automation-filter-form span {
@@ -3367,14 +3366,24 @@ button.memory-audit-row:hover {
   font-weight: 700;
 }
 
-.automation-filter-form select {
+.automation-filter-form select,
+.automation-filter-form > button {
   width: 100%;
-  min-height: 36px;
+  height: 38px;
+  min-height: 38px;
+}
+
+.automation-filter-form select {
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--surface);
   color: var(--ink);
   padding: 9px 10px;
+}
+
+.automation-filter-form > button {
+  align-self: end;
+  white-space: nowrap;
 }
 
 .automation-task-list,
@@ -3781,7 +3790,6 @@ button.memory-audit-row:hover {
     grid-template-columns: 1fr;
   }
 
-  .automation-filter-form,
   .automation-task-head,
   .automation-task-actions {
     align-items: stretch;
@@ -3797,6 +3805,10 @@ button.memory-audit-row:hover {
   .automation-filter-form label {
     width: 100%;
     min-width: 0;
+  }
+
+  .automation-filter-form {
+    grid-template-columns: 1fr;
   }
 
   .automation-task-panel .panel-heading {

@@ -3656,6 +3656,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 return
             self._json(200, record)
             return
+        if parsed.path == "/api/cases/summary":
+            if not self._require_roles(_ROLE_READ, _ROLE_ANALYST, _ROLE_APPROVER):
+                return
+            self._json(200, self.state.repo.case_distribution_summary())
+            return
         if parsed.path == "/api/cases":
             if not self._require_roles(_ROLE_READ, _ROLE_ANALYST, _ROLE_APPROVER):
                 return

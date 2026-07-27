@@ -301,6 +301,71 @@ class CaseDetailHTTPIntegrationTest(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=2)
 
+
+class CaseSummaryHTTPIntegrationTest(unittest.TestCase):
+    def test_case_summary_is_independent_from_list_pagination(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            config.database.path = str(Path(tmp) / "gateway.db")
+            config.server.host = "127.0.0.1"
+            config.server.port = 0
+            config.processing.async_enabled = False
+            server = build_server(config)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base = f"http://127.0.0.1:{server.server_address[1]}"
+            try:
+                fixtures = [
+                    ("case_http_waf_attack", "waf", "malicious"),
+                    ("case_http_waf_review", "waf", "suspicious"),
+                    ("case_http_rasp_review", "rasp", "suspicious"),
+                ]
+                for index, (case_id, product, classification) in enumerate(fixtures):
+                    server.state.repo.upsert_case(
+                        AgentResult(
+                            case_id=case_id,
+                            agent="test-agent",
+                            classification=classification,
+                            confidence=0.8,
+                            severity="high",
+                            summary=f"{case_id} summary",
+                            evidence=[],
+                            missing_evidence=[],
+                            recommended_actions=[],
+                            dashboard_cards=[],
+                            created_at_ms=1_700_000_000_000 + index,
+                        ),
+                        product,
+                    )
+
+                with urllib.request.urlopen(f"{base}/api/cases?limit=1", timeout=5) as response:
+                    page = json.loads(response.read())
+                with urllib.request.urlopen(f"{base}/api/cases/summary", timeout=5) as response:
+                    summary = json.loads(response.read())
+
+                self.assertEqual(len(page["cases"]), 1)
+                self.assertEqual(page["pagination"]["total"], 3)
+                self.assertEqual(summary["total"], 3)
+                self.assertEqual(
+                    summary["products"],
+                    [
+                        {"value": "waf", "count": 2},
+                        {"value": "rasp", "count": 1},
+                    ],
+                )
+                self.assertEqual(
+                    summary["classifications"],
+                    [
+                        {"value": "suspicious", "count": 2},
+                        {"value": "malicious", "count": 1},
+                    ],
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+
 class ApprovalStateMachineTest(unittest.TestCase):
     def test_approval_decision_is_one_way_and_never_marks_execution(self):
         with tempfile.TemporaryDirectory() as tmp:

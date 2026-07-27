@@ -55,6 +55,18 @@ class DashboardQueueMetricTest(unittest.TestCase):
         self.assertIn("modelDeferredBacklog", JS)
         self.assertEqual(JS.count("modelDeferredBacklog:"), 2)
 
+    def test_dashboard_distributions_use_all_case_summary_not_the_list_page(self):
+        dashboard = JS.split("async function loadDashboardRuntime(section = activeDashboardSection)", 1)[1].split(
+            "async function loadCases", 1
+        )[0]
+        rendering = JS.split("function renderDashboard(", 1)[1].split("function statusLabel", 1)[0]
+        self.assertIn('json("/api/cases/summary")', dashboard)
+        self.assertIn("caseSummary", dashboard)
+        self.assertIn("caseSummary?.total", rendering)
+        self.assertIn("caseSummary?.products", rendering)
+        self.assertIn("caseSummary?.classifications", rendering)
+        self.assertNotIn("countBy(cases", rendering)
+
 
 class ProductBrandingTest(unittest.TestCase):
     def test_dashboard_and_detail_page_publish_consistent_favicons(self):
@@ -294,6 +306,9 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertIn("function connectorHealthLabel(status)", JS)
         self.assertIn("function responseActionLabel(actionType)", JS)
         self.assertIn('{ "network.block_ip": "responseActionBlockSourceIp" }', JS)
+        self.assertIn("grid-template-columns: minmax(220px, 280px) max-content;", CSS)
+        self.assertIn(".automation-filter-form > button {\n  align-self: end;", CSS)
+        self.assertIn("height: 38px;\n  min-height: 38px;", CSS)
 
     def test_mapping_confirmation_uses_a_full_width_workspace_row(self):
         self.assertIn("mapping-result-panel", self.elements["field-mapping-table"]["ancestors"])

@@ -781,6 +781,7 @@ class HTTPProductionBoundaryTest(unittest.TestCase):
         self.assertEqual(session["actor"], "soc-operator")
         self.assertNotIn("config", session["roles"])
         self.assertEqual(self._request("/api/cases")[0], 401)
+        self.assertEqual(self._request("/api/cases/summary")[0], 401)
 
         invalid = {"product": "waf", "severity": "high", "payload": {}}
         self.assertEqual(
@@ -794,12 +795,20 @@ class HTTPProductionBoundaryTest(unittest.TestCase):
 
         self.assertEqual(self._request("/api/memory", token="memory-only-token")[0], 200)
         self.assertEqual(self._request("/api/cases", token="memory-only-token")[0], 403)
+        self.assertEqual(self._request("/api/cases/summary", token="memory-only-token")[0], 403)
         self.assertEqual(
             self._request("/api/alerts/inbox", token="memory-only-token")[0], 403
         )
         self.assertEqual(self._request("/api/config/llm", token="config-only-token")[0], 200)
         self.assertEqual(self._request("/api/cases", token="config-only-token")[0], 403)
         self.assertEqual(self._request("/api/cases", token="analyst-only-token")[0], 200)
+        summary_status, case_summary = self._request(
+            "/api/cases/summary", token="analyst-only-token"
+        )
+        self.assertEqual(summary_status, 200)
+        self.assertEqual(case_summary["total"], 0)
+        self.assertEqual(case_summary["products"], [])
+        self.assertEqual(case_summary["classifications"], [])
         self.assertEqual(
             self._request("/api/alerts/inbox", token="analyst-only-token")[0], 403
         )

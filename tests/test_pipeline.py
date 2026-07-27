@@ -486,6 +486,49 @@ class PipelineTest(unittest.TestCase):
                 ["case_page_5", "case_page_4"],
             )
 
+    def test_case_distribution_summary_uses_all_cases_not_the_current_page(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repository(str(Path(tmp) / "gateway.db"))
+            base = 1_700_000_000_000
+            fixtures = [
+                ("case_waf_attack", "waf", "malicious"),
+                ("case_waf_review", "waf", "suspicious"),
+                ("case_rasp_review", "rasp", "suspicious"),
+            ]
+            for index, (case_id, product, classification) in enumerate(fixtures):
+                repo.upsert_case(
+                    AgentResult(
+                        case_id=case_id,
+                        agent="test-agent",
+                        classification=classification,
+                        confidence=0.8,
+                        severity="high",
+                        summary=f"{case_id} summary",
+                        evidence=[],
+                        missing_evidence=[],
+                        recommended_actions=[],
+                        dashboard_cards=[],
+                        created_at_ms=base + index,
+                    ),
+                    product,
+                )
+
+            self.assertEqual(len(repo.list_cases(limit=1)), 1)
+            self.assertEqual(
+                repo.case_distribution_summary(),
+                {
+                    "total": 3,
+                    "products": [
+                        {"value": "waf", "count": 2},
+                        {"value": "rasp", "count": 1},
+                    ],
+                    "classifications": [
+                        {"value": "suspicious", "count": 2},
+                        {"value": "malicious", "count": 1},
+                    ],
+                },
+            )
+
     def test_llm_config_update_hides_key_and_rebuilds_client(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = GatewayConfig()

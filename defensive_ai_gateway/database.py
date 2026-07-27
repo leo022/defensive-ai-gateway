@@ -4260,6 +4260,50 @@ class Repository:
             ).fetchone()
             return int(row["count"])
 
+    def case_distribution_summary(self) -> dict[str, Any]:
+        """Return all-Case dashboard distributions without page-size truncation."""
+        with self._lock:
+            total_row = self.conn.execute(
+                "SELECT COUNT(*) AS count FROM cases"
+            ).fetchone()
+            product_rows = self.conn.execute(
+                """
+                SELECT
+                  CASE
+                    WHEN TRIM(COALESCE(product, '')) = '' THEN 'unknown'
+                    ELSE LOWER(TRIM(product))
+                  END AS value,
+                  COUNT(*) AS count
+                FROM cases
+                GROUP BY value
+                ORDER BY count DESC, value ASC
+                """
+            ).fetchall()
+            classification_rows = self.conn.execute(
+                """
+                SELECT
+                  CASE
+                    WHEN TRIM(COALESCE(classification, '')) = '' THEN 'unknown'
+                    ELSE LOWER(TRIM(classification))
+                  END AS value,
+                  COUNT(*) AS count
+                FROM cases
+                GROUP BY value
+                ORDER BY count DESC, value ASC
+                """
+            ).fetchall()
+            return {
+                "total": int(total_row["count"]),
+                "products": [
+                    {"value": str(row["value"]), "count": int(row["count"])}
+                    for row in product_rows
+                ],
+                "classifications": [
+                    {"value": str(row["value"]), "count": int(row["count"])}
+                    for row in classification_rows
+                ],
+            }
+
     def get_case_detail_page(
         self,
         case_id: str,

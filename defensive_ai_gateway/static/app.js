@@ -154,9 +154,9 @@ const STRINGS = {
     healthHint: "综合 API、分析队列、模型服务与日志接入状态。",
     healthScore: "{score} 分",
     distributionTitle: "产品告警分布",
-    distributionHint: "按安全产品聚合最近 Case，快速定位噪声来源和重点防线。",
+    distributionHint: "按安全产品聚合全部 Case，快速定位噪声来源和重点防线。",
     handlingTitle: "处置结论",
-    handlingHint: "按研判结论观察真实攻击、待复核与误报占比。",
+    handlingHint: "按全部 Case 的研判结论观察真实攻击、待复核与误报占比。",
     intakeHealthTitle: "接入与监听",
     intakeHealthHint: "HTTP 入口与 Syslog 监听状态。",
     healthApi: "API 服务",
@@ -733,9 +733,9 @@ const STRINGS = {
     healthHint: "Combines API, analysis queue, model service, and log intake status.",
     healthScore: "{score} pts",
     distributionTitle: "Product Distribution",
-    distributionHint: "Recent cases grouped by security product to spot noisy sources and priority controls.",
+    distributionHint: "All cases grouped by security product to spot noisy sources and priority controls.",
     handlingTitle: "Response Verdicts",
-    handlingHint: "Verdict mix across malicious, review, benign, and insufficient evidence.",
+    handlingHint: "Verdict mix across all cases, including malicious, review, benign, and insufficient evidence.",
     intakeHealthTitle: "Intake and Listeners",
     intakeHealthHint: "HTTP endpoint and Syslog listener status.",
     healthApi: "API Service",
@@ -2139,13 +2139,10 @@ function scheduleDashboardRefresh() {
   }, DASHBOARD_REFRESH_MS);
 }
 
-function countBy(items, field) {
-  const counts = new Map();
-  for (const item of items || []) {
-    const value = text(item[field] || "unknown").toLowerCase();
-    counts.set(value, (counts.get(value) || 0) + 1);
-  }
-  return [...counts.entries()].sort((a, b) => b[1] - a[1]);
+function distributionRows(items) {
+  return (Array.isArray(items) ? items : [])
+    .map((item) => [text(item?.value || "unknown").toLowerCase(), Math.max(0, Number(item?.count) || 0)])
+    .filter(([, count]) => count > 0);
 }
 
 function renderDistribution(containerId, rows, total, labelForValue = (value) => value) {
@@ -2291,17 +2288,19 @@ function renderIntakeHealth(syslogPayload) {
   `;
 }
 
-function renderDashboard(health, cases, llmConfig, syslogPayload) {
+function renderDashboard(health, caseSummary, llmConfig, syslogPayload) {
   const processing = health?.processing || {};
   if (syslogPayload && !syslogPayload.unavailable) setSyslogRuntime(syslogPayload);
   document.querySelector("#alerts").textContent = health?.stats?.alerts ?? 0;
   document.querySelector("#cases").textContent = health?.stats?.open_cases ?? health?.stats?.cases ?? 0;
   document.querySelector("#high").textContent = health?.stats?.high_or_critical_cases ?? 0;
   document.querySelector("#queue-depth").textContent = unfinishedAlertCount(processing);
-  const productRows = countBy(cases, "product").map(([product, count]) => [product.toUpperCase(), count]);
-  const classificationRows = countBy(cases, "classification");
-  renderDistribution("#product-distribution", productRows, cases.length);
-  renderDistribution("#classification-distribution", classificationRows, cases.length, (value) => value.replaceAll("_", " "));
+  const totalCases = Math.max(0, Number(caseSummary?.total) || 0);
+  const productRows = distributionRows(caseSummary?.products)
+    .map(([product, count]) => [product.toUpperCase(), count]);
+  const classificationRows = distributionRows(caseSummary?.classifications);
+  renderDistribution("#product-distribution", productRows, totalCases);
+  renderDistribution("#classification-distribution", classificationRows, totalCases, (value) => value.replaceAll("_", " "));
   renderHealth(buildHealthItems(health, llmConfig, syslogPayload));
   renderIntakeHealth(syslogPayload);
   const lastRefresh = document.querySelector("#last-refresh");
@@ -4175,10 +4174,12 @@ function refreshCurrentView() {
 async function loadDashboardRuntime(section = activeDashboardSection) {
   const llmFallback = { provider: "unavailable", model: "-", endpoint: "", unavailable: true };
   const syslogFallback = { configs: syslogConfigs, listeners: [], unavailable: true };
+  const caseSummaryFallback = { total: 0, products: [], classifications: [] };
   const caseQuery = caseSearchQuery(section);
-  const [health, casesData, llmConfig, syslogPayload] = await Promise.all([
+  const [health, casesData, caseSummary, llmConfig, syslogPayload] = await Promise.all([
     json("/api/health", { acceptStatuses: [503] }),
     canReadCases() ? json(`/api/cases?${caseQuery}`) : Promise.resolve({ cases: [] }),
+    canReadCases() ? json("/api/cases/summary") : Promise.resolve(caseSummaryFallback),
     canReadRuntimeConfig()
       ? json("/api/config/llm").catch(() => llmFallback)
       : Promise.resolve(llmFallback),
@@ -4190,6 +4191,7 @@ async function loadDashboardRuntime(section = activeDashboardSection) {
     health,
     cases: casesData.cases || [],
     pagination: casesData.pagination || {},
+    caseSummary,
     llmConfig,
     syslogPayload,
   };
@@ -4200,8 +4202,8 @@ async function loadCases(options = {}) {
   activeDashboardSection = section;
   const list = document.querySelector(dashboardCaseListId(section));
   try {
-    const { health, cases, pagination, llmConfig, syslogPayload } = await loadDashboardRuntime(section);
-    renderDashboard(health, cases, llmConfig, syslogPayload);
+    const { health, cases, pagination, caseSummary, llmConfig, syslogPayload } = await loadDashboardRuntime(section);
+    renderDashboard(health, caseSummary, llmConfig, syslogPayload);
     detailCache.clear();
     queueCases = cases;
     applyPaginationPayload(casePagination[section], pagination);
