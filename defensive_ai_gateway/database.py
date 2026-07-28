@@ -12,6 +12,78 @@ from .models import AgentResult, NormalizedEvent, RawAlert, ValidationResult, no
 from .validation import can_continue_after_manual_review
 
 
+_RESPONSE_AGENT_CORRELATION_ALIASES = {
+    "agent_host": "host",
+    "app": "app",
+    "application": "app",
+    "asset": "host",
+    "asset_name": "host",
+    "account": "user",
+    "account_name": "user",
+    "client_ip": "src_ip",
+    "computer_name": "host",
+    "correlation_id": "trace_id",
+    "destination": "host",
+    "destination_host": "host",
+    "destination_ip": "dst_ip",
+    "device": "host",
+    "device_name": "host",
+    "dst_host": "host",
+    "dst_ip": "dst_ip",
+    "fqdn": "host",
+    "host": "host",
+    "hostname": "host",
+    "image": "process",
+    "process": "process",
+    "process_name": "process",
+    "request_id": "request_id",
+    "request_uri": "url",
+    "rasp_trace_id": "trace_id",
+    "route": "url",
+    "rule": "rule",
+    "rule_id": "rule",
+    "server": "host",
+    "server_ip": "dst_ip",
+    "service": "app",
+    "signature": "rule",
+    "source_ip": "src_ip",
+    "source_host": "host",
+    "src_host": "host",
+    "src_ip": "src_ip",
+    "trace_id": "trace_id",
+    "uri": "url",
+    "url": "url",
+    "user": "user",
+    "user_name": "user",
+    "username": "user",
+    "x_request_id": "request_id",
+}
+_RESPONSE_AGENT_CORRELATION_FIELDS = (
+    "trace_id",
+    "request_id",
+    "host",
+    "src_ip",
+    "dst_ip",
+    "user",
+    "app",
+    "process",
+    "rule",
+    "url",
+)
+_RESPONSE_AGENT_CORRELATION_WEIGHTS = {
+    "trace_id": 8,
+    "request_id": 8,
+    "network_entity": 5,
+    "host": 5,
+    "user": 4,
+    "app": 3,
+    "process": 3,
+    "rule": 2,
+    "url": 2,
+}
+_RESPONSE_AGENT_MIN_CORRELATION_SCORE = 5
+
+
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -447,6 +519,10 @@ CREATE TABLE IF NOT EXISTS inbox_capacity_state (
 INSERT OR IGNORE INTO inbox_capacity_state(singleton, unfinished_count, unfinished_bytes)
 VALUES (1, 0, 0);
 CREATE INDEX IF NOT EXISTS idx_normalized_alert ON normalized_events(alert_id);
+CREATE INDEX IF NOT EXISTS idx_raw_alert_created
+  ON raw_alerts(created_at_ms DESC, alert_id);
+CREATE INDEX IF NOT EXISTS idx_raw_alert_product_created
+  ON raw_alerts(product, created_at_ms DESC, alert_id);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_case ON agent_runs(case_id);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_case_created
   ON agent_runs(case_id, created_at_ms DESC, run_id);
@@ -541,7 +617,7 @@ BEGIN
 END;
 """
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 _LLM_DEFERRED_ERROR_PREFIX = "analysis_deferred:"
 _LEGACY_LLM_DEFERRED_ERROR_FRAGMENT = "remote LLM analysis deferred"
 _TERMINAL_LLM_ERROR_FRAGMENTS = (
@@ -1285,6 +1361,20 @@ class Repository:
                     raise RuntimeError("schema v17 Response Agent session columns are incomplete")
                 self.conn.execute(
                     "INSERT OR REPLACE INTO schema_version(version, applied_at_ms) VALUES (17, ?)",
+                    (now_ms(),),
+                )
+
+            if current < 18:
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_raw_alert_created "
+                    "ON raw_alerts(created_at_ms DESC, alert_id)"
+                )
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_raw_alert_product_created "
+                    "ON raw_alerts(product, created_at_ms DESC, alert_id)"
+                )
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO schema_version(version, applied_at_ms) VALUES (18, ?)",
                     (now_ms(),),
                 )
 
@@ -3534,6 +3624,596 @@ class Repository:
             )
         matches.sort(key=lambda item: (item["time_delta_ms"], item["timestamp"], item["event_id"]))
         return matches[: max(1, min(int(limit), 100))]
+
+    @staticmethod
+    def _response_agent_canonical_field(value: Any) -> str:
+        rendered = "".join(
+            character.lower() if character.isalnum() else "_"
+            for character in str(value or "")
+        )
+        while "__" in rendered:
+            rendered = rendered.replace("__", "_")
+        return rendered.strip("_")
+
+    @classmethod
+    def _response_agent_collect_values(
+        cls,
+        value: Any,
+        *,
+        max_nodes: int = 10_000,
+    ) -> dict[str, set[str]]:
+        """Extract only allowlisted correlation values from normalized or raw JSON."""
+        result = {field: set() for field in _RESPONSE_AGENT_CORRELATION_FIELDS}
+        stack: list[tuple[Any, str]] = [(value, "")]
+        visited = 0
+        while stack and visited < max(1, int(max_nodes)):
+            item, inherited_field = stack.pop()
+            visited += 1
+            if isinstance(item, dict):
+                for key, nested in reversed(list(item.items())):
+                    canonical = cls._response_agent_canonical_field(key)
+                    mapped = _RESPONSE_AGENT_CORRELATION_ALIASES.get(canonical)
+                    stack.append((nested, mapped or inherited_field))
+                continue
+            if isinstance(item, list):
+                stack.extend((nested, inherited_field) for nested in reversed(item[:2_000]))
+                continue
+            if not inherited_field or item in (None, ""):
+                continue
+            rendered = cls._entity_value(item)
+            if (
+                rendered
+                and rendered != "[redacted]"
+                and 2 <= len(rendered) <= 256
+                and len(result[inherited_field]) < 128
+            ):
+                result[inherited_field].add(rendered)
+        return result
+
+    @staticmethod
+    def _merge_response_agent_values(
+        target: dict[str, set[str]], source: dict[str, set[str]]
+    ) -> None:
+        for field in _RESPONSE_AGENT_CORRELATION_FIELDS:
+            target.setdefault(field, set()).update(
+                list(source.get(field) or set())[:128]
+            )
+            if len(target[field]) > 128:
+                target[field] = set(sorted(target[field])[:128])
+
+    @staticmethod
+    def _response_agent_json_type(value: Any) -> str:
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "boolean"
+        if isinstance(value, (int, float)):
+            return "number"
+        if isinstance(value, str):
+            return "string"
+        if isinstance(value, list):
+            return "array"
+        if isinstance(value, dict):
+            return "object"
+        return "unknown"
+
+    @classmethod
+    def _response_agent_json_catalog(
+        cls,
+        value: Any,
+        *,
+        max_entries: int = 120,
+        max_depth: int = 3,
+    ) -> list[dict[str, Any]]:
+        """Build a value-free JSON Pointer catalog for targeted raw-log reads."""
+        entries: list[dict[str, Any]] = []
+        stack: list[tuple[str, Any, int]] = [("", value, 0)]
+        while stack and len(entries) < max(1, int(max_entries)):
+            pointer, item, depth = stack.pop()
+            if pointer:
+                byte_size = None
+                if depth <= 1 or not isinstance(item, (dict, list)):
+                    byte_size = len(
+                        json.dumps(
+                            item,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    )
+                entries.append(
+                    {
+                        "json_pointer": pointer,
+                        "type": cls._response_agent_json_type(item),
+                        "bytes": byte_size,
+                        "items": (
+                            len(item) if isinstance(item, (dict, list)) else None
+                        ),
+                    }
+                )
+            if depth >= max_depth:
+                continue
+            children: list[tuple[str, Any]] = []
+            if isinstance(item, dict):
+                for key in sorted(item, key=str)[:200]:
+                    escaped = str(key).replace("~", "~0").replace("/", "~1")
+                    child_pointer = f"{pointer}/{escaped}" if pointer else f"/{escaped}"
+                    children.append((child_pointer, item[key]))
+            elif isinstance(item, list):
+                for index, nested in enumerate(item[:50]):
+                    child_pointer = f"{pointer}/{index}" if pointer else f"/{index}"
+                    children.append((child_pointer, nested))
+            stack.extend(
+                (child_pointer, nested, depth + 1)
+                for child_pointer, nested in reversed(children)
+            )
+        return entries
+
+    def _response_agent_scope_locked(self, case_id: str) -> dict[str, Any] | None:
+        case_row = self.conn.execute(
+            """
+            SELECT case_id, product, created_at_ms, updated_at_ms, last_alert_at_ms
+            FROM cases WHERE case_id = ?
+            """,
+            (case_id,),
+        ).fetchone()
+        if not case_row:
+            return None
+        rows = self.conn.execute(
+            """
+            SELECT l.alert_id, l.event_id, l.created_at_ms AS linked_at_ms,
+                   ne.event_at_ms, ne.entities_json,
+                   ra.payload_json, ra.created_at_ms AS raw_created_at_ms
+            FROM case_alert_links l
+            LEFT JOIN normalized_events ne ON ne.event_id = l.event_id
+            LEFT JOIN raw_alerts ra ON ra.alert_id = l.alert_id
+            WHERE l.case_id = ?
+            ORDER BY l.created_at_ms ASC, l.alert_id ASC, l.event_id ASC
+            """,
+            (case_id,),
+        ).fetchall()
+        values = {field: set() for field in _RESPONSE_AGENT_CORRELATION_FIELDS}
+        event_times: list[int] = []
+        created_times: list[int] = []
+        linked_alert_ids: set[str] = set()
+        event_ids: set[str] = set()
+        for row in rows:
+            linked_alert_ids.add(str(row["alert_id"]))
+            event_ids.add(str(row["event_id"]))
+            event_at_ms = int(row["event_at_ms"] or 0)
+            if event_at_ms > 0:
+                event_times.append(event_at_ms)
+            raw_created_at_ms = int(row["raw_created_at_ms"] or row["linked_at_ms"] or 0)
+            if raw_created_at_ms > 0:
+                created_times.append(raw_created_at_ms)
+            if row["entities_json"]:
+                self._merge_response_agent_values(
+                    values,
+                    self._response_agent_collect_values(
+                        json.loads(row["entities_json"]),
+                        max_nodes=2_000,
+                    ),
+                )
+            if row["payload_json"]:
+                self._merge_response_agent_values(
+                    values,
+                    self._response_agent_collect_values(
+                        json.loads(row["payload_json"])
+                    ),
+                )
+        fallback = int(
+            case_row["last_alert_at_ms"]
+            or case_row["updated_at_ms"]
+            or case_row["created_at_ms"]
+            or now_ms()
+        )
+        return {
+            "case_id": str(case_row["case_id"]),
+            "product": str(case_row["product"]),
+            "linked_alert_ids": linked_alert_ids,
+            "event_ids": event_ids,
+            "values": values,
+            "event_min_ms": min(event_times) if event_times else fallback,
+            "event_max_ms": max(event_times) if event_times else fallback,
+            "created_min_ms": min(created_times) if created_times else fallback,
+            "created_max_ms": max(created_times) if created_times else fallback,
+        }
+
+    @classmethod
+    def _response_agent_match_candidate(
+        cls,
+        scope: dict[str, Any],
+        row: dict[str, Any],
+    ) -> tuple[list[dict[str, str]], int]:
+        candidate_values = {
+            field: set() for field in _RESPONSE_AGENT_CORRELATION_FIELDS
+        }
+        if row.get("entities_json"):
+            cls._merge_response_agent_values(
+                candidate_values,
+                cls._response_agent_collect_values(
+                    json.loads(row["entities_json"]),
+                    max_nodes=2_000,
+                ),
+            )
+        if row.get("payload_json"):
+            cls._merge_response_agent_values(
+                candidate_values,
+                cls._response_agent_collect_values(json.loads(row["payload_json"])),
+            )
+
+        matched: list[dict[str, str]] = []
+        anchor_values = scope["values"]
+        anchor_network = (
+            set(anchor_values.get("src_ip") or set())
+            | set(anchor_values.get("dst_ip") or set())
+        )
+        candidate_network = (
+            set(candidate_values.get("src_ip") or set())
+            | set(candidate_values.get("dst_ip") or set())
+        )
+        for value in sorted(anchor_network & candidate_network)[:8]:
+            matched.append({"field": "network_entity", "value": value})
+        for field in (
+            "trace_id",
+            "request_id",
+            "host",
+            "user",
+            "app",
+            "process",
+            "rule",
+            "url",
+        ):
+            shared = set(anchor_values.get(field) or set()) & set(
+                candidate_values.get(field) or set()
+            )
+            for value in sorted(shared)[:4]:
+                matched.append({"field": field, "value": value})
+        score = sum(
+            _RESPONSE_AGENT_CORRELATION_WEIGHTS.get(item["field"], 1)
+            for item in matched
+        )
+        return matched[:16], score
+
+    @staticmethod
+    def _response_agent_raw_hash(row: dict[str, Any]) -> str:
+        encoded = json.dumps(
+            {
+                "alert_id": row.get("alert_id"),
+                "source": row.get("source"),
+                "product": row.get("product"),
+                "event_type": row.get("event_type"),
+                "severity": row.get("severity"),
+                "timestamp": row.get("timestamp"),
+                "payload": json.loads(row.get("payload_json") or "{}"),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @classmethod
+    def _response_agent_raw_manifest(
+        cls,
+        row: dict[str, Any],
+        *,
+        relation: str,
+        matched: list[dict[str, str]] | None = None,
+        correlation_score: int = 0,
+        time_delta_ms: int = 0,
+        include_catalog: bool = True,
+    ) -> dict[str, Any]:
+        payload = json.loads(row.get("payload_json") or "{}")
+        original_log = payload.get("original_log") if isinstance(payload, dict) else None
+        return {
+            "alert_id": str(row.get("alert_id") or ""),
+            "event_id": str(row.get("event_id") or ""),
+            "source": str(row.get("source") or ""),
+            "product": str(row.get("product") or ""),
+            "event_type": str(row.get("event_type") or ""),
+            "severity": str(row.get("severity") or ""),
+            "timestamp": str(row.get("timestamp") or ""),
+            "created_at_ms": int(row.get("created_at_ms") or 0),
+            "relation": relation,
+            "matched_entities": list(matched or []),
+            "correlation_score": int(correlation_score),
+            "time_delta_ms": int(time_delta_ms),
+            "raw_bytes": len(
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ),
+            "original_log_present": original_log is not None,
+            "original_log_bytes": (
+                len(
+                    json.dumps(
+                        original_log,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                )
+                if original_log is not None
+                else 0
+            ),
+            "source_hash": cls._response_agent_raw_hash(row),
+            "field_catalog": (
+                cls._response_agent_json_catalog(payload)
+                if include_catalog
+                else []
+            ),
+        }
+
+    def query_response_agent_case_raw_alerts(
+        self,
+        case_id: str,
+        *,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict[str, Any] | None:
+        """List complete raw-alert manifests linked to a controller-owned Case."""
+        page_limit = max(1, min(int(limit), 50))
+        page_offset = max(0, int(offset))
+        with self._lock:
+            if not self.conn.execute(
+                "SELECT 1 FROM cases WHERE case_id = ?", (case_id,)
+            ).fetchone():
+                return None
+            total = int(
+                self.conn.execute(
+                    "SELECT COUNT(DISTINCT alert_id) AS count "
+                    "FROM case_alert_links WHERE case_id = ?",
+                    (case_id,),
+                ).fetchone()["count"]
+            )
+            rows = self.conn.execute(
+                """
+                SELECT l.alert_id, l.event_id, l.linked_at_ms,
+                       ra.source, ra.product, ra.event_type, ra.severity,
+                       ra.timestamp, ra.payload_json, ra.created_at_ms
+                FROM (
+                    SELECT alert_id, MIN(event_id) AS event_id,
+                           MAX(created_at_ms) AS linked_at_ms
+                    FROM case_alert_links
+                    WHERE case_id = ?
+                    GROUP BY alert_id
+                ) l
+                JOIN raw_alerts ra ON ra.alert_id = l.alert_id
+                ORDER BY l.linked_at_ms DESC, l.alert_id ASC
+                LIMIT ? OFFSET ?
+                """,
+                (case_id, page_limit, page_offset),
+            ).fetchall()
+            items = [
+                {
+                    **self._response_agent_raw_manifest(
+                        dict(row), relation="linked_to_case"
+                    ),
+                    "linked_at_ms": int(row["linked_at_ms"] or 0),
+                }
+                for row in rows
+            ]
+            next_offset = page_offset + len(items)
+            return {
+                "items": items,
+                "total": total,
+                "limit": page_limit,
+                "offset": page_offset,
+                "next_offset": next_offset if next_offset < total else None,
+                "query_mode": "controller_scoped_raw_manifest",
+            }
+
+    def query_response_agent_related_alerts(
+        self,
+        case_id: str,
+        *,
+        products: list[str] | None = None,
+        window_ms: int = 24 * 60 * 60 * 1_000,
+        scan_limit: int = 2_000,
+        scan_max_bytes: int = 64_000_000,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict[str, Any] | None:
+        """Search bounded raw/normalized telemetry using Case-derived indicators."""
+        bounded_window = max(60_000, min(int(window_ms), 7 * 24 * 60 * 60 * 1_000))
+        bounded_scan = max(100, min(int(scan_limit), 10_000))
+        bounded_scan_bytes = max(
+            1_000_000, min(int(scan_max_bytes), 512_000_000)
+        )
+        page_limit = max(1, min(int(limit), 100))
+        page_offset = max(0, int(offset))
+        selected_products = []
+        for product in products or []:
+            rendered = str(product or "").strip().lower()
+            if (
+                rendered
+                and len(rendered) <= 32
+                and all(character.isalnum() or character in "._-" for character in rendered)
+                and rendered not in selected_products
+            ):
+                selected_products.append(rendered)
+            if len(selected_products) >= 12:
+                break
+        with self._lock:
+            scope = self._response_agent_scope_locked(case_id)
+            if not scope:
+                return None
+            product_clause = ""
+            parameters: list[Any] = [
+                scope["event_min_ms"] - bounded_window,
+                scope["event_max_ms"] + bounded_window,
+                scope["created_min_ms"] - bounded_window,
+                scope["created_max_ms"] + bounded_window,
+            ]
+            if selected_products:
+                placeholders = ",".join("?" for _ in selected_products)
+                product_clause = f" AND LOWER(ra.product) IN ({placeholders})"
+                parameters.extend(selected_products)
+            parameters.append(bounded_scan)
+            rows = self.conn.execute(
+                f"""
+                SELECT ra.alert_id, ra.source, ra.product, ra.event_type,
+                       ra.severity, ra.timestamp, ra.payload_json, ra.created_at_ms,
+                       ne.event_id, ne.entities_json, ne.event_at_ms
+                FROM raw_alerts ra
+                LEFT JOIN normalized_events ne ON ne.event_id = (
+                    SELECT ne_latest.event_id
+                    FROM normalized_events ne_latest
+                    WHERE ne_latest.alert_id = ra.alert_id
+                    ORDER BY ne_latest.created_at_ms DESC, ne_latest.event_id ASC
+                    LIMIT 1
+                )
+                WHERE (
+                    COALESCE(NULLIF(ne.event_at_ms, 0), ra.created_at_ms)
+                      BETWEEN ? AND ?
+                    OR ra.created_at_ms BETWEEN ? AND ?
+                )
+                {product_clause}
+                ORDER BY COALESCE(NULLIF(ne.event_at_ms, 0), ra.created_at_ms) ASC,
+                         ra.created_at_ms ASC, ra.alert_id ASC
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+            matches: list[dict[str, Any]] = []
+            seen_alerts: set[str] = set()
+            scanned_alerts: set[str] = set()
+            scanned_bytes = 0
+            scan_truncated = False
+            for sql_row in rows:
+                row = dict(sql_row)
+                alert_id = str(row["alert_id"])
+                if alert_id in seen_alerts or alert_id in scope["linked_alert_ids"]:
+                    continue
+                if alert_id not in scanned_alerts:
+                    payload_bytes = len(
+                        str(row.get("payload_json") or "").encode("utf-8")
+                    )
+                    if scanned_alerts and scanned_bytes + payload_bytes > bounded_scan_bytes:
+                        scan_truncated = True
+                        break
+                    scanned_alerts.add(alert_id)
+                    scanned_bytes += payload_bytes
+                matched, score = self._response_agent_match_candidate(scope, row)
+                if score < _RESPONSE_AGENT_MIN_CORRELATION_SCORE:
+                    continue
+                seen_alerts.add(alert_id)
+                event_at_ms = int(row.get("event_at_ms") or row["created_at_ms"] or 0)
+                time_delta_ms = min(
+                    abs(event_at_ms - int(scope["event_min_ms"])),
+                    abs(event_at_ms - int(scope["event_max_ms"])),
+                )
+                matches.append(
+                    self._response_agent_raw_manifest(
+                        row,
+                        relation="case_indicator_correlation",
+                        matched=matched,
+                        correlation_score=score,
+                        time_delta_ms=time_delta_ms,
+                        include_catalog=False,
+                    )
+                )
+            matches.sort(
+                key=lambda item: (
+                    -int(item["correlation_score"]),
+                    int(item["time_delta_ms"]),
+                    str(item["timestamp"]),
+                    str(item["alert_id"]),
+                )
+            )
+            page = matches[page_offset : page_offset + page_limit]
+            next_offset = page_offset + len(page)
+            return {
+                "items": page,
+                "total": len(matches),
+                "limit": page_limit,
+                "offset": page_offset,
+                "next_offset": next_offset if next_offset < len(matches) else None,
+                "query_mode": "case_indicator_correlation",
+                "products": selected_products,
+                "window_ms": bounded_window,
+                "scan_limit": bounded_scan,
+                "scan_max_bytes": bounded_scan_bytes,
+                "scanned": len(scanned_alerts),
+                "scanned_bytes": scanned_bytes,
+                "scan_truncated": scan_truncated,
+                "minimum_correlation_score": _RESPONSE_AGENT_MIN_CORRELATION_SCORE,
+                "anchor_fields": [
+                    field for field, values in scope["values"].items() if values
+                ],
+            }
+
+    def get_response_agent_raw_alert(
+        self,
+        case_id: str,
+        alert_id: str,
+        *,
+        window_ms: int = 24 * 60 * 60 * 1_000,
+    ) -> dict[str, Any] | None:
+        """Return raw evidence only when linked or correlated to the controller Case."""
+        bounded_window = max(60_000, min(int(window_ms), 7 * 24 * 60 * 60 * 1_000))
+        with self._lock:
+            scope = self._response_agent_scope_locked(case_id)
+            if not scope:
+                return None
+            sql_row = self.conn.execute(
+                """
+                SELECT ra.alert_id, ra.source, ra.product, ra.event_type,
+                       ra.severity, ra.timestamp, ra.payload_json, ra.created_at_ms,
+                       ne.event_id, ne.entities_json, ne.evidence_hash, ne.event_at_ms
+                FROM raw_alerts ra
+                LEFT JOIN normalized_events ne ON ne.event_id = (
+                    SELECT ne_latest.event_id
+                    FROM normalized_events ne_latest
+                    WHERE ne_latest.alert_id = ra.alert_id
+                    ORDER BY ne_latest.created_at_ms DESC, ne_latest.event_id ASC
+                    LIMIT 1
+                )
+                WHERE ra.alert_id = ?
+                LIMIT 1
+                """,
+                (alert_id,),
+            ).fetchone()
+            if not sql_row:
+                return None
+            row = dict(sql_row)
+            linked = str(alert_id) in scope["linked_alert_ids"]
+            matched: list[dict[str, str]] = []
+            score = 0
+            if not linked:
+                event_at_ms = int(row.get("event_at_ms") or row["created_at_ms"] or 0)
+                within_event_window = (
+                    int(scope["event_min_ms"]) - bounded_window
+                    <= event_at_ms
+                    <= int(scope["event_max_ms"]) + bounded_window
+                )
+                within_ingest_window = (
+                    int(scope["created_min_ms"]) - bounded_window
+                    <= int(row["created_at_ms"])
+                    <= int(scope["created_max_ms"]) + bounded_window
+                )
+                if not (within_event_window or within_ingest_window):
+                    return None
+                matched, score = self._response_agent_match_candidate(scope, row)
+                if score < _RESPONSE_AGENT_MIN_CORRELATION_SCORE:
+                    return None
+            manifest = self._response_agent_raw_manifest(
+                row,
+                relation=(
+                    "linked_to_case" if linked else "case_indicator_correlation"
+                ),
+                matched=matched,
+                correlation_score=score,
+            )
+            return {
+                **manifest,
+                "payload": json.loads(row["payload_json"]),
+                "normalized_evidence_hash": str(row.get("evidence_hash") or ""),
+            }
 
     @staticmethod
     def _entity_value(value: Any) -> str:

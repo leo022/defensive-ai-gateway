@@ -187,10 +187,14 @@ class ResponseAgentConfig:
     """Bounded investigation loop used by the Case response workbench."""
 
     enabled: bool = True
-    max_turns: int = 12
-    max_tool_calls: int = 20
-    max_wall_seconds: int = 480
-    tool_result_max_bytes: int = 32_000
+    max_turns: int = 48
+    max_tool_calls: int = 40
+    max_wall_seconds: int = 900
+    tool_result_max_bytes: int = 48_000
+    correlation_window_minutes: int = 1_440
+    correlation_scan_limit: int = 2_000
+    correlation_scan_max_bytes: int = 64_000_000
+    raw_chunk_max_bytes: int = 4_096
 
 
 @dataclass
@@ -493,24 +497,24 @@ def load_config(path: str | None = None) -> GatewayConfig:
             )
             in {"1", "true", "True", "yes"},
             max_turns=max(
-                6,
+                9,
                 min(
                     int(
                         os.getenv(
                             "DEFENSIVE_AI_RESPONSE_AGENT_MAX_TURNS",
-                            response_agent.get("max_turns", 12),
+                            response_agent.get("max_turns", 48),
                         )
                     ),
-                    40,
+                    128,
                 ),
             ),
             max_tool_calls=max(
-                5,
+                8,
                 min(
                     int(
                         os.getenv(
                             "DEFENSIVE_AI_RESPONSE_AGENT_MAX_TOOL_CALLS",
-                            response_agent.get("max_tool_calls", 20),
+                            response_agent.get("max_tool_calls", 40),
                         )
                     ),
                     80,
@@ -522,7 +526,7 @@ def load_config(path: str | None = None) -> GatewayConfig:
                     int(
                         os.getenv(
                             "DEFENSIVE_AI_RESPONSE_AGENT_MAX_WALL_SECONDS",
-                            response_agent.get("max_wall_seconds", 480),
+                            response_agent.get("max_wall_seconds", 900),
                         )
                     ),
                     3600,
@@ -534,10 +538,60 @@ def load_config(path: str | None = None) -> GatewayConfig:
                     int(
                         os.getenv(
                             "DEFENSIVE_AI_RESPONSE_AGENT_TOOL_RESULT_MAX_BYTES",
-                            response_agent.get("tool_result_max_bytes", 32_000),
+                            response_agent.get("tool_result_max_bytes", 48_000),
                         )
                     ),
                     256_000,
+                ),
+            ),
+            correlation_window_minutes=max(
+                15,
+                min(
+                    int(
+                        os.getenv(
+                            "DEFENSIVE_AI_RESPONSE_AGENT_CORRELATION_WINDOW_MINUTES",
+                            response_agent.get("correlation_window_minutes", 1_440),
+                        )
+                    ),
+                    10_080,
+                ),
+            ),
+            correlation_scan_limit=max(
+                100,
+                min(
+                    int(
+                        os.getenv(
+                            "DEFENSIVE_AI_RESPONSE_AGENT_CORRELATION_SCAN_LIMIT",
+                            response_agent.get("correlation_scan_limit", 2_000),
+                        )
+                    ),
+                    10_000,
+                ),
+            ),
+            correlation_scan_max_bytes=max(
+                1_000_000,
+                min(
+                    int(
+                        os.getenv(
+                            "DEFENSIVE_AI_RESPONSE_AGENT_CORRELATION_SCAN_MAX_BYTES",
+                            response_agent.get(
+                                "correlation_scan_max_bytes", 64_000_000
+                            ),
+                        )
+                    ),
+                    512_000_000,
+                ),
+            ),
+            raw_chunk_max_bytes=max(
+                2_048,
+                min(
+                    int(
+                        os.getenv(
+                            "DEFENSIVE_AI_RESPONSE_AGENT_RAW_CHUNK_MAX_BYTES",
+                            response_agent.get("raw_chunk_max_bytes", 4_096),
+                        )
+                    ),
+                    4_096,
                 ),
             ),
         ),

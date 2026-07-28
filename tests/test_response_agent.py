@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import threading
@@ -24,7 +25,7 @@ from defensive_ai_gateway.llm import (
     parse_structured_gateway_response,
 )
 from defensive_ai_gateway.models import RawAlert
-from defensive_ai_gateway.response_agent import CONTROLLER_TOOLS
+from defensive_ai_gateway.response_agent import CONTROLLER_TOOLS, MANDATORY_TOOLS
 from scripts.clean_alerts_and_memory import _delete
 
 
@@ -92,6 +93,167 @@ class _BlockingAgentLLM:
         }
 
 
+class _ScopeEchoAgentLLM:
+    is_deterministic = False
+    runtime_metadata = {
+        "provider": "test",
+        "model": "scope-echo-agent-model",
+        "endpoint_host": "",
+    }
+
+    def __init__(self):
+        self.planner_calls = 0
+
+    def generate_structured(self, prompt, context, schema=None):  # noqa: ANN001
+        if prompt.startswith("Write a complete"):
+            return {}
+        self.planner_calls += 1
+        if self.planner_calls == 1:
+            return {
+                "action": "tool_call",
+                "tool_name": "query_case_snapshot",
+                "arguments": {"case_id": context["case"]["case_id"]},
+                "rationale": "Load the controller Case baseline.",
+            }
+        return {
+            "action": "finish",
+            "rationale": "The governed baseline is sufficient for this contract test.",
+        }
+
+
+class _ScopeAttackAgentLLM:
+    is_deterministic = False
+    runtime_metadata = {
+        "provider": "test",
+        "model": "scope-attack-agent-model",
+        "endpoint_host": "",
+    }
+
+    def generate_structured(self, prompt, context, schema=None):  # noqa: ANN001
+        if prompt.startswith("Write a complete"):
+            return {}
+        return {
+            "action": "tool_call",
+            "tool_name": "query_case_snapshot",
+            "arguments": {"case_id": "case_outside_controller_scope"},
+            "rationale": "Attempt a different Case.",
+        }
+
+
+class _ForbiddenSQLAgentLLM:
+    is_deterministic = False
+    runtime_metadata = {
+        "provider": "test",
+        "model": "forbidden-sql-agent-model",
+        "endpoint_host": "",
+    }
+
+    def generate_structured(self, prompt, context, schema=None):  # noqa: ANN001
+        if prompt.startswith("Write a complete"):
+            return {}
+        return {
+            "action": "tool_call",
+            "tool_name": "search_related_alerts",
+            "arguments": {
+                "products": ["waf"],
+                "filters": {"sql": "SELECT payload_json FROM raw_alerts"},
+            },
+            "rationale": "Attempt an arbitrary database query.",
+        }
+
+
+class _RecoverableToolAgentLLM:
+    is_deterministic = False
+    runtime_metadata = {
+        "provider": "test",
+        "model": "tool-recovery-agent-model",
+        "endpoint_host": "",
+    }
+
+    def __init__(self):
+        self.planner_calls = 0
+
+    def generate_structured(self, prompt, context, schema=None):  # noqa: ANN001
+        if prompt.startswith("Write a complete"):
+            return {}
+        self.planner_calls += 1
+        if self.planner_calls == 1:
+            return {
+                "action": "tool_call",
+                "tool_name": "read_raw_alert_chunk",
+                "arguments": {"alert_id": "alert_not_correlated_to_this_case"},
+                "rationale": "Test the controller data boundary.",
+            }
+        return {
+            "action": "finish",
+            "rationale": "The refused read is recorded and no retry is required.",
+        }
+
+
+class _ChunkAwareAgentLLM:
+    is_deterministic = False
+    runtime_metadata = {
+        "provider": "test",
+        "model": "chunk-aware-agent-model",
+        "endpoint_host": "",
+    }
+
+    def __init__(self, alert_id: str):
+        self.alert_id = alert_id
+        self.planner_calls = 0
+        self.seen_chunks: list[str] = []
+        self.report_context: dict = {}
+
+    def generate_structured(self, prompt, context, schema=None):  # noqa: ANN001
+        if prompt.startswith("Write a complete"):
+            self.report_context = context
+            return {}
+        self.planner_calls += 1
+        active = context.get("active_raw_observation")
+        if self.planner_calls == 1:
+            return {
+                "action": "tool_call",
+                "tool_name": "query_case_raw_alerts",
+                "arguments": {},
+                "rationale": "Discover the Case-linked raw alert.",
+            }
+        if not active:
+            return {
+                "action": "tool_call",
+                "tool_name": "read_raw_alert_chunk",
+                "arguments": {
+                    "alert_id": self.alert_id,
+                    "json_pointer": "/original_log",
+                    "offset": 0,
+                },
+                "rationale": "Begin the complete raw-log review.",
+            }
+        prompt_context = json.loads(prompt.split("CONTEXT=", 1)[1])
+        prompt_active = prompt_context["active_raw_observation"]
+        result = active["result"]
+        if prompt_active["result"]["content"] != result["content"]:
+            raise AssertionError("raw chunk was changed at the final prompt boundary")
+        if "[TRUNCATED]" in result["content"]:
+            raise AssertionError("raw chunk was truncated before reaching the model")
+        self.seen_chunks.append(result["content"])
+        marker = "END" if "END" in result["content"] else f"offset {result['offset']}"
+        if not result["complete"]:
+            return {
+                "action": "tool_call",
+                "tool_name": "read_raw_alert_chunk",
+                "arguments": {
+                    "alert_id": self.alert_id,
+                    "json_pointer": "/original_log",
+                    "offset": result["next_offset"],
+                },
+                "rationale": f"Preserved facts from raw chunk {marker}; continue.",
+            }
+        return {
+            "action": "finish",
+            "rationale": f"Preserved facts from the final raw chunk {marker}; synthesize.",
+        }
+
+
 class ResponseAgentTest(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -121,6 +283,8 @@ class ResponseAgentTest(unittest.TestCase):
         raise AssertionError(f"session did not reach {statuses}: {session}")
 
     def test_deterministic_loop_persists_tools_report_and_citations(self):
+        self.state.response_agent.config.max_turns = 9
+        self.state.response_agent.config.max_tool_calls = 8
         case_id = self._case("response-agent-complete", injected=True)
         tasks_before = self.state.repo.count_response_tasks()
         artifact = self.state.case_response.generate(
@@ -141,7 +305,7 @@ class ResponseAgentTest(unittest.TestCase):
         self.assertEqual(session["status"], "completed")
         self.assertEqual(
             [item["tool_name"] for item in session["tool_calls"]],
-            list(CONTROLLER_TOOLS),
+            [*MANDATORY_TOOLS, "read_raw_alert_chunk"],
         )
         self.assertTrue(all(item["status"] == "completed" for item in session["tool_calls"]))
         self.assertTrue(
@@ -235,6 +399,366 @@ class ResponseAgentTest(unittest.TestCase):
         self.assertEqual(paused["last_error"], "model_error:RuntimeError")
         self.assertEqual(paused["usage"]["tool_calls"], 0)
 
+    def test_redundant_matching_case_scope_is_normalized_not_failed(self):
+        llm = _ScopeEchoAgentLLM()
+        self.state.response_agent.set_llm(llm)
+        case_id = self._case("response-agent-scope-echo")
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        started = self.state.response_agent.create(
+            case_id,
+            artifact=artifact,
+            goal="scope normalization",
+            actor="analyst",
+        )
+
+        session = self._wait(
+            self.state.response_agent,
+            started["session_id"],
+            {"completed", "review", "blocked", "failed", "paused"},
+        )
+
+        self.assertEqual(session["status"], "completed")
+        stored = self.state.repo.get_response_agent_session(
+            started["session_id"]
+        )
+        self.assertEqual(stored["tool_calls"][0]["arguments"], {})
+        self.assertEqual(stored["usage"]["model_calls"], 3)
+        self.assertNotIn("override controller scope", stored["last_error"])
+
+    def test_mismatched_case_scope_pauses_after_bounded_retries(self):
+        self.state.response_agent.set_llm(_ScopeAttackAgentLLM())
+        case_id = self._case("response-agent-scope-attack")
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        started = self.state.response_agent.create(
+            case_id,
+            artifact=artifact,
+            goal="scope rejection",
+            actor="analyst",
+        )
+
+        session = self._wait(
+            self.state.response_agent,
+            started["session_id"],
+            {"paused", "failed"},
+        )
+
+        self.assertEqual(session["status"], "paused")
+        self.assertEqual(
+            session["last_error"], "decision_contract_error:scope_override"
+        )
+        self.assertEqual(session["usage"]["model_calls"], 3)
+        self.assertEqual(session["usage"]["tool_calls"], 0)
+        rejected = [
+            step
+            for step in session["steps"]
+            if step["phase"] == "decision_rejected"
+        ]
+        self.assertEqual(len(rejected), 3)
+
+    def test_arbitrary_sql_arguments_are_rejected_without_database_execution(self):
+        self.state.response_agent.set_llm(_ForbiddenSQLAgentLLM())
+        case_id = self._case("response-agent-forbidden-sql")
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        started = self.state.response_agent.create(
+            case_id,
+            artifact=artifact,
+            goal="SQL boundary",
+            actor="analyst",
+        )
+
+        session = self._wait(
+            self.state.response_agent,
+            started["session_id"],
+            {"paused", "failed"},
+        )
+
+        self.assertEqual(session["status"], "paused")
+        self.assertEqual(
+            session["last_error"],
+            "decision_contract_error:forbidden_tool_argument",
+        )
+        self.assertEqual(session["usage"]["tool_calls"], 0)
+        self.assertFalse(session["tool_calls"])
+
+    def test_out_of_scope_raw_read_is_recoverable_and_audited(self):
+        self.state.response_agent.set_llm(_RecoverableToolAgentLLM())
+        case_id = self._case("response-agent-tool-recovery")
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        started = self.state.response_agent.create(
+            case_id,
+            artifact=artifact,
+            goal="tool rejection recovery",
+            actor="analyst",
+        )
+
+        session = self._wait(
+            self.state.response_agent,
+            started["session_id"],
+            {"completed", "review", "blocked", "failed", "paused"},
+        )
+
+        self.assertEqual(session["status"], "completed")
+        stored = self.state.repo.get_response_agent_session(
+            started["session_id"]
+        )
+        self.assertEqual(stored["tool_calls"][0]["status"], "failed")
+        self.assertIn(
+            "raw_alert_outside_scope", stored["tool_calls"][0]["error"]
+        )
+        self.assertTrue(
+            any(step["phase"] == "tool_rejected" for step in stored["steps"])
+        )
+
+    def test_raw_syslog_can_be_read_completely_in_redacted_chunks(self):
+        alert = _waf_alert("response-agent-full-raw")
+        alert.payload["original_log"] = {
+            "message": "BEGIN-" + ("证据" * 4_000) + "-END",
+            "password": "bank-secret-password",
+            "authorization": "Bearer secret-token-value",
+        }
+        case_id = self.state.orchestrator.handle_alert(alert).case_id
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        source = self.state.repo.get_case_response_source(case_id)
+        manifest, manifest_refs = self.state.response_agent._execute_tool(
+            "query_case_raw_alerts",
+            {"limit": 10, "offset": 0},
+            source,
+            artifact,
+        )
+        item = next(
+            row
+            for row in manifest["items"]
+            if row["alert_id"] == alert.alert_id
+        )
+        self.assertTrue(item["original_log_present"])
+        self.assertTrue(
+            any(
+                entry["json_pointer"] == "/original_log"
+                for entry in item["field_catalog"]
+            )
+        )
+        self.assertEqual(manifest_refs[0]["ref_id"], f"raw-alert:{alert.alert_id}")
+
+        self.state.response_agent.config.raw_chunk_max_bytes = 2_048
+        chunks = []
+        offset = 0
+        content_hash = ""
+        source_hash = ""
+        while True:
+            result, refs = self.state.response_agent._execute_tool(
+                "read_raw_alert_chunk",
+                {
+                    "alert_id": alert.alert_id,
+                    "json_pointer": "/original_log",
+                    "offset": offset,
+                    "max_bytes": 2_048,
+                },
+                source,
+                artifact,
+            )
+            chunks.append(result["content"])
+            content_hash = result["content_sha256"]
+            source_hash = result["source_hash"]
+            self.assertEqual(refs[0]["ref_id"], f"raw-alert:{alert.alert_id}")
+            if result["complete"]:
+                break
+            offset = result["next_offset"]
+            self.assertLess(len(chunks), 100)
+
+        reconstructed = "".join(chunks)
+        raw_log = json.loads(reconstructed)
+        self.assertTrue(raw_log["message"].endswith("-END"))
+        self.assertEqual(raw_log["password"], "[REDACTED]")
+        self.assertEqual(raw_log["authorization"], "[REDACTED]")
+        self.assertNotIn("bank-secret-password", reconstructed)
+        self.assertEqual(
+            content_hash,
+            hashlib.sha256(reconstructed.encode("utf-8")).hexdigest(),
+        )
+        self.assertEqual(source_hash, item["source_hash"])
+
+    def test_llm_sees_every_complete_raw_chunk_and_report_gets_rolling_notes(self):
+        alert = _waf_alert("response-agent-llm-raw-loop")
+        alert.payload["original_log"] = "BEGIN-" + ('evidence-"\\-' * 900) + "END"
+        llm = _ChunkAwareAgentLLM(alert.alert_id)
+        self.state.response_agent.set_llm(llm)
+        case_id = self.state.orchestrator.handle_alert(alert).case_id
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        started = self.state.response_agent.create(
+            case_id,
+            artifact=artifact,
+            goal="Read the complete raw log",
+            actor="analyst",
+        )
+
+        session = self._wait(
+            self.state.response_agent,
+            started["session_id"],
+            {"completed", "review", "blocked", "failed", "paused"},
+        )
+
+        self.assertEqual(session["status"], "completed")
+        reconstructed = json.loads("".join(llm.seen_chunks))
+        self.assertTrue(reconstructed.startswith("BEGIN-"))
+        self.assertTrue(reconstructed.endswith("END"))
+        self.assertGreater(len(llm.seen_chunks), 2)
+        notes = llm.report_context.get("investigation_notes") or []
+        self.assertTrue(any("final raw chunk END" in item["note"] for item in notes))
+        raw_calls = [
+            call
+            for call in session["tool_calls"]
+            if call["tool_name"] == "read_raw_alert_chunk"
+        ]
+        self.assertEqual(len(raw_calls), len(llm.seen_chunks))
+        self.assertTrue(all(call["status"] == "completed" for call in raw_calls))
+
+    def test_related_search_uses_normalized_and_raw_only_case_indicators(self):
+        case_id = self._case("response-agent-correlation-anchor")
+        source = self.state.repo.get_case_response_source(case_id)
+        timestamp = source["events"][0]["timestamp"]
+        shared_ip = "43.154.138.159"
+
+        hips = RawAlert(
+            source="endpoint-sensor",
+            product="hips",
+            event_type="suspicious_process",
+            severity="high",
+            timestamp=timestamp,
+            payload={
+                "src_ip": shared_ip,
+                "process_name": "powershell.exe",
+                "original_log": {
+                    "client_ip": shared_ip,
+                    "command": "encoded-command",
+                },
+            },
+            alert_id="response-agent-related-hips",
+        )
+        self.state.repo.insert_raw_alert(hips)
+        self.state.repo.insert_normalized_event(
+            self.state.normalizer.normalize(hips)
+        )
+
+        raw_only = RawAlert(
+            source="edr-sensor",
+            product="edr",
+            event_type="network_connection",
+            severity="medium",
+            timestamp=timestamp,
+            payload={
+                "original_log": {
+                    "client_ip": shared_ip,
+                    "destination": "application-server",
+                }
+            },
+            alert_id="response-agent-related-edr-raw-only",
+        )
+        self.state.repo.insert_raw_alert(raw_only)
+        unrelated = RawAlert(
+            source="unrelated-sensor",
+            product="edr",
+            event_type="network_connection",
+            severity="low",
+            timestamp=timestamp,
+            payload={"src_ip": "192.0.2.88"},
+            alert_id="response-agent-unrelated",
+        )
+        self.state.repo.insert_raw_alert(unrelated)
+        weak_rule_match = RawAlert(
+            source="unrelated-sensor",
+            product="edr",
+            event_type="generic_detection",
+            severity="low",
+            timestamp=timestamp,
+            payload={"rule_id": "WAF-942-SQLI"},
+            alert_id="response-agent-weak-rule-only",
+        )
+        self.state.repo.insert_raw_alert(weak_rule_match)
+
+        related = self.state.repo.query_response_agent_related_alerts(
+            case_id,
+            products=["hips", "edr"],
+            window_ms=60 * 60 * 1_000,
+            scan_limit=100,
+            scan_max_bytes=2_000_000,
+            limit=20,
+        )
+
+        ids = {item["alert_id"] for item in related["items"]}
+        self.assertIn(hips.alert_id, ids)
+        self.assertIn(raw_only.alert_id, ids)
+        self.assertNotIn(unrelated.alert_id, ids)
+        self.assertNotIn(weak_rule_match.alert_id, ids)
+        self.assertFalse(related["scan_truncated"])
+        self.assertEqual(related["minimum_correlation_score"], 5)
+        correlated_raw = self.state.repo.get_response_agent_raw_alert(
+            case_id,
+            raw_only.alert_id,
+            window_ms=60 * 60 * 1_000,
+        )
+        self.assertEqual(
+            correlated_raw["relation"], "case_indicator_correlation"
+        )
+        self.assertIsNone(
+            self.state.repo.get_response_agent_raw_alert(
+                case_id,
+                unrelated.alert_id,
+                window_ms=60 * 60 * 1_000,
+            )
+        )
+        self.assertIsNone(
+            self.state.repo.get_response_agent_raw_alert(
+                case_id,
+                weak_rule_match.alert_id,
+                window_ms=60 * 60 * 1_000,
+            )
+        )
+
+    def test_related_search_stops_at_bounded_raw_byte_budget(self):
+        case_id = self._case("response-agent-scan-budget")
+        source = self.state.repo.get_case_response_source(case_id)
+        timestamp = source["events"][0]["timestamp"]
+        for index in range(2):
+            self.state.repo.insert_raw_alert(
+                RawAlert(
+                    source=f"large-edr-{index}",
+                    product="edr",
+                    event_type="large_raw_event",
+                    severity="medium",
+                    timestamp=timestamp,
+                    payload={
+                        "src_ip": "43.154.138.159",
+                        "original_log": "x" * 700_000,
+                    },
+                    alert_id=f"response-agent-large-related-{index}",
+                )
+            )
+
+        related = self.state.repo.query_response_agent_related_alerts(
+            case_id,
+            window_ms=60 * 60 * 1_000,
+            scan_limit=100,
+            scan_max_bytes=1_000_000,
+            limit=20,
+        )
+
+        self.assertTrue(related["scan_truncated"])
+        self.assertEqual(related["scanned"], 1)
+        self.assertLessEqual(related["scanned_bytes"], 1_000_000)
+        self.assertEqual(len(related["items"]), 1)
+
     def test_cancel_during_planning_cannot_resurrect_session(self):
         llm = _BlockingAgentLLM("planner")
         self.state.response_agent.set_llm(llm)
@@ -290,7 +814,7 @@ class ResponseAgentTest(unittest.TestCase):
         self.assertEqual(report_count, 0)
 
     def test_schema_and_static_workbench_contract(self):
-        self.assertEqual(SCHEMA_VERSION, 17)
+        self.assertEqual(SCHEMA_VERSION, 18)
         tables = {
             row["name"]
             for row in self.state.repo.conn.execute(
@@ -305,6 +829,18 @@ class ResponseAgentTest(unittest.TestCase):
                 "response_agent_reports",
                 "response_agent_report_refs",
             }.issubset(tables)
+        )
+        indexes = {
+            row["name"]
+            for row in self.state.repo.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            ).fetchall()
+        }
+        self.assertTrue(
+            {
+                "idx_raw_alert_created",
+                "idx_raw_alert_product_created",
+            }.issubset(indexes)
         )
         html = Path("defensive_ai_gateway/static/case-response.html").read_text(
             encoding="utf-8"

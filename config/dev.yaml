@@ -45,10 +45,14 @@ memory_matching:
   vector_dimensions: 256
 response_agent:
   enabled: true
-  max_turns: 12
-  max_tool_calls: 20
-  max_wall_seconds: 480
-  tool_result_max_bytes: 32000
+  max_turns: 48
+  max_tool_calls: 40
+  max_wall_seconds: 900
+  tool_result_max_bytes: 48000
+  correlation_window_minutes: 1440
+  correlation_scan_limit: 2000
+  correlation_scan_max_bytes: 64000000
+  raw_chunk_max_bytes: 4096
 syslog:
   embedded_listeners_enabled: true
   max_frame_bytes: 2000000
