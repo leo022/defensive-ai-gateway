@@ -9,19 +9,37 @@ from .config import PolicyConfig
 
 
 SECRET_PATTERNS = [
+    re.compile(r"(?i)(\bhttps?://)[^/@\s:]+:[^/@\s]+(?=@)"),
+    re.compile(r"(?i)(\b(?:cookie|set-cookie)\s*[:=]\s*[\"']?)[^\"'\r\n]+"),
     re.compile(r"(?i)\b((?:bearer|basic)\s+)[a-z0-9+/=._~\-]+"),
     re.compile(
         r"(?i)([\"']?(?:api[_-]?key|x-api-key|access[_-]?token|refresh[_-]?token|"
-        r"id[_-]?token|client[_-]?secret|password|passwd)[\"']?\s*[:=]\s*[\"']?)"
+        r"id[_-]?token|token|client[_-]?secret|secret|credential|password|passwd|authorization|proxy[_-]?authorization|"
+        r"cookie|set[_-]?cookie|session(?:[_-]?id)?|jsessionid|customer[_-]?id|email|phone|mobile|"
+        r"account[_-]?number|card[_-]?number|bank[_-]?card)[\"']?\s*[:=]\s*[\"']?)"
         r"[^\"'\s,;}&]+"
     ),
+    re.compile(r"(?i)(?<![a-z0-9._%+\-])[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}(?![a-z0-9.\-])"),
+    re.compile(r"(?<!\d)(?:\+?86[\s-]?)?1[3-9]\d{9}(?!\d)"),
     # Avoid treating a long decimal tail such as 0.9199999999999999 as an ID.
     re.compile(r"(?<![\d.])(?:\d{15}|\d{17}[0-9Xx])(?![\d.])"),
 ]
 
 _BUILTIN_SENSITIVE_FIELDS = {
+    "account_number",
+    "bank_card",
+    "card_number",
+    "credential",
+    "customer_id",
+    "email",
+    "id_card",
+    "identity_card",
+    "mobile",
     "password",
     "passwd",
+    "phone",
+    "secret",
+    "ssn",
     "token",
     "access_token",
     "refresh_token",
@@ -63,17 +81,17 @@ _EVIDENCE_CONTEXT_PRIORITY = {
     "host": 2,
     "status": 2,
     "exception": 3,
-    "stack_trace": 4,
-    "stacktrace": 4,
+    "stack_trace": 1,
+    "stacktrace": 1,
     "rasp_evidence_integrity": 2,
 }
 
 _EVIDENCE_CONTEXT_ITEM_CAPS = {
-    "request_context": 700,
-    "hook_data": 700,
-    "hook_data_summary": 700,
-    "rasp_items_context": 1500,
-    "request_parameters": 450,
+    "request_context": 3000,
+    "hook_data": 1800,
+    "hook_data_summary": 1800,
+    "rasp_items_context": 5000,
+    "request_parameters": 1800,
     "sink": 500,
     "taint_source": 500,
     "payload_category": 500,
@@ -304,7 +322,17 @@ class PolicyEngine:
         text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         if len(text) <= self.config.max_prompt_chars:
             return text
-        return text[: self.config.max_prompt_chars] + "...[TRUNCATED]"
+        # Preserve valid JSON at the final prompt boundary. The context has
+        # already been byte-bounded, but max_prompt_chars may be lower and a raw
+        # string slice would leave the model with malformed evidence.
+        fitted = _fit_json_value(
+            payload,
+            max(2, int(self.config.max_prompt_chars)),
+            top_level=True,
+        )
+        if not isinstance(fitted, dict):
+            return "{}"
+        return json.dumps(fitted, ensure_ascii=False, sort_keys=True)
 
     def sanitize_context(self, context: dict[str, Any]) -> dict[str, Any]:
         """Redact + bound the size of any payload sent to an LLM.

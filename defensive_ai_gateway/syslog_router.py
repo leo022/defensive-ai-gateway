@@ -9,7 +9,7 @@ from typing import Any
 
 from .log_adapter import DEFAULT_SEVERITY_MAP, SUPPORTED_PRODUCTS
 from .json_safety import loads_bounded_json
-from .models import new_id
+from .models import SERVER_OWNED_ALERT_PAYLOAD_FIELDS, new_id
 
 
 @dataclass
@@ -203,7 +203,11 @@ class SyslogPortRouter:
         if severity not in {"critical", "high", "medium", "low"}:
             severity = "medium"
         timestamp = str(_nested_get(structured, "timestamp", "event.time", "event_time", "time", "@timestamp") or "")
-        payload = dict(structured)
+        payload = {
+            key: value
+            for key, value in structured.items()
+            if str(key).casefold() not in SERVER_OWNED_ALERT_PAYLOAD_FIELDS
+        }
         payload["syslog_route"] = envelope
         payload["original_log"] = structured
         return {

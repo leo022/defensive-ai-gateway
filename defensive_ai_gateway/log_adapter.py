@@ -6,15 +6,35 @@ import re
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import parse_qsl
 
+from .config import PolicyConfig
 from .json_safety import loads_bounded_json
-from .models import RawAlert, new_id, now_ms
+from .models import (
+    RawAlert,
+    new_id,
+    now_ms,
+    strip_server_owned_alert_payload_fields,
+)
 from .normalizer import EventNormalizer
+from .policy import PolicyEngine
 
 
 SUPPORTED_PRODUCTS = {"hips", "rasp", "ndr", "waf", "siem"}
 PRODUCT_LABELS = {"hips": "HIPS", "rasp": "RASP", "ndr": "NDR", "waf": "WAF", "siem": "SIEM"}
 DEFAULT_REQUIRED_FIELDS = ["alert_id", "product", "event_type", "severity", "timestamp"]
+_MODEL_ENTITY_TARGETS = {
+    "action",
+    "app",
+    "dst_ip",
+    "host",
+    "method",
+    "process",
+    "rule",
+    "src_ip",
+    "url",
+    "user",
+}
 RASP_ALERT_ID_PATHS = [
     "$.metadata.id",
     "$.alert.id",
@@ -28,22 +48,89 @@ RASP_ALERT_ID_PATHS = [
 _RASP_CONTEXT_MAX_ITEMS = 20
 _RASP_CONTEXT_MAX_LEAVES = 64
 _RASP_CONTEXT_MAX_TEXT = 16_384
+_RASP_EVIDENCE_MAX_DEPTH = 6
+_RASP_EVIDENCE_MAX_NODES = 128
+_RASP_EVIDENCE_MAX_ENTRIES = 8
+_RASP_EVIDENCE_MAX_VALUE_BYTES = 384
+_TRUSTED_TRANSPORT_MARKER = "_gateway_transport_trusted"
 _RASP_SEMANTIC_FIELD_NAMES = {
     "class",
+    "class_loader",
     "class_name",
     "classloader",
+    "classname",
     "cmd",
     "command",
     "domain",
     "expression",
     "file",
+    "file_name",
+    "filename",
     "host",
+    "method",
     "path",
     "payload",
     "protocol",
     "script",
     "sql",
+    "suffix",
     "url",
+    "xss",
+}
+_RASP_REQUEST_ATTACK_FIELD_NAMES = {
+    "class",
+    "class_loader",
+    "class_name",
+    "classloader",
+    "classname",
+    "cmd",
+    "command",
+    "expression",
+    "script",
+    "sql",
+    "suffix",
+    "xss",
+}
+_RASP_HOOK_ATTACK_FIELD_NAMES = _RASP_SEMANTIC_FIELD_NAMES - {"payload"}
+_RASP_EXPLICIT_ATTACK_INDICATORS = {
+    "expression_execution_reference",
+    "java_deserialization_hint",
+    "jdbc_connection_reference",
+    "jndi_reference",
+    "path_traversal_reference",
+    "process_execution_reference",
+    "script_execution_reference",
+    "sql_injection_reference",
+    "xss_reference",
+}
+_RASP_SENSITIVE_FIELD_MARKERS = {
+    "account_number",
+    "api_key",
+    "authorization",
+    "bank_card",
+    "card_number",
+    "client_secret",
+    "cookie",
+    "credential",
+    "customer_id",
+    "email",
+    "id_card",
+    "identity_card",
+    "jsessionid",
+    "mobile",
+    "password",
+    "passwd",
+    "phone",
+    "proxy_authorization",
+    "pwd",
+    "refresh_token",
+    "secret",
+    "session",
+    "session_id",
+    "set_cookie",
+    "ssn",
+    "token",
+    "x_api_key",
 }
 _RASP_INDICATORS = (
     ("jndi_reference", re.compile(r"\b(?:ldap|rmi|iiop|dns)://", re.IGNORECASE)),
@@ -53,6 +140,9 @@ _RASP_INDICATORS = (
     ("expression_execution_reference", re.compile(r"\$\{|#\{|\bspel\b|\bognl\b|\bmvel\b|\bjexl\b", re.IGNORECASE)),
     ("script_execution_reference", re.compile(r"\b(?:javascript|groovy|rhino|nashorn)\b", re.IGNORECASE)),
     ("external_url_reference", re.compile(r"\b(?:https?|ftp)://", re.IGNORECASE)),
+    ("sql_injection_reference", re.compile(r"(?:\bunion\s+(?:all\s+)?select\b|\bor\s+['\"]?1['\"]?\s*=\s*['\"]?1|\b(?:sleep|benchmark|load_file)\s*\()", re.IGNORECASE)),
+    ("path_traversal_reference", re.compile(r"(?:\.\.[/\\]|%2e%2e(?:%2f|/|%5c))", re.IGNORECASE)),
+    ("xss_reference", re.compile(r"(?:<\s*script\b|javascript\s*:|\bon(?:error|load)\s*=)", re.IGNORECASE)),
 )
 
 # product → 默认自动套用的 mapping profile_id。仅对“无显式 product 字段、靠内容
@@ -385,7 +475,7 @@ def demo_rasp_profile() -> MappingProfile:
     return MappingProfile(
         profile_id="demo-rasp-json",
         name="Demo RASP JSON 日志",
-        version="v5",
+        version="v6",
         description="示例：把常见 RASP JSON 日志映射为内部 RawAlert，并保留 host、time、stacktrace、hook 和 trace 关键上下文。",
         mappings={
             "alert_id": list(RASP_ALERT_ID_PATHS),
@@ -433,7 +523,7 @@ def demo_rasp_profile() -> MappingProfile:
                     {"path": "$.request_message", "transform": "rasp_request_context"},
                     {"path": "$.http.request", "transform": "rasp_request_context"},
                 ],
-                "why_it_matters": "请求参数与请求体的受控语义摘要；原始内容仍保存在受保护的原始告警中。",
+                "why_it_matters": "请求参数与请求体仅保留命中明确攻击特征的受控片段；完整原文仍保存在受保护的原始告警中。",
             },
             {
                 "type": "request_parameters",
@@ -443,7 +533,7 @@ def demo_rasp_profile() -> MappingProfile:
                     {"path": "$.request.parameters", "transform": "rasp_request_parameter_summary"},
                     {"path": "$.http.request.parameters", "transform": "rasp_request_parameter_summary"},
                 ],
-                "why_it_matters": "请求参数摘要用于判断入口特征；空对象表示上游未提供有效请求参数，而非网关丢失字段。",
+                "why_it_matters": "请求参数仅保留命中明确攻击特征的受控片段；空对象表示上游未提供有效请求参数，而非网关丢失字段。",
             },
             {
                 "type": "hook_data",
@@ -452,7 +542,7 @@ def demo_rasp_profile() -> MappingProfile:
                     {"path": "$.items[0].hook_data", "transform": "rasp_hook_data_summary"},
                     {"path": "$.attack.hook_data", "transform": "rasp_hook_data_summary"},
                 ],
-                "why_it_matters": "hook_data 的受控语义摘要可证明关键字段已由 RASP 提供，而不向模型泄露原始载荷。",
+                "why_it_matters": "hook_data 仅投影规则相关字段的脱敏、限长原值，并保留完整原文的受保护引用。",
             },
             {
                 "type": "rasp_items_context",
@@ -489,7 +579,7 @@ def builtin_product_profile(product: str) -> MappingProfile:
         profile = demo_rasp_profile()
         profile.profile_id = profile_id
         profile.name = name
-        profile.version = "v6"
+        profile.version = "v7"
         profile.description = description
         profile.mappings["product"] = [
             "$.product",
@@ -671,21 +761,67 @@ def _mapping_includes_path(mapping: Any, path: str) -> bool:
 class LogAdapter:
     def __init__(self, normalizer: EventNormalizer | None = None):
         self.normalizer = normalizer
+        self.policy = normalizer.policy if normalizer is not None else PolicyEngine(PolicyConfig())
 
-    def adapt(self, profile: MappingProfile, log: dict[str, Any]) -> dict[str, Any]:
-        log, envelope = self.unwrap_syslog_envelope(log)
+    def adapt(
+        self,
+        profile: MappingProfile,
+        log: dict[str, Any],
+        *,
+        trusted_syslog_envelope: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        input_log = dict(log)
+        for key in list(input_log):
+            if str(key).casefold() == "_syslog_envelope":
+                input_log.pop(key, None)
+        nested_log = input_log.get("log")
+        if isinstance(nested_log, dict):
+            nested_log = dict(nested_log)
+            for key in list(nested_log):
+                if str(key).casefold() == "_syslog_envelope":
+                    nested_log.pop(key, None)
+            input_log["log"] = nested_log
+        log, envelope = self.unwrap_syslog_envelope(input_log)
+        log = dict(log)
+        if isinstance(envelope, dict):
+            envelope = dict(envelope)
+            envelope.pop(_TRUSTED_TRANSPORT_MARKER, None)
+            log["_syslog_envelope"] = envelope
+        if isinstance(trusted_syslog_envelope, dict):
+            envelope = dict(trusted_syslog_envelope)
+            envelope.pop(_TRUSTED_TRANSPORT_MARKER, None)
+            envelope[_TRUSTED_TRANSPORT_MARKER] = True
+            log["_syslog_envelope"] = envelope
         errors: list[str] = []
         warnings: list[str] = ["已从 Syslog envelope 的 JSON message 中提取原始日志。"] if envelope else []
         mapped: dict[str, Any] = {}
         entities: dict[str, Any] = {}
         payload_fields: dict[str, Any] = {}
 
+        profile_product = self._map_value(
+            self._resolve_mapping(profile.mappings.get("product"), log),
+            profile.product_map,
+        ).lower()
+        rasp_model_mappings = demo_rasp_profile().mappings if profile_product == "rasp" else {}
         for target, source in profile.mappings.items():
+            if profile_product == "rasp" and (
+                target in {"alert_id", "event_type", "payload"}
+                or target.startswith("entities.")
+                or target.startswith("payload.")
+            ):
+                source = self._filter_mapping_to_reference(
+                    source,
+                    rasp_model_mappings.get(target),
+                )
+                if source is None:
+                    continue
             value = self._resolve_mapping(source, log)
             if value in ("", None):
                 continue
             if target.startswith("entities."):
-                entities[target.split(".", 1)[1]] = value
+                entity_name = target.split(".", 1)[1]
+                if entity_name in _MODEL_ENTITY_TARGETS:
+                    entities[entity_name] = value
             elif target.startswith("payload."):
                 self._assign_nested(payload_fields, target.split(".", 1)[1], value)
             else:
@@ -712,11 +848,29 @@ class LogAdapter:
         if mapped.get("severity") and mapped["severity"] not in {"critical", "high", "medium", "low"}:
             errors.append(f"unsupported_severity:{mapped['severity']}")
 
-        payload = dict(mapped.get("payload") or {})
+        payload = (
+            {}
+            if mapped.get("product") == "rasp"
+            else dict(mapped.get("payload") or {})
+        )
+        strip_server_owned_alert_payload_fields(payload)
         self._merge_dict(payload, payload_fields)
-        payload.setdefault("original_log", log)
+        strip_server_owned_alert_payload_fields(payload)
+        if mapped.get("product") == "rasp":
+            integrity = self._summarize_rasp_evidence_integrity(log)
+            if integrity:
+                payload["rasp_evidence_integrity"] = integrity
+        clean_log = dict(log)
+        clean_envelope = clean_log.get("_syslog_envelope")
+        if isinstance(clean_envelope, dict):
+            clean_envelope = dict(clean_envelope)
+            clean_envelope.pop(_TRUSTED_TRANSPORT_MARKER, None)
+            clean_log["_syslog_envelope"] = clean_envelope
+        payload["original_log"] = clean_log
         if envelope:
-            payload.setdefault("syslog_envelope", envelope)
+            public_envelope = dict(envelope)
+            public_envelope.pop(_TRUSTED_TRANSPORT_MARKER, None)
+            payload["syslog_envelope"] = public_envelope
         payload["adapter"] = {
             "profile_id": profile.profile_id,
             "profile_name": profile.name,
@@ -729,7 +883,11 @@ class LogAdapter:
             payload["mapped_entities"] = entities
             payload.update({key: value for key, value in entities.items() if key not in payload})
 
-        adapter_evidence = self._build_adapter_evidence(profile, log)
+        adapter_evidence = self._build_adapter_evidence(
+            profile,
+            log,
+            product=str(mapped.get("product") or ""),
+        )
         if adapter_evidence:
             payload["adapter_evidence"] = adapter_evidence
 
@@ -1152,7 +1310,7 @@ class LogAdapter:
         return value
 
     def _summarize_rasp_request_parameters(self, value: Any) -> dict[str, Any] | None:
-        """Keep parameter presence useful to analysts without forwarding raw payloads."""
+        """Retain bounded attack semantics while filtering unrelated request data."""
         if value is None:
             return None
         if isinstance(value, str):
@@ -1162,17 +1320,44 @@ class LogAdapter:
             try:
                 value = loads_bounded_json(text)
             except (TypeError, ValueError, json.JSONDecodeError):
-                return {"state": "present", "format": "text", "length": len(text)}
+                return {
+                    "state": "present",
+                    "format": "text",
+                    "length": len(text),
+                    "selected_evidence": self._project_rasp_attack_evidence(
+                        value,
+                        source="request_parameters",
+                        direct_fields=_RASP_REQUEST_ATTACK_FIELD_NAMES,
+                    ),
+                }
 
         if isinstance(value, dict):
             if not value:
                 return {"state": "empty", "format": "json_object"}
-            return {"state": "present", "format": "json_object", "field_count": len(value)}
+            summary = {"state": "present", "format": "json_object", "field_count": len(value)}
+            summary["selected_evidence"] = self._project_rasp_attack_evidence(
+                value,
+                source="request_parameters",
+                direct_fields=_RASP_REQUEST_ATTACK_FIELD_NAMES,
+            )
+            return summary
         if isinstance(value, list):
             if not value:
                 return {"state": "empty", "format": "json_array"}
-            return {"state": "present", "format": "json_array", "item_count": len(value)}
-        return {"state": "present", "format": type(value).__name__}
+            summary = {"state": "present", "format": "json_array", "item_count": len(value)}
+            summary["selected_evidence"] = self._project_rasp_attack_evidence(
+                value,
+                source="request_parameters",
+                direct_fields=_RASP_REQUEST_ATTACK_FIELD_NAMES,
+            )
+            return summary
+        summary = {"state": "present", "format": type(value).__name__}
+        summary["selected_evidence"] = self._project_rasp_attack_evidence(
+            value,
+            source="request_parameters",
+            direct_fields=_RASP_REQUEST_ATTACK_FIELD_NAMES,
+        )
+        return summary
 
     def _summarize_rasp_request_context(self, value: Any) -> dict[str, Any] | None:
         """Project HTTP context into a model-safe, evidence-preserving summary.
@@ -1186,6 +1371,18 @@ class LogAdapter:
             return None
         parameter = self._summarize_rasp_value(value.get("parameter"))
         body = self._summarize_rasp_value(value.get("body"))
+        if parameter.get("state") == "present":
+            parameter["selected_evidence"] = self._project_rasp_attack_evidence(
+                value.get("parameter"),
+                source="request_parameter",
+                direct_fields=_RASP_REQUEST_ATTACK_FIELD_NAMES,
+            )
+        if body.get("state") == "present":
+            body["selected_evidence"] = self._project_rasp_attack_evidence(
+                value.get("body"),
+                source="request_body",
+                direct_fields=_RASP_REQUEST_ATTACK_FIELD_NAMES,
+            )
         headers = value.get("header") or value.get("headers")
         header_names = []
         if isinstance(headers, dict):
@@ -1211,7 +1408,7 @@ class LogAdapter:
         }
 
     def _summarize_rasp_hook_data(self, value: Any) -> dict[str, Any] | None:
-        """Expose hook-data semantics while retaining the raw value only in storage."""
+        """Expose selected hook values while retaining the full raw value only in storage."""
         summary = self._summarize_rasp_value(value)
         if summary.get("state") == "missing":
             return None
@@ -1223,6 +1420,12 @@ class LogAdapter:
                     fields[name] = self._summarize_rasp_value(item)
             if fields:
                 summary["semantic_fields"] = fields
+        if summary.get("state") == "present":
+            summary["selected_evidence"] = self._project_rasp_attack_evidence(
+                value,
+                source="hook_data",
+                direct_fields=_RASP_HOOK_ATTACK_FIELD_NAMES,
+            )
         summary["raw_evidence_retained"] = summary.get("state") == "present"
         return summary
 
@@ -1290,7 +1493,11 @@ class LogAdapter:
                 if isinstance(item, dict) and (item.get("stacktrace") or item.get("stack_trace"))
             ),
         }
-        protocol = self._safe_rasp_label(envelope.get("protocol"), limit=16)
+        protocol = (
+            self._safe_rasp_label(envelope.get("protocol"), limit=16)
+            if envelope.get(_TRUSTED_TRANSPORT_MARKER) is True
+            else ""
+        )
         if protocol:
             summary["syslog_protocol"] = protocol
             summary["transport_assurance"] = (
@@ -1334,12 +1541,13 @@ class LogAdapter:
         elif isinstance(value, list):
             value_format = "json_array"
 
-        serialized = self._rasp_serialized(value)
+        raw_serialized = self._rasp_serialized(value)
+        redacted_serialized = self._rasp_serialized(self.policy.redact(value))
         summary: dict[str, Any] = {
             "state": "empty" if decoded in ("", {}, []) else "present",
             "format": value_format,
-            "length": len(serialized.encode("utf-8")),
-            "sha256": hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+            "length": len(raw_serialized.encode("utf-8")),
+            "sha256": hashlib.sha256(redacted_serialized.encode("utf-8")).hexdigest(),
         }
         if isinstance(decoded, dict):
             summary["field_count"] = len(decoded)
@@ -1357,6 +1565,198 @@ class LogAdapter:
             summary["indicator_categories"] = indicators
         return summary
 
+    def _project_rasp_attack_evidence(
+        self,
+        value: Any,
+        *,
+        source: str,
+        direct_fields: set[str],
+    ) -> dict[str, Any]:
+        """Return a bounded, redacted projection of rule-relevant RASP values.
+
+        Telemetry is always untrusted. Only allowlisted security fields or values
+        matching deterministic attack indicators are reflected. Sensitive paths
+        are dropped before hashing or projection, while selected values are
+        policy-redacted and byte-bounded before they can enter model evidence.
+        """
+        entries: list[dict[str, Any]] = []
+        nodes_scanned = 0
+        projection_truncated = False
+        decoded = self._decode_rasp_evidence_value(value, allow_form=True)
+
+        configured_sensitive = {
+            self._canonical_rasp_field_name(field)
+            for field in getattr(self.policy.config, "redact_fields", [])
+        }
+        sensitive_fields = _RASP_SENSITIVE_FIELD_MARKERS | configured_sensitive
+
+        def sensitive_field(name: str) -> bool:
+            if name in sensitive_fields:
+                return True
+            parts = set(name.split("_"))
+            return bool(
+                parts
+                & {
+                    "account",
+                    "authorization",
+                    "card",
+                    "cookie",
+                    "credential",
+                    "customer",
+                    "email",
+                    "identity",
+                    "mobile",
+                    "passwd",
+                    "password",
+                    "phone",
+                    "pwd",
+                    "secret",
+                    "session",
+                    "ssn",
+                    "token",
+                }
+            )
+
+        def safe_path(parent: str, field_name: str) -> str:
+            if field_name in direct_fields:
+                return f"{parent}.{field_name}"
+            return f"{parent}.[filtered_field]"
+
+        def walk(node: Any, path: str, depth: int, direct: bool = False) -> None:
+            nonlocal nodes_scanned, projection_truncated
+            if len(entries) >= _RASP_EVIDENCE_MAX_ENTRIES:
+                projection_truncated = True
+                return
+            if depth > _RASP_EVIDENCE_MAX_DEPTH or nodes_scanned >= _RASP_EVIDENCE_MAX_NODES:
+                projection_truncated = True
+                return
+            nodes_scanned += 1
+
+            if isinstance(node, dict):
+                ordered_items = sorted(
+                    node.items(),
+                    key=lambda pair: (
+                        self._canonical_rasp_field_name(pair[0]) not in direct_fields,
+                        str(pair[0]),
+                    ),
+                )
+                for key, item in ordered_items:
+                    name = self._canonical_rasp_field_name(key)
+                    if sensitive_field(name):
+                        continue
+                    field_direct = name in direct_fields
+                    walk(item, safe_path(path, name), depth + 1, field_direct)
+                    if len(entries) >= _RASP_EVIDENCE_MAX_ENTRIES:
+                        projection_truncated = True
+                        break
+                return
+            if isinstance(node, list):
+                for index, item in enumerate(node):
+                    walk(item, f"{path}[{index}]", depth + 1, direct)
+                    if len(entries) >= _RASP_EVIDENCE_MAX_ENTRIES:
+                        projection_truncated = True
+                        break
+                return
+
+            if isinstance(node, str) and not direct:
+                nested = self._decode_rasp_evidence_value(node, allow_form=False)
+                if isinstance(nested, (dict, list)):
+                    walk(nested, f"{path}.decoded", depth + 1)
+                    return
+
+            raw_text = node if isinstance(node, str) else self._rasp_serialized(node)
+            indicators = self._rasp_indicator_categories(raw_text)
+            explicit_indicators = sorted(set(indicators) & _RASP_EXPLICIT_ATTACK_INDICATORS)
+            require_explicit_indicator = source.startswith("request_")
+            if require_explicit_indicator and not direct and not explicit_indicators:
+                return
+            if not require_explicit_indicator and not direct and not explicit_indicators:
+                return
+            projected_text = raw_text
+            context_trimmed = False
+            if not direct:
+                projected_text, context_trimmed = self._rasp_attack_indicator_excerpt(raw_text)
+            redacted_value = self.policy.redact({"selected_value": projected_text}).get("selected_value", "")
+            redacted_text = str(redacted_value)
+            evidence_bytes = redacted_text.encode("utf-8", errors="replace")
+            safe_value, value_truncated = self._truncate_rasp_evidence_text(
+                redacted_text,
+                _RASP_EVIDENCE_MAX_VALUE_BYTES,
+            )
+            entries.append(
+                {
+                    "source": source,
+                    "path": path,
+                    "value": safe_value,
+                    "evidence_bytes": len(evidence_bytes),
+                    "evidence_sha256": hashlib.sha256(evidence_bytes).hexdigest(),
+                    "value_truncated": value_truncated or context_trimmed,
+                    "context_trimmed_to_indicator": context_trimmed,
+                    "sensitive_content_redacted": redacted_text != projected_text,
+                    "indicator_categories": explicit_indicators,
+                    "trust": "untrusted_external_telemetry",
+                }
+            )
+
+        walk(decoded, "$", 0)
+        return {
+            "policy": "rule_relevant_fields_and_attack_indicators_only",
+            "trust": "untrusted_external_telemetry",
+            "entries": entries,
+            "entry_count": len(entries),
+            "truncated": projection_truncated,
+            "limits": {
+                "max_entries": _RASP_EVIDENCE_MAX_ENTRIES,
+                "max_depth": _RASP_EVIDENCE_MAX_DEPTH,
+                "max_nodes": _RASP_EVIDENCE_MAX_NODES,
+                "max_value_bytes": _RASP_EVIDENCE_MAX_VALUE_BYTES,
+            },
+        }
+
+    def _decode_rasp_evidence_value(self, value: Any, *, allow_form: bool) -> Any:
+        if not isinstance(value, str):
+            return value
+        text = value.strip()
+        if not text:
+            return value
+        if len(text) <= _RASP_CONTEXT_MAX_TEXT and text[:1] in {"{", "["}:
+            try:
+                parsed = loads_bounded_json(text)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                parsed = None
+            if isinstance(parsed, (dict, list)):
+                return parsed
+        if allow_form and len(text) <= _RASP_CONTEXT_MAX_TEXT and "=" in text:
+            try:
+                pairs = parse_qsl(
+                    text,
+                    keep_blank_values=True,
+                    strict_parsing=False,
+                    max_num_fields=_RASP_EVIDENCE_MAX_NODES,
+                )
+            except ValueError:
+                return value
+            if pairs:
+                parsed_form: dict[str, Any] = {}
+                for key, item in pairs:
+                    if key in parsed_form:
+                        current = parsed_form[key]
+                        parsed_form[key] = [*current, item] if isinstance(current, list) else [current, item]
+                    else:
+                        parsed_form[key] = item
+                return parsed_form
+        return value
+
+    @staticmethod
+    def _truncate_rasp_evidence_text(value: str, max_bytes: int) -> tuple[str, bool]:
+        encoded = value.encode("utf-8", errors="replace")
+        if len(encoded) <= max_bytes:
+            return value, False
+        marker = "...[TRUNCATED]"
+        available = max(0, max_bytes - len(marker.encode("utf-8")))
+        prefix = encoded[:available].decode("utf-8", errors="ignore")
+        return f"{prefix}{marker}", True
+
     def _rasp_indicator_categories(self, value: Any) -> list[str]:
         found: set[str] = set()
         for text in self._rasp_text_leaves(value):
@@ -1364,6 +1764,21 @@ class LogAdapter:
                 if pattern.search(text):
                     found.add(name)
         return sorted(found)
+
+    @staticmethod
+    def _rasp_attack_indicator_excerpt(value: str) -> tuple[str, bool]:
+        matches = []
+        for name, pattern in _RASP_INDICATORS:
+            if name not in _RASP_EXPLICIT_ATTACK_INDICATORS:
+                continue
+            match = pattern.search(value)
+            if match:
+                matches.append(match)
+        if not matches:
+            return value, False
+        start = min(match.start() for match in matches)
+        end = min(len(value), start + _RASP_EVIDENCE_MAX_VALUE_BYTES * 2)
+        return value[start:end], start > 0 or end < len(value)
 
     def _rasp_text_leaves(self, value: Any, depth: int = 0) -> list[str]:
         if depth > 8:
@@ -1388,7 +1803,8 @@ class LogAdapter:
 
     @staticmethod
     def _canonical_rasp_field_name(value: Any) -> str:
-        return re.sub(r"[^a-z0-9]+", "_", str(value).strip().lower()).strip("_")[:64]
+        text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(value).strip())
+        return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")[:64]
 
     @staticmethod
     def _safe_rasp_label(value: Any, limit: int) -> str:
@@ -1464,24 +1880,129 @@ class LogAdapter:
         symbol = frame.split("(", 1)[0].strip()
         return symbol or frame.strip()
 
-    def _build_adapter_evidence(self, profile: MappingProfile, log: dict[str, Any]) -> list[dict[str, Any]]:
+    def _build_adapter_evidence(
+        self,
+        profile: MappingProfile,
+        log: dict[str, Any],
+        *,
+        product: str,
+    ) -> list[dict[str, Any]]:
         evidence = []
+        product = str(product or "").strip().lower()
+        rasp_compound_transforms = {
+            "hook_data": ("rasp_hook_data_summary", self._summarize_rasp_hook_data),
+            "request_context": ("rasp_request_context", self._summarize_rasp_request_context),
+            "request_parameters": ("rasp_request_parameter_summary", self._summarize_rasp_request_parameters),
+            "rasp_items_context": ("rasp_items_context", self._summarize_rasp_items_context),
+            "rasp_evidence_integrity": ("rasp_evidence_integrity", self._summarize_rasp_evidence_integrity),
+        }
         for idx, item in enumerate(profile.evidence_fields):
             if not isinstance(item, dict):
                 continue
-            value = self._resolve_mapping(item.get("path"), log)
+            item_type = str(item.get("type") or "mapped_field").strip().lower()
+            evidence_mapping = item.get("path")
+            if product == "rasp" and not self._mapping_is_unambiguous_path_only(evidence_mapping):
+                continue
+            value = self._resolve_mapping(evidence_mapping, log)
             if value in ("", None):
                 continue
+            if product == "rasp":
+                compound_transform = rasp_compound_transforms.get(item_type)
+                if compound_transform is None:
+                    if not self._rasp_scalar_evidence_mapping_allowed(item_type, item.get("path")):
+                        # A configurable profile cannot reflect an arbitrary raw
+                        # path merely by labelling it rule/sink/stack evidence.
+                        continue
+                    value = self.policy.redact(value)
+                else:
+                    transform_name, transform = compound_transform
+                    if not self._mapping_uses_only_transform(item.get("path"), transform_name):
+                        # Never trust the external value's shape as proof that it
+                        # was projected. Missing/alternate transforms are rebuilt
+                        # through the system-owned projector unconditionally.
+                        value = transform(value)
+                if value in ("", None):
+                    continue
             evidence.append(
                 {
                     "ref": f"mapping:{profile.profile_id}:{idx}",
                     "source": profile.profile_id,
-                    "type": str(item.get("type") or "mapped_field"),
+                    "type": item_type,
                     "value": value,
                     "why_it_matters": str(item.get("why_it_matters") or item.get("label") or "日志适配配置提取的证据字段。"),
                 }
             )
         return evidence
+
+    def _mapping_uses_only_transform(self, mapping: Any, expected: str) -> bool:
+        if isinstance(mapping, list):
+            return bool(mapping) and all(
+                self._mapping_uses_only_transform(item, expected) for item in mapping
+            )
+        specs = self._mapping_specs(mapping)
+        return len(specs) == 1 and next(iter(specs))[1] == expected
+
+    def _mapping_is_unambiguous_path_only(self, mapping: Any) -> bool:
+        if isinstance(mapping, list):
+            return bool(mapping) and all(
+                self._mapping_is_unambiguous_path_only(item) for item in mapping
+            )
+        return len(self._mapping_specs(mapping)) == 1
+
+    def _filter_mapping_to_reference(self, mapping: Any, reference: Any) -> Any:
+        allowed = self._mapping_specs(reference)
+        if not allowed:
+            return None
+        if isinstance(mapping, list):
+            filtered = [
+                item
+                for item in (
+                    self._filter_mapping_to_reference(candidate, reference)
+                    for candidate in mapping
+                )
+                if item is not None
+            ]
+            return filtered or None
+        specs = self._mapping_specs(mapping)
+        return mapping if specs and specs.issubset(allowed) else None
+
+    def _mapping_specs(self, mapping: Any) -> set[tuple[str, str]]:
+        if isinstance(mapping, list):
+            specs: set[tuple[str, str]] = set()
+            for item in mapping:
+                specs.update(self._mapping_specs(item))
+            return specs
+        if isinstance(mapping, dict) and mapping.get("path"):
+            # Avoid parser differentials: _resolve_mapping gives ``literal``
+            # precedence, so a model-visible path mapping must use a strict and
+            # unambiguous grammar before its path can be allowlisted.
+            if "literal" in mapping or not set(mapping).issubset({"path", "transform"}):
+                return set()
+            return {(str(mapping["path"]), str(mapping.get("transform") or ""))}
+        if isinstance(mapping, str) and (mapping.startswith("$.") or mapping == "$"):
+            return {(mapping, "")}
+        return set()
+
+    def _rasp_scalar_evidence_mapping_allowed(self, item_type: str, mapping: Any) -> bool:
+        if isinstance(mapping, list):
+            return bool(mapping) and all(
+                self._rasp_scalar_evidence_mapping_allowed(item_type, item) for item in mapping
+            )
+        specs = self._mapping_specs(mapping)
+        if len(specs) != 1:
+            return False
+        path, transform = next(iter(specs))
+        if item_type == "sink" and transform == "rasp_sink_from_stacktrace":
+            return path == "$.items[0].stacktrace"
+        if transform:
+            return False
+        allowed_paths = {
+            "action": {"$.rasp.action", "$.items[0].intercept_state"},
+            "rule_id": {"$.rule.id", "$.items[0].rule_id"},
+            "sink": {"$.sink"},
+            "stack_trace": {"$.stacktrace", "$.items[0].stacktrace"},
+        }
+        return path in allowed_paths.get(item_type, set())
 
     def _field_mapping_hints(self, profile: MappingProfile, errors: list[str]) -> dict[str, str]:
         missing = [item.split(":", 1)[1] for item in errors if item.startswith("missing_required_field:")]

@@ -6,6 +6,31 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
+# These payload keys describe server-side ingestion and projection state. They
+# are never authoritative when supplied by an alert sender, even if the sender
+# uses the same field names as the Gateway.
+SERVER_OWNED_ALERT_PAYLOAD_FIELDS = frozenset(
+    {
+        "_syslog_envelope",
+        "adapter",
+        "adapter_evidence",
+        "collector_mapping_fallback",
+        "mapped_entities",
+        "original_log",
+        "rasp_evidence_integrity",
+        "syslog_envelope",
+        "syslog_route",
+    }
+)
+
+
+def strip_server_owned_alert_payload_fields(payload: dict[str, Any]) -> None:
+    """Remove reserved ingestion keys using the same case-insensitive grammar."""
+    for key in list(payload):
+        if str(key).casefold() in SERVER_OWNED_ALERT_PAYLOAD_FIELDS:
+            payload.pop(key, None)
+
+
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:16]}"
 

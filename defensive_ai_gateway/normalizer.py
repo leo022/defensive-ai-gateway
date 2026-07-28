@@ -46,6 +46,59 @@ _COMPOUND_EVIDENCE_FIELDS = {
     "collector_mapping_fallback",
 }
 
+_RASP_ENTITY_KEYS = {"action", "app", "dst_ip", "host", "method", "process", "rule", "src_ip", "url"}
+_RASP_BLOCKED_GENERIC_EVIDENCE = {
+    "command_line",
+    "hook_data",
+    "matched_parameters",
+    "query",
+    "rasp_items_context",
+    "request_context",
+    "request_parameters",
+    "user",
+}
+
+# RASP vendor logs are retained verbatim under ``RawAlert.payload.original_log``
+# for audited forensic review. They must not also become an implicit model input:
+# an arbitrary nested business object can legitimately contain leaf names such as
+# ``url`` or ``rule_id``. Only server-mapped fields and bounded adapter evidence
+# participate in normalization.
+_RASP_ANALYSIS_PAYLOAD_FIELDS = {
+    "action",
+    "adapter",
+    "adapter_evidence",
+    "app",
+    "collector_mapping_fallback",
+    "dst_ip",
+    "event_time",
+    "exception",
+    "host",
+    "mapped_entities",
+    "method",
+    "payload_category",
+    "process",
+    "rasp_action",
+    "rasp_evidence_integrity",
+    "rasp_items_context",
+    "request_context",
+    "request_id",
+    "request_parameters",
+    "route",
+    "rule",
+    "rule_id",
+    "rule_info",
+    "rule_name",
+    "sink",
+    "src_ip",
+    "stack_trace",
+    "stacktrace",
+    "status",
+    "taint_source",
+    "trace_id",
+    "uri",
+    "url",
+}
+
 
 class EventNormalizer:
     def __init__(self, policy: PolicyEngine):
@@ -57,9 +110,16 @@ class EventNormalizer:
             if alert.trusted_sample
             else self._strip_sample_controls(alert.payload)
         )
+        if alert.product.lower() == "rasp":
+            source_payload = self._rasp_analysis_payload(
+                source_payload,
+                trusted_sample=alert.trusted_sample,
+            )
         payload = self.policy.redact(source_payload)
         flat = self._flatten(payload)
-        entities = self._extract_entities(flat)
+        entities = self._extract_entities(payload)
+        if alert.product.lower() == "rasp":
+            entities = {key: value for key, value in entities.items() if key in _RASP_ENTITY_KEYS}
         evidence = self._build_evidence(alert, payload, flat)
         tags = self._sensitivity_tags(alert.payload)
         return NormalizedEvent(
@@ -111,13 +171,36 @@ class EventNormalizer:
             out[prefix] = value
         return out
 
-    def _extract_entities(self, flat: dict[str, Any]) -> dict[str, Any]:
+    def _extract_entities(self, payload: dict[str, Any]) -> dict[str, Any]:
         entities: dict[str, Any] = {}
-        lower_map = {key.lower().split(".")[-1]: value for key, value in flat.items()}
+        sources: list[dict[str, Any]] = []
+        adapter = payload.get("adapter")
+        mapped_entities = payload.get("mapped_entities")
+        if (
+            isinstance(adapter, dict)
+            and adapter.get("mapping_status") in {"passed", "collector_fallback"}
+            and isinstance(mapped_entities, dict)
+        ):
+            sources.append(mapped_entities)
+        sources.append(payload)
+
+        scalar_maps = [
+            {
+                str(key).lower(): value
+                for key, value in source.items()
+                if isinstance(value, (str, int, float, bool)) and value not in ("", None)
+            }
+            for source in sources
+        ]
         for entity, keys in ENTITY_KEYS.items():
-            for key in keys:
-                if key in lower_map and lower_map[key] not in ("", None):
-                    entities[entity] = lower_map[key]
+            found = False
+            for lower_map in scalar_maps:
+                for key in keys:
+                    if key in lower_map:
+                        entities[entity] = lower_map[key]
+                        found = True
+                        break
+                if found:
                     break
         return entities
 
@@ -136,6 +219,7 @@ class EventNormalizer:
             "rule_id",
             "rule_name",
             "rule_info",
+            "feature",
             "signature",
             "process_name",
             "parent_process",
@@ -172,6 +256,15 @@ class EventNormalizer:
             "case_summary",
             "collector_mapping_fallback",
         ]:
+            if key == "collector_mapping_fallback":
+                # Projected separately from authenticated adapter state below;
+                # never reflect an arbitrary inbound fallback object.
+                continue
+            if alert.product.lower() == "rasp" and key in _RASP_BLOCKED_GENERIC_EVIDENCE:
+                # RASP request/hook values may enter evidence only through the
+                # bounded adapter projection. Direct/raw compound values are
+                # intentionally unavailable to this generic normalizer path.
+                continue
             if key in _COMPOUND_EVIDENCE_FIELDS and any(
                 str(item.get("type") or "").lower() == key
                 for item in evidence
@@ -179,7 +272,10 @@ class EventNormalizer:
             ):
                 continue
             for path, value in flat.items():
-                if path.lower().endswith(key) and value:
+                # The public analysis contract uses explicit top-level security
+                # fields. Arbitrary nested objects may contain colliding names
+                # such as business.rule_id or order.url and stay storage-only.
+                if path.lower() == key and value:
                     evidence.append(
                         {
                             "ref": f"{alert.alert_id}:{path}",
@@ -190,28 +286,32 @@ class EventNormalizer:
                         }
                     )
                     break
-        for key, value in flat.items():
-            leaf = key.lower().split(".")[-1]
-            if leaf in {
-                "payload",
-                "body",
-                "authorization",
-                "cookie",
-                "password",
-                "token",
-                "access_token",
-                "refresh_token",
-                "client_secret",
-                "api_key",
-                "x-api-key",
-                "x_api_key",
-            }:
-                continue
-            if len(evidence) >= 18:
-                break
-            if isinstance(value, (str, int, float, bool)) and value not in ("", None):
-                evidence.append({"ref": f"{alert.alert_id}:{key}", "source": alert.product.lower(), "type": leaf, "value": value})
+        # Unknown primitive fields are storage-only by default. Product adapters
+        # and the explicit evidence list above define the model contract; a generic
+        # leaf fallback would let unrelated business fields enter the LLM merely
+        # because they appeared early in an inbound object.
         return evidence[:18]
+
+    @staticmethod
+    def _rasp_analysis_payload(
+        payload: dict[str, Any],
+        *,
+        trusted_sample: bool,
+    ) -> dict[str, Any]:
+        projected = {
+            key: copy.deepcopy(value)
+            for key, value in payload.items()
+            if str(key) in _RASP_ANALYSIS_PAYLOAD_FIELDS
+        }
+        if trusted_sample:
+            for key in (
+                "evidence_assessment",
+                "whitelist_candidate",
+                "tuning_candidate",
+            ):
+                if key in payload:
+                    projected[key] = copy.deepcopy(payload[key])
+        return projected
 
     def _structured_evidence(self, alert: RawAlert, payload: dict[str, Any]) -> list[dict[str, Any]]:
         evidence: list[dict[str, Any]] = []
@@ -272,6 +372,13 @@ class EventNormalizer:
                 }
             )
         adapter_evidence = payload.get("adapter_evidence")
+        adapter = payload.get("adapter")
+        if not (
+            isinstance(adapter, dict)
+            and str(adapter.get("profile_id") or "").strip()
+            and adapter.get("mapping_status") in {"passed", "collector_fallback"}
+        ):
+            adapter_evidence = None
         if isinstance(adapter_evidence, list):
             for idx, item in enumerate(adapter_evidence[:12]):
                 if not isinstance(item, dict):
@@ -288,8 +395,37 @@ class EventNormalizer:
                         "why_it_matters": item.get("why_it_matters") or "日志适配配置提取的证据字段。",
                     }
                 )
+        collector_fallback = payload.get("collector_mapping_fallback")
+        if (
+            isinstance(adapter, dict)
+            and adapter.get("mapping_status") == "collector_fallback"
+            and isinstance(collector_fallback, dict)
+        ):
+            raw_errors = collector_fallback.get("errors")
+            safe_errors = (
+                [str(item)[:256] for item in raw_errors[:8]]
+                if isinstance(raw_errors, list)
+                else []
+            )
+            evidence.append(
+                {
+                    "ref": f"{alert.alert_id}:collector_mapping_fallback",
+                    "source": product,
+                    "type": "collector_mapping_fallback",
+                    "value": {
+                        "status": str(collector_fallback.get("status") or "")[:64],
+                        "profile_id": str(adapter.get("profile_id") or "")[:128],
+                        "errors": safe_errors,
+                    },
+                    "why_it_matters": self._why_key_matters("collector_mapping_fallback"),
+                }
+            )
         for key in ["attack_data", "correlation", "related_events", "timeline", "signals", "rate_window", "baseline", "recent_context"]:
             value = payload.get(key)
+            if product == "rasp" and not alert.trusted_sample:
+                # Generic nested containers have no RASP field-level contract
+                # and could otherwise bypass the selective adapter projection.
+                continue
             if value:
                 evidence.append(
                     {
@@ -307,6 +443,7 @@ class EventNormalizer:
             "rule_id": "检测规则是判断规则有效性和调优边界的核心字段。",
             "rule_name": "规则描述帮助判断命中逻辑是否符合攻击类型。",
             "rule_info": "规则说明可用于对照漏洞或行为特征。",
+            "feature": "产品归一化攻击特征用于区分安全行为类型并关联历史处置。",
             "process_name": "进程名用于分析主机行为和父子进程链。",
             "parent_process": "父进程可验证进程链是否符合正常业务或运维路径。",
             "command_line": "命令行是主机攻击意图和误报边界的重要证据。",

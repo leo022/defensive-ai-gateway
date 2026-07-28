@@ -940,7 +940,7 @@ class AlertProductRoutingTest(unittest.TestCase):
                 with self.subTest(product=product, port=port):
                     raw = (root / "samples_syslog" / product / f"{product}_alert.json").read_bytes()
                     routed = router.route(port, raw, hostname=f"{product}-device-01", appname=product)
-                    alert = state.alert_from_payload(routed.payload, routed.profile_id)
+                    alert = state.alert_from_routed_syslog(routed)
 
                     self.assertEqual(routed.product, product)
                     self.assertEqual(alert.product, product)
@@ -965,7 +965,7 @@ class AlertProductRoutingTest(unittest.TestCase):
                 hostname="waf-device-01",
                 appname="waf",
             )
-            alert = state.alert_from_payload(routed.payload, routed.profile_id)
+            alert = state.alert_from_routed_syslog(routed)
 
             self.assertEqual(routed.product, "waf")
             self.assertEqual(alert.product, "waf")

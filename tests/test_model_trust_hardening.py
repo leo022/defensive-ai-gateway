@@ -266,6 +266,43 @@ class SampleTrustBoundaryTest(unittest.TestCase):
         })
         self.assertEqual(result["classification"], "benign")
 
+    def test_unknown_business_scalars_do_not_enter_any_product_model_evidence(self):
+        normalizer = EventNormalizer(_policy())
+        for product in ("waf", "hips", "ndr", "rasp", "siem"):
+            with self.subTest(product=product):
+                alert = RawAlert(
+                    source="direct",
+                    product=product,
+                    event_type="security_event",
+                    severity="high",
+                    timestamp="2026-07-28T10:00:00Z",
+                    alert_id=f"business-isolation-{product}",
+                    payload={
+                        "rule_id": f"RULE-{product.upper()}",
+                        "src_ip": "192.0.2.10",
+                        "beneficiary_name": "PRIVATE-BENEFICIARY",
+                        "business_note": "PRIVATE-BUSINESS-NOTE",
+                        "nested": {
+                            "settlement_reference": "PRIVATE-SETTLEMENT",
+                            "rule_id": "PRIVATE-NESTED-RULE",
+                            "url": "PRIVATE-NESTED-URL",
+                            "action": "PRIVATE-NESTED-ACTION",
+                            "sink": "PRIVATE-NESTED-SINK",
+                            "host": "PRIVATE-NESTED-HOST",
+                        },
+                    },
+                )
+                event = normalizer.normalize(alert)
+                rendered = json.dumps(
+                    {"entities": event.entities, "evidence": event.evidence},
+                    ensure_ascii=False,
+                )
+                self.assertIn(f"RULE-{product.upper()}", rendered)
+                self.assertNotIn("PRIVATE-BENEFICIARY", rendered)
+                self.assertNotIn("PRIVATE-BUSINESS-NOTE", rendered)
+                self.assertNotIn("PRIVATE-SETTLEMENT", rendered)
+                self.assertNotIn("PRIVATE-NESTED-", rendered)
+
 
 class PolicyBoundaryTest(unittest.TestCase):
     def test_secrets_are_redacted_without_redacting_long_float(self):

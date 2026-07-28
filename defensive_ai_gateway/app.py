@@ -57,7 +57,15 @@ from .memory import (
     MemoryManager,
 )
 from .memory_matcher import MemoryMatcher
-from .models import AgentResult, RawAlert, ValidationResult, new_id, now_ms
+from .models import (
+    SERVER_OWNED_ALERT_PAYLOAD_FIELDS,
+    AgentResult,
+    RawAlert,
+    ValidationResult,
+    new_id,
+    now_ms,
+    strip_server_owned_alert_payload_fields,
+)
 from .network_safety import EndpointPin, pinned_endpoint_handlers, resolve_http_endpoint_pin
 from .normalizer import EventNormalizer
 from .orchestrator import Orchestrator
@@ -75,7 +83,7 @@ from .response_automation import (
 )
 from .skills import SkillRegistry
 from .syslog_receiver import SyslogListenerSpec, SyslogReceiverManager
-from .syslog_router import SyslogPortRouter
+from .syslog_router import RoutedSyslog, SyslogPortRouter
 from .validation import can_continue_after_manual_review
 
 
@@ -511,13 +519,17 @@ def _looks_like_standard_alert(payload: dict) -> bool:
 
 
 def _build_raw_alert(payload: dict, product: str) -> RawAlert:
+    alert_payload = dict(payload.get("payload", payload))
+    # These fields are produced only by the server-side mapping pipeline. A
+    # direct alert must not be able to forge normalized evidence provenance.
+    strip_server_owned_alert_payload_fields(alert_payload)
     alert = RawAlert(
         source=str(payload.get("source", "direct")),
         product=product,
         event_type=str(payload.get("event_type", "unknown")),
         severity=str(payload.get("severity", "medium")),
         timestamp=str(payload.get("timestamp", "")),
-        payload=dict(payload.get("payload", payload)),
+        payload=alert_payload,
         alert_id=str(payload.get("alert_id") or payload.get("id") or ""),
     )
     if not alert.alert_id:
@@ -1158,7 +1170,7 @@ class GatewayState:
                 appname=spec.product,
                 protocol=spec.protocol,
             )
-            alert = self.alert_from_payload(routed.payload, routed.profile_id)
+            alert = self.alert_from_routed_syslog(routed)
         self.submit_alert(alert)
 
     def _storage_stats(self) -> dict:
@@ -1523,7 +1535,7 @@ class GatewayState:
         # context. Preserve it under payload.original_log, but replace only the
         # system-owned projection with the current semantic summary. Custom
         # profile fields/mappings remain untouched.
-        is_legacy_builtin = profile.name == expected.name and profile.version in {"v1", "v2", "v3", "v4", "v5"}
+        is_legacy_builtin = profile.name == expected.name and profile.version in {"v1", "v2", "v3", "v4", "v5", "v6"}
         if is_legacy_builtin:
             hook_mapping = expected.mappings.get("payload.hook_data")
             if hook_mapping is not None and profile.mappings.get("payload.hook_data") != hook_mapping:
@@ -2192,16 +2204,45 @@ class GatewayState:
             raise ValueError(f"sample log not found for product: {product}")
         return json.loads(sample_path.read_text(encoding="utf-8"))
 
-    def alert_from_payload(self, payload: dict, profile_id: str = "") -> RawAlert:
+    def alert_from_routed_syslog(self, routed: RoutedSyslog) -> RawAlert:
+        original_log = None
+        if not routed.profile_id:
+            routed_payload = routed.payload.get("payload")
+            if isinstance(routed_payload, dict):
+                original_log = routed_payload.get("original_log")
+        return self.alert_from_payload(
+            routed.payload,
+            routed.profile_id,
+            trusted_syslog_route=routed.envelope,
+            trusted_original_log=original_log if isinstance(original_log, dict) else None,
+        )
+
+    def alert_from_payload(
+        self,
+        payload: dict,
+        profile_id: str = "",
+        *,
+        trusted_syslog_route: dict | None = None,
+        trusted_original_log: dict | None = None,
+    ) -> RawAlert:
         if not isinstance(payload, dict):
             raise ValueError("alert body must be a JSON object")
         selected_profile = profile_id or str(payload.get("profile_id") or payload.get("_profile_id") or "")
         if selected_profile:
             log = payload.get("log") if isinstance(payload.get("log"), dict) else payload
             profile = self.get_mapping_profile(selected_profile)
-            result = self.log_adapter.adapt(profile, log)
+            result = self.log_adapter.adapt(
+                profile,
+                log,
+                trusted_syslog_envelope=trusted_syslog_route,
+            )
             if not result["ok"]:
-                route = self._collector_profile_route(payload)
+                route = (
+                    dict(trusted_syslog_route)
+                    if isinstance(trusted_syslog_route, dict)
+                    and trusted_syslog_route.get("route_reason") == "port_profile"
+                    else None
+                )
                 if route is not None:
                     return self._collector_mapping_fallback(profile, log, route, result)
                 raise ValueError("log mapping failed: " + ", ".join(result["errors"]))
@@ -2226,7 +2267,15 @@ class GatewayState:
                     "product_mismatch",
                     {"declared_product": product, "fingerprint_product": detected, "alert_id": payload.get("alert_id") or payload.get("id")},
                 )
-            return _build_raw_alert(payload, product)
+            alert = _build_raw_alert(payload, product)
+            if (
+                isinstance(trusted_syslog_route, dict)
+                and trusted_syslog_route.get("route_reason") == "port_standard"
+            ):
+                alert.payload["syslog_route"] = dict(trusted_syslog_route)
+                if isinstance(trusted_original_log, dict):
+                    alert.payload["original_log"] = copy.deepcopy(trusted_original_log)
+            return alert
 
         # 无显式 product 的厂商原生日志：按内容指纹识别 product；若该产品已注册
         # 自动 profile，则套用 profile 做深度字段映射（如 cloudcrasp → auto-rasp-json）。
@@ -2257,20 +2306,45 @@ class GatewayState:
             "或补全顶层 product 字段（hips/rasp/ndr/waf/siem）。"
         )
 
-    @staticmethod
-    def _collector_profile_route(payload: dict) -> dict | None:
-        """Recognize the trusted Vector profiled-envelope shape.
-
-        Direct API submissions keep their strict mapping errors. Only Vector's
-        port-profiled envelopes are allowed to take the durable fallback path,
-        so malformed third-party API input does not silently become an alert.
-        """
+    def validated_http_collector_route(self, payload: dict) -> dict | None:
+        """Validate transport metadata supplied by the authenticated Vector role."""
         route = payload.get("syslog_route")
         if not isinstance(route, dict):
+            alert_payload = payload.get("payload")
+            route = alert_payload.get("syslog_route") if isinstance(alert_payload, dict) else None
+        if not isinstance(route, dict):
             return None
-        if str(route.get("route_reason") or "").strip().lower() != "port_profile":
+        if str(route.get("collector") or "").strip().lower() != "vector":
+            return None
+        route_reason = str(route.get("route_reason") or "").strip().lower()
+        if route_reason not in {"port_profile", "port_standard"}:
+            return None
+        product = str(route.get("product") or "").strip().lower()
+        expected_port = self.config.syslog.product_ports.get(product)
+        try:
+            destination_port = int(route.get("destination_port"))
+        except (TypeError, ValueError):
+            return None
+        if product not in SUPPORTED_PRODUCTS or expected_port != destination_port:
+            return None
+        declared_product = explicit_product(payload)
+        if declared_product and declared_product != product:
             return None
         return dict(route)
+
+    @staticmethod
+    def collector_original_log(payload: dict) -> dict | None:
+        alert_payload = payload.get("payload")
+        if not isinstance(alert_payload, dict):
+            return None
+        original = alert_payload.get("original_log")
+        if isinstance(original, dict):
+            return copy.deepcopy(original)
+        return {
+            key: copy.deepcopy(value)
+            for key, value in alert_payload.items()
+            if str(key).casefold() not in SERVER_OWNED_ALERT_PAYLOAD_FIELDS
+        }
 
     @staticmethod
     def _collector_fallback_product(profile: MappingProfile, route: dict, mapped: dict) -> str:
@@ -4333,7 +4407,26 @@ class GatewayHandler(BaseHTTPRequestHandler):
         try:
             payload = self._read_json()
             profile_id = parse_qs(parsed.query).get("profile", [""])[0]
-            alert = self.state.alert_from_payload(payload, profile_id)
+            trusted_route = (
+                self.state.validated_http_collector_route(payload)
+                if self._authenticated_actor() == "ingest-collector"
+                else None
+            )
+            trusted_original = (
+                self.state.collector_original_log(payload)
+                if isinstance(trusted_route, dict)
+                and trusted_route.get("route_reason") == "port_standard"
+                else None
+            )
+            if trusted_route is None:
+                alert = self.state.alert_from_payload(payload, profile_id)
+            else:
+                alert = self.state.alert_from_payload(
+                    payload,
+                    profile_id,
+                    trusted_syslog_route=trusted_route,
+                    trusted_original_log=trusted_original,
+                )
             if self._is_trusted_demo_sample_request():
                 alert.trusted_sample = True
             result = self.state.submit_alert(alert)

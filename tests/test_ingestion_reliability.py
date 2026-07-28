@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import socket
 import tempfile
 import threading
@@ -983,11 +984,19 @@ class SyslogEnvelopeTest(unittest.TestCase):
             router.route(15140, nodes)
 
     def test_standard_route_preserves_transport_envelope_and_raw_message(self):
-        raw = b'<134>1 2026-07-14T10:00:00Z host waf - - - {"alert_id":"waf-1","severity":"high"}'
+        raw = (
+            b'<134>1 2026-07-14T10:00:00Z host waf - - - '
+            b'{"alert_id":"waf-1","severity":"high",'
+            b'"adapter":{"mapping_status":"passed"},'
+            b'"mapped_entities":{"url":"FORGED-SYSLOG-URL"},'
+            b'"collector_mapping_fallback":{"status":"forged"},'
+            b'"Rasp_Evidence_Integrity":{"value":"CASE-VARIANT-SYSLOG-LEAK"}}'
+        )
         router = SyslogPortRouter({"waf": 15140})
         routed = router.route(15140, raw, hostname="10.0.0.8", appname="waf", protocol="tcp")
 
-        envelope = routed.payload["payload"]["syslog_route"]
+        payload = routed.payload["payload"]
+        envelope = payload["syslog_route"]
         self.assertEqual(envelope["destination_port"], 15140)
         self.assertEqual(envelope["hostname"], "10.0.0.8")
         self.assertEqual(envelope["protocol"], "tcp")
@@ -996,6 +1005,55 @@ class SyslogEnvelopeTest(unittest.TestCase):
         self.assertEqual(envelope["raw_message_bytes"], len(raw))
         self.assertEqual(envelope["raw_message_sha256"], hashlib.sha256(raw).hexdigest())
         self.assertEqual(envelope["message_format"], "embedded_json")
+        self.assertNotIn("adapter", payload)
+        self.assertNotIn("mapped_entities", payload)
+        self.assertNotIn("collector_mapping_fallback", payload)
+        self.assertNotIn("Rasp_Evidence_Integrity", payload)
+        self.assertEqual(
+            payload["original_log"]["mapped_entities"]["url"],
+            "FORGED-SYSLOG-URL",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            config.database.path = str(Path(tmp) / "gateway.db")
+            config.processing.async_enabled = False
+            config.syslog.embedded_listeners_enabled = False
+            state = GatewayState(config)
+            try:
+                alert = state.alert_from_routed_syslog(routed)
+                self.assertEqual(alert.payload["syslog_route"], routed.envelope)
+                self.assertEqual(
+                    alert.payload["original_log"]["mapped_entities"]["url"],
+                    "FORGED-SYSLOG-URL",
+                )
+                rendered = json.dumps(
+                    {
+                        "entities": state.normalizer.normalize(alert).entities,
+                        "evidence": state.normalizer.normalize(alert).evidence,
+                    }
+                )
+                self.assertNotIn("FORGED-SYSLOG-URL", rendered)
+                self.assertNotIn("CASE-VARIANT-SYSLOG-LEAK", rendered)
+
+                vector_payload = json.loads(json.dumps(routed.payload))
+                vector_route = dict(vector_payload["payload"]["syslog_route"])
+                vector_route["collector"] = "vector"
+                vector_payload["payload"]["syslog_route"] = vector_route
+                validated_route = state.validated_http_collector_route(vector_payload)
+                self.assertEqual(validated_route, vector_route)
+                http_alert = state.alert_from_payload(
+                    vector_payload,
+                    trusted_syslog_route=validated_route,
+                    trusted_original_log=state.collector_original_log(vector_payload),
+                )
+                self.assertEqual(http_alert.payload["syslog_route"], vector_route)
+                self.assertEqual(
+                    http_alert.payload["original_log"]["mapped_entities"]["url"],
+                    "FORGED-SYSLOG-URL",
+                )
+            finally:
+                state.stop()
 
     def test_adapter_rejects_excessive_nested_envelope_json(self):
         nested = "{}"
@@ -1048,7 +1106,7 @@ class SyslogEnvelopeTest(unittest.TestCase):
                     protocol="tcp",
                 )
 
-                alert = state.alert_from_payload(routed.payload, routed.profile_id)
+                alert = state.alert_from_routed_syslog(routed)
                 event = state.normalizer.normalize(alert)
 
                 self.assertEqual(alert.product, "rasp")
