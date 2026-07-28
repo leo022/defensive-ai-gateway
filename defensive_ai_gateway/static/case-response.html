@@ -57,6 +57,9 @@
             <span>03</span>
             <h2 id="response-playbook-heading">响应 Playbook</h2>
           </div>
+          <button id="case-response-agent-open" class="case-response-agent-open primary" type="button">
+            唤起调查 Agent
+          </button>
         </div>
         <div id="case-response-playbook" class="case-response-section-body"></div>
       </section>
@@ -89,6 +92,65 @@
         <nav id="case-response-timeline-pagination" class="case-response-pagination" aria-label="Timeline pagination" aria-busy="false"></nav>
       </section>
     </main>
+
+    <div id="response-agent-backdrop" class="response-agent-backdrop" hidden></div>
+    <aside
+      id="response-agent-drawer"
+      class="response-agent-drawer"
+      aria-labelledby="response-agent-title"
+      aria-hidden="true"
+      hidden
+    >
+      <header class="response-agent-header">
+        <div>
+          <span id="response-agent-kicker">Response Agent</span>
+          <h2 id="response-agent-title">深度响应调查</h2>
+        </div>
+        <button id="response-agent-close" class="response-agent-close" type="button" aria-label="关闭" title="关闭">
+          ×
+        </button>
+      </header>
+      <div class="response-agent-body">
+        <div id="response-agent-notice" class="response-agent-notice" role="status" aria-live="polite"></div>
+        <section id="response-agent-start-panel" class="response-agent-start-panel">
+          <label for="response-agent-goal" id="response-agent-goal-label">调查目标</label>
+          <textarea id="response-agent-goal" rows="4"></textarea>
+          <button id="response-agent-start" class="primary" type="button">开始调查</button>
+        </section>
+        <section id="response-agent-session-panel" class="response-agent-session-panel" hidden>
+          <div class="response-agent-session-head">
+            <div>
+              <span id="response-agent-session-label">调查会话</span>
+              <strong id="response-agent-session-id">-</strong>
+            </div>
+            <span id="response-agent-status" class="case-response-state tone-neutral">-</span>
+          </div>
+          <dl id="response-agent-metrics" class="response-agent-metrics"></dl>
+          <section class="response-agent-band" aria-labelledby="response-agent-plan-title">
+            <h3 id="response-agent-plan-title">调查计划</h3>
+            <div id="response-agent-plan"></div>
+          </section>
+          <section class="response-agent-band" aria-labelledby="response-agent-trace-title">
+            <h3 id="response-agent-trace-title">调查轨迹</h3>
+            <div id="response-agent-trace"></div>
+          </section>
+          <form id="response-agent-input-form" class="response-agent-input-form" hidden>
+            <label id="response-agent-input-label" for="response-agent-input">补充信息</label>
+            <textarea id="response-agent-input" rows="3" required></textarea>
+            <button id="response-agent-input-submit" type="submit">提交并继续</button>
+          </form>
+          <section id="response-agent-report-band" class="response-agent-band response-agent-report-band" hidden aria-labelledby="response-agent-report-title">
+            <h3 id="response-agent-report-title">深度调查报告</h3>
+            <div id="response-agent-report"></div>
+          </section>
+        </section>
+      </div>
+      <footer id="response-agent-controls" class="response-agent-controls" hidden>
+        <button id="response-agent-pause" type="button">暂停</button>
+        <button id="response-agent-resume" type="button">继续</button>
+        <button id="response-agent-cancel" class="danger" type="button">取消</button>
+      </footer>
+    </aside>
     <script src="/case-response.js"></script>
   </body>
 </html>

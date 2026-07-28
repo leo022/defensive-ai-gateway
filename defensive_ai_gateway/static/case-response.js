@@ -1,6 +1,13 @@
 const API_TOKEN_KEY = "defensive-ai-api-token";
 const LANGUAGE_KEY = "dashboard-language";
 const TIMELINE_PAGE_SIZE = 20;
+const AGENT_POLL_INTERVAL_MS = 1500;
+const AGENT_ACTIVE_STATUSES = new Set([
+  "queued", "running", "waiting_input", "paused", "synthesizing", "validating",
+]);
+const AGENT_POLL_STATUSES = new Set([
+  "queued", "running", "synthesizing", "validating",
+]);
 
 let caseId = "";
 let artifact = null;
@@ -13,6 +20,13 @@ let timelineRevision = "";
 let latestAbortController = null;
 let timelineAbortController = null;
 let canGenerate = false;
+let agentSession = null;
+let agentSteps = [];
+let agentAfterSequence = 0;
+let agentRequestSequence = 0;
+let agentAbortController = null;
+let agentPollTimer = null;
+let agentDrawerOpen = false;
 
 const COPY = {
   zh: {
@@ -109,6 +123,42 @@ const COPY = {
     previous: "上一页",
     next: "下一页",
     page: (current, total, count) => `第 ${current} / ${total} 页 · 共 ${count} 条`,
+    agentOpen: "唤起调查 Agent",
+    agentTitle: "深度响应调查",
+    closeAgent: "关闭",
+    agentGoal: "调查目标",
+    agentDefaultGoal: "基于当前 Case 的受治理证据，完成深入调查并形成可审计的完整结论。",
+    agentStart: "开始调查",
+    agentStarting: "正在启动…",
+    agentLoading: "正在加载调查会话…",
+    agentNoSession: "当前 Case 尚无调查会话。",
+    agentSession: "调查会话",
+    agentPlan: "调查计划",
+    agentTrace: "调查轨迹",
+    agentReport: "深度调查报告",
+    agentTurns: "轮次",
+    agentTools: "工具调用",
+    agentElapsed: "活动时长",
+    agentSeconds: "秒",
+    agentPause: "暂停",
+    agentResume: "继续",
+    agentCancel: "取消",
+    agentInput: "补充信息",
+    agentInputSubmit: "提交并继续",
+    agentStale: "当前 Case 已出现新证据，本会话和报告基于旧快照。",
+    agentReadOnly: "第一阶段仅执行内部只读调查，不会直接执行生产处置。",
+    agentGate: "报告门禁",
+    agentConclusion: "完整结论",
+    agentFindings: "关键发现",
+    agentImpact: "影响分析",
+    agentGaps: "证据缺口",
+    agentResponsePlan: "响应计划",
+    agentFinalAssessment: "最终判断",
+    agentEmptyFindings: "暂无结构化发现。",
+    agentEmptyGaps: "暂无新增证据缺口。",
+    agentEmptyPlan: "暂无响应步骤。",
+    agentCommandFailed: "Agent 操作失败",
+    agentWaitingInput: "Agent 正在等待分析员补充信息。",
   },
   en: {
     back: "Back to Case",
@@ -204,6 +254,42 @@ const COPY = {
     previous: "Previous",
     next: "Next",
     page: (current, total, count) => `Page ${current} of ${total} · ${count} entries`,
+    agentOpen: "Open investigation agent",
+    agentTitle: "Deep response investigation",
+    closeAgent: "Close",
+    agentGoal: "Investigation goal",
+    agentDefaultGoal: "Investigate the governed Case evidence and produce a complete, auditable conclusion.",
+    agentStart: "Start investigation",
+    agentStarting: "Starting…",
+    agentLoading: "Loading investigation session…",
+    agentNoSession: "This Case has no investigation session.",
+    agentSession: "Investigation session",
+    agentPlan: "Investigation plan",
+    agentTrace: "Investigation trace",
+    agentReport: "Deep investigation report",
+    agentTurns: "Turns",
+    agentTools: "Tool calls",
+    agentElapsed: "Active time",
+    agentSeconds: "sec",
+    agentPause: "Pause",
+    agentResume: "Resume",
+    agentCancel: "Cancel",
+    agentInput: "Additional information",
+    agentInputSubmit: "Submit and continue",
+    agentStale: "New Case evidence exists; this session and report use an older snapshot.",
+    agentReadOnly: "Phase 1 performs internal read-only investigation and never executes a production response directly.",
+    agentGate: "Report gate",
+    agentConclusion: "Conclusion",
+    agentFindings: "Key findings",
+    agentImpact: "Impact",
+    agentGaps: "Evidence gaps",
+    agentResponsePlan: "Response plan",
+    agentFinalAssessment: "Final assessment",
+    agentEmptyFindings: "No structured findings.",
+    agentEmptyGaps: "No additional evidence gaps.",
+    agentEmptyPlan: "No response steps.",
+    agentCommandFailed: "Agent operation failed",
+    agentWaitingInput: "The agent is waiting for analyst input.",
   },
 };
 
@@ -233,6 +319,11 @@ const ENUM_LABELS = {
       read_only: "只读核验",
       approve_required: "审批后执行",
       draft_only: "仅草稿",
+    },
+    claimState: {
+      confirmed: "已确认",
+      inferred: "推断",
+      unverified: "未验证",
     },
     kind: {
       security_event: "安全告警",
@@ -284,6 +375,10 @@ const ENUM_LABELS = {
       under_review: "复核中",
       queued: "已排队",
       running: "执行中",
+      waiting_input: "等待补充",
+      synthesizing: "生成报告中",
+      validating: "报告校验中",
+      budget_exhausted: "预算已耗尽",
       retry_wait: "等待重试",
       waiting_configuration: "等待配置",
       waiting_dispatch: "等待下发",
@@ -326,6 +421,11 @@ const ENUM_LABELS = {
       read_only: "Read-only check",
       approve_required: "Execute after approval",
       draft_only: "Draft only",
+    },
+    claimState: {
+      confirmed: "Confirmed",
+      inferred: "Inferred",
+      unverified: "Unverified",
     },
     kind: {
       security_event: "Security alert",
@@ -377,6 +477,10 @@ const ENUM_LABELS = {
       under_review: "Under review",
       queued: "Queued",
       running: "Running",
+      waiting_input: "Waiting for input",
+      synthesizing: "Synthesizing report",
+      validating: "Validating report",
+      budget_exhausted: "Budget exhausted",
       retry_wait: "Waiting to retry",
       waiting_configuration: "Waiting for configuration",
       waiting_dispatch: "Waiting for dispatch",
@@ -435,6 +539,22 @@ function applyLocalizedStaticText() {
   document.querySelector("#response-playbook-heading").textContent = tr("playbookHeading");
   document.querySelector("#response-communication-heading").textContent = tr("communicationHeading");
   document.querySelector("#response-timeline-heading").textContent = tr("timelineHeading");
+  document.querySelector("#case-response-agent-open").textContent = tr("agentOpen");
+  document.querySelector("#response-agent-title").textContent = tr("agentTitle");
+  document.querySelector("#response-agent-close").setAttribute("aria-label", tr("closeAgent"));
+  document.querySelector("#response-agent-close").title = tr("closeAgent");
+  document.querySelector("#response-agent-goal-label").textContent = tr("agentGoal");
+  document.querySelector("#response-agent-goal").value = tr("agentDefaultGoal");
+  document.querySelector("#response-agent-start").textContent = tr("agentStart");
+  document.querySelector("#response-agent-session-label").textContent = tr("agentSession");
+  document.querySelector("#response-agent-plan-title").textContent = tr("agentPlan");
+  document.querySelector("#response-agent-trace-title").textContent = tr("agentTrace");
+  document.querySelector("#response-agent-report-title").textContent = tr("agentReport");
+  document.querySelector("#response-agent-input-label").textContent = tr("agentInput");
+  document.querySelector("#response-agent-input-submit").textContent = tr("agentInputSubmit");
+  document.querySelector("#response-agent-pause").textContent = tr("agentPause");
+  document.querySelector("#response-agent-resume").textContent = tr("agentResume");
+  document.querySelector("#response-agent-cancel").textContent = tr("agentCancel");
   document.querySelector("#case-response-overview").setAttribute("aria-label", tr("overviewLabel"));
   document.querySelector("#case-response-timeline-pagination").setAttribute(
     "aria-label",
@@ -451,10 +571,12 @@ function stateTone(value) {
   if ([
     "review", "stale", "pending", "queued", "running", "retry_wait", "waiting_configuration",
     "waiting_dispatch", "paused", "shadowed", "under_review", "suspicious", "medium",
-    "rollback_queued", "rollback_running", "rollback_retry", "cancelled",
+    "rollback_queued", "rollback_running", "rollback_retry", "cancelled", "waiting_input",
+    "synthesizing", "validating",
   ].includes(state)) return "tone-warning";
   if ([
     "blocked", "failed", "rejected", "malicious", "critical", "high", "error", "rollback_failed",
+    "budget_exhausted",
   ].includes(state)) return "tone-risk";
   return "tone-neutral";
 }
@@ -1109,6 +1231,318 @@ async function generate() {
   }
 }
 
+function setAgentNotice(message, state = "") {
+  const notice = document.querySelector("#response-agent-notice");
+  notice.textContent = message || "";
+  notice.dataset.state = state;
+}
+
+function agentEvidenceRefs(values) {
+  return (values || []).map((value) => (
+    typeof value === "object" ? value?.ref_id : value
+  )).map(String).filter(Boolean);
+}
+
+function compactAgentRefs(values, limit = 4) {
+  const items = [...new Set(agentEvidenceRefs(values))];
+  if (!items.length) return "";
+  const remaining = Math.max(0, items.length - limit);
+  const label = remaining ? `${tr("evidence")} · +${remaining}` : tr("evidence");
+  return `<div class="case-response-refs"><span>${escapeHtml(label)}</span>${items
+    .slice(0, limit)
+    .map((item) => `<code>${escapeHtml(item)}</code>`)
+    .join("")}</div>`;
+}
+
+function renderAgentPlan() {
+  const target = document.querySelector("#response-agent-plan");
+  const plan = agentSession?.plan || [];
+  target.innerHTML = plan.length ? `<div class="response-agent-plan-list">${plan.map((item, index) => `
+    <div class="response-agent-plan-row">
+      <span class="response-agent-plan-index">${String(index + 1).padStart(2, "0")}</span>
+      <strong>${escapeHtml(item.title || item.id)}</strong>
+      <span class="case-response-state ${stateTone(item.status)}">${escapeHtml(enumLabel("state", item.status))}</span>
+    </div>
+  `).join("")}</div>` : `<p class="case-response-empty">${escapeHtml(tr("empty"))}</p>`;
+}
+
+function renderAgentTrace() {
+  const target = document.querySelector("#response-agent-trace");
+  target.innerHTML = agentSteps.length ? `<div class="response-agent-trace-list">${agentSteps.map((step) => {
+    const detail = step.detail || {};
+    const summary = detail.summary || detail.question || detail.message || "";
+    return `
+      <article class="response-agent-trace-row">
+        <span>${String(Number(step.sequence || 0)).padStart(2, "0")} · ${escapeHtml(fmtTime(step.created_at_ms))}</span>
+        <strong>${escapeHtml(step.title || step.phase)}</strong>
+        ${step.rationale ? `<p>${escapeHtml(step.rationale)}</p>` : ""}
+        ${summary ? `<p>${escapeHtml(summary)}</p>` : ""}
+        ${compactAgentRefs(step.evidence_refs)}
+      </article>
+    `;
+  }).join("")}</div>` : `<p class="case-response-empty">${escapeHtml(tr("empty"))}</p>`;
+}
+
+function reportItems(items, renderItem, emptyText) {
+  if (!Array.isArray(items) || !items.length) {
+    return `<p class="case-response-empty">${escapeHtml(emptyText)}</p>`;
+  }
+  return `<ol class="response-agent-report-list">${items.map(renderItem).join("")}</ol>`;
+}
+
+function renderAgentReport() {
+  const band = document.querySelector("#response-agent-report-band");
+  const target = document.querySelector("#response-agent-report");
+  const report = agentSession?.report;
+  if (!report?.content) {
+    band.hidden = true;
+    target.innerHTML = "";
+    return;
+  }
+  band.hidden = false;
+  const content = report.content;
+  const conclusion = content.conclusion || {};
+  const validation = report.validation || {};
+  target.innerHTML = `
+    <article class="response-agent-report">
+      <section class="response-agent-report-section">
+        <h4>${escapeHtml(content.title || tr("agentReport"))}</h4>
+        <p>${escapeHtml(content.executive_summary || "-")}</p>
+      </section>
+      <section class="response-agent-report-section response-agent-report-conclusion">
+        <h4>${escapeHtml(tr("agentConclusion"))}</h4>
+        <p><strong>${escapeHtml(enumLabel("state", conclusion.classification))} · ${escapeHtml(fmtConfidence(conclusion.confidence))}</strong></p>
+        <p>${escapeHtml(conclusion.statement || "-")}</p>
+      </section>
+      <section class="response-agent-report-section">
+        <h4>${escapeHtml(tr("agentFindings"))}</h4>
+        ${reportItems(content.findings, (item) => `
+          <li>
+            ${escapeHtml(item.statement || "-")}
+            <small>${escapeHtml(enumLabel("claimState", item.claim_state))}</small>
+            ${compactAgentRefs(item.evidence_refs)}
+          </li>
+        `, tr("agentEmptyFindings"))}
+      </section>
+      <section class="response-agent-report-section">
+        <h4>${escapeHtml(tr("agentImpact"))}</h4>
+        <p>${escapeHtml(content.impact || "-")}</p>
+      </section>
+      <section class="response-agent-report-section">
+        <h4>${escapeHtml(tr("agentGaps"))}</h4>
+        ${reportItems(content.evidence_gaps, (item) => `<li>${escapeHtml(item)}</li>`, tr("agentEmptyGaps"))}
+      </section>
+      <section class="response-agent-report-section">
+        <h4>${escapeHtml(tr("agentResponsePlan"))}</h4>
+        ${reportItems(content.response_plan, (item) => `
+          <li>
+            <strong>${escapeHtml(item.action || "-")}</strong>
+            <small>${escapeHtml(enumLabel("mode", item.mode))} · ${escapeHtml(item.stage || "-")}</small>
+            ${item.rationale ? `<small>${escapeHtml(item.rationale)}</small>` : ""}
+            ${compactAgentRefs(item.evidence_refs)}
+          </li>
+        `, tr("agentEmptyPlan"))}
+      </section>
+      <section class="response-agent-report-section">
+        <h4>${escapeHtml(tr("agentFinalAssessment"))}</h4>
+        <p>${escapeHtml(content.final_assessment || "-")}</p>
+      </section>
+      <section class="response-agent-report-section">
+        <h4>${escapeHtml(tr("agentGate"))}</h4>
+        <p><span class="case-response-state ${stateTone(report.validation_status)}">${escapeHtml(enumLabel("state", report.validation_status))}</span></p>
+        ${(validation.warnings || []).length ? `<small>${escapeHtml(validation.warnings.join(" · "))}</small>` : ""}
+      </section>
+    </article>
+  `;
+}
+
+function renderAgentSession() {
+  const startPanel = document.querySelector("#response-agent-start-panel");
+  const sessionPanel = document.querySelector("#response-agent-session-panel");
+  const controls = document.querySelector("#response-agent-controls");
+  const startButton = document.querySelector("#response-agent-start");
+  const goal = document.querySelector("#response-agent-goal");
+  if (!agentSession) {
+    startPanel.hidden = false;
+    sessionPanel.hidden = true;
+    controls.hidden = true;
+    startButton.hidden = !canGenerate;
+    goal.disabled = !canGenerate;
+    renderAgentReport();
+    return;
+  }
+
+  startPanel.hidden = true;
+  sessionPanel.hidden = false;
+  document.querySelector("#response-agent-session-id").textContent = agentSession.session_id || "-";
+  const status = document.querySelector("#response-agent-status");
+  status.textContent = enumLabel("state", agentSession.status);
+  status.className = `case-response-state ${stateTone(agentSession.status)}`;
+  const usage = agentSession.usage || {};
+  const budget = agentSession.budget || {};
+  document.querySelector("#response-agent-metrics").innerHTML = `
+    <div><dt>${escapeHtml(tr("agentTurns"))}</dt><dd>${Number(usage.turns || 0)} / ${Number(budget.max_turns || 0)}</dd></div>
+    <div><dt>${escapeHtml(tr("agentTools"))}</dt><dd>${Number(usage.tool_calls || 0)} / ${Number(budget.max_tool_calls || 0)}</dd></div>
+    <div><dt>${escapeHtml(tr("agentElapsed"))}</dt><dd>${Math.round(Number(usage.active_seconds || 0))} ${escapeHtml(tr("agentSeconds"))}</dd></div>
+  `;
+  renderAgentPlan();
+  renderAgentTrace();
+  renderAgentReport();
+
+  const active = AGENT_ACTIVE_STATUSES.has(agentSession.status);
+  controls.hidden = !canGenerate || !active;
+  document.querySelector("#response-agent-pause").hidden = ![
+    "queued", "running", "synthesizing", "validating",
+  ].includes(agentSession.status);
+  document.querySelector("#response-agent-resume").hidden = agentSession.status !== "paused";
+  document.querySelector("#response-agent-cancel").hidden = !active;
+  document.querySelector("#response-agent-input-form").hidden = !(
+    canGenerate && agentSession.status === "waiting_input"
+  );
+
+  if (agentSession.freshness?.is_stale) {
+    setAgentNotice(tr("agentStale"), "warning");
+  } else if (agentSession.status === "waiting_input") {
+    setAgentNotice(tr("agentWaitingInput"), "warning");
+  } else if (agentSession.last_error) {
+    setAgentNotice(agentSession.last_error, agentSession.status === "failed" ? "error" : "warning");
+  } else if (["completed", "review", "blocked"].includes(agentSession.status)) {
+    setAgentNotice(`${tr("agentGate")}: ${enumLabel("state", agentSession.report?.validation_status || agentSession.status)}`, agentSession.status === "completed" ? "success" : "warning");
+  } else {
+    setAgentNotice(tr("agentReadOnly"));
+  }
+}
+
+function mergeAgentSession(next, replaceSteps = false) {
+  const incoming = Array.isArray(next.steps) ? next.steps : [];
+  if (replaceSteps || !agentSession || agentSession.session_id !== next.session_id) {
+    agentSteps = incoming;
+  } else {
+    const byId = new Map(agentSteps.map((step) => [step.step_id, step]));
+    incoming.forEach((step) => byId.set(step.step_id, step));
+    agentSteps = [...byId.values()].sort((left, right) => Number(left.sequence) - Number(right.sequence));
+  }
+  agentAfterSequence = agentSteps.reduce(
+    (maximum, step) => Math.max(maximum, Number(step.sequence || 0)),
+    0,
+  );
+  agentSession = { ...next, steps: agentSteps };
+  renderAgentSession();
+}
+
+function stopAgentPolling() {
+  if (agentPollTimer) window.clearTimeout(agentPollTimer);
+  agentPollTimer = null;
+}
+
+function scheduleAgentPolling() {
+  stopAgentPolling();
+  if (!agentDrawerOpen || !agentSession || !AGENT_POLL_STATUSES.has(agentSession.status)) return;
+  agentPollTimer = window.setTimeout(() => refreshAgentSession({ incremental: true }), AGENT_POLL_INTERVAL_MS);
+}
+
+async function refreshAgentSession({ incremental = false } = {}) {
+  if (!agentDrawerOpen) return;
+  const requestId = ++agentRequestSequence;
+  agentAbortController?.abort();
+  const controller = new AbortController();
+  agentAbortController = controller;
+  try {
+    let payload;
+    if (incremental && agentSession?.session_id) {
+      payload = await api(`/api/response-agent/sessions/${encodeURIComponent(agentSession.session_id)}?after_sequence=${agentAfterSequence}`, {
+        signal: controller.signal,
+      });
+    } else {
+      payload = await api(`/api/cases/${encodeURIComponent(caseId)}/response-agent/latest`, {
+        signal: controller.signal,
+      });
+    }
+    if (requestId !== agentRequestSequence) return;
+    mergeAgentSession(payload.session, !incremental);
+  } catch (err) {
+    if (err.name === "AbortError" || requestId !== agentRequestSequence) return;
+    if (err.status === 404 && !incremental) {
+      agentSession = null;
+      agentSteps = [];
+      agentAfterSequence = 0;
+      renderAgentSession();
+      setAgentNotice(tr("agentNoSession"));
+    } else {
+      setAgentNotice(`${tr("agentCommandFailed")}: ${err.message}`, "error");
+    }
+  } finally {
+    if (requestId === agentRequestSequence) {
+      agentAbortController = null;
+      scheduleAgentPolling();
+    }
+  }
+}
+
+async function openResponseAgent() {
+  const drawer = document.querySelector("#response-agent-drawer");
+  const backdrop = document.querySelector("#response-agent-backdrop");
+  agentDrawerOpen = true;
+  drawer.hidden = false;
+  backdrop.hidden = false;
+  drawer.setAttribute("aria-hidden", "false");
+  document.body.classList.add("response-agent-open");
+  setAgentNotice(tr("agentLoading"));
+  drawer.querySelector("#response-agent-close").focus();
+  await refreshAgentSession();
+}
+
+function closeResponseAgent() {
+  agentDrawerOpen = false;
+  stopAgentPolling();
+  agentAbortController?.abort();
+  document.querySelector("#response-agent-drawer").hidden = true;
+  document.querySelector("#response-agent-drawer").setAttribute("aria-hidden", "true");
+  document.querySelector("#response-agent-backdrop").hidden = true;
+  document.body.classList.remove("response-agent-open");
+  document.querySelector("#case-response-agent-open").focus();
+}
+
+async function startResponseAgent() {
+  if (!canGenerate) return;
+  const button = document.querySelector("#response-agent-start");
+  button.disabled = true;
+  button.textContent = tr("agentStarting");
+  setAgentNotice(tr("agentStarting"));
+  try {
+    const payload = await api(`/api/cases/${encodeURIComponent(caseId)}/response-agent/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ goal: document.querySelector("#response-agent-goal").value }),
+    });
+    mergeAgentSession(payload.session, true);
+    await loadAll();
+    scheduleAgentPolling();
+  } catch (err) {
+    setAgentNotice(`${tr("agentCommandFailed")}: ${err.message}`, "error");
+  } finally {
+    button.disabled = false;
+    button.textContent = tr("agentStart");
+  }
+}
+
+async function agentCommand(command, body = {}) {
+  if (!canGenerate || !agentSession?.session_id) return;
+  stopAgentPolling();
+  try {
+    const payload = await api(`/api/response-agent/sessions/${encodeURIComponent(agentSession.session_id)}/${command}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    mergeAgentSession(payload.session);
+  } catch (err) {
+    setAgentNotice(`${tr("agentCommandFailed")}: ${err.message}`, "error");
+  } finally {
+    scheduleAgentPolling();
+  }
+}
+
 function initialize() {
   const params = new URLSearchParams(window.location.search);
   caseId = params.get("case_id") || "";
@@ -1127,6 +1561,24 @@ function initialize() {
   document.querySelector("#case-response-refresh").addEventListener("click", () => loadAll());
   document.querySelector("#case-response-generate").addEventListener("click", generate);
   document.querySelector("#case-response-copy-report").addEventListener("click", copyCommunicationReport);
+  document.querySelector("#case-response-agent-open").addEventListener("click", openResponseAgent);
+  document.querySelector("#response-agent-close").addEventListener("click", closeResponseAgent);
+  document.querySelector("#response-agent-backdrop").addEventListener("click", closeResponseAgent);
+  document.querySelector("#response-agent-start").addEventListener("click", startResponseAgent);
+  document.querySelector("#response-agent-pause").addEventListener("click", () => agentCommand("pause"));
+  document.querySelector("#response-agent-resume").addEventListener("click", () => agentCommand("resume"));
+  document.querySelector("#response-agent-cancel").addEventListener("click", () => agentCommand("cancel"));
+  document.querySelector("#response-agent-input-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const input = document.querySelector("#response-agent-input");
+    const message = input.value.trim();
+    if (!message) return;
+    await agentCommand("input", { message });
+    input.value = "";
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && agentDrawerOpen) closeResponseAgent();
+  });
   loadSession()
     .catch(() => {
       canGenerate = false;

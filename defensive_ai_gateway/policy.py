@@ -334,6 +334,17 @@ class PolicyEngine:
             return "{}"
         return json.dumps(fitted, ensure_ascii=False, sort_keys=True)
 
+    def sanitize_json_value(self, value: Any, max_bytes: int) -> Any:
+        """Redact and structurally fit a tool/report value to an exact byte cap."""
+        budget = max(2, int(max_bytes))
+        redacted = self.redact(value)
+        fitted = _fit_json_value(redacted, budget, top_level=isinstance(redacted, dict))
+        if fitted is _OMIT:
+            return {} if isinstance(redacted, dict) else []
+        if _json_size(fitted) > budget:  # pragma: no cover
+            return {} if isinstance(redacted, dict) else []
+        return fitted
+
     def sanitize_context(self, context: dict[str, Any]) -> dict[str, Any]:
         """Redact + bound the size of any payload sent to an LLM.
 

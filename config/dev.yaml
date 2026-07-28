@@ -43,6 +43,12 @@ memory_matching:
   semantic_weight: 0.22
   retrieval_weight: 0.10
   vector_dimensions: 256
+response_agent:
+  enabled: true
+  max_turns: 12
+  max_tool_calls: 20
+  max_wall_seconds: 480
+  tool_result_max_bytes: 32000
 syslog:
   embedded_listeners_enabled: true
   max_frame_bytes: 2000000

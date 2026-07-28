@@ -183,6 +183,17 @@ class SyslogConfig:
 
 
 @dataclass
+class ResponseAgentConfig:
+    """Bounded investigation loop used by the Case response workbench."""
+
+    enabled: bool = True
+    max_turns: int = 12
+    max_tool_calls: int = 20
+    max_wall_seconds: int = 480
+    tool_result_max_bytes: int = 32_000
+
+
+@dataclass
 class GatewayConfig:
     server: ServerConfig = field(default_factory=ServerConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
@@ -193,6 +204,7 @@ class GatewayConfig:
     operations: OperationsConfig = field(default_factory=OperationsConfig)
     memory_matching: MemoryMatchingConfig = field(default_factory=MemoryMatchingConfig)
     syslog: SyslogConfig = field(default_factory=SyslogConfig)
+    response_agent: ResponseAgentConfig = field(default_factory=ResponseAgentConfig)
 
 
 def _parse_scalar(value: str) -> Any:
@@ -258,6 +270,7 @@ def load_config(path: str | None = None) -> GatewayConfig:
     operations = raw.get("operations", {})
     memory_matching = raw.get("memory_matching", {})
     syslog = raw.get("syslog", {})
+    response_agent = raw.get("response_agent", {})
     provider = str(os.getenv("DEFENSIVE_AI_LLM_PROVIDER", llm.get("provider", "local")))
     endpoint_env = os.getenv("DEFENSIVE_AI_LLM_ENDPOINT")
     anthropic_base_url = str(os.getenv("ANTHROPIC_BASE_URL", "")).strip()
@@ -470,6 +483,63 @@ def load_config(path: str | None = None) -> GatewayConfig:
             in {"1", "true", "True", "yes"},
             max_frame_bytes=max(1024, min(int(syslog.get("max_frame_bytes", 1_000_000)), 10_000_000)),
             max_connections=max(1, min(int(syslog.get("max_connections", 64)), 1024)),
+        ),
+        response_agent=ResponseAgentConfig(
+            enabled=str(
+                os.getenv(
+                    "DEFENSIVE_AI_RESPONSE_AGENT_ENABLED",
+                    "1" if response_agent.get("enabled", True) else "0",
+                )
+            )
+            in {"1", "true", "True", "yes"},
+            max_turns=max(
+                6,
+                min(
+                    int(
+                        os.getenv(
+                            "DEFENSIVE_AI_RESPONSE_AGENT_MAX_TURNS",
+                            response_agent.get("max_turns", 12),
+                        )
+                    ),
+                    40,
+                ),
+            ),
+            max_tool_calls=max(
+                5,
+                min(
+                    int(
+                        os.getenv(
+                            "DEFENSIVE_AI_RESPONSE_AGENT_MAX_TOOL_CALLS",
+                            response_agent.get("max_tool_calls", 20),
+                        )
+                    ),
+                    80,
+                ),
+            ),
+            max_wall_seconds=max(
+                30,
+                min(
+                    int(
+                        os.getenv(
+                            "DEFENSIVE_AI_RESPONSE_AGENT_MAX_WALL_SECONDS",
+                            response_agent.get("max_wall_seconds", 480),
+                        )
+                    ),
+                    3600,
+                ),
+            ),
+            tool_result_max_bytes=max(
+                4096,
+                min(
+                    int(
+                        os.getenv(
+                            "DEFENSIVE_AI_RESPONSE_AGENT_TOOL_RESULT_MAX_BYTES",
+                            response_agent.get("tool_result_max_bytes", 32_000),
+                        )
+                    ),
+                    256_000,
+                ),
+            ),
         ),
     )
     return config

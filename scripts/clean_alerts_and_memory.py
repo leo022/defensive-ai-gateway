@@ -29,6 +29,12 @@ ALERT_TABLES = [
     # Alert dispositions are alert-runtime state. They must be removed before
     # cases/raw alerts so a reused demo alert_id cannot inherit an old verdict.
     "alert_dispositions",
+    # Agent sessions own steps, tool calls, reports, and report refs through
+    # cascading foreign keys. They must be removed before their frozen Pack.
+    "response_agent_sessions",
+    "case_response_artifacts",
+    "response_attempts",
+    "response_tasks",
     "case_alert_links",
     "agent_runs",
     "approval_votes",

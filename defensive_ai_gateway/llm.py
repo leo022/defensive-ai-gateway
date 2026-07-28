@@ -337,8 +337,41 @@ def parse_gateway_response(parsed: Any, model: str) -> dict[str, Any]:
     return _validate_result_shape(parsed, model)
 
 
+def parse_structured_gateway_response(parsed: Any) -> dict[str, Any]:
+    """Extract a provider-neutral JSON object without applying alert enums."""
+    if (
+        isinstance(parsed, dict)
+        and parsed.get("type") == "message"
+        and isinstance(parsed.get("content"), list)
+    ):
+        text = _text_from_content(parsed["content"])
+        if not text:
+            raise LLMResponseContractError("Anthropic gateway returned no text content")
+        parsed = _parse_strict_json_object(text)
+    elif isinstance(parsed, dict):
+        text = _openai_response_text(parsed)
+        if text:
+            parsed = _parse_strict_json_object(text)
+        elif isinstance(parsed.get("response"), str):
+            parsed = _parse_strict_json_object(str(parsed["response"]))
+        elif isinstance(parsed.get("result"), dict):
+            parsed = parsed["result"]
+    if not isinstance(parsed, dict):
+        raise LLMResponseContractError("LLM gateway returned a non-object structured result")
+    return dict(parsed)
+
+
 class LLMClient:
     def analyze(self, prompt: str, context: dict[str, Any]) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def generate_structured(
+        self,
+        prompt: str,
+        context: dict[str, Any],
+        schema: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Generate a generic JSON object for bounded controller-owned workflows."""
         raise NotImplementedError
 
     @property
@@ -880,7 +913,37 @@ class GatewayLLM(LLMClient):
         self._circuit.success()
         return result
 
+    def generate_structured(
+        self,
+        prompt: str,
+        context: dict[str, Any],
+        schema: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self._circuit.before_request()
+        try:
+            result = parse_structured_gateway_response(
+                self._request_json(prompt, context)
+            )
+        except AlertNonRetryableError:
+            raise
+        except Exception:
+            self._circuit.failure()
+            raise
+        self._circuit.success()
+        return result
+
     def _analyze(self, prompt: str, context: dict[str, Any]) -> dict[str, Any]:
+        parsed = self._request_json(prompt, context)
+        try:
+            return parse_gateway_response(parsed, self.config.model)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise LLMResponseContractError(
+                f"LLM gateway response does not match the analysis contract: {exc}"
+            ) from exc
+
+    def _request_json(
+        self, prompt: str, context: dict[str, Any]
+    ) -> dict[str, Any]:
         if not self.config.endpoint:
             raise LLMEndpointConfigurationError("LLM endpoint is not configured")
         endpoint_pin = _validate_http_endpoint(
@@ -943,12 +1006,9 @@ class GatewayLLM(LLMClient):
             raise LLMResponseContractError(
                 f"LLM gateway returned invalid JSON response: {body[:200]}"
             ) from exc
-        try:
-            return parse_gateway_response(parsed, self.config.model)
-        except (KeyError, TypeError, ValueError) as exc:
-            raise LLMResponseContractError(
-                f"LLM gateway response does not match the analysis contract: {exc}"
-            ) from exc
+        if not isinstance(parsed, dict):
+            raise LLMResponseContractError("LLM gateway returned non-object JSON")
+        return parsed
 
 
 def _validate_result_shape(parsed: Any, model: str) -> dict[str, Any]:
@@ -1076,6 +1136,27 @@ class OllamaLLM(LLMClient):
         self._circuit.success()
         return result
 
+    def generate_structured(
+        self,
+        prompt: str,
+        context: dict[str, Any],
+        schema: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self._circuit.before_request()
+        try:
+            model = self.config.model or "gemma3:4b"
+            result = self._generate_schema(
+                model,
+                prompt,
+                schema or {"type": "object"},
+                strict=True,
+            )
+        except Exception:
+            self._circuit.failure()
+            raise
+        self._circuit.success()
+        return result
+
     def _analyze(self, prompt: str, context: dict[str, Any]) -> dict[str, Any]:
         model = self.config.model or "gemma3:4b"
         try:
@@ -1106,6 +1187,19 @@ class OllamaLLM(LLMClient):
             raise RuntimeError("Ollama returned invalid JSON response") from exc
 
     def _generate(self, model: str, prompt: str) -> dict[str, Any]:
+        parsed = self._generate_schema(model, prompt, OLLAMA_ANALYSIS_SCHEMA)
+        parsed.setdefault("reason", "Ollama 本地模型完成分析。")
+        parsed.setdefault("model", model)
+        return _validate_result_shape(parsed, model)
+
+    def _generate_schema(
+        self,
+        model: str,
+        prompt: str,
+        schema: dict[str, Any],
+        *,
+        strict: bool = False,
+    ) -> dict[str, Any]:
         endpoint_pin = _validate_http_endpoint(
             self.endpoint,
             backend="Ollama",
@@ -1119,7 +1213,7 @@ class OllamaLLM(LLMClient):
             # 仅靠 format:"json" 时，reasoning 模型（如 deepseek-r1）的 <think> 被
             # 语法约束抑制，容易原样回吐输入字段或产出错误 schema；显式 schema 可
             # 强制字段名与枚举值，显著提升本地小模型的字段遵循率。
-            "format": OLLAMA_ANALYSIS_SCHEMA,
+            "format": schema,
             "options": {
                 # temperature 0 + fixed seed for reproducible harness replay; a
                 # failing sample should fail consistently rather than pass on retry.
@@ -1146,10 +1240,40 @@ class OllamaLLM(LLMClient):
         if not isinstance(data, dict):
             raise RuntimeError("Ollama returned non-object JSON")
         response = str(data.get("response", "")).strip()
-        parsed = _parse_json_object(response)
-        parsed.setdefault("reason", "Ollama 本地模型完成分析。")
-        parsed.setdefault("model", model)
-        return _validate_result_shape(parsed, model)
+        if strict:
+            return _parse_strict_json_object(response)
+        return _parse_json_object(response)
+
+
+def _parse_strict_json_object(text: str) -> dict[str, Any]:
+    """Parse one bounded JSON object without analysis-specific fallback fields."""
+    rendered = re.sub(
+        r"<think>.*?</think>",
+        "",
+        str(text or ""),
+        flags=re.DOTALL,
+    ).strip()
+    if not rendered:
+        raise LLMResponseContractError("LLM returned an empty structured result")
+    try:
+        parsed = loads_bounded_json(rendered)
+    except ValueError as exc:
+        match = re.search(r"\{.*\}", rendered, re.DOTALL)
+        if not match:
+            raise LLMResponseContractError(
+                "LLM returned invalid structured JSON"
+            ) from exc
+        try:
+            parsed = loads_bounded_json(match.group(0))
+        except ValueError as nested_exc:
+            raise LLMResponseContractError(
+                "LLM returned invalid structured JSON"
+            ) from nested_exc
+    if not isinstance(parsed, dict):
+        raise LLMResponseContractError(
+            "LLM returned a non-object structured result"
+        )
+    return parsed
 
 
 def _parse_json_object(text: str) -> dict[str, Any]:

@@ -316,6 +316,94 @@ CREATE TABLE IF NOT EXISTS case_response_artifact_refs (
   PRIMARY KEY (artifact_id, claim_scope, ref_type, ref_id, source_event_id),
   FOREIGN KEY (artifact_id) REFERENCES case_response_artifacts(artifact_id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS response_agent_sessions (
+  session_id TEXT PRIMARY KEY,
+  case_id TEXT NOT NULL,
+  artifact_id TEXT NOT NULL,
+  source_snapshot_hash TEXT NOT NULL,
+  source_json TEXT NOT NULL,
+  goal TEXT NOT NULL,
+  status TEXT NOT NULL,
+  plan_json TEXT NOT NULL DEFAULT '[]',
+  budget_json TEXT NOT NULL DEFAULT '{}',
+  usage_json TEXT NOT NULL DEFAULT '{}',
+  model_metadata_json TEXT NOT NULL DEFAULT '{}',
+  report_id TEXT,
+  last_error TEXT NOT NULL DEFAULT '',
+  created_by TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  claimed_at_ms INTEGER,
+  completed_at_ms INTEGER,
+  FOREIGN KEY (case_id) REFERENCES cases(case_id),
+  FOREIGN KEY (artifact_id) REFERENCES case_response_artifacts(artifact_id),
+  CHECK (status IN (
+    'queued','running','waiting_input','paused','synthesizing','validating',
+    'completed','review','blocked','failed','cancelled','budget_exhausted'
+  ))
+);
+CREATE TABLE IF NOT EXISTS response_agent_steps (
+  step_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  phase TEXT NOT NULL,
+  status TEXT NOT NULL,
+  title TEXT NOT NULL,
+  rationale TEXT NOT NULL DEFAULT '',
+  detail_json TEXT NOT NULL DEFAULT '{}',
+  evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+  created_at_ms INTEGER NOT NULL,
+  completed_at_ms INTEGER,
+  FOREIGN KEY (session_id) REFERENCES response_agent_sessions(session_id) ON DELETE CASCADE,
+  UNIQUE (session_id, sequence)
+);
+CREATE TABLE IF NOT EXISTS response_agent_tool_calls (
+  call_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  step_id TEXT NOT NULL,
+  tool_name TEXT NOT NULL,
+  tool_version TEXT NOT NULL,
+  arguments_json TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  result_json TEXT NOT NULL DEFAULT '{}',
+  result_hash TEXT NOT NULL DEFAULT '',
+  evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+  error TEXT NOT NULL DEFAULT '',
+  created_at_ms INTEGER NOT NULL,
+  completed_at_ms INTEGER,
+  FOREIGN KEY (session_id) REFERENCES response_agent_sessions(session_id) ON DELETE CASCADE,
+  FOREIGN KEY (step_id) REFERENCES response_agent_steps(step_id) ON DELETE CASCADE,
+  CHECK (status IN ('running','completed','failed'))
+);
+CREATE TABLE IF NOT EXISTS response_agent_reports (
+  report_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL UNIQUE,
+  case_id TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  schema_version TEXT NOT NULL,
+  source_snapshot_hash TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  content_json TEXT NOT NULL,
+  validation_status TEXT NOT NULL,
+  validation_json TEXT NOT NULL,
+  model_metadata_json TEXT NOT NULL DEFAULT '{}',
+  created_at_ms INTEGER NOT NULL,
+  FOREIGN KEY (session_id) REFERENCES response_agent_sessions(session_id) ON DELETE CASCADE,
+  FOREIGN KEY (case_id) REFERENCES cases(case_id),
+  UNIQUE (case_id, version),
+  CHECK (validation_status IN ('passed','review','blocked'))
+);
+CREATE TABLE IF NOT EXISTS response_agent_report_refs (
+  report_id TEXT NOT NULL,
+  claim_id TEXT NOT NULL,
+  ref_type TEXT NOT NULL,
+  ref_id TEXT NOT NULL,
+  source_event_id TEXT NOT NULL DEFAULT '',
+  source_hash TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (report_id, claim_id, ref_type, ref_id, source_event_id),
+  FOREIGN KEY (report_id) REFERENCES response_agent_reports(report_id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS alert_dispositions (
   alert_id TEXT PRIMARY KEY,
   case_id TEXT NOT NULL,
@@ -396,6 +484,23 @@ CREATE INDEX IF NOT EXISTS idx_case_response_artifacts_case
   ON case_response_artifacts(case_id, version DESC);
 CREATE INDEX IF NOT EXISTS idx_case_response_refs_ref
   ON case_response_artifact_refs(ref_type, ref_id);
+CREATE INDEX IF NOT EXISTS idx_response_agent_sessions_case
+  ON response_agent_sessions(case_id, created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_response_agent_sessions_claim
+  ON response_agent_sessions(status, created_at_ms ASC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_response_agent_one_active_case
+  ON response_agent_sessions(case_id)
+  WHERE status IN (
+    'queued','running','waiting_input','paused','synthesizing','validating'
+  );
+CREATE INDEX IF NOT EXISTS idx_response_agent_steps_session
+  ON response_agent_steps(session_id, sequence ASC);
+CREATE INDEX IF NOT EXISTS idx_response_agent_tool_calls_session
+  ON response_agent_tool_calls(session_id, created_at_ms ASC);
+CREATE INDEX IF NOT EXISTS idx_response_agent_reports_case
+  ON response_agent_reports(case_id, version DESC);
+CREATE INDEX IF NOT EXISTS idx_response_agent_report_refs_ref
+  ON response_agent_report_refs(ref_type, ref_id);
 CREATE INDEX IF NOT EXISTS idx_alert_dispositions_case ON alert_dispositions(case_id, updated_at_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_inbox_claim ON durable_alert_inbox(status, available_at_ms, created_at_ms);
 CREATE INDEX IF NOT EXISTS idx_inbox_status_created ON durable_alert_inbox(status, created_at_ms);
@@ -436,7 +541,7 @@ BEGIN
 END;
 """
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 _LLM_DEFERRED_ERROR_PREFIX = "analysis_deferred:"
 _LEGACY_LLM_DEFERRED_ERROR_FRAGMENT = "remote LLM analysis deferred"
 _TERMINAL_LLM_ERROR_FRAGMENTS = (
@@ -1142,6 +1247,44 @@ class Repository:
                 )
                 self.conn.execute(
                     "INSERT OR REPLACE INTO schema_version(version, applied_at_ms) VALUES (16, ?)",
+                    (now_ms(),),
+                )
+
+            if current < 17:
+                required_tables = {
+                    "response_agent_sessions",
+                    "response_agent_steps",
+                    "response_agent_tool_calls",
+                    "response_agent_reports",
+                    "response_agent_report_refs",
+                }
+                actual_tables = {
+                    row["name"]
+                    for row in self.conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    ).fetchall()
+                }
+                if not required_tables.issubset(actual_tables):
+                    raise RuntimeError("schema v17 Response Agent tables are incomplete")
+                session_columns = {
+                    row["name"]
+                    for row in self.conn.execute(
+                        "PRAGMA table_info(response_agent_sessions)"
+                    ).fetchall()
+                }
+                if not {
+                    "session_id",
+                    "case_id",
+                    "artifact_id",
+                    "source_snapshot_hash",
+                    "source_json",
+                    "status",
+                    "budget_json",
+                    "usage_json",
+                }.issubset(session_columns):
+                    raise RuntimeError("schema v17 Response Agent session columns are incomplete")
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO schema_version(version, applied_at_ms) VALUES (17, ?)",
                     (now_ms(),),
                 )
 
@@ -3001,6 +3144,8 @@ class Repository:
             "raw_alerts": 0,
             "normalized_events": 0,
             "agent_runs": 0,
+            "response_agent_sessions": 0,
+            "case_response_artifacts": 0,
             "validations": 0,
             "validation_review_resolutions": 0,
             "approvals": 0,
@@ -3206,6 +3351,16 @@ class Repository:
                     (case_id,),
                 )
                 counts["agent_runs"] += cur.rowcount
+                cur = self.conn.execute(
+                    "DELETE FROM response_agent_sessions WHERE case_id = ?",
+                    (case_id,),
+                )
+                counts["response_agent_sessions"] += cur.rowcount
+                cur = self.conn.execute(
+                    "DELETE FROM case_response_artifacts WHERE case_id = ?",
+                    (case_id,),
+                )
+                counts["case_response_artifacts"] += cur.rowcount
                 self.conn.execute(
                     "DELETE FROM alert_dispositions WHERE case_id = ?",
                     (case_id,),
@@ -3473,6 +3628,11 @@ class Repository:
                 self.cancel_pending_approvals(
                     case_id,
                     actor="case-lifecycle",
+                    reason=f"Case transitioned to terminal status: {status}",
+                    _commit=False,
+                )
+                self.cancel_case_response_agents(
+                    case_id,
                     reason=f"Case transitioned to terminal status: {status}",
                     _commit=False,
                 )
@@ -5200,6 +5360,51 @@ class Repository:
         payload["evidence_refs"] = list(refs or [])
         return payload
 
+    @staticmethod
+    def _response_agent_session_row(row: sqlite3.Row) -> dict[str, Any]:
+        payload = dict(row)
+        payload["plan"] = json.loads(payload.pop("plan_json") or "[]")
+        payload["budget"] = json.loads(payload.pop("budget_json") or "{}")
+        payload["usage"] = json.loads(payload.pop("usage_json") or "{}")
+        payload["model_metadata"] = json.loads(
+            payload.pop("model_metadata_json") or "{}"
+        )
+        payload.pop("source_json", None)
+        return payload
+
+    @staticmethod
+    def _response_agent_step_row(row: sqlite3.Row) -> dict[str, Any]:
+        payload = dict(row)
+        payload["detail"] = json.loads(payload.pop("detail_json") or "{}")
+        payload["evidence_refs"] = json.loads(
+            payload.pop("evidence_refs_json") or "[]"
+        )
+        return payload
+
+    @staticmethod
+    def _response_agent_tool_call_row(row: sqlite3.Row) -> dict[str, Any]:
+        payload = dict(row)
+        payload["arguments"] = json.loads(payload.pop("arguments_json") or "{}")
+        payload["result"] = json.loads(payload.pop("result_json") or "{}")
+        payload["evidence_refs"] = json.loads(
+            payload.pop("evidence_refs_json") or "[]"
+        )
+        return payload
+
+    @staticmethod
+    def _response_agent_report_row(
+        row: sqlite3.Row,
+        refs: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        payload = dict(row)
+        payload["content"] = json.loads(payload.pop("content_json") or "{}")
+        payload["validation"] = json.loads(payload.pop("validation_json") or "{}")
+        payload["model_metadata"] = json.loads(
+            payload.pop("model_metadata_json") or "{}"
+        )
+        payload["evidence_refs"] = list(refs or [])
+        return payload
+
     def get_case_response_source(self, case_id: str) -> dict[str, Any] | None:
         """Load the bounded, structured facts used by the Case Response Pack.
 
@@ -5723,6 +5928,577 @@ class Repository:
                 ).fetchall()
             ]
             return self._case_response_artifact_row(row, refs)
+
+    def get_case_response_artifact(
+        self, artifact_id: str
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM case_response_artifacts WHERE artifact_id = ?",
+                (artifact_id,),
+            ).fetchone()
+            if not row:
+                return None
+            refs = [
+                dict(item)
+                for item in self.conn.execute(
+                    """
+                    SELECT claim_scope, ref_type, ref_id, source_event_id, source_hash
+                    FROM case_response_artifact_refs WHERE artifact_id = ?
+                    ORDER BY claim_scope ASC, ref_type ASC, ref_id ASC, source_event_id ASC
+                    """,
+                    (artifact_id,),
+                ).fetchall()
+            ]
+            return self._case_response_artifact_row(row, refs)
+
+    def create_response_agent_session(
+        self, session: dict[str, Any], *, _commit: bool = True
+    ) -> tuple[dict[str, Any], bool]:
+        """Create one bounded investigation session, or return the active one."""
+        with self._lock:
+            active = self.conn.execute(
+                """
+                SELECT * FROM response_agent_sessions
+                WHERE case_id = ? AND status IN (
+                  'queued','running','waiting_input','paused','synthesizing','validating'
+                )
+                ORDER BY created_at_ms DESC LIMIT 1
+                """,
+                (session["case_id"],),
+            ).fetchone()
+            if active:
+                return self._response_agent_session_row(active), False
+            if not self.conn.execute(
+                "SELECT 1 FROM cases WHERE case_id = ?", (session["case_id"],)
+            ).fetchone():
+                raise KeyError("case not found")
+            self.conn.execute(
+                """
+                INSERT INTO response_agent_sessions(
+                  session_id, case_id, artifact_id, source_snapshot_hash, goal,
+                  source_json, status, plan_json, budget_json, usage_json, model_metadata_json,
+                  last_error, created_by, created_at_ms, updated_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, '', ?, ?, ?)
+                """,
+                (
+                    session["session_id"],
+                    session["case_id"],
+                    session["artifact_id"],
+                    session["source_snapshot_hash"],
+                    session["goal"],
+                    json.dumps(
+                        session["source_snapshot"], ensure_ascii=False, sort_keys=True
+                    ),
+                    json.dumps(session.get("plan") or [], ensure_ascii=False, sort_keys=True),
+                    json.dumps(session.get("budget") or {}, ensure_ascii=False, sort_keys=True),
+                    json.dumps(session.get("usage") or {}, ensure_ascii=False, sort_keys=True),
+                    json.dumps(
+                        session.get("model_metadata") or {},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    session["created_by"],
+                    int(session["created_at_ms"]),
+                    int(session["created_at_ms"]),
+                ),
+            )
+            if _commit:
+                self.conn.commit()
+            row = self.conn.execute(
+                "SELECT * FROM response_agent_sessions WHERE session_id = ?",
+                (session["session_id"],),
+            ).fetchone()
+            if not row:  # pragma: no cover
+                raise RuntimeError("Response Agent session was not persisted")
+            return self._response_agent_session_row(row), True
+
+    def recover_response_agent_sessions(self) -> int:
+        """Requeue work interrupted after a process restart."""
+        with self._lock:
+            timestamp = now_ms()
+            cur = self.conn.execute(
+                """
+                UPDATE response_agent_sessions
+                SET status = 'queued', claimed_at_ms = NULL, updated_at_ms = ?,
+                    last_error = 'worker_restarted'
+                WHERE status IN ('running','synthesizing','validating')
+                """,
+                (timestamp,),
+            )
+            self.conn.commit()
+            return int(cur.rowcount)
+
+    def claim_response_agent_session(self) -> dict[str, Any] | None:
+        """Atomically claim the oldest queued session for the single worker."""
+        with self._lock:
+            row = self.conn.execute(
+                """
+                SELECT session_id FROM response_agent_sessions
+                WHERE status = 'queued'
+                ORDER BY created_at_ms ASC, session_id ASC LIMIT 1
+                """
+            ).fetchone()
+            if not row:
+                return None
+            timestamp = now_ms()
+            cur = self.conn.execute(
+                """
+                UPDATE response_agent_sessions
+                SET status = 'running', claimed_at_ms = ?, updated_at_ms = ?,
+                    last_error = ''
+                WHERE session_id = ? AND status = 'queued'
+                """,
+                (timestamp, timestamp, row["session_id"]),
+            )
+            if cur.rowcount != 1:
+                self.conn.rollback()
+                return None
+            self.conn.commit()
+            claimed = self.conn.execute(
+                "SELECT * FROM response_agent_sessions WHERE session_id = ?",
+                (row["session_id"],),
+            ).fetchone()
+            return self._response_agent_session_row(claimed) if claimed else None
+
+    def update_response_agent_session(
+        self,
+        session_id: str,
+        *,
+        expected_statuses: tuple[str, ...] | None = None,
+        status: str | None = None,
+        plan: list[dict[str, Any]] | None = None,
+        usage: dict[str, Any] | None = None,
+        model_metadata: dict[str, Any] | None = None,
+        report_id: str | None = None,
+        last_error: str | None = None,
+        completed: bool = False,
+        _commit: bool = True,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            assignments = ["updated_at_ms = ?"]
+            values: list[Any] = [now_ms()]
+            if status is not None:
+                assignments.append("status = ?")
+                values.append(status)
+            if plan is not None:
+                assignments.append("plan_json = ?")
+                values.append(json.dumps(plan, ensure_ascii=False, sort_keys=True))
+            if usage is not None:
+                assignments.append("usage_json = ?")
+                values.append(json.dumps(usage, ensure_ascii=False, sort_keys=True))
+            if model_metadata is not None:
+                assignments.append("model_metadata_json = ?")
+                values.append(
+                    json.dumps(model_metadata, ensure_ascii=False, sort_keys=True)
+                )
+            if report_id is not None:
+                assignments.append("report_id = ?")
+                values.append(report_id)
+            if last_error is not None:
+                assignments.append("last_error = ?")
+                values.append(str(last_error)[:2000])
+            if completed:
+                assignments.append("completed_at_ms = ?")
+                values.append(now_ms())
+            where = "WHERE session_id = ?"
+            values.append(session_id)
+            if expected_statuses:
+                placeholders = ",".join("?" for _ in expected_statuses)
+                where += f" AND status IN ({placeholders})"
+                values.extend(expected_statuses)
+            cur = self.conn.execute(
+                f"UPDATE response_agent_sessions SET {', '.join(assignments)} "
+                f"{where}",
+                values,
+            )
+            if cur.rowcount != 1:
+                return None
+            if _commit:
+                self.conn.commit()
+            row = self.conn.execute(
+                "SELECT * FROM response_agent_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return self._response_agent_session_row(row) if row else None
+
+    def transition_response_agent_session(
+        self,
+        session_id: str,
+        from_statuses: tuple[str, ...],
+        to_status: str,
+        *,
+        last_error: str = "",
+        _commit: bool = True,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            placeholders = ",".join("?" for _ in from_statuses)
+            timestamp = now_ms()
+            completed_at = (
+                timestamp
+                if to_status in {
+                    "completed",
+                    "review",
+                    "blocked",
+                    "failed",
+                    "cancelled",
+                    "budget_exhausted",
+                }
+                else None
+            )
+            cur = self.conn.execute(
+                f"""
+                UPDATE response_agent_sessions
+                SET status = ?, updated_at_ms = ?, claimed_at_ms = NULL,
+                    completed_at_ms = COALESCE(?, completed_at_ms), last_error = ?
+                WHERE session_id = ? AND status IN ({placeholders})
+                """,
+                (
+                    to_status,
+                    timestamp,
+                    completed_at,
+                    str(last_error)[:2000],
+                    session_id,
+                    *from_statuses,
+                ),
+            )
+            if _commit:
+                self.conn.commit()
+            if cur.rowcount != 1:
+                return None
+            row = self.conn.execute(
+                "SELECT * FROM response_agent_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return self._response_agent_session_row(row) if row else None
+
+    def append_response_agent_step(
+        self, step: dict[str, Any], *, _commit: bool = True
+    ) -> dict[str, Any]:
+        with self._lock:
+            sequence_row = self.conn.execute(
+                """
+                SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence
+                FROM response_agent_steps WHERE session_id = ?
+                """,
+                (step["session_id"],),
+            ).fetchone()
+            sequence = int(sequence_row["next_sequence"])
+            self.conn.execute(
+                """
+                INSERT INTO response_agent_steps(
+                  step_id, session_id, sequence, phase, status, title, rationale,
+                  detail_json, evidence_refs_json, created_at_ms, completed_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    step["step_id"],
+                    step["session_id"],
+                    sequence,
+                    step["phase"],
+                    step.get("status") or "completed",
+                    str(step.get("title") or "")[:500],
+                    str(step.get("rationale") or "")[:4000],
+                    json.dumps(step.get("detail") or {}, ensure_ascii=False, sort_keys=True),
+                    json.dumps(
+                        step.get("evidence_refs") or [],
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    int(step.get("created_at_ms") or now_ms()),
+                    int(step.get("completed_at_ms") or now_ms()),
+                ),
+            )
+            if _commit:
+                self.conn.commit()
+            row = self.conn.execute(
+                "SELECT * FROM response_agent_steps WHERE step_id = ?",
+                (step["step_id"],),
+            ).fetchone()
+            if not row:  # pragma: no cover
+                raise RuntimeError("Response Agent step was not persisted")
+            return self._response_agent_step_row(row)
+
+    def start_response_agent_tool_call(
+        self, call: dict[str, Any], *, _commit: bool = True
+    ) -> tuple[dict[str, Any], bool]:
+        with self._lock:
+            existing = self.conn.execute(
+                "SELECT * FROM response_agent_tool_calls WHERE idempotency_key = ?",
+                (call["idempotency_key"],),
+            ).fetchone()
+            if existing:
+                return self._response_agent_tool_call_row(existing), False
+            self.conn.execute(
+                """
+                INSERT INTO response_agent_tool_calls(
+                  call_id, session_id, step_id, tool_name, tool_version,
+                  arguments_json, status, idempotency_key, created_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?)
+                """,
+                (
+                    call["call_id"],
+                    call["session_id"],
+                    call["step_id"],
+                    call["tool_name"],
+                    call.get("tool_version") or "1",
+                    json.dumps(
+                        call.get("arguments") or {}, ensure_ascii=False, sort_keys=True
+                    ),
+                    call["idempotency_key"],
+                    int(call.get("created_at_ms") or now_ms()),
+                ),
+            )
+            if _commit:
+                self.conn.commit()
+            row = self.conn.execute(
+                "SELECT * FROM response_agent_tool_calls WHERE call_id = ?",
+                (call["call_id"],),
+            ).fetchone()
+            if not row:  # pragma: no cover
+                raise RuntimeError("Response Agent tool call was not persisted")
+            return self._response_agent_tool_call_row(row), True
+
+    def finish_response_agent_tool_call(
+        self,
+        call_id: str,
+        *,
+        result: dict[str, Any],
+        result_hash: str,
+        evidence_refs: list[dict[str, Any]],
+        error: str = "",
+        _commit: bool = True,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            status = "failed" if error else "completed"
+            self.conn.execute(
+                """
+                UPDATE response_agent_tool_calls
+                SET status = ?, result_json = ?, result_hash = ?,
+                    evidence_refs_json = ?, error = ?, completed_at_ms = ?
+                WHERE call_id = ?
+                """,
+                (
+                    status,
+                    json.dumps(result, ensure_ascii=False, sort_keys=True),
+                    result_hash,
+                    json.dumps(evidence_refs, ensure_ascii=False, sort_keys=True),
+                    str(error)[:2000],
+                    now_ms(),
+                    call_id,
+                ),
+            )
+            if _commit:
+                self.conn.commit()
+            row = self.conn.execute(
+                "SELECT * FROM response_agent_tool_calls WHERE call_id = ?",
+                (call_id,),
+            ).fetchone()
+            return self._response_agent_tool_call_row(row) if row else None
+
+    def insert_response_agent_report(
+        self,
+        report: dict[str, Any],
+        refs: list[dict[str, Any]],
+        *,
+        _commit: bool = True,
+    ) -> dict[str, Any]:
+        with self._lock:
+            existing = self.conn.execute(
+                "SELECT * FROM response_agent_reports WHERE session_id = ?",
+                (report["session_id"],),
+            ).fetchone()
+            if existing:
+                existing_refs = [
+                    dict(row)
+                    for row in self.conn.execute(
+                        """
+                        SELECT claim_id, ref_type, ref_id, source_event_id, source_hash
+                        FROM response_agent_report_refs WHERE report_id = ?
+                        ORDER BY claim_id, ref_type, ref_id, source_event_id
+                        """,
+                        (existing["report_id"],),
+                    ).fetchall()
+                ]
+                return self._response_agent_report_row(existing, existing_refs)
+            version_row = self.conn.execute(
+                """
+                SELECT COALESCE(MAX(version), 0) + 1 AS next_version
+                FROM response_agent_reports WHERE case_id = ?
+                """,
+                (report["case_id"],),
+            ).fetchone()
+            version = int(version_row["next_version"])
+            self.conn.execute(
+                """
+                INSERT INTO response_agent_reports(
+                  report_id, session_id, case_id, version, schema_version,
+                  source_snapshot_hash, content_hash, content_json,
+                  validation_status, validation_json, model_metadata_json,
+                  created_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    report["report_id"],
+                    report["session_id"],
+                    report["case_id"],
+                    version,
+                    report["schema_version"],
+                    report["source_snapshot_hash"],
+                    report["content_hash"],
+                    json.dumps(report["content"], ensure_ascii=False, sort_keys=True),
+                    report["validation_status"],
+                    json.dumps(
+                        report["validation"], ensure_ascii=False, sort_keys=True
+                    ),
+                    json.dumps(
+                        report.get("model_metadata") or {},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    int(report["created_at_ms"]),
+                ),
+            )
+            for ref in refs:
+                self.conn.execute(
+                    """
+                    INSERT OR IGNORE INTO response_agent_report_refs(
+                      report_id, claim_id, ref_type, ref_id,
+                      source_event_id, source_hash
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        report["report_id"],
+                        str(ref.get("claim_id") or "report")[:128],
+                        str(ref.get("ref_type") or "evidence")[:64],
+                        str(ref.get("ref_id") or "")[:512],
+                        str(ref.get("source_event_id") or "")[:256],
+                        str(ref.get("source_hash") or "")[:128],
+                    ),
+                )
+            if _commit:
+                self.conn.commit()
+            row = self.conn.execute(
+                "SELECT * FROM response_agent_reports WHERE report_id = ?",
+                (report["report_id"],),
+            ).fetchone()
+            saved_refs = [
+                dict(item)
+                for item in self.conn.execute(
+                    """
+                    SELECT claim_id, ref_type, ref_id, source_event_id, source_hash
+                    FROM response_agent_report_refs WHERE report_id = ?
+                    ORDER BY claim_id, ref_type, ref_id, source_event_id
+                    """,
+                    (report["report_id"],),
+                ).fetchall()
+            ]
+            if not row:  # pragma: no cover
+                raise RuntimeError("Response Agent report was not persisted")
+            return self._response_agent_report_row(row, saved_refs)
+
+    def get_response_agent_session(
+        self, session_id: str, *, after_sequence: int = 0
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM response_agent_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if not row:
+                return None
+            payload = self._response_agent_session_row(row)
+            payload["steps"] = [
+                self._response_agent_step_row(item)
+                for item in self.conn.execute(
+                    """
+                    SELECT * FROM response_agent_steps
+                    WHERE session_id = ? AND sequence > ?
+                    ORDER BY sequence ASC
+                    """,
+                    (session_id, max(0, int(after_sequence))),
+                ).fetchall()
+            ]
+            payload["tool_calls"] = [
+                self._response_agent_tool_call_row(item)
+                for item in self.conn.execute(
+                    """
+                    SELECT * FROM response_agent_tool_calls
+                    WHERE session_id = ?
+                    ORDER BY created_at_ms ASC, call_id ASC
+                    """,
+                    (session_id,),
+                ).fetchall()
+            ]
+            payload["report"] = None
+            if payload.get("report_id"):
+                report_row = self.conn.execute(
+                    "SELECT * FROM response_agent_reports WHERE report_id = ?",
+                    (payload["report_id"],),
+                ).fetchone()
+                if report_row:
+                    refs = [
+                        dict(item)
+                        for item in self.conn.execute(
+                            """
+                            SELECT claim_id, ref_type, ref_id, source_event_id, source_hash
+                            FROM response_agent_report_refs WHERE report_id = ?
+                            ORDER BY claim_id, ref_type, ref_id, source_event_id
+                            """,
+                            (payload["report_id"],),
+                        ).fetchall()
+                    ]
+                    payload["report"] = self._response_agent_report_row(
+                        report_row, refs
+                    )
+            return payload
+
+    def get_latest_response_agent_session(
+        self, case_id: str
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.conn.execute(
+                """
+                SELECT session_id FROM response_agent_sessions
+                WHERE case_id = ?
+                ORDER BY created_at_ms DESC, session_id DESC LIMIT 1
+                """,
+                (case_id,),
+            ).fetchone()
+            if not row:
+                return None
+            return self.get_response_agent_session(str(row["session_id"]))
+
+    def get_response_agent_source(
+        self, session_id: str
+    ) -> dict[str, Any] | None:
+        """Return the immutable normalized source snapshot for worker use only."""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT source_json FROM response_agent_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return json.loads(row["source_json"]) if row else None
+
+    def cancel_case_response_agents(
+        self, case_id: str, *, reason: str, _commit: bool = True
+    ) -> int:
+        with self._lock:
+            timestamp = now_ms()
+            cur = self.conn.execute(
+                """
+                UPDATE response_agent_sessions
+                SET status = 'cancelled', updated_at_ms = ?, completed_at_ms = ?,
+                    claimed_at_ms = NULL, last_error = ?
+                WHERE case_id = ? AND status IN (
+                  'queued','running','waiting_input','paused','synthesizing','validating'
+                )
+                """,
+                (timestamp, timestamp, str(reason)[:2000], case_id),
+            )
+            if _commit:
+                self.conn.commit()
+            return int(cur.rowcount)
 
     def stats(self) -> dict[str, Any]:
         with self._lock:

@@ -81,6 +81,7 @@ from .response_automation import (
     RESPONSE_TASK_STATUSES,
     ResponseAutomationService,
 )
+from .response_agent import ResponseInvestigationAgent
 from .skills import SkillRegistry
 from .syslog_receiver import SyslogListenerSpec, SyslogReceiverManager
 from .syslog_router import RoutedSyslog, SyslogPortRouter
@@ -691,6 +692,12 @@ class GatewayState:
         self.memory = MemoryManager(self.repo, self.policy)
         self.skills = SkillRegistry()
         self.llm = build_llm(config.llm)
+        self.response_agent = ResponseInvestigationAgent(
+            self.repo,
+            self.policy,
+            self.llm,
+            config.response_agent,
+        )
         self.log_adapter = LogAdapter(self.normalizer)
         self._seed_mapping_profiles()
         self.orchestrator = Orchestrator(
@@ -752,6 +759,7 @@ class GatewayState:
         )
         self._maintenance_thread.start()
         self.response_automation.start()
+        self.response_agent.start()
 
     def _restore_runtime_settings(self) -> None:
         saved_llm = self.repo.get_runtime_setting("llm")
@@ -1153,6 +1161,7 @@ class GatewayState:
             self.alert_processor.stop()
 
     def stop(self) -> None:
+        self.response_agent.stop()
         self.response_automation.stop()
         self.syslog_receiver.stop()
         self._maintenance_stop.set()
@@ -1350,10 +1359,12 @@ class GatewayState:
                 and all(bool(listener.get("active")) for listener in listeners)
             )
         )
+        response_agent = self.response_agent.health()
         checks = {
             "database": database,
             "processor": {"ok": processor_ok},
             "dispatcher": {"ok": dispatcher_ok},
+            "response_agent": response_agent,
             "maintenance": {
                 "ok": maintenance_ok,
                 "last_success_age_ms": maintenance_age_ms,
@@ -1626,6 +1637,7 @@ class GatewayState:
             )
             self.config.llm = updated
             self.llm = build_llm(updated)
+            self.response_agent.set_llm(self.llm)
             self.orchestrator = Orchestrator(
                 self.repo,
                 self.normalizer,
@@ -1924,6 +1936,7 @@ class GatewayState:
             )
             self.config.llm = loaded.llm
             self.llm = build_llm(loaded.llm)
+            self.response_agent.set_llm(self.llm)
             self.orchestrator = Orchestrator(
                 self.repo,
                 self.normalizer,
@@ -3831,6 +3844,50 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if (
+            parsed.path.startswith("/api/cases/")
+            and parsed.path.endswith("/response-agent/latest")
+        ):
+            if not self._require_roles(
+                _ROLE_READ, _ROLE_ANALYST, _ROLE_APPROVER, _ROLE_RESPONDER
+            ):
+                return
+            parts = parsed.path.split("/")
+            if len(parts) != 6 or parts[4] != "response-agent":
+                self._json(404, {"error": "Response Agent endpoint not found"})
+                return
+            case_id = unquote(parts[3])
+            try:
+                session = self.state.response_agent.latest(case_id)
+            except KeyError:
+                self._json(404, {"error": "case not found"})
+                return
+            if not session:
+                self._json(404, {"error": "Response Agent session not found"})
+                return
+            self._json(200, {"session": session})
+            return
+        if parsed.path.startswith("/api/response-agent/sessions/"):
+            if not self._require_roles(
+                _ROLE_READ, _ROLE_ANALYST, _ROLE_APPROVER, _ROLE_RESPONDER
+            ):
+                return
+            parts = parsed.path.split("/")
+            if len(parts) != 5:
+                self._json(404, {"error": "Response Agent endpoint not found"})
+                return
+            query = parse_qs(parsed.query)
+            session = self.state.response_agent.get(
+                unquote(parts[4]),
+                after_sequence=_query_int(
+                    query, "after_sequence", 0, min_value=0
+                ),
+            )
+            if not session:
+                self._json(404, {"error": "Response Agent session not found"})
+                return
+            self._json(200, {"session": session})
+            return
         if parsed.path.startswith("/api/cases/") and parsed.path.endswith("/response-pack/latest"):
             if not self._require_roles(
                 _ROLE_READ, _ROLE_ANALYST, _ROLE_APPROVER, _ROLE_RESPONDER
@@ -3978,6 +4035,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             authorized = self._require_roles(_ROLE_ANALYST, _ROLE_CONFIG)
         elif parsed.path.startswith("/api/memory/"):
             authorized = self._require_roles(_ROLE_MEMORY)
+        elif parsed.path.startswith("/api/response-agent/"):
+            authorized = self._require_roles(_ROLE_ANALYST)
         elif (
             parsed.path.startswith("/api/cases/")
             and "/alert-clusters/" in parsed.path
@@ -4204,6 +4263,80 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 self._json(413, {"error": "request body too large"})
             except KeyError:
                 self._json(404, {"error": "case not found"})
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                self._client_error(exc)
+            except Exception as exc:
+                self._server_error(exc)
+            return
+        if (
+            parsed.path.startswith("/api/cases/")
+            and parsed.path.endswith("/response-agent/start")
+        ):
+            parts = parsed.path.split("/")
+            if len(parts) != 6 or parts[4] != "response-agent":
+                self._json(404, {"error": "Response Agent endpoint not found"})
+                return
+            case_id = unquote(parts[3])
+            try:
+                body = self._governance_body(self._read_json())
+                artifact = self.state.case_response.latest(case_id)
+                if not artifact or (artifact.get("freshness") or {}).get("is_stale"):
+                    artifact = self.state.case_response.generate(
+                        case_id,
+                        actor=str(body.get("_actor") or "soc-analyst"),
+                    )["artifact"]
+                session = self.state.response_agent.create(
+                    case_id,
+                    artifact=artifact,
+                    goal=str(body.get("goal") or ""),
+                    actor=str(body.get("_actor") or "soc-analyst"),
+                )
+                self._json(202, {"session": session})
+            except _PayloadTooLarge:
+                self._json(413, {"error": "request body too large"})
+            except KeyError:
+                self._json(404, {"error": "case not found"})
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                self._client_error(exc)
+            except Exception as exc:
+                self._server_error(exc)
+            return
+        if parsed.path.startswith("/api/response-agent/sessions/"):
+            parts = parsed.path.split("/")
+            if len(parts) != 6:
+                self._json(404, {"error": "Response Agent endpoint not found"})
+                return
+            session_id = unquote(parts[4])
+            command = unquote(parts[5])
+            try:
+                body = self._governance_body(self._read_json())
+                actor = str(body.get("_actor") or "soc-analyst")
+                if command == "pause":
+                    session = self.state.response_agent.pause(
+                        session_id, actor=actor
+                    )
+                elif command == "resume":
+                    session = self.state.response_agent.resume(
+                        session_id, actor=actor
+                    )
+                elif command == "cancel":
+                    session = self.state.response_agent.cancel(
+                        session_id, actor=actor
+                    )
+                elif command == "input":
+                    session = self.state.response_agent.provide_input(
+                        session_id,
+                        message=str(body.get("message") or ""),
+                        actor=actor,
+                    )
+                else:
+                    self._json(
+                        404, {"error": "Response Agent command not found"}
+                    )
+                    return
+                self._json(200, {"session": session})
+            except _PayloadTooLarge:
+                self._json(413, {"error": "request body too large"})
             except (ValueError, TypeError, json.JSONDecodeError) as exc:
                 self._client_error(exc)
             except Exception as exc:

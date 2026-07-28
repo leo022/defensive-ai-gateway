@@ -243,6 +243,7 @@ defensive_ai_gateway/
   skills.py           版本化 Skill 清单与权限边界
   validation.py       确定性证据/策略 Validator
   response.py         生成审批请求与结构化处置建议的 Response Advisor
+  response_agent.py   Case 级持久化 ReAct 调查、只读工具、深度报告与门禁
   response_automation.py 审批后处置任务、连接器调用、核验与回滚
   llm.py              默认本地 LLM 适配器与企业网关接口
   policy.py           沙箱策略、脱敏、工具权限控制
@@ -263,6 +264,7 @@ docs/
   OFFLINE_MIGRATION.md 离线迁移步骤
   HARNESS.md          回放评测说明
   PHASE2_DEFENSE_AGENT.md 第二阶段 Agent、验证与审批设计
+  RESPONSE_AGENT.md   Response Agent 总体方案、第一阶段实现与后续路线
   AUTOMATED_RESPONSE.md 审批后自动化处置的控制、协议与运维说明
   MEMORY.md           多层记忆管理与治理
   SYSLOG_INGESTION.md syslog collector 接入说明
@@ -276,5 +278,6 @@ docs/
 - 高影响动作只生成 `approve_required` 建议。
 - 只有 Validator `passed` 的建议可以进入审批队列；仅明确的来源 IP 临时封禁可在策略开启、审批达标和连接器健康时进入受控执行，其他高影响建议仍保持只读。
 - 自动化处置默认关闭，支持影子、手工和自动模式；连接器凭据只从环境变量读取，规则必须经设备核验并在 TTL 到期、Case 关闭或误报确认后回滚。完整契约见 `docs/AUTOMATED_RESPONSE.md`。
+- Response Agent 第一阶段仅调用 Case 内部只读工具，冻结证据快照并输出带引用的深度报告；完整架构与迭代路线见 `docs/RESPONSE_AGENT.md`。
 - 生产模板要求两个不同的服务端认证主体投票；本地 Demo 保持单签。
 - Demo 样本真值只在回环请求带 `X-Defensive-AI-Demo-Sample: 1` 时生效，普通告警不能用请求体自证结论。
