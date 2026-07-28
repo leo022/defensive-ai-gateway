@@ -138,6 +138,25 @@ class _EarlyFinishAgentLLM:
         }
 
 
+class _DuplicateToolAgentLLM:
+    is_deterministic = False
+    runtime_metadata = {
+        "provider": "test",
+        "model": "duplicate-tool-agent-model",
+        "endpoint_host": "",
+    }
+
+    def generate_structured(self, prompt, context, schema=None):  # noqa: ANN001
+        if prompt.startswith("Write a complete"):
+            return {}
+        return {
+            "action": "tool_call",
+            "tool_name": "query_case_snapshot",
+            "arguments": {},
+            "rationale": "Repeat the same completed baseline query.",
+        }
+
+
 class _ScopeAttackAgentLLM:
     is_deterministic = False
     runtime_metadata = {
@@ -556,6 +575,49 @@ class ResponseAgentTest(unittest.TestCase):
         )
         self.assertIn("raw_evidence_read_incomplete", raw_validation["errors"])
         self.assertFalse(raw_validation["checks"]["raw_evidence_complete"])
+
+    def test_duplicate_tool_loop_advances_required_evidence_before_synthesis(self):
+        self.state.response_agent.set_llm(_DuplicateToolAgentLLM())
+        case_id = self._case("response-agent-duplicate-loop")
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        started = self.state.response_agent.create(
+            case_id,
+            artifact=artifact,
+            goal="Break a duplicate tool loop without losing evidence coverage",
+            actor="analyst",
+        )
+
+        session = self._wait(
+            self.state.response_agent,
+            started["session_id"],
+            {"completed", "review", "blocked", "failed", "paused"},
+        )
+
+        self.assertEqual(
+            session["status"],
+            "completed",
+            session.get("report", {}).get("validation"),
+        )
+        self.assertEqual(
+            [item["tool_name"] for item in session["tool_calls"]],
+            [*MANDATORY_TOOLS, "read_raw_alert_chunk"],
+        )
+        guard_steps = [
+            step
+            for step in session["steps"]
+            if (step.get("detail") or {}).get("completion_guard")
+        ]
+        self.assertEqual(len(guard_steps), len(CONTROLLER_TOOLS) - 1)
+        self.assertTrue(
+            session["report"]["validation"]["checks"][
+                "mandatory_tools_completed"
+            ]
+        )
+        self.assertTrue(
+            session["report"]["validation"]["checks"]["raw_evidence_complete"]
+        )
 
     def test_mismatched_case_scope_pauses_after_bounded_retries(self):
         self.state.response_agent.set_llm(_ScopeAttackAgentLLM())

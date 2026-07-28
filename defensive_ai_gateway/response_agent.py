@@ -849,22 +849,60 @@ class ResponseInvestigationAgent:
                     call["evidence_refs"],
                 )
                 if duplicate_count >= 2:
-                    synthesizing = self.repo.update_response_agent_session(
-                        session_id,
-                        expected_statuses=("running",),
-                        status="synthesizing",
-                        plan=self._mark_plan_report(plan, "running"),
-                        usage=usage,
-                    )
-                    if not synthesizing:
+                    required = self._completion_guard_decision(calls)
+                    if not required:
+                        synthesizing = self.repo.update_response_agent_session(
+                            session_id,
+                            expected_statuses=("running",),
+                            status="synthesizing",
+                            plan=self._mark_plan_report(plan, "running"),
+                            usage=usage,
+                        )
+                        if not synthesizing:
+                            return
+                        self._synthesize_report(
+                            synthesizing,
+                            source,
+                            artifact,
+                        )
                         return
-                    self._synthesize_report(
-                        synthesizing,
-                        source,
-                        artifact,
+                    duplicate_count = 0
+                    tool_name = required["tool_name"]
+                    arguments = required.get("arguments") or {}
+                    step = self._append_step(
+                        session_id,
+                        "tool_decision",
+                        f"完成门禁补齐只读工具：{tool_name}",
+                        required["rationale"],
+                        {
+                            "tool_name": tool_name,
+                            "arguments": arguments,
+                            "completion_guard": True,
+                        },
+                        [],
                     )
-                    return
-                continue
+                    idempotency_key = _canonical_hash(
+                        {
+                            "session_id": session_id,
+                            "tool_name": tool_name,
+                            "arguments": arguments,
+                        }
+                    )
+                    call, created = self.repo.start_response_agent_tool_call(
+                        {
+                            "call_id": new_id("response_agent_call"),
+                            "session_id": session_id,
+                            "step_id": step["step_id"],
+                            "tool_name": tool_name,
+                            "tool_version": TOOL_VERSION,
+                            "arguments": arguments,
+                            "idempotency_key": idempotency_key,
+                        }
+                    )
+                    if not created and call["status"] == "completed":
+                        continue
+                else:
+                    continue
 
             try:
                 result, refs = self._execute_tool(
@@ -927,6 +965,7 @@ class ResponseInvestigationAgent:
                 result_hash=_canonical_hash(result),
                 evidence_refs=refs,
             )
+            duplicate_count = 0
             usage["tool_calls"] = int(usage.get("tool_calls") or 0) + 1
             plan = self._mark_tool_complete(plan, tool_name)
             self._append_step(
