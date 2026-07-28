@@ -236,8 +236,12 @@ class CaseResponseServiceTest(unittest.TestCase):
         self.assertIn("fine_grained_candidate", script)
         self.assertIn('roles.includes("analyst")', script)
         self.assertIn("communicationList(draft.known_facts", script)
-        self.assertIn('fact.claim_type === "analysis_finding"', script)
-        self.assertIn("${refs(summary.headline_evidence_refs)}", script)
+        self.assertIn("factPresentation(fact)", script)
+        self.assertIn("dimension || tr(\"eventRecord\")", script)
+        self.assertNotIn("AI 研判结论", script)
+        self.assertIn("case-response-overview-evidence", script)
+        self.assertIn("const evidenceBlock = refs(summary.headline_evidence_refs)", script)
+        self.assertNotIn("${refs(summary.headline_evidence_refs)}", script)
         self.assertNotIn("${refs(fact.evidence_refs)}", script)
         self.assertNotIn("${refs(step.evidence_refs)}", script)
         self.assertNotIn("${refs(value.evidence_refs)}", script)
@@ -287,6 +291,11 @@ class CaseResponseServiceTest(unittest.TestCase):
             css,
             r"(?s)\.case-response-summary-pending\s*\{[^}]*"
             r"padding-left: 18px;[^}]*border-left:",
+        )
+        self.assertRegex(
+            css,
+            r"(?s)\.case-response-overview-evidence\s*\{[^}]*"
+            r"grid-column: 1 / -1;[^}]*padding-top: 9px;",
         )
         self.assertIn("response-pack-link", app_script)
         self.assertNotIn("direct_communication_delivery: true", script)

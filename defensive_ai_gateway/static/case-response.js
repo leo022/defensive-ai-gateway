@@ -99,7 +99,6 @@ const COPY = {
     noExceptions: "暂无执行异常。",
     noUnknowns: "暂无新增待确认事项。",
     noApprovals: "暂无待审批事项。",
-    analysisFinding: "AI 研判结论",
     eventRecord: "事件记录",
     decisionItem: (value) => `审批单 ${value} 待处理`,
     occurred: "发生时间",
@@ -195,7 +194,6 @@ const COPY = {
     noExceptions: "No execution exception has been recorded.",
     noUnknowns: "No additional open question has been recorded.",
     noApprovals: "No approval is pending.",
-    analysisFinding: "AI analysis finding",
     eventRecord: "Event record",
     decisionItem: (value) => `Approval ${value} is pending`,
     occurred: "Occurred",
@@ -535,6 +533,24 @@ function refs(values) {
   return `<div class="case-response-refs"><span>${escapeHtml(tr("evidence"))}</span>${items.map((item) => `<code>${escapeHtml(item)}</code>`).join("")}</div>`;
 }
 
+function factPresentation(fact) {
+  const dimension = String(fact?.dimension || "").trim();
+  let text = String(fact?.text || "").trim();
+  if (dimension) {
+    for (const separator of ["：", ":"]) {
+      const prefix = `${dimension}${separator}`;
+      if (text.startsWith(prefix)) {
+        text = text.slice(prefix.length).trim();
+        break;
+      }
+    }
+  }
+  return {
+    label: dimension || tr("eventRecord"),
+    text,
+  };
+}
+
 function list(items, renderItem, empty = tr("empty")) {
   if (!Array.isArray(items) || !items.length) {
     return `<p class="case-response-empty">${escapeHtml(empty)}</p>`;
@@ -552,6 +568,7 @@ function renderOverview() {
   const summary = pack.case_summary || {};
   const stale = Boolean(artifact.freshness?.is_stale);
   const validationStatus = String(artifact.validation_status || "-");
+  const evidenceBlock = refs(summary.headline_evidence_refs);
   container.innerHTML = `
     <div class="case-response-overview-main">
       <strong>${escapeHtml(summary.headline || caseId)}</strong>
@@ -566,6 +583,7 @@ function renderOverview() {
       <div><dt>${escapeHtml(tr("confidence"))}</dt><dd>${escapeHtml(fmtConfidence(summary.confidence))}</dd></div>
       <div><dt>${escapeHtml(tr("asOf"))}</dt><dd>${escapeHtml(fmtTime(summary.as_of_ms))}</dd></div>
     </dl>
+    ${evidenceBlock ? `<div class="case-response-overview-evidence">${evidenceBlock}</div>` : ""}
   `;
 }
 
@@ -576,21 +594,24 @@ function renderSummary() {
     container.innerHTML = `<p class="case-response-empty">${escapeHtml(tr("notGenerated"))}</p>`;
     return;
   }
-  const factBlock = list(summary.key_facts, (fact, index) => `
-    <article class="case-response-fact">
-      <div class="case-response-fact-title">
-        <span>${String(index + 1).padStart(2, "0")}</span>
-        <div>
-          <strong>${escapeHtml(fact.text)}</strong>
-          <small>
-            ${escapeHtml(fact.claim_type === "analysis_finding" ? tr("analysisFinding") : tr("eventRecord"))}
-            ${fact.status ? ` · ${escapeHtml(enumLabel("state", fact.status))}` : ""}
-          </small>
+  const factBlock = list(summary.key_facts, (fact, index) => {
+    const presentation = factPresentation(fact);
+    return `
+      <article class="case-response-fact">
+        <div class="case-response-fact-title">
+          <span>${String(index + 1).padStart(2, "0")}</span>
+          <div>
+            <small>
+              ${escapeHtml(presentation.label)}
+              ${fact.status ? ` · ${escapeHtml(enumLabel("state", fact.status))}` : ""}
+            </small>
+            <strong>${escapeHtml(presentation.text)}</strong>
+          </div>
         </div>
-      </div>
-      <span>${escapeHtml(fmtTime(fact.occurred_at_ms))} · ${escapeHtml(timeBasisLabel(fact.time_basis))}</span>
-    </article>
-  `, tr("noKnownFacts"));
+        <span>${escapeHtml(fmtTime(fact.occurred_at_ms))} · ${escapeHtml(timeBasisLabel(fact.time_basis))}</span>
+      </article>
+    `;
+  }, tr("noKnownFacts"));
   const gaps = list(summary.uncertainties, (item, index) => `<div class="case-response-line"><strong>${index + 1}.</strong> ${escapeHtml(item)}</div>`, tr("noUnknowns"));
   const decisions = list(summary.pending_decisions, (item, index) => `<div class="case-response-line"><strong>${index + 1}.</strong> ${escapeHtml(tr("decisionItem", item))}</div>`, tr("noApprovals"));
   container.innerHTML = `
@@ -599,7 +620,6 @@ function renderSummary() {
       <div class="case-response-summary-panel case-response-summary-uncertainties"><span>${escapeHtml(tr("uncertainties"))}</span>${gaps}</div>
       <div class="case-response-summary-panel case-response-summary-pending"><span>${escapeHtml(tr("pending"))}</span>${decisions}</div>
     </div>
-    ${refs(summary.headline_evidence_refs)}
   `;
 }
 
