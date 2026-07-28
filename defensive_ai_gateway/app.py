@@ -2475,7 +2475,7 @@ class GatewayState:
                 "gates": gates,
                 "reasons": reasons,
                 "events": self.repo.list_memory_events(memory_id=memory_id, limit=200),
-                "matches": self.repo.list_memory_matches(memory_id=memory_id, limit=200),
+                "association_count": self.repo.count_memory_matches(memory_id=memory_id),
             }
             return detail
 
@@ -2514,22 +2514,43 @@ class GatewayState:
                 "pagination": _pagination_payload(total, options["limit"], options["offset"]),
             }
 
+    @staticmethod
+    def _memory_match_options(filters: dict) -> dict:
+        try:
+            limit = int(filters.get("limit", 100))
+        except (TypeError, ValueError):
+            limit = 100
+        try:
+            offset = int(filters.get("offset", 0))
+        except (TypeError, ValueError):
+            offset = 0
+        decision = str(filters.get("decision") or "").strip()
+        if len(decision) > 100:
+            raise ValueError("memory match decision is too long")
+        return {
+            "memory_id": str(filters.get("memory_id") or "").strip() or None,
+            "event_id": str(filters.get("event_id") or "").strip() or None,
+            "case_id": str(filters.get("case_id") or "").strip() or None,
+            "decision": decision or None,
+            "limit": max(1, min(limit, 500)),
+            "offset": max(0, offset),
+        }
+
     def list_memory_matches(self, filters: dict) -> list[dict]:
         with self.lock:
-            try:
-                limit = int(filters.get("limit", 100))
-            except (TypeError, ValueError):
-                limit = 100
-            decision = str(filters.get("decision") or "").strip()
-            if len(decision) > 100:
-                raise ValueError("memory match decision is too long")
-            return self.repo.list_memory_matches(
-                memory_id=str(filters.get("memory_id") or "").strip() or None,
-                event_id=str(filters.get("event_id") or "").strip() or None,
-                case_id=str(filters.get("case_id") or "").strip() or None,
-                decision=decision or None,
-                limit=max(1, min(limit, 500)),
-            )
+            return self.repo.list_memory_matches(**self._memory_match_options(filters))
+
+    def list_memory_matches_page(self, filters: dict) -> dict:
+        with self.lock:
+            options = self._memory_match_options(filters)
+            count_options = {
+                key: value for key, value in options.items() if key not in {"limit", "offset"}
+            }
+            total = self.repo.count_memory_matches(**count_options)
+            return {
+                "matches": self.repo.list_memory_matches(**options),
+                "pagination": _pagination_payload(total, options["limit"], options["offset"]),
+            }
 
     def promote_memory(self, memory_id: str, body: dict) -> dict:
         with self.lock:
@@ -3753,7 +3774,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 return
             query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
             try:
-                self._json(200, {"matches": self.state.list_memory_matches(query)})
+                self._json(200, self.state.list_memory_matches_page(query))
             except ValueError as exc:
                 self._client_error(exc)
             return

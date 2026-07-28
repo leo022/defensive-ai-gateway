@@ -66,6 +66,7 @@ const STRINGS = {
     workspaceTitleHistory: "告警处理记录",
     workspaceTitleTriage: "研判与处置",
     workspaceTitleMemory: "记忆治理工作台",
+    workspaceTitleMemoryAssociations: "关联告警清单",
     workspaceTitleAdapter: "日志接入",
     workspaceTitleAutomation: "自动化处置",
     workspaceTitleSettings: "运行配置",
@@ -286,6 +287,12 @@ const STRINGS = {
     memoryAssociations: "关联告警",
     memoryAssociationsHint: "由统一 matcher 保存的候选评分与最终影响。",
     memoryAssociationsEmpty: "尚无后续告警与该记忆产生有效候选关联。",
+    memoryAssociationsOpen: "查看清单",
+    memoryAssociationsBack: "返回治理详情",
+    memoryAssociationsBreadcrumb: "记忆治理 / 关联告警",
+    memoryAssociationsPageTitle: "关联告警清单",
+    memoryAssociationsRecordCount: "关联记录",
+    memoryAssociationsRecords: "匹配记录",
     memoryMatchOverall: "综合分",
     memoryMatchStructured: "结构化",
     memoryMatchSemantic: "语义向量",
@@ -645,6 +652,7 @@ const STRINGS = {
     workspaceTitleHistory: "Disposition History",
     workspaceTitleTriage: "Triage and Disposition",
     workspaceTitleMemory: "Memory Governance",
+    workspaceTitleMemoryAssociations: "Associated Alerts",
     workspaceTitleAdapter: "Log Intake",
     workspaceTitleAutomation: "Automated Response",
     workspaceTitleSettings: "Runtime Configuration",
@@ -865,6 +873,12 @@ const STRINGS = {
     memoryAssociations: "Associated Alerts",
     memoryAssociationsHint: "Candidate scores and final effects persisted by the unified matcher.",
     memoryAssociationsEmpty: "No subsequent alert has produced an eligible association with this memory.",
+    memoryAssociationsOpen: "View alerts",
+    memoryAssociationsBack: "Back to governance detail",
+    memoryAssociationsBreadcrumb: "Memory Governance / Associated Alerts",
+    memoryAssociationsPageTitle: "Associated Alert Records",
+    memoryAssociationsRecordCount: "associated records",
+    memoryAssociationsRecords: "Match records",
     memoryMatchOverall: "Overall",
     memoryMatchStructured: "Structured",
     memoryMatchSemantic: "Semantic vector",
@@ -1202,6 +1216,9 @@ let memoryItems = [];
 let memoryAuditEvents = [];
 let memoryPagination = { page: 1, size: 20, total: 0, totalPages: 1 };
 let memoryAuditPagination = { page: 1, size: 20, total: 0, totalPages: 1 };
+let memoryAssociationPagination = { page: 1, size: 20, total: 0, totalPages: 1 };
+let memoryAssociationItems = [];
+let memoryAssociationMemoryId = "";
 let responseTasks = [];
 let responseConnectors = [];
 let responsePolicy = {};
@@ -1210,6 +1227,7 @@ let responseTaskPagination = { page: 1, size: 20, total: 0, totalPages: 1 };
 let selectedMemoryId = "";
 let selectedMemoryDetail = null;
 let memorySelectionRequestId = 0;
+let memoryAssociationRequestId = 0;
 let queueCases = [];
 const casePagination = {
   pending: { page: 1, size: 20, total: 0, totalPages: 1 },
@@ -1451,6 +1469,7 @@ function paginationState(key) {
   if (key === "cases-history") return casePagination.history;
   if (key === "memory-inventory") return memoryPagination;
   if (key === "memory-audit") return memoryAuditPagination;
+  if (key === "memory-associations") return memoryAssociationPagination;
   if (key === "automation-tasks") return responseTaskPagination;
   return null;
 }
@@ -1483,6 +1502,7 @@ function reloadPagination(key) {
   if (key === "cases-history") return loadCases({ quiet: true, section: "history" });
   if (key === "memory-inventory") return loadMemoryInventory({ quiet: true });
   if (key === "memory-audit") return loadMemoryAudit({ quiet: true });
+  if (key === "memory-associations") return loadMemoryAssociations({ quiet: true });
   if (key === "automation-tasks") return loadResponseTasks({ quiet: true });
   return Promise.resolve();
 }
@@ -1585,6 +1605,7 @@ function applyLanguage() {
   renderMemoryList();
   renderMemoryAudit(memoryAuditEvents, "#memory-audit-list");
   if (selectedMemoryDetail) renderMemoryDetail(selectedMemoryDetail);
+  if (memoryAssociationMemoryId) renderMemoryAssociationPage();
   updateRefreshModeUi();
   if (queueCases.length || document.querySelector("#cases-list, #processed-cases-list")) {
     renderActiveDashboardList();
@@ -1986,6 +2007,7 @@ function updateWorkspaceTitle(name) {
     dashboard: activeDashboardSection === "history" ? "workspaceTitleHistory" : "workspaceTitleDashboard",
     triage: "workspaceTitleTriage",
     memory: "workspaceTitleMemory",
+    "memory-associations": "workspaceTitleMemoryAssociations",
     adapter: "workspaceTitleAdapter",
     automation: "workspaceTitleAutomation",
     settings: "workspaceTitleSettings",
@@ -3499,19 +3521,20 @@ function memoryScorePercent(value) {
 }
 
 function renderMemoryAssociations(matches) {
-  if (!matches.length) {
+  const items = Array.isArray(matches) ? matches : [];
+  if (!items.length) {
     return `<p class="empty-state">${escapeHtml(tr("memoryAssociationsEmpty"))}</p>`;
   }
   return `
     <div class="memory-association-list">
-      ${matches.slice(0, 50).map((match) => `
+      ${items.map((match) => `
         <article class="memory-association-row">
           <div class="memory-association-heading">
             <span>
               <strong>${escapeHtml(match.alert_id)}</strong>
               <code>${escapeHtml(match.case_id)} · ${escapeHtml(match.event_id)}</code>
             </span>
-            <span class="memory-match-decision ${escapeHtml(match.decision.replaceAll("_", "-"))}">
+            <span class="memory-match-decision ${escapeHtml(text(match.decision || match.final_effect || "ignored").replaceAll("_", "-"))}">
               ${escapeHtml(memoryMatchDecisionLabel(match.decision, match.final_effect))}
             </span>
           </div>
@@ -3530,6 +3553,31 @@ function renderMemoryAssociations(matches) {
       `).join("")}
     </div>
   `;
+}
+
+function memoryAssociationContext() {
+  const memory = selectedMemoryDetail?.memory_id === memoryAssociationMemoryId
+    ? selectedMemoryDetail
+    : memoryItems.find((item) => item.memory_id === memoryAssociationMemoryId);
+  const summary = memory ? memoryContentSummary(memory) : "";
+  return [summary, memoryAssociationMemoryId].filter(Boolean).join(" · ") || "-";
+}
+
+function renderMemoryAssociationPage() {
+  const container = document.querySelector("#memory-associations-page-list");
+  const context = document.querySelector("#memory-associations-page-context");
+  const count = document.querySelector("#memory-associations-page-count");
+  if (container) container.innerHTML = renderMemoryAssociations(memoryAssociationItems);
+  if (context) {
+    context.textContent = memoryAssociationContext();
+    context.title = memoryAssociationContext();
+  }
+  if (count) count.textContent = String(memoryAssociationPagination.total);
+  renderPagination(
+    "#memory-associations-page-pagination",
+    memoryAssociationPagination,
+    "memory-associations",
+  );
 }
 
 function renderMemoryDetail(memory) {
@@ -3570,10 +3618,17 @@ function renderMemoryDetail(memory) {
       </section>
     ` : ""}
     ${governance.actionable ? `
-      <section class="memory-associations">
-        <h4>${escapeHtml(tr("memoryAssociations"))}</h4>
-        <p>${escapeHtml(tr("memoryAssociationsHint"))}</p>
-        ${renderMemoryAssociations(governance.matches || [])}
+      <section class="memory-association-entry">
+        <div class="memory-association-entry-copy">
+          <div class="memory-association-entry-title">
+            <h4>${escapeHtml(tr("memoryAssociations"))}</h4>
+            <span>${escapeHtml(String(Number(governance.association_count || 0)))}</span>
+          </div>
+          <p>${escapeHtml(tr("memoryAssociationsHint"))}</p>
+        </div>
+        <button type="button" data-memory-associations-id="${escapeHtml(memory.memory_id)}">
+          ${escapeHtml(tr("memoryAssociationsOpen"))}
+        </button>
       </section>
     ` : ""}
     <section class="memory-content-section">
@@ -3618,6 +3673,11 @@ function renderMemoryDetail(memory) {
   `;
   container.querySelectorAll("[data-memory-action]").forEach((button) => {
     button.addEventListener("click", () => governMemory(button.dataset.memoryAction, button));
+  });
+  container.querySelector("[data-memory-associations-id]")?.addEventListener("click", (event) => {
+    openMemoryAssociations(event.currentTarget.dataset.memoryAssociationsId).catch((err) =>
+      showToast(tr("refreshFailed", { message: err.message || String(err) }), "error"),
+    );
   });
   renderMemoryAudit(governance.events || [], "#memory-detail-audit-list", false);
 }
@@ -3683,6 +3743,67 @@ async function selectMemory(memoryId) {
     if (requestId !== memorySelectionRequestId || memoryId !== selectedMemoryId) return;
     if (container) container.innerHTML = `<p class="empty-state">${escapeHtml(err.message || String(err))}</p>`;
   }
+}
+
+async function loadMemoryAssociations(options = {}) {
+  const memoryId = memoryAssociationMemoryId;
+  const container = document.querySelector("#memory-associations-page-list");
+  const status = document.querySelector("#memory-associations-page-status");
+  if (!memoryId) return;
+  const requestId = ++memoryAssociationRequestId;
+  if (status) {
+    status.textContent = "";
+    status.classList.remove("error");
+  }
+  if (container && !options.quiet) {
+    container.innerHTML = `<p class="empty-state">${escapeHtml(tr("memoryLoading"))}</p>`;
+  }
+  const params = new URLSearchParams({
+    memory_id: memoryId,
+    limit: String(memoryAssociationPagination.size),
+    offset: String((memoryAssociationPagination.page - 1) * memoryAssociationPagination.size),
+  });
+  try {
+    const page = await json(`/api/memory/matches?${params}`);
+    if (requestId !== memoryAssociationRequestId || memoryId !== memoryAssociationMemoryId) return;
+    applyPaginationPayload(memoryAssociationPagination, page.pagination);
+    if (memoryAssociationPagination.page > memoryAssociationPagination.totalPages) {
+      memoryAssociationPagination.page = memoryAssociationPagination.totalPages;
+      return loadMemoryAssociations(options);
+    }
+    memoryAssociationItems = page.matches || [];
+    renderMemoryAssociationPage();
+  } catch (err) {
+    if (requestId !== memoryAssociationRequestId || memoryId !== memoryAssociationMemoryId) return;
+    const message = err.message || String(err);
+    if (container) container.innerHTML = `<p class="empty-state">${escapeHtml(message)}</p>`;
+    if (status) {
+      status.textContent = message;
+      status.classList.add("error");
+    }
+    throw err;
+  }
+}
+
+async function openMemoryAssociations(memoryId) {
+  if (!memoryId) return;
+  if (memoryAssociationMemoryId !== memoryId) {
+    memoryAssociationPagination.page = 1;
+    memoryAssociationPagination.total = Number(
+      selectedMemoryDetail?.memory_id === memoryId
+        ? selectedMemoryDetail.governance?.association_count || 0
+        : 0,
+    );
+    memoryAssociationPagination.totalPages = Math.max(
+      1,
+      Math.ceil(memoryAssociationPagination.total / memoryAssociationPagination.size),
+    );
+    memoryAssociationItems = [];
+  }
+  memoryAssociationMemoryId = memoryId;
+  setView("memory-associations");
+  renderMemoryAssociationPage();
+  await loadMemoryAssociations();
 }
 
 async function loadMemoryInventory(options = {}) {
@@ -4069,7 +4190,11 @@ async function sweepMemory() {
 function setView(name) {
   const target = document.querySelector(`#${name}-view`);
   if (!target) return;
-  const navigationView = name === "triage" ? "dashboard" : name;
+  const navigationView = name === "triage"
+    ? "dashboard"
+    : name === "memory-associations"
+      ? "memory"
+      : name;
   document.querySelectorAll(".view").forEach((view) => view.classList.remove("active"));
   target.classList.add("active");
   document.querySelectorAll(".nav-button").forEach((btn) => {
@@ -4167,6 +4292,9 @@ function refreshCurrentView() {
     || "monitor";
   if (active === "triage") {
     return loadCases({ quiet: true, section: activeDashboardSection }).then(() => selectedCaseId ? loadTriageCase(selectedCaseId) : undefined);
+  }
+  if (active === "memory-associations") {
+    return loadMemoryAssociations({ quiet: true });
   }
   return loadViewData(active);
 }
@@ -4730,6 +4858,16 @@ document.querySelector("#triage-back").addEventListener("click", () => {
   setView("dashboard");
   setSecondaryView("dashboard", activeDashboardSection);
   loadCases({ quiet: true, section: activeDashboardSection }).catch((err) => showToast(err.message || String(err), "error"));
+});
+document.querySelector("#memory-associations-back").addEventListener("click", () => {
+  memoryAssociationRequestId += 1;
+  setView("memory");
+  setSecondaryView("memory", "inventory");
+});
+document.querySelector("#memory-associations-refresh").addEventListener("click", () => {
+  loadMemoryAssociations({ quiet: true }).catch((err) =>
+    showToast(tr("refreshFailed", { message: err.message || String(err) }), "error"),
+  );
 });
 document.querySelectorAll(".case-search-form").forEach((form) => {
   const section = form.dataset.caseSearchSection === "history" ? "history" : "pending";

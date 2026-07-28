@@ -506,6 +506,89 @@ class MemoryGovernanceAPITest(unittest.TestCase):
             self.assertGreaterEqual(audit_page["pagination"]["total"], 2)
             self.assertEqual(audit_page["pagination"]["page"], 2)
 
+    def test_memory_associations_have_stable_server_side_pagination(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            config.database.path = str(Path(tmp) / "gateway.db")
+            state = GatewayState(config)
+            memory_id = "memory-pagination-target"
+            state.repo.save_memory(
+                {
+                    "memory_id": memory_id,
+                    "layer": LAYER_PRODUCT_LONG_TERM,
+                    "namespace": "product/waf",
+                    "retrieval_key": "WAF-PAGINATION",
+                    "content": "{}",
+                    "source_case_id": "case-pagination-source",
+                    "scope": "waf:false_positive_pattern",
+                    "trust_level": "medium",
+                    "status": STATUS_ACTIVE,
+                    "sensitivity_ok": True,
+                    "approved_by": "analyst-pagination",
+                    "expires_at_ms": now_ms() + 86_400_000,
+                }
+            )
+            for index in range(5):
+                state.repo.insert_memory_matches(
+                    event_id=f"event-pagination-{index}",
+                    alert_id=f"alert-pagination-{index}",
+                    case_id=f"case-pagination-{index}",
+                    analysis_run_id=f"run-pagination-{index}",
+                    matcher_version="hybrid-memory-v3",
+                    final_effect="review_only",
+                    candidates=[
+                        {
+                            "memory_id": memory_id,
+                            "rank": 1,
+                            "structured_score": 0.8,
+                            "semantic_score": 0.6,
+                            "retrieval_score": 1.0,
+                            "overall_score": 0.776,
+                            "decision": "review_only",
+                        }
+                    ],
+                )
+            # Force identical primary sort values so the match_id tie-breaker is
+            # exercised across page boundaries.
+            state.repo.conn.execute(
+                "UPDATE memory_matches SET created_at_ms = 100, overall_score = 0.776 WHERE memory_id = ?",
+                (memory_id,),
+            )
+            state.repo.conn.commit()
+
+            first = state.list_memory_matches_page(
+                {"memory_id": memory_id, "limit": "2", "offset": "0"}
+            )
+            second = state.list_memory_matches_page(
+                {"memory_id": memory_id, "limit": "2", "offset": "2"}
+            )
+            third = state.list_memory_matches_page(
+                {"memory_id": memory_id, "limit": "2", "offset": "4"}
+            )
+
+            self.assertEqual(first["pagination"]["total"], 5)
+            self.assertEqual(first["pagination"]["total_pages"], 3)
+            self.assertEqual(second["pagination"]["page"], 2)
+            self.assertEqual(len(first["matches"]), 2)
+            self.assertEqual(len(second["matches"]), 2)
+            self.assertEqual(len(third["matches"]), 1)
+            paged_ids = [
+                item["match_id"]
+                for page in (first, second, third)
+                for item in page["matches"]
+            ]
+            expected_ids = [
+                item["match_id"]
+                for item in state.repo.list_memory_matches(memory_id=memory_id, limit=10)
+            ]
+            self.assertEqual(paged_ids, expected_ids)
+
+            detail = state.memory_detail(memory_id)
+            self.assertIsNotNone(detail)
+            self.assertEqual(detail["governance"]["association_count"], 5)
+            self.assertNotIn("matches", detail["governance"])
+            self.assertNotIn("matches_pagination", detail["governance"])
+
     def test_memory_governance_summary_search_and_detail(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = GatewayConfig()

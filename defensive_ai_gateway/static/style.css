@@ -2898,7 +2898,7 @@ h4 {
 }
 
 .memory-gates,
-.memory-associations,
+.memory-association-entry,
 .memory-content-section,
 .memory-action-form,
 .memory-detail-audit {
@@ -2907,10 +2907,139 @@ h4 {
   padding-top: 2px;
 }
 
-.memory-associations > p {
-  margin: -3px 0 10px;
+.memory-association-entry {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding-top: 14px;
+}
+
+.memory-association-entry-copy {
+  min-width: 0;
+}
+
+.memory-association-entry-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.memory-association-entry-title span {
+  display: inline-grid;
+  min-width: 24px;
+  height: 24px;
+  place-items: center;
+  border: 1px solid var(--brand-line);
+  border-radius: 999px;
+  background: var(--brand-bg);
+  color: var(--brand-strong);
+  padding: 0 7px;
+  font-size: 11px;
+  font-weight: 780;
+}
+
+.memory-association-entry p {
+  margin-top: 4px;
   color: var(--muted);
   font-size: 12px;
+}
+
+.memory-association-entry button {
+  flex: 0 0 auto;
+  border-color: var(--brand-line);
+  background: var(--brand-bg);
+  color: var(--brand-strong);
+  font-weight: 760;
+}
+
+.memory-associations-page-header {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 16px;
+  align-items: center;
+  margin-bottom: 14px;
+  border-bottom: 1px solid var(--line);
+  padding: 2px 0 16px;
+}
+
+.memory-associations-back {
+  align-self: start;
+  border-color: var(--line);
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 720;
+}
+
+.memory-associations-back:hover {
+  border-color: var(--brand-line);
+  background: var(--brand-bg);
+  color: var(--brand-strong);
+}
+
+.memory-associations-page-heading {
+  min-width: 0;
+}
+
+.memory-associations-page-heading p {
+  color: var(--brand-strong);
+  font-size: 11px;
+  font-weight: 760;
+}
+
+.memory-associations-page-heading h2 {
+  margin-top: 2px;
+  color: var(--ink-strong);
+  font-size: 20px;
+  font-weight: 780;
+}
+
+.memory-associations-page-heading span {
+  display: block;
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.memory-associations-page-summary {
+  display: grid;
+  min-width: 112px;
+  justify-items: end;
+  border-left: 1px solid var(--line);
+  padding-left: 16px;
+}
+
+.memory-associations-page-summary strong {
+  color: var(--ink-strong);
+  font-size: 24px;
+  line-height: 1.15;
+}
+
+.memory-associations-page-summary span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 680;
+}
+
+.memory-associations-page-panel {
+  max-width: 1180px;
+  margin-top: 0;
+  overflow: hidden;
+}
+
+.memory-associations-page-panel > .form-status {
+  margin: 0;
+  padding: 10px 16px 0;
+}
+
+.memory-associations-page-panel > .form-status:empty {
+  display: none;
+}
+
+.memory-associations-page-list {
+  padding: 16px;
 }
 
 .memory-association-list {
@@ -3732,6 +3861,7 @@ button.memory-audit-row:hover {
   .form-actions,
   .memory-browser-panel .panel-heading,
   .memory-audit-panel .panel-heading,
+  .memory-associations-page-panel .panel-heading,
   .syslog-config-heading,
   .syslog-deployment-identity {
     align-items: stretch;
@@ -3750,6 +3880,7 @@ button.memory-audit-row:hover {
   .form-actions button,
   .memory-browser-panel .panel-heading button,
   .memory-audit-panel .panel-heading button,
+  .memory-associations-page-panel .panel-heading button,
   .syslog-config-heading button,
   .syslog-deployment-form .form-actions button {
     width: 100%;
@@ -3866,6 +3997,37 @@ button.memory-audit-row:hover {
   .memory-association-heading {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .memory-association-entry {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .memory-association-entry button {
+    width: 100%;
+  }
+
+  .memory-associations-page-header {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+
+  .memory-associations-back {
+    width: 100%;
+  }
+
+  .memory-associations-page-summary {
+    min-width: 0;
+    justify-items: start;
+    border-top: 1px solid var(--line);
+    border-left: 0;
+    padding-top: 12px;
+    padding-left: 0;
+  }
+
+  .memory-associations-page-list {
+    padding: 10px;
   }
 
   .memory-match-decision {

@@ -3910,6 +3910,7 @@ class Repository:
         case_id: str | None = None,
         decision: str | None = None,
         limit: int = 100,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         with self._lock:
             clauses: list[str] = []
@@ -3931,9 +3932,10 @@ class Repository:
                        overall_score, decision, final_effect, matched_features_json,
                        score_breakdown_json, created_at_ms
                 FROM memory_matches {where}
-                ORDER BY created_at_ms DESC, overall_score DESC LIMIT ?
+                ORDER BY created_at_ms DESC, overall_score DESC, match_id ASC
+                LIMIT ? OFFSET ?
                 """,
-                (*params, max(1, min(int(limit), 500))),
+                (*params, max(1, min(int(limit), 500)), max(0, int(offset))),
             ).fetchall()
             output: list[dict[str, Any]] = []
             for row in rows:
@@ -3942,6 +3944,31 @@ class Repository:
                 item["score_breakdown"] = json.loads(item.pop("score_breakdown_json"))
                 output.append(item)
             return output
+
+    def count_memory_matches(
+        self,
+        memory_id: str | None = None,
+        event_id: str | None = None,
+        case_id: str | None = None,
+        decision: str | None = None,
+    ) -> int:
+        with self._lock:
+            clauses: list[str] = []
+            params: list[Any] = []
+            for column, value in (
+                ("memory_id", memory_id),
+                ("event_id", event_id),
+                ("case_id", case_id),
+                ("decision", decision),
+            ):
+                if value:
+                    clauses.append(f"{column} = ?")
+                    params.append(value)
+            where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            row = self.conn.execute(
+                f"SELECT COUNT(*) AS count FROM memory_matches {where}", params
+            ).fetchone()
+            return int(row["count"])
 
     def memory_governance_summary(self, now_ms_value: int, review_before_ms: int) -> dict[str, Any]:
         """Aggregate governance counts without loading memory content into application memory."""

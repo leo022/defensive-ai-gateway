@@ -82,6 +82,63 @@ class _Server:
 
 
 class HttpAuthTest(unittest.TestCase):
+    def test_memory_association_http_endpoints_return_real_pages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            srv = _Server(_config(Path(tmp), token=""))
+            try:
+                memory_id = "memory-http-pagination"
+                srv.server.state.repo.save_memory(
+                    {
+                        "memory_id": memory_id,
+                        "layer": "product_long_term",
+                        "namespace": "product/waf",
+                        "retrieval_key": "WAF-HTTP-PAGINATION",
+                        "content": "{}",
+                        "source_case_id": "case-http-pagination",
+                        "scope": "waf:false_positive_pattern",
+                        "trust_level": "medium",
+                        "status": "active",
+                        "sensitivity_ok": True,
+                        "approved_by": "http-pagination-test",
+                    }
+                )
+                for index in range(5):
+                    srv.server.state.repo.insert_memory_matches(
+                        event_id=f"event-http-pagination-{index}",
+                        alert_id=f"alert-http-pagination-{index}",
+                        case_id=f"case-http-pagination-{index}",
+                        analysis_run_id=f"run-http-pagination-{index}",
+                        matcher_version="hybrid-memory-v3",
+                        final_effect="review_only",
+                        candidates=[
+                            {
+                                "memory_id": memory_id,
+                                "rank": 1,
+                                "structured_score": 0.8,
+                                "semantic_score": 0.6,
+                                "retrieval_score": 1.0,
+                                "overall_score": 0.776,
+                                "decision": "review_only",
+                            }
+                        ],
+                    )
+
+                status, detail = srv.get(f"/api/memory/{memory_id}")
+                self.assertEqual(status, 200)
+                self.assertEqual(detail["governance"]["association_count"], 5)
+                self.assertNotIn("matches", detail["governance"])
+                self.assertNotIn("matches_pagination", detail["governance"])
+
+                status, page = srv.get(
+                    f"/api/memory/matches?memory_id={memory_id}&limit=2&offset=4"
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(len(page["matches"]), 1)
+                self.assertEqual(page["pagination"]["total_pages"], 3)
+                self.assertEqual(page["pagination"]["page"], 3)
+            finally:
+                srv.stop()
+
     def test_tokenless_loopback_demo_rejects_dns_rebinding_authority(self):
         config = GatewayConfig()
         config.auth = AuthConfig(

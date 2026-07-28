@@ -437,6 +437,16 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertIn("function renderProcessedList", JS)
         self.assertIn("function renderPagination", JS)
         self.assertIn("PAGE_SIZE_OPTIONS = [10, 20, 50, 100]", JS)
+        self.assertIn('id="memory-associations-view"', HTML)
+        self.assertIn('id="memory-associations-page-list"', HTML)
+        self.assertIn('id="memory-associations-page-pagination"', HTML)
+        self.assertIn('if (key === "memory-associations")', JS)
+        self.assertIn("/api/memory/matches?", JS)
+        self.assertIn('setView("memory-associations")', JS)
+        self.assertIn("function openMemoryAssociations", JS)
+        self.assertIn('data-memory-associations-id=', JS)
+        self.assertNotIn('id="memory-association-results"', JS)
+        self.assertNotIn("matches.slice(0, 50)", JS)
         self.assertIn('params.set("terminal_only", "1")', JS)
         self.assertIn('data-pagination-size=', JS)
         self.assertIn('data-pagination-action="previous"', JS)
@@ -468,6 +478,32 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertIn("bindLazyRecordPayloads(records)", DETAIL_JS)
         self.assertIn("data-json-payload", DETAIL_JS)
         self.assertNotIn('class="json-details" open', DETAIL_JS)
+
+    def test_memory_associations_use_contextual_page_without_resetting_governance_form(self):
+        detail_renderer = JS.split("function renderMemoryDetail(memory)", 1)[1].split(
+            "function renderMemoryAudit", 1
+        )[0]
+        self.assertIn("governance.association_count", detail_renderer)
+        self.assertIn("data-memory-associations-id", detail_renderer)
+        self.assertNotIn("renderMemoryAssociations(", detail_renderer)
+
+        association_loader = JS.split("async function loadMemoryAssociations", 1)[1].split(
+            "async function openMemoryAssociations", 1
+        )[0]
+        self.assertIn("memory_id: memoryId", association_loader)
+        self.assertIn("limit: String(memoryAssociationPagination.size)", association_loader)
+        self.assertIn("offset: String((memoryAssociationPagination.page - 1)", association_loader)
+        self.assertIn("page.pagination", association_loader)
+
+        back_handler = JS.split(
+            'document.querySelector("#memory-associations-back").addEventListener', 1
+        )[1].split(
+            'document.querySelector("#memory-associations-refresh")', 1
+        )[0]
+        self.assertIn('setView("memory")', back_handler)
+        self.assertIn('setSecondaryView("memory", "inventory")', back_handler)
+        self.assertNotIn("selectMemory", back_handler)
+        self.assertNotIn("loadMemory", back_handler)
         self.assertIn("case-details-pagination", DETAIL_JS)
         self.assertIn(".case-details-pagination", CSS)
 

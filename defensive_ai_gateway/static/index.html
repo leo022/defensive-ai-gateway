@@ -380,6 +380,32 @@
             </section>
             </div>
           </section>
+          <section id="memory-associations-view" class="view">
+            <header class="memory-associations-page-header">
+              <button id="memory-associations-back" class="memory-associations-back" type="button" data-i18n="memoryAssociationsBack">返回治理详情</button>
+              <div class="memory-associations-page-heading">
+                <p data-i18n="memoryAssociationsBreadcrumb">记忆治理 / 关联告警</p>
+                <h2 data-i18n="memoryAssociationsPageTitle">关联告警清单</h2>
+                <span id="memory-associations-page-context">-</span>
+              </div>
+              <div class="memory-associations-page-summary" aria-live="polite">
+                <strong id="memory-associations-page-count">0</strong>
+                <span data-i18n="memoryAssociationsRecordCount">关联记录</span>
+              </div>
+            </header>
+            <section class="panel memory-associations-page-panel">
+              <div class="panel-heading">
+                <div>
+                  <h3 data-i18n="memoryAssociationsRecords">匹配记录</h3>
+                  <p data-i18n="memoryAssociationsHint">由统一 matcher 保存的候选评分与最终影响。</p>
+                </div>
+                <button id="memory-associations-refresh" type="button" data-i18n="refresh">刷新</button>
+              </div>
+              <p id="memory-associations-page-status" class="form-status" aria-live="polite"></p>
+              <div id="memory-associations-page-list" class="memory-associations-page-list" aria-live="polite"></div>
+              <div id="memory-associations-page-pagination" class="list-pagination-slot"></div>
+            </section>
+          </section>
           <section id="automation-view" class="view">
             <div id="automation-tasks-panel" class="secondary-view active" aria-labelledby="automation-tab-tasks" data-secondary-panel="automation" data-secondary-name="tasks">
               <section class="stats automation-kpis">
