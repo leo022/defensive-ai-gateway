@@ -212,6 +212,33 @@ class SecurityAgent(ABC):
                 )
             )
 
+        def selected_projection_truncated(value: Any) -> bool:
+            if isinstance(value, dict):
+                if (
+                    "entries" in value
+                    and "truncated" in value
+                    and bool(value.get("truncated"))
+                ):
+                    return True
+                return any(selected_projection_truncated(item) for item in value.values())
+            if isinstance(value, list):
+                return any(selected_projection_truncated(item) for item in value)
+            return False
+
+        evidence_projection_truncated = selected_projection_truncated(request_context) or (
+            selected_projection_truncated(hook_value)
+        )
+        if not evidence_projection_truncated:
+            rewrites.append(
+                (
+                    [
+                        r"(?:由于|因|受限于)[^。；\n]{0,24}(?:长度|条目|深度|脱敏)"
+                        r"[^。；\n]{0,24}(?:未提取|提取值为空|无法提取|为空)",
+                    ],
+                    "当前受控证据投影未识别出规则相关值",
+                )
+            )
+
         def rewrite(value: Any) -> tuple[Any, bool]:
             if not isinstance(value, str):
                 return value, False

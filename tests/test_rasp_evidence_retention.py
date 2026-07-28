@@ -70,6 +70,78 @@ class RaspEvidenceRetentionTest(unittest.TestCase):
         self.assertIn("请求参数=空 JSON 对象", dimensions["参数特征"])
         self.assertNotIn("缺少 hook_data", dimensions["上下文"])
 
+    def test_jni_unc_evidence_is_projected_from_hook_and_vendor_body_wrapper(self):
+        raw_log = copy.deepcopy(self._cloudrasp_log())
+        unc_path = r"\\203.0.113.77\payloads\probe.dll"
+        raw_log["event"]["request_message"]["method"] = "POST"
+        raw_log["event"]["request_message"]["url"] = (
+            "http://example.test/bastestground/jni/load"
+        )
+        raw_log["event"]["request_message"]["parameter"] = "payload=probe"
+        raw_log["event"]["request_message"]["body"] = {
+            "rasp_raw_type": "json",
+            "rasp_raw_data": json.dumps({"library": unc_path}),
+        }
+        raw_log["items"][0].update(
+            {
+                "rule_id": "cloudrasp_jni_105",
+                "rule_name": "UNC 路径判断",
+                "hook_data": {"lib": unc_path},
+                "stacktrace": [
+                    "org.apache.catalina.connector.CoyoteAdapter.service(CoyoteAdapter.java:343)",
+                    "java.lang.System.load(System.java)",
+                    "cn.rasp.vuln.controller.JNIController.load(JNIController.java:14)",
+                ],
+            }
+        )
+
+        policy = PolicyEngine(GatewayConfig().policy)
+        event = EventNormalizer(policy).normalize(
+            LogAdapter(EventNormalizer(policy)).adapt(
+                builtin_product_profile("rasp"), raw_log
+            )["raw_alert"]
+        )
+        by_type = {item["type"]: item.get("value") for item in event.evidence}
+        hook_selected = by_type["hook_data"]["selected_evidence"]
+        body_selected = by_type["request_context"]["body"]["selected_evidence"]
+        item = by_type["rasp_items_context"]["items"][0]
+
+        self.assertEqual(hook_selected["selection_status"], "selected")
+        self.assertFalse(hook_selected["truncated"])
+        self.assertEqual(hook_selected["entries"][0]["path"], "$.lib")
+        self.assertIn(unc_path, hook_selected["entries"][0]["value"])
+        self.assertIn("unc_path_reference", hook_selected["entries"][0]["indicator_categories"])
+        self.assertEqual(body_selected["selection_status"], "selected")
+        self.assertFalse(body_selected["truncated"])
+        self.assertIn("rasp_raw_data", body_selected["entries"][0]["path"])
+        self.assertIn(unc_path, body_selected["entries"][0]["value"])
+        self.assertEqual(item["sink"], "java.lang.System.load")
+
+    def test_empty_untruncated_projection_reports_no_rule_match(self):
+        raw_log = copy.deepcopy(self._cloudrasp_log())
+        raw_log["event"]["request_message"]["body"] = {"note": "ordinary business value"}
+        raw_log["items"][0]["hook_data"] = {"other": "ordinary hook value"}
+
+        policy = PolicyEngine(GatewayConfig().policy)
+        event = EventNormalizer(policy).normalize(
+            LogAdapter(EventNormalizer(policy)).adapt(
+                builtin_product_profile("rasp"), raw_log
+            )["raw_alert"]
+        )
+        by_type = {item["type"]: item.get("value") for item in event.evidence}
+
+        self.assertEqual(
+            by_type["request_context"]["body"]["selected_evidence"]["selection_status"],
+            "no_rule_match",
+        )
+        self.assertFalse(
+            by_type["request_context"]["body"]["selected_evidence"]["truncated"]
+        )
+        self.assertEqual(
+            by_type["hook_data"]["selected_evidence"]["selection_status"],
+            "no_rule_match",
+        )
+
     def test_full_items_and_request_context_survive_a_long_stacktrace_in_model_context(self):
         raw_log = copy.deepcopy(self._cloudrasp_log())
         raw_log["event"]["request_message"]["parameter"] = '{"url":"jdbc:mysql://probe"}'

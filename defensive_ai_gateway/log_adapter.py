@@ -67,7 +67,12 @@ _RASP_SEMANTIC_FIELD_NAMES = {
     "file_name",
     "filename",
     "host",
+    "lib",
+    "library",
+    "library_path",
     "method",
+    "native_library",
+    "native_library_path",
     "path",
     "payload",
     "protocol",
@@ -76,6 +81,9 @@ _RASP_SEMANTIC_FIELD_NAMES = {
     "suffix",
     "url",
     "xss",
+}
+_RASP_EVIDENCE_WRAPPER_FIELD_NAMES = {
+    "rasp_raw_data",
 }
 _RASP_REQUEST_ATTACK_FIELD_NAMES = {
     "class",
@@ -101,6 +109,8 @@ _RASP_EXPLICIT_ATTACK_INDICATORS = {
     "process_execution_reference",
     "script_execution_reference",
     "sql_injection_reference",
+    "smb_reference",
+    "unc_path_reference",
     "xss_reference",
 }
 _RASP_SENSITIVE_FIELD_MARKERS = {
@@ -133,6 +143,19 @@ _RASP_SENSITIVE_FIELD_MARKERS = {
     "x_api_key",
 }
 _RASP_INDICATORS = (
+    (
+        "unc_path_reference",
+        re.compile(
+            r"(?<![\\])\\\\(?:[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?|"
+            r"(?:\d{1,3}\.){3}\d{1,3})\\[^\\/\s]+(?:\\[^\\\r\n]*)?",
+            re.IGNORECASE,
+        ),
+    ),
+    ("smb_reference", re.compile(r"\bsmb://[^/\s]+/[^?\s]+", re.IGNORECASE)),
+    (
+        "native_library_reference",
+        re.compile(r"(?:^|[/\\])[^/\\\r\n]+\.(?:dll|so|dylib)\b", re.IGNORECASE),
+    ),
     ("jndi_reference", re.compile(r"\b(?:ldap|rmi|iiop|dns)://", re.IGNORECASE)),
     ("jdbc_connection_reference", re.compile(r"\bjdbc:[a-z0-9_+.-]+:", re.IGNORECASE)),
     ("java_deserialization_hint", re.compile(r"@type|objectinputstream|readobject|serialization", re.IGNORECASE)),
@@ -1582,6 +1605,7 @@ class LogAdapter:
         entries: list[dict[str, Any]] = []
         nodes_scanned = 0
         projection_truncated = False
+        unrecognized_security_fields: set[str] = set()
         decoded = self._decode_rasp_evidence_value(value, allow_form=True)
 
         configured_sensitive = {
@@ -1618,7 +1642,7 @@ class LogAdapter:
             )
 
         def safe_path(parent: str, field_name: str) -> str:
-            if field_name in direct_fields:
+            if field_name in direct_fields or field_name in _RASP_EVIDENCE_WRAPPER_FIELD_NAMES:
                 return f"{parent}.{field_name}"
             return f"{parent}.[filtered_field]"
 
@@ -1645,6 +1669,11 @@ class LogAdapter:
                     if sensitive_field(name):
                         continue
                     field_direct = name in direct_fields
+                    if not field_direct and name not in _RASP_EVIDENCE_WRAPPER_FIELD_NAMES and any(
+                        marker in name
+                        for marker in ("lib", "library", "payload", "path", "raw_data")
+                    ):
+                        unrecognized_security_fields.add(name)
                     walk(item, safe_path(path, name), depth + 1, field_direct)
                     if len(entries) >= _RASP_EVIDENCE_MAX_ENTRIES:
                         projection_truncated = True
@@ -1659,7 +1688,11 @@ class LogAdapter:
                 return
 
             if isinstance(node, str) and not direct:
-                nested = self._decode_rasp_evidence_value(node, allow_form=False)
+                allow_nested_form = any(
+                    path.endswith(f".{name}")
+                    for name in _RASP_EVIDENCE_WRAPPER_FIELD_NAMES
+                )
+                nested = self._decode_rasp_evidence_value(node, allow_form=allow_nested_form)
                 if isinstance(nested, (dict, list)):
                     walk(nested, f"{path}.decoded", depth + 1)
                     return
@@ -1699,12 +1732,19 @@ class LogAdapter:
             )
 
         walk(decoded, "$", 0)
-        return {
+        if entries:
+            selection_status = (
+                "selected_with_truncation" if projection_truncated else "selected"
+            )
+        else:
+            selection_status = "truncated" if projection_truncated else "no_rule_match"
+        result = {
             "policy": "rule_relevant_fields_and_attack_indicators_only",
             "trust": "untrusted_external_telemetry",
             "entries": entries,
             "entry_count": len(entries),
             "truncated": projection_truncated,
+            "selection_status": selection_status,
             "limits": {
                 "max_entries": _RASP_EVIDENCE_MAX_ENTRIES,
                 "max_depth": _RASP_EVIDENCE_MAX_DEPTH,
@@ -1712,6 +1752,11 @@ class LogAdapter:
                 "max_value_bytes": _RASP_EVIDENCE_MAX_VALUE_BYTES,
             },
         }
+        if unrecognized_security_fields:
+            result["unrecognized_security_fields"] = sorted(
+                unrecognized_security_fields
+            )
+        return result
 
     def _decode_rasp_evidence_value(self, value: Any, *, allow_form: bool) -> Any:
         if not isinstance(value, str):
@@ -1821,6 +1866,14 @@ class LogAdapter:
         frames = self._stack_frames(stacktrace)
         if not frames:
             return ""
+        high_risk_sink_needles = [
+            "java.lang.system.loadlibrary",
+            "java.lang.system.load",
+            "java.lang.runtime.loadlibrary",
+            "java.lang.runtime.load",
+            "runtime.loadlibrary",
+            "runtime.load",
+        ]
         sink_needles = [
             ".lookup",
             ".connect",
@@ -1845,6 +1898,10 @@ class LogAdapter:
             "socketprocessor",
             "reflect.",
         ]
+        for frame in frames:
+            normalized = frame.lower()
+            if any(needle in normalized for needle in high_risk_sink_needles):
+                return self._frame_symbol(frame)
         for frame in frames:
             normalized = frame.lower()
             if any(needle in normalized for needle in sink_needles):
