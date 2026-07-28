@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from defensive_ai_gateway.app import GatewayState, build_server
+from defensive_ai_gateway.case_response import _analysis_facts
 from defensive_ai_gateway.config import AuthPrincipalConfig, GatewayConfig
 from defensive_ai_gateway.database import Repository
 from defensive_ai_gateway.models import RawAlert, now_ms
@@ -72,6 +73,19 @@ class CaseResponseServiceTest(unittest.TestCase):
             pack["incident_communication"]["known_facts"],
             pack["case_summary"]["key_facts"],
         )
+        confirmed = pack["case_summary"]["key_facts"]
+        self.assertEqual(confirmed[0]["claim_type"], "analysis_finding")
+        self.assertEqual(confirmed[0]["status"], "risk")
+        self.assertIn("请求特征：", confirmed[0]["text"])
+        self.assertTrue(
+            any(
+                item["claim_type"] == "analysis_finding"
+                and item["dimension"] == "参数/Header"
+                and "SQL boolean expression markers" in item["text"]
+                for item in confirmed
+            )
+        )
+        self.assertEqual(confirmed[-1]["claim_type"], "security_event")
         self.assertEqual(pack["containment"]["allowed_action_types"], ["network.block_ip"])
 
         option = pack["containment"]["options"][0]
@@ -222,6 +236,7 @@ class CaseResponseServiceTest(unittest.TestCase):
         self.assertIn("fine_grained_candidate", script)
         self.assertIn('roles.includes("analyst")', script)
         self.assertIn("communicationList(draft.known_facts", script)
+        self.assertIn('fact.claim_type === "analysis_finding"', script)
         self.assertIn("copyCommunicationReport", script)
         self.assertIn('addEventListener("click", copyCommunicationReport)', script)
         self.assertIn("timelinePageMustReset", script)
@@ -253,6 +268,50 @@ class CaseResponseServiceTest(unittest.TestCase):
         )
         self.assertIn("response-pack-link", app_script)
         self.assertNotIn("direct_communication_delivery: true", script)
+
+    def test_confirmed_facts_exclude_review_and_uncertain_info_dimensions(self):
+        facts = _analysis_facts(
+            {
+                "explanation": {
+                    "dimensions": [
+                        {
+                            "title": "参数特征",
+                            "status": "risk",
+                            "evidence": "输入包含已识别的表达式对象构造与方法调用链。",
+                        },
+                        {
+                            "title": "危险调用",
+                            "status": "risk",
+                            "evidence": "调用栈已触达 java.io.File.list。",
+                        },
+                        {
+                            "title": "成功与危害",
+                            "status": "review",
+                            "evidence": "尚未确认响应是否返回目录内容。",
+                        },
+                        {
+                            "title": "上下文",
+                            "status": "info",
+                            "evidence": "缺少应用主机审计。",
+                        },
+                        {
+                            "title": "规则匹配",
+                            "status": "info",
+                            "evidence": "cloudrasp_list_file_102 与目录枚举调用一致。",
+                        },
+                    ]
+                }
+            },
+            analyzed_at_ms=123,
+            evidence_refs=["event-1:rule_id"],
+        )
+
+        self.assertEqual(
+            [item["dimension"] for item in facts],
+            ["参数特征", "危险调用", "规则匹配"],
+        )
+        self.assertTrue(all(item["claim_type"] == "analysis_finding" for item in facts))
+        self.assertTrue(all(item["evidence_refs"] == ["event-1:rule_id"] for item in facts))
 
     def test_static_responsive_contract_covers_target_viewports(self):
         html = Path("defensive_ai_gateway/static/case-response.html").read_text(

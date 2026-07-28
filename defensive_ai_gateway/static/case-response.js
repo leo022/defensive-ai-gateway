@@ -99,6 +99,8 @@ const COPY = {
     noExceptions: "暂无执行异常。",
     noUnknowns: "暂无新增待确认事项。",
     noApprovals: "暂无待审批事项。",
+    analysisFinding: "AI 研判结论",
+    eventRecord: "事件记录",
     decisionItem: (value) => `审批单 ${value} 待处理`,
     occurred: "发生时间",
     recorded: "系统记录",
@@ -193,6 +195,8 @@ const COPY = {
     noExceptions: "No execution exception has been recorded.",
     noUnknowns: "No additional open question has been recorded.",
     noApprovals: "No approval is pending.",
+    analysisFinding: "AI analysis finding",
+    eventRecord: "Event record",
     decisionItem: (value) => `Approval ${value} is pending`,
     occurred: "Occurred",
     recorded: "Recorded",
@@ -576,7 +580,13 @@ function renderSummary() {
     <article class="case-response-fact">
       <div class="case-response-fact-title">
         <span>${String(index + 1).padStart(2, "0")}</span>
-        <strong>${escapeHtml(fact.text)}</strong>
+        <div>
+          <strong>${escapeHtml(fact.text)}</strong>
+          <small>
+            ${escapeHtml(fact.claim_type === "analysis_finding" ? tr("analysisFinding") : tr("eventRecord"))}
+            ${fact.status ? ` · ${escapeHtml(enumLabel("state", fact.status))}` : ""}
+          </small>
+        </div>
       </div>
       <span>${escapeHtml(fmtTime(fact.occurred_at_ms))} · ${escapeHtml(timeBasisLabel(fact.time_basis))}</span>
       ${refs(fact.evidence_refs)}

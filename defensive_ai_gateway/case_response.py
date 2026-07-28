@@ -10,13 +10,27 @@ from .models import NormalizedEvent, new_id, now_ms
 from .response_automation import ACTION_BLOCK_IP, compile_response_action
 
 
-PACK_SCHEMA_VERSION = "case-response-pack-v1"
-PACK_GENERATOR = "deterministic-case-response-assembler-v1"
+PACK_SCHEMA_VERSION = "case-response-pack-v2"
+PACK_GENERATOR = "deterministic-case-response-assembler-v2"
 MAX_TIMELINE_ITEMS = 2_000
 MAX_PACK_TIMELINE_ITEMS = 12
 MAX_PLAYBOOK_STEPS = 12
 MAX_EVIDENCE_REFS = 64
+MAX_CONFIRMED_FACTS = 8
 _TERMINAL_CASE_STATUSES = {"closed", "false_positive"}
+_CONFIRMED_DIMENSION_STATUSES = {"risk", "blocked", "benign", "normal", "info"}
+_UNCERTAIN_INFO_MARKERS = (
+    "不能确认",
+    "尚未确认",
+    "无法确认",
+    "待确认",
+    "待核实",
+    "需人工",
+    "证据不足",
+    "缺少",
+    "未提供",
+    "未见",
+)
 
 
 def _canonical_hash(value: Any) -> str:
@@ -114,6 +128,93 @@ def _source_event_refs(
 ) -> list[str]:
     event = events_by_id.get(str(event_id or ""))
     return _event_refs(event) if event else []
+
+
+def _analysis_facts(
+    result: dict[str, Any],
+    *,
+    analyzed_at_ms: int,
+    evidence_refs: list[str],
+) -> list[dict[str, Any]]:
+    """Promote grounded analysis dimensions into analyst-facing confirmed facts."""
+    explanation = (
+        result.get("explanation")
+        if isinstance(result.get("explanation"), dict)
+        else {}
+    )
+    dimensions = explanation.get("dimensions")
+    if not isinstance(dimensions, list):
+        return []
+
+    candidates: list[tuple[int, int, dict[str, Any]]] = []
+    seen: set[tuple[str, str]] = set()
+    status_priority = {
+        "risk": 0,
+        "blocked": 1,
+        "benign": 2,
+        "normal": 3,
+        "info": 4,
+    }
+    for index, item in enumerate(dimensions):
+        if not isinstance(item, dict):
+            continue
+        title = _bounded_text(item.get("title"), 160)
+        evidence = _bounded_text(item.get("evidence"), 1_000)
+        status = str(item.get("status") or "").strip().casefold()
+        if not title or not evidence or status not in _CONFIRMED_DIMENSION_STATUSES:
+            continue
+        # An informational dimension that only describes a gap belongs under
+        # uncertainties, not under "confirmed facts". Risk/benign/normal
+        # dimensions remain useful even when their evidence also states a
+        # bounded uncertainty about impact or authorization.
+        if status == "info" and any(marker in evidence for marker in _UNCERTAIN_INFO_MARKERS):
+            continue
+        dedupe_key = (title.casefold(), evidence.casefold())
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        candidates.append(
+            (
+                status_priority[status],
+                index,
+                {
+                    "claim_id": "",
+                    "claim_type": "analysis_finding",
+                    "dimension": title,
+                    "status": status,
+                    "text": f"{title}：{evidence}",
+                    "occurred_at_ms": int(analyzed_at_ms or 0),
+                    "time_basis": "system",
+                    "evidence_refs": list(evidence_refs),
+                },
+            )
+        )
+
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    facts = [item[2] for item in candidates[:MAX_CONFIRMED_FACTS]]
+    for index, fact in enumerate(facts):
+        fact["claim_id"] = f"analysis-fact-{index + 1}"
+    return facts
+
+
+def _event_facts(
+    security_entries: list[dict[str, Any]], *, limit: int
+) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    selected = security_entries[-limit:]
+    return [
+        {
+            "claim_id": f"event-fact-{index + 1}",
+            "claim_type": "security_event",
+            "status": "info",
+            "text": item["title"],
+            "occurred_at_ms": item["occurred_at_ms"],
+            "time_basis": item["time_basis"],
+            "evidence_refs": item["evidence_refs"],
+        }
+        for index, item in enumerate(selected)
+    ]
 
 
 def _json_object(value: Any) -> dict[str, Any]:
@@ -675,20 +776,26 @@ class CaseResponseService:
         security_entries = [
             item for item in timeline if item.get("kind") == "security_event"
         ]
-        key_facts = [
-            {
-                "claim_id": f"fact-{index + 1}",
-                "text": item["title"],
-                "occurred_at_ms": item["occurred_at_ms"],
-                "time_basis": item["time_basis"],
-                "evidence_refs": item["evidence_refs"],
-            }
-            for index, item in enumerate(security_entries[-5:])
-        ]
         explanation = (
             latest_result.get("explanation")
             if isinstance(latest_result.get("explanation"), dict)
             else {}
+        )
+        analysis_facts = _analysis_facts(
+            latest_result,
+            analyzed_at_ms=int(latest_run.get("created_at_ms") or 0),
+            evidence_refs=latest_refs,
+        )
+        # Conclusions are the primary reading path. Keep at most one raw event
+        # receipt as provenance context when analysis dimensions are available;
+        # older event-only behavior remains as a safe fallback.
+        event_fact_limit = (
+            min(1, MAX_CONFIRMED_FACTS - len(analysis_facts))
+            if analysis_facts
+            else min(5, MAX_CONFIRMED_FACTS)
+        )
+        key_facts = analysis_facts + _event_facts(
+            security_entries, limit=event_fact_limit
         )
         pending_approvals = [
             str(item.get("approval_id") or "")

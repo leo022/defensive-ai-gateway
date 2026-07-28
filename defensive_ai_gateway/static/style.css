@@ -4051,9 +4051,21 @@ button.memory-audit-row:hover {
   font-weight: 800;
 }
 
-.case-response-fact-title > strong {
+.case-response-fact-title > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.case-response-fact-title strong {
   color: var(--ink-strong);
   overflow-wrap: anywhere;
+}
+
+.case-response-fact-title small {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 720;
 }
 
 .case-response-fact > span {
