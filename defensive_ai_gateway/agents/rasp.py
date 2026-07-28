@@ -8,7 +8,7 @@ from .base import SecurityAgent
 class RaspAgent(SecurityAgent):
     name = "rasp-agent"
     product = "rasp"
-    prompt_version = "rasp-v12"
+    prompt_version = "rasp-v15"
 
     _LAB_TARGET_MARKERS = (
         "cloudrasp-vulns",
@@ -48,6 +48,12 @@ class RaspAgent(SecurityAgent):
 4. 上下文验证：检查 hook_data 是否包含攻击载荷、污染源、危险 sink、文件路径、SQL、表达式、命令或外联地址等关键证据。
 5. 成功性判断：仅当判断为真实攻击时，说明攻击是否被阻断、是否可能执行成功、可能影响的数据或系统范围。
 6. 误报收敛：仅当判断为误报时，解释误报原因，并给出白名单建议；白名单必须足够精确，不能用过宽的路径、域名、堆栈或参数通配。
+
+渗透研判视角（只做防御分析，不生成利用步骤）：
+- 不得仅凭 `/expression/ognl/` 等请求路径判定攻击；路径只能作为入口上下文，必须继续核对实际参数、hook_data、规则和危险 sink。
+- OGNL 不只表现为 `${...}`、`#{...}` 或出现 `ognl` 字样。还要识别 `new java.*(...)` 对象构造、Java 类访问、连续方法调用，以及 File/Runtime/反射等敏感 API。
+- 对目录枚举类告警，应按“外部输入中的 Java File 构造或敏感方法链 → hook_data.hitEvidence/path → java.io.File.list/listFiles → 规则命中”建立交叉证据链。
+- `java.io.File.list/listFiles` 证明目录枚举调用已触达，但不能单独证明结果已返回给攻击者；RASP action=log 只表示未阻断，成功性仍需应用响应和主机审计确认。
 
 结论映射：
 - 真实攻击：classification 使用 malicious；证据强但缺少成功性确认时可使用 suspicious。
@@ -225,6 +231,7 @@ reason 字段必须按以下结构输出：
         dimensions: list[dict[str, str]] = []
         environment_added = False
         success_added = False
+        log_only_action = self._is_log_only_action(event)
         for item in source_dimensions:
             if not isinstance(item, dict):
                 continue
@@ -243,7 +250,10 @@ reason 字段必须按以下结构输出：
                     }
                 )
                 continue
-            dimensions.append(dict(item))
+            normalized_item = dict(item)
+            if log_only_action and str(normalized_item.get("status") or "") == "blocked":
+                normalized_item["status"] = "risk"
+            dimensions.append(normalized_item)
         if not environment_added:
             dimensions.append(self._environment_dimension(event))
         if not success_added:
@@ -255,6 +265,25 @@ reason 字段必须按以下结构输出：
                 }
             )
         return dimensions
+
+    @classmethod
+    def _is_log_only_action(cls, event: NormalizedEvent) -> bool:
+        """Return true when received RASP evidence only records and never blocks."""
+        actions: list[str] = []
+        entity_action = cls._entity_text(event, "action").casefold()
+        if entity_action:
+            actions.append(entity_action)
+        for evidence in event.evidence or []:
+            if not isinstance(evidence, dict):
+                continue
+            value = evidence.get("value")
+            if evidence.get("type") == "rasp_items_context" and isinstance(value, dict):
+                for item in value.get("items") or []:
+                    if isinstance(item, dict):
+                        action = str(item.get("action") or "").strip().casefold()
+                        if action:
+                            actions.append(action)
+        return bool(actions) and all(action == "log" for action in actions)
 
     @classmethod
     def _lab_target_clues(cls, event: NormalizedEvent) -> list[str]:
@@ -396,6 +425,7 @@ reason 字段必须按以下结构输出：
             (("classloader", "class_loader"), "恶意类加载"),
             (("cloudrasp_jni", "jni", "system.load", "native_library"), "恶意 JNI 加载"),
             (("file_input_stream", "file_read"), "任意文件读取"),
+            (("cloudrasp_list_file", "java.io.file.list", "list_file"), "目录枚举"),
             (("file_write", "file_output_stream"), "任意文件写入"),
             (("ssrf",), "服务端请求伪造"),
             (("xxe",), "XML 实体注入"),

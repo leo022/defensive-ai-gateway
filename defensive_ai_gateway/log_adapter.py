@@ -66,7 +66,9 @@ _RASP_SEMANTIC_FIELD_NAMES = {
     "file",
     "file_name",
     "filename",
+    "absolute_path",
     "host",
+    "hit_evidence",
     "lib",
     "library",
     "library_path",
@@ -102,12 +104,15 @@ _RASP_REQUEST_ATTACK_FIELD_NAMES = {
 _RASP_HOOK_ATTACK_FIELD_NAMES = _RASP_SEMANTIC_FIELD_NAMES - {"payload"}
 _RASP_EXPLICIT_ATTACK_INDICATORS = {
     "expression_execution_reference",
+    "java_file_api_reference",
     "java_deserialization_hint",
     "jdbc_connection_reference",
     "jndi_reference",
+    "ognl_object_construction_reference",
     "path_traversal_reference",
     "process_execution_reference",
     "script_execution_reference",
+    "sensitive_method_chain_reference",
     "sql_injection_reference",
     "smb_reference",
     "unc_path_reference",
@@ -155,6 +160,26 @@ _RASP_INDICATORS = (
     (
         "native_library_reference",
         re.compile(r"(?:^|[/\\])[^/\\\r\n]+\.(?:dll|so|dylib)\b", re.IGNORECASE),
+    ),
+    (
+        "ognl_object_construction_reference",
+        re.compile(
+            r"\bnew\s+(?:java|javax|ognl|com\.opensymphony)"
+            r"(?:\.[a-z_$][\w$]*)+\s*\(",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "java_file_api_reference",
+        re.compile(r"\bjava\.io\.File\s*\(", re.IGNORECASE),
+    ),
+    (
+        "sensitive_method_chain_reference",
+        re.compile(
+            r"(?:\.list(?:Files)?|\.delete|\.renameTo|\.getRuntime\s*\(\s*\)"
+            r"\s*\.exec|\.forName|\.newInstance|\.getDeclaredMethod)\s*\(",
+            re.IGNORECASE,
+        ),
     ),
     ("jndi_reference", re.compile(r"\b(?:ldap|rmi|iiop|dns)://", re.IGNORECASE)),
     ("jdbc_connection_reference", re.compile(r"\bjdbc:[a-z0-9_+.-]+:", re.IGNORECASE)),
@@ -1873,6 +1898,10 @@ class LogAdapter:
             "java.lang.runtime.load",
             "runtime.loadlibrary",
             "runtime.load",
+            "java.io.file.listfiles",
+            "java.io.file.list",
+            "java.io.file.delete",
+            "java.io.file.renameto",
         ]
         sink_needles = [
             ".lookup",

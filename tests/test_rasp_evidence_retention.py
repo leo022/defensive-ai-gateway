@@ -142,6 +142,90 @@ class RaspEvidenceRetentionTest(unittest.TestCase):
             "no_rule_match",
         )
 
+    def test_ognl_java_file_constructor_and_listing_chain_are_projected(self):
+        raw_log = copy.deepcopy(self._cloudrasp_log())
+        expression = "new java.io.File('/usr').list()"
+        raw_log["event"]["request_message"]["method"] = "POST"
+        raw_log["event"]["request_message"]["url"] = (
+            "http://example.test/bastestground/expression/ognl/postBody"
+        )
+        raw_log["event"]["request_message"]["parameter"] = json.dumps(
+            {"payload": [expression]}
+        )
+        raw_log["event"]["request_message"]["body"] = {
+            "rasp_raw_data": (
+                'Content-Disposition: form-data; name="payload"\r\n\r\n'
+                f"{expression}\r\n"
+            ),
+            "rasp_raw_type": "formdata",
+        }
+        raw_log["items"][0].update(
+            {
+                "rule_id": "cloudrasp_list_file_102",
+                "rule_name": "用户输入判断",
+                "hook_data": {
+                    "absolutePath": "/usr",
+                    "hitEvidence": expression,
+                    "name": "usr",
+                    "path": "/usr",
+                    "suffix": "",
+                },
+                "stacktrace": [
+                    "ognl.SimpleNode.evaluateGetValueBody(SimpleNode.java:212)",
+                    "ognl.OgnlRuntime.invokeMethod(OgnlRuntime.java:830)",
+                    "java.io.File.list(File.java)",
+                    "cn.rasp.vuln.controller.common.AbstractPostBodyController.postBody(AbstractPostBodyController.java:26)",
+                ],
+            }
+        )
+
+        policy = PolicyEngine(GatewayConfig().policy)
+        event = EventNormalizer(policy).normalize(
+            LogAdapter(EventNormalizer(policy)).adapt(
+                builtin_product_profile("rasp"), raw_log
+            )["raw_alert"]
+        )
+        by_type = {item["type"]: item.get("value") for item in event.evidence}
+        parameter_selected = by_type["request_context"]["parameter"]["selected_evidence"]
+        body_selected = by_type["request_context"]["body"]["selected_evidence"]
+        hook = by_type["hook_data"]
+        item = by_type["rasp_items_context"]["items"][0]
+
+        self.assertEqual(parameter_selected["selection_status"], "selected")
+        self.assertFalse(parameter_selected["truncated"])
+        self.assertIn(expression, parameter_selected["entries"][0]["value"])
+        self.assertTrue(
+            {
+                "java_file_api_reference",
+                "ognl_object_construction_reference",
+                "sensitive_method_chain_reference",
+            }.issubset(parameter_selected["entries"][0]["indicator_categories"])
+        )
+        self.assertEqual(body_selected["selection_status"], "selected")
+        self.assertIn("rasp_raw_data", body_selected["entries"][0]["path"])
+        self.assertIn(expression, body_selected["entries"][0]["value"])
+        self.assertEqual(hook["semantic_fields"]["absolute_path"]["state"], "present")
+        self.assertEqual(hook["semantic_fields"]["hit_evidence"]["state"], "present")
+        self.assertTrue(
+            any(entry["path"] == "$.hit_evidence" for entry in hook["selected_evidence"]["entries"])
+        )
+        self.assertEqual(item["sink"], "java.io.File.list")
+
+        dimensions = RaspAgent(LocalHeuristicLLM(), policy)._review_dimensions(
+            event,
+            [
+                {
+                    "title": "上下文",
+                    "status": "blocked",
+                    "evidence": "RASP action=log，检测到调用但未实施阻断。",
+                }
+            ],
+        )
+        context_dimension = next(
+            dimension for dimension in dimensions if dimension["title"] == "上下文"
+        )
+        self.assertEqual(context_dimension["status"], "risk")
+
     def test_full_items_and_request_context_survive_a_long_stacktrace_in_model_context(self):
         raw_log = copy.deepcopy(self._cloudrasp_log())
         raw_log["event"]["request_message"]["parameter"] = '{"url":"jdbc:mysql://probe"}'
