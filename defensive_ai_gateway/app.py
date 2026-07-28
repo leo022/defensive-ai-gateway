@@ -20,6 +20,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .config import GatewayConfig, LLMConfig, load_config
+from .case_response import CaseResponseService
 from .database import AlertIdentityConflict, Repository
 from .json_safety import loads_bounded_json
 from .log_adapter import (
@@ -314,13 +315,14 @@ def _case_triage_payload(case_data: dict) -> dict:
     linked_alerts = list(case_data.get("linked_alerts") or [])
     agent_runs = list(case_data.get("agent_runs") or [])
     validation_runs = list(case_data.get("validation_runs") or [])
-    payload["detail_counts"] = {
-        "raw_alerts": sum(bool(link.get("raw_alert")) for link in linked_alerts),
-        "normalized_evidence": sum(
-            bool(link.get("normalized_event")) for link in linked_alerts
-        ),
-        "analysis_runs": len(agent_runs) + len(validation_runs),
-    }
+    if not isinstance(case_data.get("detail_counts"), dict):
+        payload["detail_counts"] = {
+            "raw_alerts": sum(bool(link.get("raw_alert")) for link in linked_alerts),
+            "normalized_evidence": sum(
+                bool(link.get("normalized_event")) for link in linked_alerts
+            ),
+            "analysis_runs": len(agent_runs) + len(validation_runs),
+        }
     payload["linked_alerts"] = [_case_alert_summary(link) for link in linked_alerts]
     payload["agent_runs"] = agent_runs[:1]
     payload["validation_runs"] = validation_runs[:1]
@@ -672,6 +674,7 @@ class GatewayState:
         self._syslog_deployment = {"collector_address": "", "source_cidrs": []}
         self._restore_runtime_settings()
         self.policy = PolicyEngine(config.policy)
+        self.case_response = CaseResponseService(self.repo, self.policy)
         self.normalizer = EventNormalizer(self.policy)
         self.memory = MemoryManager(self.repo, self.policy)
         self.skills = SkillRegistry()
@@ -1227,9 +1230,14 @@ class GatewayState:
             "admission_ok": admission_ok,
         }
 
-    def processing_stats(self) -> dict:
-        inbox = self.repo.inbox_stats()
-        capacity = self._inbox_capacity_stats()
+    def processing_stats(
+        self,
+        *,
+        inbox: dict | None = None,
+        capacity: dict | None = None,
+    ) -> dict:
+        inbox = inbox if inbox is not None else self.repo.inbox_stats()
+        capacity = capacity if capacity is not None else self._inbox_capacity_stats()
         deferred_stats = getattr(self.repo, "llm_deferred_inbox_stats", None)
         llm_deferred = (
             deferred_stats()
@@ -1283,15 +1291,20 @@ class GatewayState:
         stats["capacity"] = capacity
         return stats
 
-    def readiness(self) -> dict:
+    def readiness(
+        self,
+        *,
+        inbox: dict | None = None,
+        capacity: dict | None = None,
+    ) -> dict:
         """Return dependency health used by readiness and operator diagnostics."""
         database = self.repo.readiness_check()
-        inbox = self.repo.inbox_stats()
+        inbox = inbox if inbox is not None else self.repo.inbox_stats()
         backlog = sum(
             int(inbox.get(status, 0))
             for status in ("pending", "retry", "deferred", "processing")
         )
-        capacity = self._inbox_capacity_stats()
+        capacity = capacity if capacity is not None else self._inbox_capacity_stats()
         capacity_ok = not self.alert_processor or bool(capacity["admission_ok"])
         processor_ok = (
             True if not self.alert_processor else self.alert_processor.is_healthy()
@@ -1356,6 +1369,25 @@ class GatewayState:
                 if name != "inbox_capacity"
             ),
             "checks": checks,
+        }
+
+    def dashboard_snapshot(self) -> dict:
+        """Build one internally consistent monitor sample without duplicate queue reads."""
+        inbox = self.repo.inbox_stats()
+        capacity = self._inbox_capacity_stats()
+        readiness = self.readiness(inbox=inbox, capacity=capacity)
+        return {
+            "health": {
+                "ok": bool(readiness["ok"]),
+                "status": "ready" if readiness["ok"] else "not_ready",
+                "checks": readiness["checks"],
+                "stats": self.repo.stats(),
+                "processing": self.processing_stats(
+                    inbox=inbox,
+                    capacity=capacity,
+                ),
+            },
+            "case_summary": self.repo.case_distribution_summary(),
         }
 
     def submit_alert(self, alert: RawAlert) -> dict:
@@ -2684,8 +2716,14 @@ class GatewayState:
             return case
 
     def case_triage_detail(self, case_id: str) -> dict | None:
-        case = self.case_detail(case_id)
-        return _case_triage_payload(case) if case else None
+        with self.lock:
+            case = self.repo.get_case_triage(case_id)
+            if not case:
+                return None
+            case["alert_clusters"] = self.memory.cluster_case_alerts(
+                case.get("linked_alerts") or []
+            )
+            return _case_triage_payload(case)
 
     def replay_case_alert_analysis(self, case_id: str, alert_id: str, actor: str) -> dict:
         """Re-map retained RASP evidence and replace the live Case assessment.
@@ -3525,6 +3563,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 )
             self._json(200 if readiness["ok"] else 503, payload)
             return
+        if parsed.path == "/api/dashboard/snapshot":
+            if not self._require_roles(_ROLE_READ, _ROLE_ANALYST, _ROLE_APPROVER):
+                return
+            snapshot = self.state.dashboard_snapshot()
+            self._json(
+                200 if snapshot["health"]["ok"] else 503,
+                snapshot,
+            )
+            return
         if parsed.path == "/api/samples/rasp-alert":
             self._json(200, self.state.rasp_sample_log())
             return
@@ -3709,6 +3756,48 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     "pagination": _pagination_payload(total, limit, offset),
                 },
             )
+            return
+        if parsed.path.startswith("/api/cases/") and parsed.path.endswith("/response-pack/latest"):
+            if not self._require_roles(
+                _ROLE_READ, _ROLE_ANALYST, _ROLE_APPROVER, _ROLE_RESPONDER
+            ):
+                return
+            parts = parsed.path.split("/")
+            if len(parts) != 6 or parts[4] != "response-pack":
+                self._json(404, {"error": "Case Response Pack endpoint not found"})
+                return
+            case_id = unquote(parts[3])
+            try:
+                artifact = self.state.case_response.latest(case_id)
+            except KeyError:
+                self._json(404, {"error": "case not found"})
+                return
+            if not artifact:
+                self._json(404, {"error": "Case Response Pack has not been generated"})
+                return
+            self._json(200, {"artifact": artifact})
+            return
+        if parsed.path.startswith("/api/cases/") and parsed.path.endswith("/timeline"):
+            if not self._require_roles(
+                _ROLE_READ, _ROLE_ANALYST, _ROLE_APPROVER, _ROLE_RESPONDER
+            ):
+                return
+            parts = parsed.path.split("/")
+            if len(parts) != 5:
+                self._json(404, {"error": "Case timeline endpoint not found"})
+                return
+            case_id = unquote(parts[3])
+            query = parse_qs(parsed.query)
+            try:
+                timeline = self.state.case_response.timeline(
+                    case_id,
+                    limit=_query_int(query, "limit", 20, min_value=1, max_value=100),
+                    offset=_query_int(query, "offset", 0, min_value=0),
+                )
+            except KeyError:
+                self._json(404, {"error": "case not found"})
+                return
+            self._json(200, timeline)
             return
         if parsed.path.startswith("/api/cases/") and "/details/" in parsed.path:
             if not self._require_roles(_ROLE_READ, _ROLE_ANALYST, _ROLE_APPROVER):
@@ -4020,6 +4109,28 @@ class GatewayHandler(BaseHTTPRequestHandler):
             except _PayloadTooLarge:
                 self._json(413, {"error": "request body too large"})
             except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                self._client_error(exc)
+            except Exception as exc:
+                self._server_error(exc)
+            return
+        if parsed.path.startswith("/api/cases/") and parsed.path.endswith("/response-pack/generate"):
+            parts = parsed.path.split("/")
+            if len(parts) != 6 or parts[4] != "response-pack":
+                self._json(404, {"error": "Case Response Pack endpoint not found"})
+                return
+            case_id = unquote(parts[3])
+            try:
+                body = self._governance_body(self._read_json())
+                result = self.state.case_response.generate(
+                    case_id,
+                    actor=str(body.get("_actor") or "soc-analyst"),
+                )
+                self._json(201 if result["created"] else 200, result)
+            except _PayloadTooLarge:
+                self._json(413, {"error": "request body too large"})
+            except KeyError:
+                self._json(404, {"error": "case not found"})
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
                 self._client_error(exc)
             except Exception as exc:
                 self._server_error(exc)

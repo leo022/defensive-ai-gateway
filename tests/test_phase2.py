@@ -302,6 +302,31 @@ class CaseDetailHTTPIntegrationTest(unittest.TestCase):
                 thread.join(timeout=2)
 
 
+class CaseTriageOverviewTest(unittest.TestCase):
+    def test_overview_uses_bounded_repository_path_and_preserves_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            config.database.path = str(Path(tmp) / "gateway.db")
+            config.processing.async_enabled = False
+            state = GatewayState(config)
+            analyzed = state.orchestrator.handle_alert(_waf_alert())
+
+            def fail_full_graph(_case_id):
+                raise AssertionError("Case overview must not load the full Case graph")
+
+            state.repo.get_case = fail_full_graph
+            overview = state.case_triage_detail(analyzed.case_id)
+
+            self.assertIsNotNone(overview)
+            self.assertEqual(overview["detail_counts"]["raw_alerts"], 1)
+            self.assertEqual(overview["detail_counts"]["normalized_evidence"], 1)
+            self.assertGreaterEqual(overview["detail_counts"]["analysis_runs"], 2)
+            self.assertEqual(len(overview["agent_runs"]), 1)
+            self.assertEqual(len(overview["validation_runs"]), 1)
+            raw_payload = overview["linked_alerts"][0]["raw_alert"]["payload"]
+            self.assertTrue(set(raw_payload).issubset({"adapter"}))
+
+
 class CaseSummaryHTTPIntegrationTest(unittest.TestCase):
     def test_case_summary_is_independent_from_list_pagination(self):
         with tempfile.TemporaryDirectory() as tmp:

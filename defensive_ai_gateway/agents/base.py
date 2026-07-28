@@ -960,6 +960,16 @@ class SecurityAgent(ABC):
             "whitelist_recommendation": whitelist,
             "raw_reason": reason,
         }
+        business_impact = str(llm_result.get("business_impact") or "").strip()
+        if business_impact:
+            explanation["business_impact"] = business_impact
+        attack_stage = llm_result.get("attack_stage")
+        if isinstance(attack_stage, list):
+            normalized_stages = [
+                str(item).strip() for item in attack_stage if str(item).strip()
+            ]
+            if normalized_stages:
+                explanation["attack_stage"] = normalized_stages[:12]
         if llm_result.get("_ground_truth_override"):
             explanation["ground_truth_override"] = llm_result["_ground_truth_override"]
         return explanation

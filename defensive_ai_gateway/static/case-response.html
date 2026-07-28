@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#f4f6f8" />
+    <title>Case Response Pack</title>
+    <link rel="icon" href="/logo-mark.svg" type="image/svg+xml" />
+    <link rel="icon" href="/favicon.ico" sizes="any" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180" />
+    <script src="/theme-init.js"></script>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body class="case-response-page">
+    <header class="case-response-header">
+      <button id="case-response-back" class="case-response-back" type="button">返回 Case</button>
+      <div class="case-response-heading">
+        <span id="case-response-kicker">Respond powered by AI</span>
+        <h1 id="case-response-title">Case 响应工作台</h1>
+        <p id="case-response-subtitle">正在加载 Case…</p>
+      </div>
+      <div class="case-response-actions">
+        <button id="case-response-refresh" type="button">刷新</button>
+        <button id="case-response-generate" class="primary" type="button">生成新版本</button>
+      </div>
+    </header>
+
+    <main class="case-response-main" aria-busy="false">
+      <div id="case-response-status" class="case-response-status" role="status" aria-live="polite"></div>
+      <section id="case-response-overview" class="case-response-overview" aria-label="Case overview"></section>
+
+      <section class="case-response-section" aria-labelledby="response-summary-heading">
+        <div class="case-response-section-heading">
+          <div>
+            <span>01</span>
+            <h2 id="response-summary-heading">Case 摘要</h2>
+          </div>
+        </div>
+        <div id="case-response-summary" class="case-response-section-body"></div>
+      </section>
+
+      <section class="case-response-section" aria-labelledby="response-containment-heading">
+        <div class="case-response-section-heading">
+          <div>
+            <span>02</span>
+            <h2 id="response-containment-heading">精细遏制建议</h2>
+          </div>
+          <strong id="case-response-containment-state"></strong>
+        </div>
+        <div id="case-response-containment" class="case-response-section-body"></div>
+      </section>
+
+      <section class="case-response-section" aria-labelledby="response-playbook-heading">
+        <div class="case-response-section-heading">
+          <div>
+            <span>03</span>
+            <h2 id="response-playbook-heading">响应 Playbook</h2>
+          </div>
+        </div>
+        <div id="case-response-playbook" class="case-response-section-body"></div>
+      </section>
+
+      <section class="case-response-section" aria-labelledby="response-communication-heading">
+        <div class="case-response-section-heading">
+          <div>
+            <span>04</span>
+            <h2 id="response-communication-heading">内部事件沟通草稿</h2>
+          </div>
+          <div class="case-response-section-tools">
+            <strong id="case-response-communication-state"></strong>
+            <button id="case-response-copy-report" class="case-response-copy-report" type="button" disabled>
+              复制汇报内容
+            </button>
+          </div>
+        </div>
+        <div id="case-response-communication" class="case-response-section-body"></div>
+      </section>
+
+      <section class="case-response-section" aria-labelledby="response-timeline-heading">
+        <div class="case-response-section-heading">
+          <div>
+            <span>05</span>
+            <h2 id="response-timeline-heading" tabindex="-1">事件时间线</h2>
+          </div>
+          <strong id="case-response-timeline-count"></strong>
+        </div>
+        <div id="case-response-timeline" class="case-response-section-body" aria-busy="false"></div>
+        <nav id="case-response-timeline-pagination" class="case-response-pagination" aria-label="Timeline pagination" aria-busy="false"></nav>
+      </section>
+    </main>
+    <script src="/case-response.js"></script>
+  </body>
+</html>

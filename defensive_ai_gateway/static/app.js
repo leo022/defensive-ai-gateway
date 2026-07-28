@@ -7,7 +7,7 @@ const REFRESH_PAUSED_KEY = "dashboard-refresh-paused";
 const LEGACY_OFFLINE_MODE_KEY = "dashboard-offline-mode";
 const COLLAPSIBLE_TEXT_LIMIT = 280;
 const COLLAPSIBLE_TEXT_LINE_LIMIT = 8;
-const DASHBOARD_REFRESH_MS = 5000;
+const DASHBOARD_REFRESH_MS = 10_000;
 const OLLAMA_MODEL_REFRESH_MS = 15000;
 const REQUEST_TIMEOUT_MS = 30_000;
 const PAGE_SIZE_OPTIONS = [10, 20, 50, 100];
@@ -219,6 +219,9 @@ const STRINGS = {
     detailRawAlertsHint: "查看关联告警的完整原始载荷与处置状态。",
     detailEvidenceHint: "查看结构化实体、证据和敏感标签。",
     detailRunsHint: "查看分析结果与验证记录。",
+    responsePackTitle: "AI 响应工作台",
+    responsePackHint: "按需生成证据约束的摘要、时间线、遏制建议、Playbook 与内部沟通草稿。",
+    responsePackBadge: "按需生成",
     detailOpen: "打开详情",
     memoryTotal: "记忆总量",
     memoryActive: "生效中",
@@ -805,6 +808,9 @@ const STRINGS = {
     detailRawAlertsHint: "View the complete raw payload and disposition for each linked alert.",
     detailEvidenceHint: "View structured entities, evidence, and sensitivity tags.",
     detailRunsHint: "View analysis outputs and validation records.",
+    responsePackTitle: "AI response workspace",
+    responsePackHint: "Generate an evidence-bound summary, timeline, containment plan, playbook, and internal communication draft on demand.",
+    responsePackBadge: "On demand",
     detailOpen: "Open details",
     memoryTotal: "Total Memories",
     memoryActive: "Active",
@@ -1210,8 +1216,11 @@ const sampleLogCache = new Map();
 let syslogConfigs = loadSyslogConfigs();
 let syslogRuntime = { mode: "embedded", editable: true, unavailable: false };
 let syslogDeployment = { collector_address: "", source_cidrs: [], targets: [] };
+let dashboardLlmConfig = { provider: "unavailable", model: "-", endpoint: "", unavailable: true };
+let dashboardSyslogPayload = { configs: syslogConfigs, listeners: [], unavailable: true };
 let refreshPaused = false;
 let dashboardRefreshTimer = null;
+let dashboardRefreshPromise = null;
 let memoryItems = [];
 let memoryAuditEvents = [];
 let memoryPagination = { page: 1, size: 20, total: 0, totalPages: 1 };
@@ -1229,6 +1238,7 @@ let selectedMemoryDetail = null;
 let memorySelectionRequestId = 0;
 let memoryAssociationRequestId = 0;
 let queueCases = [];
+const caseListRenderKeys = { pending: "", history: "" };
 const casePagination = {
   pending: { page: 1, size: 20, total: 0, totalPages: 1 },
   history: { page: 1, size: 20, total: 0, totalPages: 1 },
@@ -1688,12 +1698,14 @@ async function loadSyslogConfig() {
     if (!isApiNotFoundError(err)) throw err;
     setSyslogRuntime({ mode: "embedded", editable: true, unavailable: true });
     mergeSyslogConfigs(loadSyslogConfigs());
+    dashboardSyslogPayload = { configs: syslogConfigs, listeners: [], unavailable: true };
     renderSyslogConfigTable();
     setSyslogConfigStatus(tr("syslogConfigApiUnavailable"));
-    return { configs: syslogConfigs, unavailable: true };
+    return dashboardSyslogPayload;
   }
   setSyslogRuntime(payload);
   mergeSyslogConfigs(payload.configs || []);
+  dashboardSyslogPayload = { ...payload, configs: syslogConfigs };
   persistSyslogConfigs();
   renderSyslogConfigTable();
   if (syslogRuntime.mode === "external_vector") {
@@ -1719,12 +1731,16 @@ function setSyslogConfigStatus(message, isError = false) {
 
 function setSyslogRuntime(payload = {}) {
   const mode = payload.mode === "external_vector" ? "external_vector" : "embedded";
-  syslogRuntime = {
+  const next = {
     mode,
     editable: mode === "embedded" && payload.editable !== false,
     unavailable: Boolean(payload.unavailable),
   };
-  updateSyslogModeUi();
+  const changed = next.mode !== syslogRuntime.mode
+    || next.editable !== syslogRuntime.editable
+    || next.unavailable !== syslogRuntime.unavailable;
+  syslogRuntime = next;
+  if (changed) updateSyslogModeUi();
 }
 
 function updateSyslogModeUi() {
@@ -1861,6 +1877,12 @@ async function saveSyslogConfigRow(product) {
     body: JSON.stringify({ product, port, protocol }),
   });
   mergeSyslogConfigs(result.syslog?.configs || []);
+  dashboardSyslogPayload = {
+    ...dashboardSyslogPayload,
+    ...(result.syslog || {}),
+    configs: syslogConfigs,
+    unavailable: false,
+  };
   const saved = syslogConfigs.find((item) => item.product === product) || config;
   persistSyslogConfigs();
   renderSyslogConfigTable();
@@ -1879,6 +1901,7 @@ function fillDefaultSyslogConfigs() {
     return;
   }
   syslogConfigs = defaultSyslogConfigs();
+  dashboardSyslogPayload = { ...dashboardSyslogPayload, configs: syslogConfigs };
   persistSyslogConfigs();
   renderSyslogConfigTable();
   setSyslogConfigStatus(tr("syslogDefaultsRestored"));
@@ -2023,6 +2046,23 @@ function escapeHtml(value) {
     .replaceAll('"', "&quot;");
 }
 
+const renderedMarkup = new WeakMap();
+
+function setHtmlIfChanged(node, markup) {
+  if (!node || renderedMarkup.get(node) === markup) return false;
+  renderedMarkup.set(node, markup);
+  node.innerHTML = markup;
+  return true;
+}
+
+function setTextIfChanged(node, value) {
+  if (!node) return false;
+  const next = String(value);
+  if (node.textContent === next) return false;
+  node.textContent = next;
+  return true;
+}
+
 function pretty(value) {
   return escapeHtml(JSON.stringify(value || {}, null, 2));
 }
@@ -2136,7 +2176,7 @@ function saveRefreshPreference(paused) {
     // The current session still honors the selected refresh mode when storage is unavailable.
   }
   updateRefreshModeUi();
-  scheduleDashboardRefresh();
+  scheduleDashboardRefresh({ immediate: !refreshPaused });
 }
 
 function updateRefreshModeUi() {
@@ -2148,17 +2188,31 @@ function updateRefreshModeUi() {
   label.textContent = tr(refreshPaused ? "autoRefreshPaused" : "autoRefreshOn");
 }
 
-function scheduleDashboardRefresh() {
+function monitorViewIsActive() {
+  return document.querySelector("#monitor-view")?.classList.contains("active") === true;
+}
+
+function clearDashboardRefreshTimer() {
   if (dashboardRefreshTimer) {
-    window.clearInterval(dashboardRefreshTimer);
+    window.clearTimeout(dashboardRefreshTimer);
     dashboardRefreshTimer = null;
   }
-  if (refreshPaused) return;
-  dashboardRefreshTimer = window.setInterval(() => {
-    if (document.querySelector("#monitor-view")?.classList.contains("active")) {
-      loadCases({ quiet: true }).catch((err) => showToast(err.message || String(err), "error"));
+}
+
+function scheduleDashboardRefresh({ immediate = false } = {}) {
+  clearDashboardRefreshTimer();
+  if (refreshPaused || document.hidden || !monitorViewIsActive()) return;
+  dashboardRefreshTimer = window.setTimeout(async () => {
+    dashboardRefreshTimer = null;
+    if (refreshPaused || document.hidden || !monitorViewIsActive()) return;
+    try {
+      await loadMonitorDashboard({ refreshConfig: false });
+    } catch (err) {
+      // Automatic refresh is best effort; manual refresh surfaces errors.
+    } finally {
+      scheduleDashboardRefresh();
     }
-  }, DASHBOARD_REFRESH_MS);
+  }, immediate ? 0 : DASHBOARD_REFRESH_MS);
 }
 
 function distributionRows(items) {
@@ -2170,25 +2224,27 @@ function distributionRows(items) {
 function renderDistribution(containerId, rows, total, labelForValue = (value) => value) {
   const container = document.querySelector(containerId);
   if (!container) return;
+  let markup = "";
   if (!rows.length || !total) {
-    container.innerHTML = `<p class="empty">${escapeHtml(tr("noDistribution"))}</p>`;
-    return;
-  }
-  container.innerHTML = rows
-    .map(([value, count]) => {
-      const percent = Math.round((count / total) * 100);
-      return `
-        <div class="distribution-row">
-          <div>
-            <strong>${escapeHtml(labelForValue(value))}</strong>
-            <span>${escapeHtml(String(count))}</span>
+    markup = `<p class="empty">${escapeHtml(tr("noDistribution"))}</p>`;
+  } else {
+    markup = rows
+      .map(([value, count]) => {
+        const percent = Math.round((count / total) * 100);
+        return `
+          <div class="distribution-row">
+            <div>
+              <strong>${escapeHtml(labelForValue(value))}</strong>
+              <span>${escapeHtml(String(count))}</span>
+            </div>
+            <div class="distribution-bar" aria-hidden="true"><i style="width: ${percent}%"></i></div>
+            <small>${percent}%</small>
           </div>
-          <div class="distribution-bar" aria-hidden="true"><i style="width: ${percent}%"></i></div>
-          <small>${percent}%</small>
-        </div>
-      `;
-    })
-    .join("");
+        `;
+      })
+      .join("");
+  }
+  setHtmlIfChanged(container, markup);
 }
 
 function healthItem(status, title, detail) {
@@ -2263,13 +2319,14 @@ function renderHealth(items) {
   );
   const runtimeStatus = items.some((item) => item.status === "bad") ? "bad" : items.some((item) => item.status === "warn") ? "warn" : "ok";
   const runtimeLabel = runtimeStatus === "ok" ? tr("runtimeHealthy") : runtimeStatus === "warn" ? tr("runtimeDegraded") : tr("runtimeCritical");
-  scoreNode.textContent = tr("healthScore", { score });
-  scoreNode.className = `health-score ${runtimeStatus}`;
-  runtime.innerHTML = `
+  setTextIfChanged(scoreNode, tr("healthScore", { score }));
+  const scoreClass = `health-score ${runtimeStatus}`;
+  if (scoreNode.className !== scoreClass) scoreNode.className = scoreClass;
+  setHtmlIfChanged(runtime, `
     <span class="runtime-dot ${runtimeStatus}" aria-hidden="true"></span>
     <span>${escapeHtml(runtimeLabel)}</span>
-  `;
-  container.innerHTML = items
+  `);
+  setHtmlIfChanged(container, items
     .map(
       (item) => `
         <article class="health-check ${escapeHtml(item.status)}">
@@ -2282,7 +2339,7 @@ function renderHealth(items) {
         </article>
       `,
     )
-    .join("");
+    .join(""));
 }
 
 function renderIntakeHealth(syslogPayload) {
@@ -2290,7 +2347,7 @@ function renderIntakeHealth(syslogPayload) {
   if (!container) return;
   const external = syslogPayload?.mode === "external_vector";
   const configs = Array.isArray(syslogPayload?.configs) ? syslogPayload.configs : syslogConfigs;
-  container.innerHTML = `
+  setHtmlIfChanged(container, `
     <article class="intake-health-row ok">
       <strong>HTTP</strong>
       <span>${escapeHtml(tr("httpActive"))}</span>
@@ -2307,16 +2364,16 @@ function renderIntakeHealth(syslogPayload) {
         `,
       )
       .join("")}
-  `;
+  `);
 }
 
 function renderDashboard(health, caseSummary, llmConfig, syslogPayload) {
   const processing = health?.processing || {};
   if (syslogPayload && !syslogPayload.unavailable) setSyslogRuntime(syslogPayload);
-  document.querySelector("#alerts").textContent = health?.stats?.alerts ?? 0;
-  document.querySelector("#cases").textContent = health?.stats?.open_cases ?? health?.stats?.cases ?? 0;
-  document.querySelector("#high").textContent = health?.stats?.high_or_critical_cases ?? 0;
-  document.querySelector("#queue-depth").textContent = unfinishedAlertCount(processing);
+  setTextIfChanged(document.querySelector("#alerts"), health?.stats?.alerts ?? 0);
+  setTextIfChanged(document.querySelector("#cases"), health?.stats?.open_cases ?? health?.stats?.cases ?? 0);
+  setTextIfChanged(document.querySelector("#high"), health?.stats?.high_or_critical_cases ?? 0);
+  setTextIfChanged(document.querySelector("#queue-depth"), unfinishedAlertCount(processing));
   const totalCases = Math.max(0, Number(caseSummary?.total) || 0);
   const productRows = distributionRows(caseSummary?.products)
     .map(([product, count]) => [product.toUpperCase(), count]);
@@ -2948,12 +3005,29 @@ function renderDetail(detail) {
           </div>
         </div>
         <div class="detail-link-list">
+          ${responsePackLink(detail.case_id)}
           ${detailLink(detail.case_id, "raw-alerts", tr("linkedRawAlerts"), tr("detailRawAlertsHint"), tr("alertCount", { count: detailCounts.raw_alerts ?? linked.length }))}
           ${detailLink(detail.case_id, "normalized-evidence", tr("normalizedEvidence"), tr("detailEvidenceHint"), tr("alertCount", { count: detailCounts.normalized_evidence ?? linked.length }))}
           ${detailLink(detail.case_id, "analysis-runs", tr("agentRuns"), tr("detailRunsHint"), tr("runCount", { count: detailCounts.analysis_runs ?? detail.agent_runs?.length ?? 0 }))}
         </div>
       </section>
     </div>
+  `;
+}
+
+function responsePackLink(caseId) {
+  const href = `/case-response.html?${new URLSearchParams({ case_id: caseId }).toString()}`;
+  return `
+    <a class="detail-link-card response-pack-link" href="${escapeHtml(href)}">
+      <span class="detail-link-copy">
+        <strong>${escapeHtml(tr("responsePackTitle"))}</strong>
+        <span>${escapeHtml(tr("responsePackHint"))}</span>
+      </span>
+      <span class="detail-link-meta">
+        <small>${escapeHtml(tr("responsePackBadge"))}</small>
+        <b>${escapeHtml(tr("detailOpen"))} →</b>
+      </span>
+    </a>
   `;
 }
 
@@ -2989,6 +3063,13 @@ function renderCaseList(cases, section, emptyKey) {
   const list = document.querySelector(dashboardCaseListId(section));
   if (!list) return;
   const visible = cases || [];
+  const renderKey = JSON.stringify({
+    language: currentLanguage,
+    cases: visible,
+    pagination: casePagination[section],
+  });
+  if (caseListRenderKeys[section] === renderKey) return;
+  caseListRenderKeys[section] = renderKey;
   list.innerHTML = "";
   if (!visible.length) {
     list.innerHTML = `<div class="empty-state">${escapeHtml(tr(emptyKey))}</div>`;
@@ -4209,6 +4290,8 @@ function setView(name) {
     else btn.removeAttribute("aria-current");
   });
   updateWorkspaceTitle(name);
+  clearDashboardRefreshTimer();
+  if (name !== "settings") stopOllamaModelRefresh();
 }
 
 function updateTriageBackLabel() {
@@ -4247,6 +4330,10 @@ function activeSecondaryView(group, fallback = "") {
 
 function loadViewData(name) {
   if (name === "triage") return Promise.resolve();
+  if (name === "monitor") {
+    clearDashboardRefreshTimer();
+    return loadMonitorDashboard({ refreshConfig: true }).finally(() => scheduleDashboardRefresh());
+  }
   if (name === "dashboard") return loadCases({ section: activeDashboardSection });
   if (name === "settings") {
     if (!canReadRuntimeConfig()) return Promise.resolve();
@@ -4283,7 +4370,7 @@ function loadViewData(name) {
     }
     return Promise.all(tasks);
   }
-  return loadCases();
+  return Promise.resolve();
 }
 
 function refreshCurrentView() {
@@ -4299,30 +4386,49 @@ function refreshCurrentView() {
   return loadViewData(active);
 }
 
-async function loadDashboardRuntime(section = activeDashboardSection) {
+async function loadDashboardRuntime({ refreshConfig = true } = {}) {
   const llmFallback = { provider: "unavailable", model: "-", endpoint: "", unavailable: true };
   const syslogFallback = { configs: syslogConfigs, listeners: [], unavailable: true };
-  const caseSummaryFallback = { total: 0, products: [], classifications: [] };
-  const caseQuery = caseSearchQuery(section);
-  const [health, casesData, caseSummary, llmConfig, syslogPayload] = await Promise.all([
-    json("/api/health", { acceptStatuses: [503] }),
-    canReadCases() ? json(`/api/cases?${caseQuery}`) : Promise.resolve({ cases: [] }),
-    canReadCases() ? json("/api/cases/summary") : Promise.resolve(caseSummaryFallback),
-    canReadRuntimeConfig()
-      ? json("/api/config/llm").catch(() => llmFallback)
-      : Promise.resolve(llmFallback),
-    canReadRuntimeConfig()
-      ? json("/api/config/syslog").catch(() => syslogFallback)
-      : Promise.resolve(syslogFallback),
+  const llmRequest = canReadRuntimeConfig()
+    ? (refreshConfig
+      ? json("/api/config/llm").catch(() => dashboardLlmConfig)
+      : Promise.resolve(dashboardLlmConfig))
+    : Promise.resolve(llmFallback);
+  const syslogRequest = canReadRuntimeConfig()
+    ? (refreshConfig
+      ? json("/api/config/syslog").catch(() => dashboardSyslogPayload)
+      : Promise.resolve(dashboardSyslogPayload))
+    : Promise.resolve(syslogFallback);
+  const [snapshot, llmConfig, syslogPayload] = await Promise.all([
+    json("/api/dashboard/snapshot", { acceptStatuses: [503] }),
+    llmRequest,
+    syslogRequest,
   ]);
+  if (canReadRuntimeConfig()) {
+    dashboardLlmConfig = llmConfig;
+    dashboardSyslogPayload = syslogPayload;
+  }
   return {
-    health,
-    cases: casesData.cases || [],
-    pagination: casesData.pagination || {},
-    caseSummary,
+    health: snapshot.health || {},
+    caseSummary: snapshot.case_summary || { total: 0, products: [], classifications: [] },
     llmConfig,
     syslogPayload,
   };
+}
+
+async function loadMonitorDashboard(options = {}) {
+  if (dashboardRefreshPromise) return dashboardRefreshPromise;
+  const request = (async () => {
+    const runtime = await loadDashboardRuntime(options);
+    renderDashboard(runtime.health, runtime.caseSummary, runtime.llmConfig, runtime.syslogPayload);
+    return runtime;
+  })();
+  dashboardRefreshPromise = request;
+  try {
+    return await request;
+  } finally {
+    if (dashboardRefreshPromise === request) dashboardRefreshPromise = null;
+  }
 }
 
 async function loadCases(options = {}) {
@@ -4330,14 +4436,17 @@ async function loadCases(options = {}) {
   activeDashboardSection = section;
   const list = document.querySelector(dashboardCaseListId(section));
   try {
-    const { health, cases, pagination, caseSummary, llmConfig, syslogPayload } = await loadDashboardRuntime(section);
-    renderDashboard(health, caseSummary, llmConfig, syslogPayload);
+    const caseQuery = caseSearchQuery(section);
+    const casesData = canReadCases()
+      ? await json(`/api/cases?${caseQuery}`)
+      : { cases: [], pagination: {} };
     detailCache.clear();
-    queueCases = cases;
-    applyPaginationPayload(casePagination[section], pagination);
+    queueCases = casesData.cases || [];
+    applyPaginationPayload(casePagination[section], casesData.pagination || {});
     if (section === "history") renderProcessedList(processedQueueCases(queueCases));
     else renderQueueList(pendingQueueCases(queueCases));
   } catch (err) {
+    caseListRenderKeys[section] = "";
     if (list) list.innerHTML = `<div class="empty-state">${escapeHtml(err.stack || String(err))}</div>`;
     if (!options.quiet) showToast(tr("refreshFailed", { message: err.message || String(err) }), "error");
   }
@@ -4614,10 +4723,11 @@ async function validateMappingProfile(profile, log = currentLog()) {
 
 async function loadLlmConfig() {
   const cfg = await json("/api/config/llm");
+  dashboardLlmConfig = cfg;
   populateLlmForm(cfg);
   setConfigStatus(cfg.api_key_set ? tr("configLoadedWithKey") : tr("configLoadedNoKey"));
-  if ((cfg.provider || "local") === "ollama") startOllamaModelRefresh();
-  else stopOllamaModelRefresh();
+  syncOllamaModelRefresh();
+  return cfg;
 }
 
 function populateLlmForm(cfg) {
@@ -4656,12 +4766,26 @@ function stopOllamaModelRefresh() {
   }
 }
 
+function ollamaModelRefreshAllowed() {
+  return !document.hidden
+    && document.querySelector("#settings-view")?.classList.contains("active") === true
+    && document.querySelector("#llm-provider")?.value === "ollama";
+}
+
+function syncOllamaModelRefresh() {
+  if (ollamaModelRefreshAllowed()) startOllamaModelRefresh();
+  else stopOllamaModelRefresh();
+}
+
 function startOllamaModelRefresh() {
-  stopOllamaModelRefresh();
-  if (document.querySelector("#llm-provider").value !== "ollama") return;
+  if (!ollamaModelRefreshAllowed()) {
+    stopOllamaModelRefresh();
+    return;
+  }
+  if (ollamaModelRefreshTimer) return;
   loadOllamaModels().catch((err) => setConfigStatus(err.message || String(err), true));
   ollamaModelRefreshTimer = window.setInterval(() => {
-    if (document.querySelector("#llm-provider").value !== "ollama") {
+    if (!ollamaModelRefreshAllowed()) {
       stopOllamaModelRefresh();
       return;
     }
@@ -4705,11 +4829,11 @@ async function restoreLlmDefaults() {
     headers: { "Content-Type": "application/json" },
     body: "{}",
   });
+  dashboardLlmConfig = result.llm;
   populateLlmForm(result.llm);
   document.querySelector("#llm-api-key").placeholder = result.llm.api_key_set ? tr("keySetKeep") : tr("keyUnset");
   setConfigStatus(tr("configRestored"));
-  if ((result.llm.provider || "local") === "ollama") startOllamaModelRefresh();
-  else stopOllamaModelRefresh();
+  syncOllamaModelRefresh();
 }
 
 async function loadOllamaModels({ quiet = false } = {}) {
@@ -4763,9 +4887,11 @@ async function saveLlmConfig(event) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
+  dashboardLlmConfig = result.llm;
   populateLlmForm(result.llm);
   document.querySelector("#llm-api-key").placeholder = result.llm.api_key_set ? tr("keySetKeep") : tr("keyUnset");
   setConfigStatus(tr("configSaved", { provider: result.llm.provider, model: result.llm.model }));
+  syncOllamaModelRefresh();
 }
 
 async function testLlmConnection() {
@@ -4844,6 +4970,16 @@ if (window.matchMedia) {
     }
   });
 }
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    clearDashboardRefreshTimer();
+    stopOllamaModelRefresh();
+    return;
+  }
+  if (monitorViewIsActive()) scheduleDashboardRefresh({ immediate: true });
+  syncOllamaModelRefresh();
+});
 
 document.querySelector("#refresh").addEventListener("click", () => {
   refreshCurrentView().catch((err) => showToast(err.message || String(err), "error"));
@@ -5086,19 +5222,11 @@ document.querySelectorAll(".nav-subbutton").forEach((btn) => {
 
 async function loadApplicationData() {
   await loadSession();
-  const tasks = [
-    loadSampleLog(selectedLogProduct()),
-    loadCases(),
-  ];
-  if (canReadRuntimeConfig()) {
-    tasks.push(loadLlmConfig(), loadSyslogConfig(), loadSyslogDeployment());
-  } else {
-    renderSyslogDeployment();
+  try {
+    return await loadMonitorDashboard({ refreshConfig: true });
+  } finally {
+    scheduleDashboardRefresh();
   }
-  if (canReadMappingProfiles()) {
-    tasks.push(loadMappingProfiles());
-  }
-  return Promise.all(tasks);
 }
 
 document.querySelector("#auth-session").addEventListener("click", () => showAuthDialog());
@@ -5144,4 +5272,3 @@ setPendingCaseSearchCurrentMonth();
 loadApplicationData().catch((err) =>
   showToast(err.message || String(err), "error"),
 );
-scheduleDashboardRefresh();

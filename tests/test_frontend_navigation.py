@@ -46,7 +46,7 @@ class DashboardQueueMetricTest(unittest.TestCase):
     def test_dashboard_uses_all_unfinished_alerts_and_refreshes_during_demo(self):
         self.assertIn("processing.unfinished", JS)
         self.assertIn('unfinishedAlertCount(processing)', JS)
-        self.assertIn("const DASHBOARD_REFRESH_MS = 5000;", JS)
+        self.assertIn("const DASHBOARD_REFRESH_MS = 10_000;", JS)
         self.assertIn("{queued} 等待，{inflight} 分析中", JS)
         self.assertIn('llmProvider === "gateway" && !Boolean(llmConfig?.api_key_set)', JS)
         self.assertIn("modelCredentialMissing", JS)
@@ -56,16 +56,39 @@ class DashboardQueueMetricTest(unittest.TestCase):
         self.assertEqual(JS.count("modelDeferredBacklog:"), 2)
 
     def test_dashboard_distributions_use_all_case_summary_not_the_list_page(self):
-        dashboard = JS.split("async function loadDashboardRuntime(section = activeDashboardSection)", 1)[1].split(
+        dashboard = JS.split("async function loadDashboardRuntime({ refreshConfig = true } = {})", 1)[1].split(
             "async function loadCases", 1
         )[0]
         rendering = JS.split("function renderDashboard(", 1)[1].split("function statusLabel", 1)[0]
-        self.assertIn('json("/api/cases/summary")', dashboard)
+        self.assertIn('json("/api/dashboard/snapshot", { acceptStatuses: [503] })', dashboard)
+        self.assertIn("snapshot.case_summary", dashboard)
         self.assertIn("caseSummary", dashboard)
         self.assertIn("caseSummary?.total", rendering)
         self.assertIn("caseSummary?.products", rendering)
         self.assertIn("caseSummary?.classifications", rendering)
         self.assertNotIn("countBy(cases", rendering)
+
+    def test_dashboard_refresh_is_completion_scheduled_hidden_aware_and_single_flight(self):
+        scheduler = JS.split("function scheduleDashboardRefresh", 1)[1].split(
+            "function distributionRows", 1
+        )[0]
+        monitor_loader = JS.split("async function loadMonitorDashboard", 1)[1].split(
+            "async function loadCases", 1
+        )[0]
+        self.assertIn("window.setTimeout", scheduler)
+        self.assertNotIn("window.setInterval", scheduler)
+        self.assertIn("document.hidden", scheduler)
+        self.assertIn("loadMonitorDashboard({ refreshConfig: false })", scheduler)
+        self.assertNotIn("loadCases", scheduler)
+        self.assertIn("if (dashboardRefreshPromise) return dashboardRefreshPromise", monitor_loader)
+        self.assertIn("dashboardRefreshPromise = request", monitor_loader)
+        self.assertIn("if (dashboardRefreshPromise === request) dashboardRefreshPromise = null", monitor_loader)
+
+    def test_unchanged_dashboard_and_case_content_does_not_replace_dom(self):
+        self.assertIn("const renderedMarkup = new WeakMap();", JS)
+        self.assertIn("renderedMarkup.get(node) === markup", JS)
+        self.assertIn("const caseListRenderKeys = { pending: \"\", history: \"\" };", JS)
+        self.assertIn("if (caseListRenderKeys[section] === renderKey) return;", JS)
 
 
 class ProductBrandingTest(unittest.TestCase):
@@ -349,7 +372,7 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertIn("Promise.allSettled", JS)
         self.assertIn('setSecondaryView("memory", "inventory")', JS)
         self.assertIn("await loadMemoryInventory({ skipSelection: true })", JS)
-        self.assertIn('json("/api/health", { acceptStatuses: [503] })', JS)
+        self.assertIn('json("/api/dashboard/snapshot", { acceptStatuses: [503] })', JS)
         self.assertIn("function refreshCurrentView", JS)
         self.assertIn("const controller = new AbortController()", JS)
         self.assertIn("controller.abort()", JS)
@@ -373,25 +396,33 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertIn('return hasAnyRole("config")', JS)
         self.assertIn('return hasAnyRole("read", "config", "analyst")', JS)
 
-        dashboard = JS.split("async function loadDashboardRuntime(section = activeDashboardSection)", 1)[1].split(
+        dashboard = JS.split("async function loadDashboardRuntime({ refreshConfig = true } = {})", 1)[1].split(
             "async function loadCases", 1
         )[0]
-        self.assertIn("canReadCases() ? json(`/api/cases?${caseQuery}`)", dashboard)
-        self.assertIn("Promise.resolve({ cases: [] })", dashboard)
-        self.assertIn('json("/api/config/llm").catch(() => llmFallback)', dashboard)
-        self.assertIn('json("/api/config/syslog").catch(() => syslogFallback)', dashboard)
+        self.assertIn('json("/api/dashboard/snapshot", { acceptStatuses: [503] })', dashboard)
+        self.assertNotIn('json("/api/cases/summary")', dashboard)
+        self.assertIn('json("/api/config/llm").catch(() => dashboardLlmConfig)', dashboard)
+        self.assertIn('json("/api/config/syslog").catch(() => dashboardSyslogPayload)', dashboard)
         self.assertIn("Promise.resolve(llmFallback)", dashboard)
         self.assertIn("Promise.resolve(syslogFallback)", dashboard)
+
+        cases_loader = JS.split("async function loadCases(options = {})", 1)[1].split(
+            "function setConfigStatus", 1
+        )[0]
+        self.assertIn("await json(`/api/cases?${caseQuery}`)", cases_loader)
+        self.assertIn("{ cases: [], pagination: {} }", cases_loader)
+        self.assertNotIn('json("/api/health"', cases_loader)
+        self.assertNotIn('json("/api/cases/summary")', cases_loader)
 
         bootstrap = JS.split("async function loadApplicationData()", 1)[1].split(
             'document.querySelector("#auth-session")', 1
         )[0]
         self.assertIn("await loadSession()", bootstrap)
-        self.assertIn("if (canReadRuntimeConfig())", bootstrap)
-        self.assertIn("tasks.push(loadLlmConfig(), loadSyslogConfig(), loadSyslogDeployment())", bootstrap)
-        self.assertIn("if (canReadMappingProfiles())", bootstrap)
-        self.assertIn("tasks.push(loadMappingProfiles())", bootstrap)
-        self.assertNotIn("return Promise.all([", bootstrap)
+        self.assertIn("loadMonitorDashboard({ refreshConfig: true })", bootstrap)
+        self.assertNotIn("loadSampleLog", bootstrap)
+        self.assertNotIn("loadLlmConfig", bootstrap)
+        self.assertNotIn("loadSyslogDeployment", bootstrap)
+        self.assertNotIn("loadMappingProfiles", bootstrap)
 
         view_loader = JS.split("function loadViewData(name)", 1)[1].split(
             "function refreshCurrentView", 1
@@ -478,6 +509,9 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertIn("bindLazyRecordPayloads(records)", DETAIL_JS)
         self.assertIn("data-json-payload", DETAIL_JS)
         self.assertNotIn('class="json-details" open', DETAIL_JS)
+        self.assertIn("function responsePackLink(caseId)", JS)
+        self.assertIn("/case-response.html?", JS)
+        self.assertEqual(JS.count("responsePackTitle:"), 2)
 
     def test_memory_associations_use_contextual_page_without_resetting_governance_form(self):
         detail_renderer = JS.split("function renderMemoryDetail(memory)", 1)[1].split(
@@ -519,6 +553,8 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertIn("ollamaModelLoadRequestId", JS)
         self.assertIn("startOllamaModelRefresh();", JS)
         self.assertIn("stopOllamaModelRefresh();", JS)
+        self.assertIn('document.querySelector("#settings-view")?.classList.contains("active") === true', JS)
+        self.assertIn("!document.hidden", JS)
 
 
 if __name__ == "__main__":

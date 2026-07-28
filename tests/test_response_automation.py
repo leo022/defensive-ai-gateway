@@ -216,6 +216,12 @@ class _ResponseConnectorHandler(BaseHTTPRequestHandler):
     operations: list[str] = []
     idempotency_keys: list[str] = []
     fail_apply = False
+    block_apply_response = False
+    apply_received = threading.Event()
+    release_apply_response = threading.Event()
+    block_verify_response = False
+    verify_received = threading.Event()
+    release_verify_response = threading.Event()
 
     def do_POST(self):  # noqa: N802
         length = int(self.headers.get("Content-Length", "0"))
@@ -225,6 +231,14 @@ class _ResponseConnectorHandler(BaseHTTPRequestHandler):
         self.__class__.idempotency_keys.append(
             str(self.headers.get("X-Idempotency-Key") or "")
         )
+        if operation == "apply":
+            self.__class__.apply_received.set()
+            if self.__class__.block_apply_response:
+                self.__class__.release_apply_response.wait(timeout=3)
+        if operation == "verify":
+            self.__class__.verify_received.set()
+            if self.__class__.block_verify_response:
+                self.__class__.release_verify_response.wait(timeout=3)
         if operation == "apply" and self.__class__.fail_apply:
             body = json.dumps({"ok": False}).encode()
             self.send_response(403)
@@ -253,6 +267,12 @@ class RealConnectorLifecycleTest(unittest.TestCase):
         _ResponseConnectorHandler.operations = []
         _ResponseConnectorHandler.idempotency_keys = []
         _ResponseConnectorHandler.fail_apply = False
+        _ResponseConnectorHandler.block_apply_response = False
+        _ResponseConnectorHandler.apply_received = threading.Event()
+        _ResponseConnectorHandler.release_apply_response = threading.Event()
+        _ResponseConnectorHandler.block_verify_response = False
+        _ResponseConnectorHandler.verify_received = threading.Event()
+        _ResponseConnectorHandler.release_verify_response = threading.Event()
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
 
@@ -383,6 +403,144 @@ class RealConnectorLifecycleTest(unittest.TestCase):
             finally:
                 state.stop()
 
+    def test_terminal_case_during_remote_apply_rolls_back_without_verifying(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._state(tmp)
+            _ResponseConnectorHandler.block_apply_response = True
+            try:
+                connector = state.response_automation.save_connector(
+                    {
+                        "name": "Race WAF",
+                        "endpoint": f"http://127.0.0.1:{self.server.server_port}/actions",
+                        "execution_mode": "auto",
+                        "enabled": True,
+                        "timeout_seconds": 2,
+                    },
+                    actor="config-admin",
+                )
+                state.response_automation.save_policy(
+                    {"enabled": True, "protected_cidrs": []}, actor="config-admin"
+                )
+                state.response_automation.test_connector(
+                    connector["connector_id"], actor="config-admin"
+                )
+                result = state.orchestrator.handle_alert(_waf_alert("response-race-1"))
+                approval = ApprovalResponseTaskTest._executable_approval(state, result.case_id)
+                decided = state.decide_approval(
+                    approval["approval_id"],
+                    {"decision": "approved", "actor": "approver", "reason": "authorized"},
+                )
+                task_id = decided["response_task"]["task_id"]
+                self.assertTrue(_ResponseConnectorHandler.apply_received.wait(timeout=2))
+                self.assertEqual(state.repo.get_response_task(task_id)["status"], "running")
+
+                state.repo.update_case_status(result.case_id, "closed")
+                _ResponseConnectorHandler.release_apply_response.set()
+
+                task = self._wait_for(state, task_id, "rolled_back")
+                self.assertEqual(task["status"], "rolled_back")
+                self.assertEqual(task["remote_rule_id"], "rule-42")
+                self.assertNotIn("verify", _ResponseConnectorHandler.operations)
+                self.assertEqual(_ResponseConnectorHandler.operations[-1], "rollback")
+            finally:
+                _ResponseConnectorHandler.release_apply_response.set()
+                _ResponseConnectorHandler.block_apply_response = False
+                state.stop()
+
+    def test_maintenance_reconciles_terminal_case_with_verified_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._state(tmp)
+            try:
+                connector = state.response_automation.save_connector(
+                    {
+                        "name": "Reconcile WAF",
+                        "endpoint": f"http://127.0.0.1:{self.server.server_port}/actions",
+                        "execution_mode": "auto",
+                        "enabled": True,
+                        "timeout_seconds": 2,
+                    },
+                    actor="config-admin",
+                )
+                state.response_automation.save_policy(
+                    {"enabled": True, "protected_cidrs": []}, actor="config-admin"
+                )
+                state.response_automation.test_connector(
+                    connector["connector_id"], actor="config-admin"
+                )
+                result = state.orchestrator.handle_alert(_waf_alert("response-reconcile-1"))
+                approval = ApprovalResponseTaskTest._executable_approval(state, result.case_id)
+                decided = state.decide_approval(
+                    approval["approval_id"],
+                    {"decision": "approved", "actor": "approver", "reason": "authorized"},
+                )
+                task_id = decided["response_task"]["task_id"]
+                self.assertEqual(self._wait_for(state, task_id, "verified")["status"], "verified")
+                state.response_automation.stop()
+
+                with state.repo._lock:
+                    state.repo.conn.execute(
+                        "UPDATE cases SET status = 'closed' WHERE case_id = ?",
+                        (result.case_id,),
+                    )
+                    state.repo.conn.commit()
+                reconciled = state.repo.queue_terminal_case_response_rollbacks()
+
+                self.assertEqual(reconciled, 1)
+                self.assertEqual(
+                    state.repo.get_response_task(task_id)["status"], "rollback_queued"
+                )
+            finally:
+                state.stop()
+
+    def test_late_verify_cannot_overwrite_terminal_case_rollback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._state(tmp)
+            _ResponseConnectorHandler.block_verify_response = True
+            try:
+                connector = state.response_automation.save_connector(
+                    {
+                        "name": "Verify Race WAF",
+                        "endpoint": f"http://127.0.0.1:{self.server.server_port}/actions",
+                        "execution_mode": "auto",
+                        "enabled": True,
+                        "timeout_seconds": 2,
+                    },
+                    actor="config-admin",
+                )
+                state.response_automation.save_policy(
+                    {"enabled": True, "protected_cidrs": []}, actor="config-admin"
+                )
+                state.response_automation.test_connector(
+                    connector["connector_id"], actor="config-admin"
+                )
+                result = state.orchestrator.handle_alert(_waf_alert("response-verify-race-1"))
+                approval = ApprovalResponseTaskTest._executable_approval(state, result.case_id)
+                decided = state.decide_approval(
+                    approval["approval_id"],
+                    {"decision": "approved", "actor": "approver", "reason": "authorized"},
+                )
+                task_id = decided["response_task"]["task_id"]
+                self.assertTrue(_ResponseConnectorHandler.verify_received.wait(timeout=2))
+                running = state.repo.get_response_task(task_id)
+                self.assertEqual(running["status"], "running")
+                self.assertEqual(running["remote_rule_id"], "rule-42")
+
+                state.repo.update_case_status(result.case_id, "false_positive")
+                self.assertEqual(
+                    state.repo.get_response_task(task_id)["status"], "rollback_queued"
+                )
+                _ResponseConnectorHandler.release_verify_response.set()
+
+                task = self._wait_for(state, task_id, "rolled_back")
+                self.assertEqual(task["status"], "rolled_back")
+                self.assertEqual(
+                    _ResponseConnectorHandler.operations[-2:], ["verify", "rollback"]
+                )
+            finally:
+                _ResponseConnectorHandler.release_verify_response.set()
+                _ResponseConnectorHandler.block_verify_response = False
+                state.stop()
+
     def test_rollback_failure_can_be_retried_by_responder(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = self._state(tmp)
@@ -411,7 +569,10 @@ class RealConnectorLifecycleTest(unittest.TestCase):
                 task_id = decided["response_task"]["task_id"]
                 self.assertEqual(self._wait_for(state, task_id, "verified")["status"], "verified")
                 state.repo.finish_response_task(
-                    task_id, "rollback_failed", error="temporary device outage"
+                    task_id,
+                    "rollback_failed",
+                    expected_status="verified",
+                    error="temporary device outage",
                 )
 
                 queued = state.response_automation.rollback(task_id, actor="responder")
@@ -429,6 +590,12 @@ class ResponseAutomationHTTPRoleTest(unittest.TestCase):
         _ResponseConnectorHandler.operations = []
         _ResponseConnectorHandler.idempotency_keys = []
         _ResponseConnectorHandler.fail_apply = False
+        _ResponseConnectorHandler.block_apply_response = False
+        _ResponseConnectorHandler.apply_received = threading.Event()
+        _ResponseConnectorHandler.release_apply_response = threading.Event()
+        _ResponseConnectorHandler.block_verify_response = False
+        _ResponseConnectorHandler.verify_received = threading.Event()
+        _ResponseConnectorHandler.release_verify_response = threading.Event()
         self.connector_thread = threading.Thread(
             target=self.server.serve_forever, daemon=True
         )

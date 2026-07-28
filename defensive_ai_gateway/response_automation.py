@@ -410,7 +410,11 @@ class ResponseAutomationService:
             )
         if rejection_error:
             task = self.repo.finish_response_task(
-                task["task_id"], "failed", error=rejection_error, _commit=False
+                task["task_id"],
+                "failed",
+                expected_status=task["status"],
+                error=rejection_error,
+                _commit=False,
             ) or task
         return task
 
@@ -495,11 +499,48 @@ class ResponseAutomationService:
             snapshot["health_status"] = current["health_status"]
         return snapshot
 
+    def _queue_compensating_rollback(
+        self,
+        task: dict[str, Any],
+        *,
+        remote_rule_id: str,
+        reason: str,
+    ) -> dict[str, Any] | None:
+        queued = self.repo.finish_response_task(
+            task["task_id"],
+            "rollback_queued",
+            expected_status="running",
+            remote_rule_id=remote_rule_id,
+            error=reason,
+        )
+        if queued:
+            self.repo.insert_audit(
+                new_id("audit"),
+                task["case_id"],
+                "response-dispatcher",
+                "response_rollback_queued",
+                {
+                    "case_id": task["case_id"],
+                    "task_id": task["task_id"],
+                    "remote_rule_id": remote_rule_id,
+                    "reason": reason,
+                },
+            )
+        else:
+            self.repo.queue_terminal_case_response_rollbacks(task["case_id"])
+            queued = self.repo.get_response_task(task["task_id"])
+        if queued and queued["status"] in {
+            "rollback_queued", "rollback_retry", "rollback_running"
+        }:
+            self.wake()
+        return queued
+
     def _run(self) -> None:
         last_maintenance = 0.0
         while not self._stop.is_set():
             current = time.monotonic()
             if current - last_maintenance >= 2.0:
+                self.repo.queue_terminal_case_response_rollbacks()
                 self.repo.queue_expired_response_tasks()
                 self.repo.recover_stale_response_tasks(now_ms() - 120_000)
                 last_maintenance = current
@@ -523,15 +564,33 @@ class ResponseAutomationService:
         if not rollback:
             preflight = self.repo.response_task_preflight(task["task_id"])
             if not preflight or not preflight["eligible"]:
+                if task.get("remote_rule_id"):
+                    self._queue_compensating_rollback(
+                        task,
+                        remote_rule_id=str(task["remote_rule_id"]),
+                        reason="response task approval is stale or its Case is terminal",
+                    )
+                    return
                 raise ResponseExecutionError(
                     "response task approval is stale or its Case is terminal",
                     retryable=False,
                 )
             policy = self.policy()
             if not policy["enabled"]:
-                self.repo.finish_response_task(
-                    task["task_id"], "paused", error="response policy is disabled"
+                paused = self.repo.finish_response_task(
+                    task["task_id"],
+                    "paused",
+                    expected_status="running",
+                    error="response policy is disabled",
+                    require_active_case=True,
                 )
+                if not paused:
+                    self.repo.finish_response_task(
+                        task["task_id"],
+                        "cancelled",
+                        expected_status="running",
+                        error="case became terminal",
+                    )
                 return
             try:
                 self._validate_action(task["action"], policy)
@@ -543,7 +602,21 @@ class ResponseAutomationService:
                 )
         if connector["execution_mode"] == "shadow":
             final = "rolled_back" if rollback else "shadowed"
-            self.repo.finish_response_task(task["task_id"], final)
+            result = self.repo.finish_response_task(
+                task["task_id"],
+                final,
+                expected_status="rollback_running" if rollback else "running",
+                require_active_case=not rollback,
+            )
+            if not result:
+                if not rollback:
+                    self.repo.finish_response_task(
+                        task["task_id"],
+                        "cancelled",
+                        expected_status="running",
+                        error="case became terminal",
+                    )
+                return
             self.repo.insert_audit(
                 new_id("audit"), task["case_id"], "response-dispatcher",
                 "response_task_shadowed" if not rollback else "response_rollback_completed",
@@ -586,8 +659,25 @@ class ResponseAutomationService:
         if rollback:
             final = "rolled_back"
         else:
-            self.repo.record_response_rule_id(task["task_id"], remote_rule_id)
-            task["remote_rule_id"] = remote_rule_id
+            recorded = self.repo.record_response_rule_id(task["task_id"], remote_rule_id)
+            if not recorded:
+                raise ResponseExecutionError(
+                    "remote rule was applied but its task lease is no longer active",
+                    retryable=False,
+                    http_status=http_status,
+                )
+            task = recorded
+            if task["status"] != "running":
+                self.wake()
+                return
+            preflight = self.repo.response_task_preflight(task["task_id"])
+            if not preflight or not preflight["eligible"]:
+                self._queue_compensating_rollback(
+                    task,
+                    remote_rule_id=remote_rule_id,
+                    reason="Case or approval changed after remote apply",
+                )
+                return
             verify, verify_status, verify_hash = self._request(
                 connector,
                 "verify",
@@ -618,8 +708,20 @@ class ResponseAutomationService:
                 )
             final = "verified"
         result = self.repo.finish_response_task(
-            task["task_id"], final, remote_rule_id=remote_rule_id
+            task["task_id"],
+            final,
+            expected_status="rollback_running" if rollback else "running",
+            remote_rule_id=remote_rule_id,
+            require_active_case=not rollback,
         )
+        if not result:
+            if not rollback:
+                self._queue_compensating_rollback(
+                    task,
+                    remote_rule_id=remote_rule_id,
+                    reason="Case became terminal before response verification committed",
+                )
+            return
         self.repo.insert_audit(
             new_id("audit"),
             task["case_id"],
@@ -657,9 +759,15 @@ class ResponseAutomationService:
                 "error": str(exc),
             }
         )
-        self.repo.finish_response_task(
-            task["task_id"], status, error=str(exc), retry_delay_ms=delay_ms
+        result = self.repo.finish_response_task(
+            task["task_id"],
+            status,
+            expected_status=str(task["status"]),
+            error=str(exc),
+            retry_delay_ms=delay_ms,
         )
+        current = result or self.repo.get_response_task(task["task_id"])
+        actual_status = current["status"] if current else status
         self.repo.insert_audit(
             new_id("audit"),
             task["case_id"],
@@ -668,7 +776,7 @@ class ResponseAutomationService:
             {
                 "case_id": task["case_id"],
                 "task_id": task["task_id"],
-                "status": status,
+                "status": actual_status,
                 "error_type": type(exc).__name__,
                 "retryable": retryable,
             },

@@ -285,6 +285,37 @@ CREATE TABLE IF NOT EXISTS response_attempts (
   FOREIGN KEY (task_id) REFERENCES response_tasks(task_id) ON DELETE CASCADE,
   CHECK (operation IN ('health_check','apply','verify','rollback'))
 );
+CREATE TABLE IF NOT EXISTS case_response_artifacts (
+  artifact_id TEXT PRIMARY KEY,
+  case_id TEXT NOT NULL,
+  artifact_type TEXT NOT NULL DEFAULT 'response_pack',
+  version INTEGER NOT NULL,
+  schema_version TEXT NOT NULL,
+  source_snapshot_hash TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  content_json TEXT NOT NULL,
+  validation_status TEXT NOT NULL,
+  validation_json TEXT NOT NULL,
+  generator TEXT NOT NULL,
+  model_metadata_json TEXT NOT NULL DEFAULT '{}',
+  created_by TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  FOREIGN KEY (case_id) REFERENCES cases(case_id),
+  UNIQUE (case_id, version),
+  UNIQUE (case_id, source_snapshot_hash, content_hash),
+  CHECK (artifact_type = 'response_pack'),
+  CHECK (validation_status IN ('passed','review','blocked'))
+);
+CREATE TABLE IF NOT EXISTS case_response_artifact_refs (
+  artifact_id TEXT NOT NULL,
+  claim_scope TEXT NOT NULL,
+  ref_type TEXT NOT NULL,
+  ref_id TEXT NOT NULL,
+  source_event_id TEXT NOT NULL DEFAULT '',
+  source_hash TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (artifact_id, claim_scope, ref_type, ref_id, source_event_id),
+  FOREIGN KEY (artifact_id) REFERENCES case_response_artifacts(artifact_id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS alert_dispositions (
   alert_id TEXT PRIMARY KEY,
   case_id TEXT NOT NULL,
@@ -329,6 +360,8 @@ INSERT OR IGNORE INTO inbox_capacity_state(singleton, unfinished_count, unfinish
 VALUES (1, 0, 0);
 CREATE INDEX IF NOT EXISTS idx_normalized_alert ON normalized_events(alert_id);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_case ON agent_runs(case_id);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_case_created
+  ON agent_runs(case_id, created_at_ms DESC, run_id);
 CREATE INDEX IF NOT EXISTS idx_case_links_alert ON case_alert_links(alert_id);
 CREATE INDEX IF NOT EXISTS idx_case_links_case ON case_alert_links(case_id);
 CREATE INDEX IF NOT EXISTS idx_case_links_case_created ON case_alert_links(case_id, created_at_ms DESC);
@@ -338,8 +371,12 @@ CREATE INDEX IF NOT EXISTS idx_cases_product_created ON cases(product, created_a
 CREATE INDEX IF NOT EXISTS idx_cases_severity_created ON cases(severity, created_at_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_memory_lookup ON memory_entries(layer, namespace, status);
 CREATE INDEX IF NOT EXISTS idx_memory_lookup_created ON memory_entries(layer, namespace, status, created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_memory_entries_created_id
+  ON memory_entries(created_at_ms DESC, memory_id);
 CREATE INDEX IF NOT EXISTS idx_memory_expiry ON memory_entries(status, expires_at_ms);
 CREATE INDEX IF NOT EXISTS idx_memory_events_mem ON memory_events(memory_id);
+CREATE INDEX IF NOT EXISTS idx_memory_events_created_id
+  ON memory_events(created_at_ms DESC, event_id);
 CREATE INDEX IF NOT EXISTS idx_memory_matches_event ON memory_matches(event_id, overall_score DESC);
 CREATE INDEX IF NOT EXISTS idx_memory_matches_memory ON memory_matches(memory_id, created_at_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_memory_matches_case ON memory_matches(case_id, created_at_ms DESC);
@@ -352,7 +389,13 @@ CREATE INDEX IF NOT EXISTS idx_approvals_status ON action_approvals(status, crea
 CREATE INDEX IF NOT EXISTS idx_approval_votes_approval ON approval_votes(approval_id, created_at_ms ASC);
 CREATE INDEX IF NOT EXISTS idx_response_tasks_status ON response_tasks(status, available_at_ms, created_at_ms);
 CREATE INDEX IF NOT EXISTS idx_response_tasks_case ON response_tasks(case_id, created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_response_tasks_created_id
+  ON response_tasks(created_at_ms DESC, task_id);
 CREATE INDEX IF NOT EXISTS idx_response_attempts_task ON response_attempts(task_id, created_at_ms ASC);
+CREATE INDEX IF NOT EXISTS idx_case_response_artifacts_case
+  ON case_response_artifacts(case_id, version DESC);
+CREATE INDEX IF NOT EXISTS idx_case_response_refs_ref
+  ON case_response_artifact_refs(ref_type, ref_id);
 CREATE INDEX IF NOT EXISTS idx_alert_dispositions_case ON alert_dispositions(case_id, updated_at_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_inbox_claim ON durable_alert_inbox(status, available_at_ms, created_at_ms);
 CREATE INDEX IF NOT EXISTS idx_inbox_status_created ON durable_alert_inbox(status, created_at_ms);
@@ -393,7 +436,7 @@ BEGIN
 END;
 """
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 _LLM_DEFERRED_ERROR_PREFIX = "analysis_deferred:"
 _LEGACY_LLM_DEFERRED_ERROR_FRAGMENT = "remote LLM analysis deferred"
 _TERMINAL_LLM_ERROR_FRAGMENTS = (
@@ -1034,6 +1077,74 @@ class Repository:
                     (now_ms(),),
                 )
 
+            if current < 16:
+                required_tables = {
+                    "case_response_artifacts",
+                    "case_response_artifact_refs",
+                }
+                actual_tables = {
+                    row["name"]
+                    for row in self.conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    ).fetchall()
+                }
+                if not required_tables.issubset(actual_tables):
+                    raise RuntimeError("schema v16 Case Response Pack tables are incomplete")
+                response_required_columns = {
+                    "response_connectors": {"connector_type", "endpoint"},
+                    "response_policy": {"enabled"},
+                    "response_tasks": {"status", "action_json"},
+                    "response_attempts": {"operation"},
+                }
+                for table, required in response_required_columns.items():
+                    columns = {
+                        row["name"]
+                        for row in self.conn.execute(
+                            f"PRAGMA table_info({table})"
+                        ).fetchall()
+                    }
+                    if not required.issubset(columns):
+                        raise RuntimeError(
+                            f"schema v15 response automation table is incomplete: {table}"
+                        )
+                artifact_columns = {
+                    row["name"]
+                    for row in self.conn.execute(
+                        "PRAGMA table_info(case_response_artifacts)"
+                    ).fetchall()
+                }
+                required_columns = {
+                    "artifact_id",
+                    "case_id",
+                    "version",
+                    "source_snapshot_hash",
+                    "content_hash",
+                    "content_json",
+                    "validation_status",
+                }
+                if not required_columns.issubset(artifact_columns):
+                    raise RuntimeError("schema v16 Case Response Pack columns are incomplete")
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_memory_entries_created_id "
+                    "ON memory_entries(created_at_ms DESC, memory_id)"
+                )
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_memory_events_created_id "
+                    "ON memory_events(created_at_ms DESC, event_id)"
+                )
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_response_tasks_created_id "
+                    "ON response_tasks(created_at_ms DESC, task_id)"
+                )
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_agent_runs_case_created "
+                    "ON agent_runs(case_id, created_at_ms DESC, run_id)"
+                )
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO schema_version(version, applied_at_ms) VALUES (16, ?)",
+                    (now_ms(),),
+                )
+
             self.conn.commit()
 
     def readiness_check(self) -> dict[str, Any]:
@@ -1533,10 +1644,19 @@ class Repository:
                 vote_item = dict(vote)
                 approval_id = str(vote_item.pop("approval_id"))
                 votes_by_approval.setdefault(approval_id, []).append(vote_item)
+            tasks_by_approval = {
+                str(task["approval_id"]): task
+                for task in self.conn.execute(
+                    f"SELECT * FROM response_tasks WHERE approval_id IN ({placeholders})",
+                    approval_ids,
+                ).fetchall()
+            }
             return [
                 self._approval_row(
                     row,
                     votes=votes_by_approval.get(str(row["approval_id"]), []),
+                    response_task=tasks_by_approval.get(str(row["approval_id"])),
+                    response_task_loaded=True,
                 )
                 for row in rows
             ]
@@ -1545,6 +1665,8 @@ class Repository:
         self,
         row: sqlite3.Row,
         votes: list[dict[str, Any]] | None = None,
+        response_task: sqlite3.Row | None = None,
+        response_task_loaded: bool = False,
     ) -> dict[str, Any]:
         payload = dict(row)
         payload["action"] = json.loads(payload.pop("action_json"))
@@ -1561,10 +1683,12 @@ class Repository:
             ]
         payload["votes"] = votes
         payload["vote_count"] = sum(1 for vote in votes if vote["decision"] == "approved")
-        task = self.conn.execute(
-            "SELECT * FROM response_tasks WHERE approval_id = ?",
-            (payload["approval_id"],),
-        ).fetchone()
+        task = response_task
+        if not response_task_loaded:
+            task = self.conn.execute(
+                "SELECT * FROM response_tasks WHERE approval_id = ?",
+                (payload["approval_id"],),
+            ).fetchone()
         payload["response_task"] = self._response_task_row(task) if task else None
         return payload
 
@@ -1951,9 +2075,11 @@ class Repository:
         task_id: str,
         status: str,
         *,
+        expected_status: str,
         remote_rule_id: str = "",
         error: str = "",
         retry_delay_ms: int = 0,
+        require_active_case: bool = False,
         _commit: bool = True,
     ) -> dict[str, Any] | None:
         with self._lock:
@@ -1966,39 +2092,85 @@ class Repository:
                 if row:
                     duration = max(60, int(json.loads(row["action_json"]).get("duration_seconds") or 0))
                     expires_at = int(verified_at or now_ms()) + duration * 1000
-            self.conn.execute(
+            active_case_clause = ""
+            if require_active_case:
+                active_case_clause = """
+                  AND EXISTS (
+                    SELECT 1 FROM cases c
+                    WHERE c.case_id = response_tasks.case_id
+                      AND c.status NOT IN ('closed', 'false_positive')
+                  )
                 """
+            cur = self.conn.execute(
+                f"""
                 UPDATE response_tasks
                 SET status = ?,
                     remote_rule_id = CASE WHEN ? != '' THEN ? ELSE remote_rule_id END,
                     last_error = ?, available_at_ms = ?, claimed_at_ms = NULL,
                     verified_at_ms = COALESCE(?, verified_at_ms),
                     expires_at_ms = COALESCE(?, expires_at_ms), updated_at_ms = ?
-                WHERE task_id = ?
+                WHERE task_id = ? AND status = ?
+                {active_case_clause}
                 """,
                 (
                     status, remote_rule_id, remote_rule_id, str(error)[:2000],
                     now_ms() + max(0, int(retry_delay_ms)), verified_at, expires_at,
-                    now_ms(), task_id,
+                    now_ms(), task_id, expected_status,
                 ),
             )
             if _commit:
                 self.conn.commit()
-            return self.get_response_task(task_id)
+            return self.get_response_task(task_id) if cur.rowcount else None
 
     def record_response_rule_id(
         self, task_id: str, remote_rule_id: str, *, _commit: bool = True
-    ) -> None:
+    ) -> dict[str, Any] | None:
         with self._lock:
-            self.conn.execute(
+            timestamp = now_ms()
+            cur = self.conn.execute(
                 """
-                UPDATE response_tasks SET remote_rule_id = ?, updated_at_ms = ?
+                UPDATE response_tasks
+                SET remote_rule_id = ?,
+                    status = CASE
+                      WHEN EXISTS (
+                        SELECT 1 FROM cases c
+                        WHERE c.case_id = response_tasks.case_id
+                          AND c.status IN ('closed', 'false_positive')
+                      ) THEN 'rollback_queued'
+                      ELSE status
+                    END,
+                    available_at_ms = CASE
+                      WHEN EXISTS (
+                        SELECT 1 FROM cases c
+                        WHERE c.case_id = response_tasks.case_id
+                          AND c.status IN ('closed', 'false_positive')
+                      ) THEN ?
+                      ELSE available_at_ms
+                    END,
+                    claimed_at_ms = CASE
+                      WHEN EXISTS (
+                        SELECT 1 FROM cases c
+                        WHERE c.case_id = response_tasks.case_id
+                          AND c.status IN ('closed', 'false_positive')
+                      ) THEN NULL
+                      ELSE claimed_at_ms
+                    END,
+                    last_error = CASE
+                      WHEN EXISTS (
+                        SELECT 1 FROM cases c
+                        WHERE c.case_id = response_tasks.case_id
+                          AND c.status IN ('closed', 'false_positive')
+                      ) THEN 'case became terminal after remote apply'
+                      ELSE last_error
+                    END,
+                    updated_at_ms = ?
                 WHERE task_id = ? AND status = 'running'
                 """,
-                (str(remote_rule_id)[:512], now_ms(), task_id),
+                (str(remote_rule_id)[:512], timestamp, timestamp, task_id),
             )
             if _commit:
                 self.conn.commit()
+            return self.get_response_task(task_id) if cur.rowcount else None
 
     def insert_response_attempt(
         self, attempt: dict[str, Any], *, _commit: bool = True
@@ -2037,6 +2209,40 @@ class Repository:
             self.conn.commit()
             return cur.rowcount
 
+    def queue_terminal_case_response_rollbacks(
+        self, case_id: str | None = None, *, _commit: bool = True
+    ) -> int:
+        """Reconcile terminal Cases with response tasks that may have a remote rule."""
+        with self._lock:
+            timestamp = now_ms()
+            case_clause = " AND case_id = ?" if case_id else ""
+            params: list[Any] = [timestamp, timestamp]
+            if case_id:
+                params.append(case_id)
+            cur = self.conn.execute(
+                f"""
+                UPDATE response_tasks
+                SET status = 'rollback_queued', available_at_ms = ?, claimed_at_ms = NULL,
+                    last_error = 'case became terminal; compensating rollback required',
+                    updated_at_ms = ?
+                WHERE EXISTS (
+                    SELECT 1 FROM cases c
+                    WHERE c.case_id = response_tasks.case_id
+                      AND c.status IN ('closed', 'false_positive')
+                )
+                  AND status NOT IN (
+                    'shadowed','rollback_queued','rollback_running','rollback_retry',
+                    'rolled_back','rollback_failed'
+                  )
+                  AND (status = 'verified' OR remote_rule_id != '')
+                  {case_clause}
+                """,
+                params,
+            )
+            if _commit:
+                self.conn.commit()
+            return cur.rowcount
+
     def recover_stale_response_tasks(self, stale_before_ms: int) -> int:
         with self._lock:
             timestamp = now_ms()
@@ -2060,6 +2266,7 @@ class Repository:
     def transition_case_response_tasks(self, case_id: str, *, _commit: bool = True) -> int:
         with self._lock:
             timestamp = now_ms()
+            rollback = self.queue_terminal_case_response_rollbacks(case_id, _commit=False)
             cancelled = self.conn.execute(
                 """
                 UPDATE response_tasks
@@ -2067,16 +2274,9 @@ class Repository:
                 WHERE case_id = ? AND status IN (
                   'waiting_configuration','waiting_dispatch','paused','queued','retry_wait'
                 )
+                  AND remote_rule_id = ''
                 """,
                 (timestamp, case_id),
-            ).rowcount
-            rollback = self.conn.execute(
-                """
-                UPDATE response_tasks
-                SET status = 'rollback_queued', available_at_ms = ?, updated_at_ms = ?
-                WHERE case_id = ? AND status = 'verified'
-                """,
-                (timestamp, timestamp, case_id),
             ).rowcount
             if _commit:
                 self.conn.commit()
@@ -4630,6 +4830,191 @@ class Repository:
             result["linked_alerts"] = self._linked_alerts_locked(case_id)
             return result
 
+    def get_case_triage(self, case_id: str) -> dict[str, Any] | None:
+        """Load the bounded Case workbench graph without deserializing raw evidence."""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM cases WHERE case_id = ?", (case_id,)
+            ).fetchone()
+            if not row:
+                return None
+            result = dict(row)
+
+            run = self.conn.execute(
+                """
+                SELECT * FROM agent_runs
+                WHERE case_id = ?
+                ORDER BY created_at_ms DESC, run_id ASC
+                LIMIT 1
+                """,
+                (case_id,),
+            ).fetchone()
+            if run:
+                latest_run = dict(run)
+                latest_run["result"] = json.loads(latest_run.pop("result_json"))
+                result["agent_runs"] = [latest_run]
+            else:
+                result["agent_runs"] = []
+
+            validation = self.conn.execute(
+                """
+                SELECT vr.result_json,
+                       rr.resolution_id, rr.decision, rr.actor, rr.reason,
+                       rr.created_at_ms AS resolution_created_at_ms
+                FROM validation_runs vr
+                LEFT JOIN validation_review_resolutions rr
+                  ON rr.validation_id = vr.validation_id
+                WHERE vr.case_id = ?
+                ORDER BY vr.created_at_ms DESC, vr.validation_id ASC
+                LIMIT 1
+                """,
+                (case_id,),
+            ).fetchone()
+            if validation:
+                latest_validation = json.loads(validation["result_json"])
+                if validation["resolution_id"]:
+                    latest_validation["manual_review_resolution"] = {
+                        "resolution_id": validation["resolution_id"],
+                        "decision": validation["decision"],
+                        "actor": validation["actor"],
+                        "reason": validation["reason"],
+                        "created_at_ms": validation["resolution_created_at_ms"],
+                    }
+                result["validation_runs"] = [latest_validation]
+            else:
+                result["validation_runs"] = []
+
+            counts = self.conn.execute(
+                """
+                SELECT
+                  (SELECT COUNT(*) FROM case_alert_links l
+                   JOIN raw_alerts ra ON ra.alert_id = l.alert_id
+                   WHERE l.case_id = ?) AS raw_alerts,
+                  (SELECT COUNT(*) FROM case_alert_links l
+                   JOIN normalized_events ne ON ne.event_id = l.event_id
+                   WHERE l.case_id = ?) AS normalized_evidence,
+                  (SELECT COUNT(*) FROM agent_runs WHERE case_id = ?)
+                    + (SELECT COUNT(*) FROM validation_runs WHERE case_id = ?)
+                    AS analysis_runs
+                """,
+                (case_id, case_id, case_id, case_id),
+            ).fetchone()
+            result["detail_counts"] = {
+                "raw_alerts": int(counts["raw_alerts"]),
+                "normalized_evidence": int(counts["normalized_evidence"]),
+                "analysis_runs": int(counts["analysis_runs"]),
+            }
+            result["approvals"] = self.list_approvals(case_id=case_id, limit=100)
+
+            confirmations = self._confirmed_false_positive_memories_locked(case_id)
+            links = self.conn.execute(
+                """
+                SELECT
+                  l.case_id, l.alert_id, l.event_id,
+                  l.created_at_ms AS linked_at_ms,
+                  ra.source AS raw_source, ra.product AS raw_product,
+                  ra.event_type AS raw_event_type, ra.severity AS raw_severity,
+                  ra.timestamp AS raw_timestamp, ra.created_at_ms AS raw_created_at_ms,
+                  CASE WHEN ra.payload_json IS NULL THEN NULL ELSE json_object(
+                    'adapter', json_extract(ra.payload_json, '$.adapter'),
+                    'rule_id', json_extract(ra.payload_json, '$.rule_id'),
+                    'rule_name', json_extract(ra.payload_json, '$.rule_name'),
+                    'app', json_extract(ra.payload_json, '$.app'),
+                    'host', json_extract(ra.payload_json, '$.host'),
+                    'src_host', json_extract(ra.payload_json, '$.src_host'),
+                    'src_ip', json_extract(ra.payload_json, '$.src_ip'),
+                    'dst_ip', json_extract(ra.payload_json, '$.dst_ip'),
+                    'method', json_extract(ra.payload_json, '$.method'),
+                    'uri', json_extract(ra.payload_json, '$.uri'),
+                    'route', json_extract(ra.payload_json, '$.route'),
+                    'headers', json_object(
+                      'user-agent', json_extract(ra.payload_json, '$.headers."user-agent"')
+                    ),
+                    'matched_parameters', json_extract(ra.payload_json, '$.matched_parameters'),
+                    'process_name', json_extract(ra.payload_json, '$.process_name'),
+                    'parent_process', json_extract(ra.payload_json, '$.parent_process'),
+                    'signature_status', json_extract(ra.payload_json, '$.signature_status'),
+                    'sni', json_extract(ra.payload_json, '$.sni'),
+                    'protocol', json_extract(ra.payload_json, '$.protocol'),
+                    'dst_port', json_extract(ra.payload_json, '$.dst_port'),
+                    'user', json_extract(ra.payload_json, '$.user'),
+                    'mitre_tactic', json_extract(ra.payload_json, '$.mitre_tactic')
+                  ) END AS compact_payload_json,
+                  ne.source AS normalized_source, ne.product AS normalized_product,
+                  ne.event_type AS normalized_event_type,
+                  ne.severity AS normalized_severity,
+                  ne.timestamp AS normalized_timestamp, ne.entities_json,
+                  CASE WHEN json_type(ne.evidence_json) = 'array'
+                       THEN json_array_length(ne.evidence_json) ELSE 0 END
+                    AS evidence_count,
+                  ne.created_at_ms AS normalized_created_at_ms,
+                  ad.case_id AS disposition_case_id,
+                  ad.disposition AS alert_disposition,
+                  ad.actor AS disposition_actor, ad.reason AS disposition_reason,
+                  ad.updated_at_ms AS disposition_updated_at_ms
+                FROM case_alert_links l
+                LEFT JOIN raw_alerts ra ON ra.alert_id = l.alert_id
+                LEFT JOIN normalized_events ne ON ne.event_id = l.event_id
+                LEFT JOIN alert_dispositions ad
+                  ON ad.alert_id = l.alert_id AND ad.case_id = l.case_id
+                WHERE l.case_id = ?
+                ORDER BY l.created_at_ms DESC, l.alert_id ASC, l.event_id ASC
+                """,
+                (case_id,),
+            ).fetchall()
+            linked_alerts: list[dict[str, Any]] = []
+            for link in links:
+                raw_alert = None
+                if link["compact_payload_json"] is not None:
+                    raw_alert = {
+                        "alert_id": link["alert_id"],
+                        "source": link["raw_source"],
+                        "product": link["raw_product"],
+                        "event_type": link["raw_event_type"],
+                        "severity": link["raw_severity"],
+                        "timestamp": link["raw_timestamp"],
+                        "payload": json.loads(link["compact_payload_json"]),
+                        "created_at_ms": link["raw_created_at_ms"],
+                    }
+                normalized_event = None
+                if link["entities_json"] is not None:
+                    normalized_event = {
+                        "event_id": link["event_id"],
+                        "source": link["normalized_source"],
+                        "product": link["normalized_product"],
+                        "event_type": link["normalized_event_type"],
+                        "severity": link["normalized_severity"],
+                        "timestamp": link["normalized_timestamp"],
+                        "entities": json.loads(link["entities_json"]),
+                        "_evidence_count": int(link["evidence_count"] or 0),
+                        "created_at_ms": link["normalized_created_at_ms"],
+                    }
+                disposition = None
+                if link["alert_disposition"]:
+                    disposition = {
+                        "case_id": link["disposition_case_id"],
+                        "status": link["alert_disposition"],
+                        "actor": link["disposition_actor"],
+                        "reason": link["disposition_reason"],
+                        "updated_at_ms": link["disposition_updated_at_ms"],
+                    }
+                    confirmation = confirmations.get(str(link["alert_id"]))
+                    if confirmation:
+                        disposition["memory_confirmation"] = confirmation
+                linked_alerts.append(
+                    {
+                        "case_id": link["case_id"],
+                        "alert_id": link["alert_id"],
+                        "event_id": link["event_id"],
+                        "linked_at_ms": link["linked_at_ms"],
+                        "disposition": disposition,
+                        "raw_alert": raw_alert,
+                        "normalized_event": normalized_event,
+                    }
+                )
+            result["linked_alerts"] = linked_alerts
+            return result
+
     def get_linked_alert(self, alert_id: str) -> dict[str, Any] | None:
         with self._lock:
             row = self.conn.execute(
@@ -4684,6 +5069,7 @@ class Repository:
             (case_id,),
         ).fetchall()
         linked = []
+        confirmations = self._confirmed_false_positive_memories_locked(case_id)
         for row in rows:
             item = dict(row)
             raw_alert = None
@@ -4715,9 +5101,7 @@ class Repository:
             disposition = None
             if item.get("alert_disposition"):
                 confirmation = (
-                    self._confirmed_false_positive_memory_locked(
-                        str(item["alert_id"]), str(item["case_id"])
-                    )
+                    confirmations.get(str(item["alert_id"]))
                     if item["alert_disposition"] == "false_positive"
                     else None
                 )
@@ -4743,6 +5127,44 @@ class Repository:
             )
         return linked
 
+    def _confirmed_false_positive_memories_locked(
+        self, case_id: str
+    ) -> dict[str, dict[str, Any]]:
+        """Load all active human confirmations for a Case in one bounded scan."""
+        rows = self.conn.execute(
+            """
+            SELECT memory_id, content, created_at_ms, updated_at_ms
+            FROM memory_entries
+            WHERE layer = 'product_long_term'
+              AND status = 'active'
+              AND source_case_id = ?
+            ORDER BY created_at_ms DESC, memory_id ASC
+            """,
+            (case_id,),
+        ).fetchall()
+        confirmations: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            try:
+                content = json.loads(row["content"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(content, dict):
+                continue
+            alert_id = str(content.get("alert_id") or "")
+            if (
+                alert_id
+                and alert_id not in confirmations
+                and content.get("human_confirmed") is True
+                and content.get("confirmation_type") == "business_false_positive"
+                and str(content.get("case_id") or "") == case_id
+            ):
+                confirmations[alert_id] = {
+                    "memory_id": row["memory_id"],
+                    "created_at_ms": row["created_at_ms"],
+                    "updated_at_ms": row["updated_at_ms"],
+                }
+        return confirmations
+
     def _confirmed_false_positive_memory_locked(
         self, alert_id: str, case_id: str
     ) -> dict[str, Any] | None:
@@ -4755,36 +5177,7 @@ class Repository:
         Caller holds ``self._lock``; JSON parsing is kept in Python so legacy
         non-JSON memory content cannot make the SQL query fail.
         """
-        rows = self.conn.execute(
-            """
-            SELECT memory_id, content, created_at_ms, updated_at_ms
-            FROM memory_entries
-            WHERE layer = 'product_long_term'
-              AND status = 'active'
-              AND source_case_id = ?
-            ORDER BY created_at_ms DESC, memory_id ASC
-            """,
-            (case_id,),
-        ).fetchall()
-        for row in rows:
-            try:
-                content = json.loads(row["content"])
-            except (TypeError, json.JSONDecodeError):
-                continue
-            if not isinstance(content, dict):
-                continue
-            if (
-                content.get("human_confirmed") is True
-                and content.get("confirmation_type") == "business_false_positive"
-                and str(content.get("alert_id") or "") == alert_id
-                and str(content.get("case_id") or "") == case_id
-            ):
-                return {
-                    "memory_id": row["memory_id"],
-                    "created_at_ms": row["created_at_ms"],
-                    "updated_at_ms": row["updated_at_ms"],
-                }
-        return None
+        return self._confirmed_false_positive_memories_locked(case_id).get(alert_id)
 
     def get_confirmed_false_positive_memory(
         self, alert_id: str, case_id: str
@@ -4792,6 +5185,544 @@ class Repository:
         """Return the active human confirmation for one alert/Case pair."""
         with self._lock:
             return self._confirmed_false_positive_memory_locked(alert_id, case_id)
+
+    @staticmethod
+    def _case_response_artifact_row(
+        row: sqlite3.Row,
+        refs: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        payload = dict(row)
+        payload["content"] = json.loads(payload.pop("content_json"))
+        payload["validation"] = json.loads(payload.pop("validation_json"))
+        payload["model_metadata"] = json.loads(
+            payload.pop("model_metadata_json") or "{}"
+        )
+        payload["evidence_refs"] = list(refs or [])
+        return payload
+
+    def get_case_response_source(self, case_id: str) -> dict[str, Any] | None:
+        """Load the bounded, structured facts used by the Case Response Pack.
+
+        Raw alert payloads are intentionally excluded. The response workbench only
+        receives normalized entities/evidence and governed workflow state.
+        """
+        with self._lock:
+            case_row = self.conn.execute(
+                """
+                SELECT case_id, correlation_key, product, status, severity,
+                       classification, confidence, summary, created_at_ms,
+                       updated_at_ms, last_alert_at_ms, closed_at_ms
+                FROM cases WHERE case_id = ?
+                """,
+                (case_id,),
+            ).fetchone()
+            if not case_row:
+                return None
+
+            event_rows = self.conn.execute(
+                """
+                SELECT * FROM (
+                  SELECT l.alert_id, l.created_at_ms AS linked_at_ms,
+                         ne.event_id, ne.source, ne.product, ne.event_type,
+                         ne.severity, ne.timestamp, ne.entities_json,
+                         ne.evidence_json, ne.sensitivity_tags_json,
+                         ne.evidence_hash, ne.event_at_ms, ne.created_at_ms
+                  FROM case_alert_links l
+                  JOIN normalized_events ne ON ne.event_id = l.event_id
+                  WHERE l.case_id = ?
+                  ORDER BY ne.event_at_ms DESC, ne.created_at_ms DESC, ne.event_id DESC
+                  LIMIT 2000
+                )
+                ORDER BY event_at_ms ASC, created_at_ms ASC, event_id ASC
+                """,
+                (case_id,),
+            ).fetchall()
+            events: list[dict[str, Any]] = []
+            for row in event_rows:
+                item = dict(row)
+                item["entities"] = json.loads(item.pop("entities_json"))
+                item["evidence"] = json.loads(item.pop("evidence_json"))
+                item["sensitivity_tags"] = json.loads(
+                    item.pop("sensitivity_tags_json")
+                )
+                events.append(item)
+
+            run_rows = self.conn.execute(
+                """
+                SELECT run_id, case_id, event_id, agent, product,
+                       prompt_version, result_json, created_at_ms
+                FROM agent_runs WHERE case_id = ?
+                ORDER BY created_at_ms DESC, run_id ASC
+                LIMIT 100
+                """,
+                (case_id,),
+            ).fetchall()
+            agent_runs = []
+            for row in run_rows:
+                item = dict(row)
+                item["result"] = json.loads(item.pop("result_json"))
+                agent_runs.append(item)
+
+            validation_rows = self.conn.execute(
+                """
+                SELECT validation_id, event_id, validator, validator_version,
+                       status, result_json, created_at_ms
+                FROM validation_runs WHERE case_id = ?
+                ORDER BY created_at_ms DESC, validation_id ASC
+                LIMIT 100
+                """,
+                (case_id,),
+            ).fetchall()
+            validations = []
+            for row in validation_rows:
+                item = dict(row)
+                item["result"] = json.loads(item.pop("result_json"))
+                validations.append(item)
+
+            approval_rows = self.conn.execute(
+                """
+                SELECT * FROM action_approvals WHERE case_id = ?
+                ORDER BY created_at_ms DESC, approval_id ASC
+                LIMIT 200
+                """,
+                (case_id,),
+            ).fetchall()
+            approvals = []
+            for row in approval_rows:
+                item = dict(row)
+                item["action"] = json.loads(item.pop("action_json"))
+                approvals.append(item)
+            approval_ids = [str(item["approval_id"]) for item in approvals]
+            votes: list[dict[str, Any]] = []
+            if approval_ids:
+                placeholders = ",".join("?" for _ in approval_ids)
+                votes = [
+                    dict(row)
+                    for row in self.conn.execute(
+                        f"""
+                        SELECT approval_id, actor, decision, reason, created_at_ms
+                        FROM approval_votes
+                        WHERE approval_id IN ({placeholders})
+                        ORDER BY created_at_ms ASC, approval_id ASC, actor ASC
+                        """,
+                        approval_ids,
+                    ).fetchall()
+                ]
+
+            task_rows = self.conn.execute(
+                """
+                SELECT * FROM response_tasks WHERE case_id = ?
+                ORDER BY created_at_ms DESC, task_id ASC
+                LIMIT 200
+                """,
+                (case_id,),
+            ).fetchall()
+            response_tasks = [self._response_task_row(row) for row in task_rows]
+            task_ids = [str(item["task_id"]) for item in response_tasks]
+            response_attempts: list[dict[str, Any]] = []
+            if task_ids:
+                placeholders = ",".join("?" for _ in task_ids)
+                response_attempts = [
+                    dict(row)
+                    for row in self.conn.execute(
+                        f"""
+                        SELECT attempt_id, task_id, operation, attempt_no,
+                               http_status, outcome, error, created_at_ms
+                        FROM response_attempts
+                        WHERE task_id IN ({placeholders})
+                        ORDER BY created_at_ms ASC, attempt_id ASC
+                        """,
+                        task_ids,
+                    ).fetchall()
+                ]
+
+            audit_actions = (
+                "escalate_case_review",
+                "confirm_case_attack",
+                "close_case",
+                "reopen_case",
+                "manual_validation_review_continued",
+                "analysis_replay_requested",
+                "analysis_replay_completed",
+            )
+            placeholders = ",".join("?" for _ in audit_actions)
+            audit_rows = self.conn.execute(
+                f"""
+                SELECT audit_id, actor, action, detail_json, created_at_ms
+                FROM audit_log
+                WHERE case_id = ? AND action IN ({placeholders})
+                ORDER BY created_at_ms ASC, audit_id ASC
+                LIMIT 500
+                """,
+                (case_id, *audit_actions),
+            ).fetchall()
+            audit_events = []
+            for row in audit_rows:
+                item = dict(row)
+                item["detail"] = json.loads(item.pop("detail_json"))
+                audit_events.append(item)
+
+            return {
+                "case": dict(case_row),
+                "events": events,
+                "agent_runs": agent_runs,
+                "validations": validations,
+                "approvals": approvals,
+                "approval_votes": votes,
+                "response_tasks": response_tasks,
+                "response_attempts": response_attempts,
+                "audit_events": audit_events,
+            }
+
+    def get_case_timeline_page(
+        self, case_id: str, *, limit: int, offset: int
+    ) -> dict[str, Any] | None:
+        """Page the reconstructed Case timeline in SQLite with a stable order."""
+        timeline_cte = """
+            WITH linked_events AS (
+              SELECT ne.event_id, ne.product, ne.event_type, ne.severity,
+                     ne.timestamp, ne.event_at_ms, ne.created_at_ms,
+                     CASE WHEN ne.event_id LIKE '%__replay_%'
+                          THEN 1 ELSE 0 END AS is_replay
+              FROM case_alert_links l
+              JOIN normalized_events ne ON ne.event_id = l.event_id
+              WHERE l.case_id = :case_id
+            ),
+            timeline(
+              entry_id, kind, kind_order, source_id, source_event_id,
+              occurred_at_ms, recorded_at_ms, time_basis, title, state,
+              product, actor
+            ) AS (
+              SELECT 'event:' || event_id,
+                     CASE WHEN is_replay = 1 THEN 'analysis_replay'
+                          ELSE 'security_event' END,
+                     CASE WHEN is_replay = 1 THEN 15 ELSE 10 END,
+                     event_id, event_id,
+                     CASE
+                       WHEN is_replay = 1 THEN created_at_ms
+                       WHEN julianday(timestamp) IS NOT NULL
+                         THEN COALESCE(NULLIF(event_at_ms, 0), created_at_ms)
+                       ELSE created_at_ms
+                     END,
+                     created_at_ms,
+                     CASE
+                       WHEN is_replay = 1 THEN 'system'
+                       WHEN julianday(timestamp) IS NOT NULL THEN 'reported'
+                       ELSE 'ingest_fallback'
+                     END,
+                     CASE
+                       WHEN is_replay = 1
+                         THEN 'Analysis replay created a normalized evidence version'
+                       ELSE UPPER(product) || ' ' || event_type
+                     END,
+                     severity, product, ''
+              FROM linked_events
+
+              UNION ALL
+              SELECT 'analysis:' || ar.run_id, 'analysis', 20,
+                     ar.run_id, ar.event_id,
+                     ar.created_at_ms, ar.created_at_ms, 'system',
+                     'AI analysis completed', '', ar.product, ar.agent
+              FROM agent_runs ar
+              WHERE ar.case_id = :case_id
+
+              UNION ALL
+              SELECT 'validation:' || vr.validation_id, 'validation', 30,
+                     vr.validation_id, vr.event_id,
+                     vr.created_at_ms, vr.created_at_ms, 'system',
+                     'Validation gate: ' || vr.status, vr.status, '', vr.validator
+              FROM validation_runs vr
+              WHERE vr.case_id = :case_id
+
+              UNION ALL
+              SELECT 'approval-request:' || aa.approval_id, 'approval_request', 40,
+                     aa.approval_id, aa.event_id,
+                     aa.created_at_ms, aa.created_at_ms, 'system',
+                     'Approval requested', 'pending', '', aa.requested_by
+              FROM action_approvals aa
+              WHERE aa.case_id = :case_id
+
+              UNION ALL
+              SELECT 'approval-vote:' || av.approval_id || ':' || av.actor,
+                     'approval_vote', 45,
+                     av.approval_id, aa.event_id,
+                     av.created_at_ms, av.created_at_ms, 'system',
+                     'Approval vote: ' || av.decision, av.decision, '', av.actor
+              FROM approval_votes av
+              JOIN action_approvals aa ON aa.approval_id = av.approval_id
+              WHERE aa.case_id = :case_id
+
+              UNION ALL
+              SELECT 'approval-decision:' || aa.approval_id,
+                     'approval_decision', 50,
+                     aa.approval_id, aa.event_id,
+                     aa.updated_at_ms, aa.updated_at_ms, 'system',
+                     'Approval decision: ' || aa.status, aa.status, '', aa.decided_by
+              FROM action_approvals aa
+              WHERE aa.case_id = :case_id
+                AND aa.status != 'pending'
+                AND aa.updated_at_ms >= aa.created_at_ms
+
+              UNION ALL
+              SELECT 'response-task:' || rt.task_id, 'response_task', 60,
+                     rt.task_id, rt.event_id,
+                     rt.created_at_ms, rt.created_at_ms, 'system',
+                     'Response task created: ' || rt.action_type, 'created', '', rt.created_by
+              FROM response_tasks rt
+              WHERE rt.case_id = :case_id
+
+              UNION ALL
+              SELECT 'response-attempt:' || ra.attempt_id, 'response_attempt', 65,
+                     ra.attempt_id, rt.event_id,
+                     ra.created_at_ms, ra.created_at_ms, 'system',
+                     'Response ' || ra.operation || ': ' || ra.outcome,
+                     ra.outcome, '', ''
+              FROM response_attempts ra
+              JOIN response_tasks rt ON rt.task_id = ra.task_id
+              WHERE rt.case_id = :case_id
+
+              UNION ALL
+              SELECT 'response-task-state:' || rt.task_id || ':' || rt.updated_at_ms,
+                     'response_task_state', 70,
+                     rt.task_id, rt.event_id,
+                     rt.updated_at_ms, rt.updated_at_ms, 'system',
+                     'Response task state: ' || rt.status, rt.status, '', ''
+              FROM response_tasks rt
+              WHERE rt.case_id = :case_id
+                AND rt.updated_at_ms > rt.created_at_ms
+
+              UNION ALL
+              SELECT 'audit:' || al.audit_id, 'governance', 80,
+                     al.audit_id, '',
+                     al.created_at_ms, al.created_at_ms, 'system',
+                     'Governance event: ' || al.action, '', '', al.actor
+              FROM audit_log al
+              WHERE al.case_id = :case_id
+                AND al.action IN (
+                  'escalate_case_review', 'confirm_case_attack', 'close_case',
+                  'reopen_case', 'manual_validation_review_continued',
+                  'analysis_replay_requested', 'analysis_replay_completed',
+                  'case_response_pack_generated', 'case_response_pack_reused'
+                )
+            )
+        """
+        page_limit = max(1, min(int(limit), 100))
+        page_offset = max(0, int(offset))
+        params = {
+            "case_id": case_id,
+            "limit": page_limit,
+            "offset": page_offset,
+        }
+        with self._lock:
+            case_row = self.conn.execute(
+                """
+                SELECT case_id, product, status, severity, classification,
+                       summary, updated_at_ms
+                FROM cases WHERE case_id = ?
+                """,
+                (case_id,),
+            ).fetchone()
+            if not case_row:
+                return None
+            totals = self.conn.execute(
+                timeline_cte
+                + """
+                  SELECT COUNT(*) AS total,
+                         COALESCE(MAX(recorded_at_ms), 0) AS latest_recorded_at_ms
+                  FROM timeline
+                """,
+                params,
+            ).fetchone()
+            rows = self.conn.execute(
+                timeline_cte
+                + """
+                  , paged AS (
+                    SELECT * FROM timeline
+                    ORDER BY occurred_at_ms ASC, recorded_at_ms ASC,
+                             kind_order ASC, entry_id ASC
+                    LIMIT :limit OFFSET :offset
+                  )
+                  SELECT p.entry_id, p.kind, p.source_id, p.source_event_id,
+                         p.occurred_at_ms, p.recorded_at_ms, p.time_basis,
+                         p.title, p.state, p.product, p.actor,
+                         COALESCE(ne.evidence_json, '[]') AS evidence_json,
+                         COALESCE(ne.evidence_hash, '') AS evidence_hash,
+                         CASE
+                           WHEN p.kind IN ('security_event', 'analysis_replay')
+                             THEN COALESCE(ne.entities_json, '{}')
+                           WHEN p.kind = 'analysis'
+                             THEN COALESCE(ar.result_json, '{}')
+                           WHEN p.kind IN ('approval_request', 'approval_decision')
+                             THEN COALESCE(aa.action_json, '{}')
+                           WHEN p.kind IN ('response_task', 'response_task_state')
+                             THEN COALESCE(rt.action_json, '{}')
+                           WHEN p.kind = 'governance'
+                             THEN COALESCE(al.detail_json, '{}')
+                           ELSE '{}'
+                         END AS detail_json
+                  FROM paged p
+                  LEFT JOIN normalized_events ne
+                    ON ne.event_id = p.source_event_id
+                  LEFT JOIN agent_runs ar
+                    ON p.kind = 'analysis' AND ar.run_id = p.source_id
+                  LEFT JOIN action_approvals aa
+                    ON p.kind IN ('approval_request', 'approval_decision')
+                   AND aa.approval_id = p.source_id
+                  LEFT JOIN response_tasks rt
+                    ON p.kind IN ('response_task', 'response_task_state')
+                   AND rt.task_id = p.source_id
+                  LEFT JOIN audit_log al
+                    ON p.kind = 'governance' AND al.audit_id = p.source_id
+                  ORDER BY p.occurred_at_ms ASC, p.recorded_at_ms ASC,
+                           p.kind_order ASC, p.entry_id ASC
+                """,
+                params,
+            ).fetchall()
+            return {
+                "case": dict(case_row),
+                "items": [dict(row) for row in rows],
+                "total": int(totals["total"] if totals else 0),
+                "latest_recorded_at_ms": int(
+                    totals["latest_recorded_at_ms"] if totals else 0
+                ),
+            }
+
+    def insert_case_response_artifact(
+        self,
+        artifact: dict[str, Any],
+        refs: list[dict[str, Any]],
+        *,
+        _commit: bool = True,
+    ) -> tuple[dict[str, Any], bool]:
+        """Persist one immutable Response Pack version and its citation manifest."""
+        with self._lock:
+            existing = self.conn.execute(
+                """
+                SELECT * FROM case_response_artifacts
+                WHERE case_id = ? AND source_snapshot_hash = ? AND content_hash = ?
+                """,
+                (
+                    artifact["case_id"],
+                    artifact["source_snapshot_hash"],
+                    artifact["content_hash"],
+                ),
+            ).fetchone()
+            if existing:
+                artifact_id = str(existing["artifact_id"])
+                existing_refs = [
+                    dict(row)
+                    for row in self.conn.execute(
+                        """
+                        SELECT claim_scope, ref_type, ref_id, source_event_id, source_hash
+                        FROM case_response_artifact_refs WHERE artifact_id = ?
+                        ORDER BY claim_scope ASC, ref_type ASC, ref_id ASC, source_event_id ASC
+                        """,
+                        (artifact_id,),
+                    ).fetchall()
+                ]
+                return self._case_response_artifact_row(existing, existing_refs), False
+
+            version_row = self.conn.execute(
+                """
+                SELECT COALESCE(MAX(version), 0) + 1 AS next_version
+                FROM case_response_artifacts WHERE case_id = ?
+                """,
+                (artifact["case_id"],),
+            ).fetchone()
+            version = int(version_row["next_version"])
+            self.conn.execute(
+                """
+                INSERT INTO case_response_artifacts(
+                  artifact_id, case_id, artifact_type, version, schema_version,
+                  source_snapshot_hash, content_hash, content_json,
+                  validation_status, validation_json, generator,
+                  model_metadata_json, created_by, created_at_ms
+                ) VALUES (?, ?, 'response_pack', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    artifact["artifact_id"],
+                    artifact["case_id"],
+                    version,
+                    artifact["schema_version"],
+                    artifact["source_snapshot_hash"],
+                    artifact["content_hash"],
+                    json.dumps(artifact["content"], ensure_ascii=False, sort_keys=True),
+                    artifact["validation_status"],
+                    json.dumps(artifact["validation"], ensure_ascii=False, sort_keys=True),
+                    artifact["generator"],
+                    json.dumps(
+                        artifact.get("model_metadata") or {},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    artifact["created_by"],
+                    int(artifact["created_at_ms"]),
+                ),
+            )
+            for ref in refs:
+                self.conn.execute(
+                    """
+                    INSERT OR IGNORE INTO case_response_artifact_refs(
+                      artifact_id, claim_scope, ref_type, ref_id,
+                      source_event_id, source_hash
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        artifact["artifact_id"],
+                        str(ref.get("claim_scope") or "pack")[:128],
+                        str(ref.get("ref_type") or "evidence")[:64],
+                        str(ref.get("ref_id") or "")[:512],
+                        str(ref.get("source_event_id") or "")[:256],
+                        str(ref.get("source_hash") or "")[:128],
+                    ),
+                )
+            if _commit:
+                self.conn.commit()
+            row = self.conn.execute(
+                "SELECT * FROM case_response_artifacts WHERE artifact_id = ?",
+                (artifact["artifact_id"],),
+            ).fetchone()
+            saved_refs = [
+                dict(row)
+                for row in self.conn.execute(
+                    """
+                    SELECT claim_scope, ref_type, ref_id, source_event_id, source_hash
+                    FROM case_response_artifact_refs WHERE artifact_id = ?
+                    ORDER BY claim_scope ASC, ref_type ASC, ref_id ASC, source_event_id ASC
+                    """,
+                    (artifact["artifact_id"],),
+                ).fetchall()
+            ]
+            if not row:  # pragma: no cover - insert above must produce a row.
+                raise RuntimeError("Case Response Pack was not persisted")
+            return self._case_response_artifact_row(row, saved_refs), True
+
+    def get_latest_case_response_artifact(
+        self, case_id: str
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.conn.execute(
+                """
+                SELECT * FROM case_response_artifacts
+                WHERE case_id = ? AND artifact_type = 'response_pack'
+                ORDER BY version DESC LIMIT 1
+                """,
+                (case_id,),
+            ).fetchone()
+            if not row:
+                return None
+            refs = [
+                dict(item)
+                for item in self.conn.execute(
+                    """
+                    SELECT claim_scope, ref_type, ref_id, source_event_id, source_hash
+                    FROM case_response_artifact_refs WHERE artifact_id = ?
+                    ORDER BY claim_scope ASC, ref_type ASC, ref_id ASC, source_event_id ASC
+                    """,
+                    (row["artifact_id"],),
+                ).fetchall()
+            ]
+            return self._case_response_artifact_row(row, refs)
 
     def stats(self) -> dict[str, Any]:
         with self._lock:

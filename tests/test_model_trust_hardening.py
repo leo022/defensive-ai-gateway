@@ -937,6 +937,36 @@ class BenignGroundingTest(unittest.TestCase):
         self.assertLessEqual(analyzed.confidence, 0.45)
         self.assertFalse(analyzed.explanation.get("whitelist_recommendation"))
 
+    def test_response_context_survives_explanation_normalization(self):
+        result = self._result(
+            [
+                {
+                    "title": "Rule and path",
+                    "status": "benign",
+                    "evidence": "WAF-920-PROTOCOL on /health matches the monitor route",
+                },
+                {
+                    "title": "Client baseline",
+                    "status": "normal",
+                    "evidence": "bank-monitor/2.4 is the observed user agent",
+                },
+            ]
+        )
+        result["business_impact"] = "Public health endpoint remained available"
+        result["attack_stage"] = ["Reconnaissance", "", "Reconnaissance"]
+        agent = build_agent("waf", _Model(result), _policy())
+
+        analyzed = agent.analyze("case-response-context", self._event(), [])
+
+        self.assertEqual(
+            analyzed.explanation["business_impact"],
+            "Public health endpoint remained available",
+        )
+        self.assertEqual(
+            analyzed.explanation["attack_stage"],
+            ["Reconnaissance", "Reconnaissance"],
+        )
+
     def test_benign_with_two_current_observables_is_kept(self):
         result = self._result(
             [

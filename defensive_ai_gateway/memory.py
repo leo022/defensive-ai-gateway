@@ -598,7 +598,13 @@ class MemoryManager:
                         bool(value)
                         for value in self.alert_cluster_signature(item).values()
                     ),
-                    len((item.get("normalized_event") or {}).get("evidence") or []),
+                    int(
+                        (item.get("normalized_event") or {}).get("_evidence_count")
+                        or len(
+                            (item.get("normalized_event") or {}).get("evidence")
+                            or []
+                        )
+                    ),
                     -ordered.index(item),
                 ),
             )
