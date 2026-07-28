@@ -121,6 +121,23 @@ class _ScopeEchoAgentLLM:
         }
 
 
+class _EarlyFinishAgentLLM:
+    is_deterministic = False
+    runtime_metadata = {
+        "provider": "test",
+        "model": "early-finish-agent-model",
+        "endpoint_host": "",
+    }
+
+    def generate_structured(self, prompt, context, schema=None):  # noqa: ANN001
+        if prompt.startswith("Write a complete"):
+            return {}
+        return {
+            "action": "finish",
+            "rationale": "Finish before collecting the frozen investigation baseline.",
+        }
+
+
 class _ScopeAttackAgentLLM:
     is_deterministic = False
     runtime_metadata = {
@@ -202,6 +219,7 @@ class _ChunkAwareAgentLLM:
         self.alert_id = alert_id
         self.planner_calls = 0
         self.seen_chunks: list[str] = []
+        self.seen_chunk_hashes: set[str] = set()
         self.report_context: dict = {}
 
     def generate_structured(self, prompt, context, schema=None):  # noqa: ANN001
@@ -235,7 +253,10 @@ class _ChunkAwareAgentLLM:
             raise AssertionError("raw chunk was changed at the final prompt boundary")
         if "[TRUNCATED]" in result["content"]:
             raise AssertionError("raw chunk was truncated before reaching the model")
-        self.seen_chunks.append(result["content"])
+        chunk_hash = str(result["chunk_sha256"])
+        if chunk_hash not in self.seen_chunk_hashes:
+            self.seen_chunks.append(result["content"])
+            self.seen_chunk_hashes.add(chunk_hash)
         marker = "END" if "END" in result["content"] else f"offset {result['offset']}"
         if not result["complete"]:
             return {
@@ -424,8 +445,117 @@ class ResponseAgentTest(unittest.TestCase):
             started["session_id"]
         )
         self.assertEqual(stored["tool_calls"][0]["arguments"], {})
-        self.assertEqual(stored["usage"]["model_calls"], 3)
+        self.assertEqual(
+            stored["usage"]["model_calls"], len(CONTROLLER_TOOLS) + 2
+        )
         self.assertNotIn("override controller scope", stored["last_error"])
+
+    def test_controller_defers_early_finish_until_evidence_floor_is_complete(self):
+        self.state.response_agent.set_llm(_EarlyFinishAgentLLM())
+        case_id = self._case("response-agent-early-finish")
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        started = self.state.response_agent.create(
+            case_id,
+            artifact=artifact,
+            goal="Enforce the investigation evidence floor",
+            actor="analyst",
+        )
+
+        session = self._wait(
+            self.state.response_agent,
+            started["session_id"],
+            {"completed", "review", "blocked", "failed", "paused"},
+        )
+
+        self.assertEqual(
+            session["status"],
+            "completed",
+            session.get("report", {}).get("validation"),
+        )
+        self.assertEqual(
+            [item["tool_name"] for item in session["tool_calls"]],
+            [*MANDATORY_TOOLS, "read_raw_alert_chunk"],
+        )
+        self.assertEqual(session["report"]["validation_status"], "passed")
+        self.assertTrue(
+            session["report"]["validation"]["checks"][
+                "mandatory_tools_completed"
+            ]
+        )
+        self.assertTrue(
+            session["report"]["validation"]["checks"]["raw_evidence_complete"]
+        )
+
+    def test_report_gate_independently_blocks_incomplete_evidence_floor(self):
+        self.state.response_agent.stop()
+        case_id = self._case("response-agent-report-floor")
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        started = self.state.response_agent.create(
+            case_id,
+            artifact=artifact,
+            goal="Validate the report evidence floor",
+            actor="analyst",
+        )
+        session = self.state.repo.get_response_agent_session(
+            started["session_id"]
+        )
+        source = self.state.repo.get_case_response_source(case_id)
+        report = self.state.response_agent._base_report(
+            session, source, artifact
+        )
+
+        missing_validation, _ = self.state.response_agent._validate_report(
+            report, session, source, artifact
+        )
+        self.assertEqual(missing_validation["status"], "blocked")
+        self.assertTrue(
+            any(
+                error.startswith("mandatory_tools_missing:")
+                for error in missing_validation["errors"]
+            )
+        )
+
+        complete_calls = [
+            {
+                "tool_name": tool_name,
+                "status": "completed",
+                "arguments": {},
+                "result": (
+                    {"items": [{"alert_id": "raw-report-floor"}]}
+                    if tool_name == "query_case_raw_alerts"
+                    else {}
+                ),
+                "evidence_refs": [],
+            }
+            for tool_name in MANDATORY_TOOLS
+        ]
+        complete_calls.append(
+            {
+                "tool_name": "read_raw_alert_chunk",
+                "status": "completed",
+                "arguments": {
+                    "alert_id": "raw-report-floor",
+                    "json_pointer": "/original_log",
+                    "offset": 0,
+                },
+                "result": {"complete": False, "next_offset": 4_096},
+                "evidence_refs": [],
+            }
+        )
+        incomplete_raw_session = {**session, "tool_calls": complete_calls}
+        raw_validation, _ = self.state.response_agent._validate_report(
+            report, incomplete_raw_session, source, artifact
+        )
+        self.assertEqual(raw_validation["status"], "blocked")
+        self.assertNotIn(
+            "mandatory_tools_missing", " ".join(raw_validation["errors"])
+        )
+        self.assertIn("raw_evidence_read_incomplete", raw_validation["errors"])
+        self.assertFalse(raw_validation["checks"]["raw_evidence_complete"])
 
     def test_mismatched_case_scope_pauses_after_bounded_retries(self):
         self.state.response_agent.set_llm(_ScopeAttackAgentLLM())

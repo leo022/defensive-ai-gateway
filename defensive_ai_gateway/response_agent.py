@@ -962,56 +962,9 @@ class ResponseInvestigationAgent:
     ) -> dict[str, Any]:
         llm = self._current_llm()
         if llm.is_deterministic:
-            completed = {
-                str(call.get("tool_name") or "")
-                for call in calls
-                if call.get("status") == "completed"
-            }
-            for tool_name in MANDATORY_TOOLS:
-                if tool_name not in completed:
-                    return {
-                        "action": "tool_call",
-                        "tool_name": tool_name,
-                        "arguments": {},
-                        "rationale": "按冻结调查计划收集下一组受治理事实。",
-                        "question": "",
-                        "plan_updates": [],
-                    }
-            if "read_raw_alert_chunk" not in completed:
-                raw_items: list[dict[str, Any]] = []
-                for call in calls:
-                    if (
-                        call.get("status") == "completed"
-                        and call.get("tool_name")
-                        in {"query_case_raw_alerts", "search_related_alerts"}
-                    ):
-                        result = call.get("result")
-                        if isinstance(result, dict):
-                            raw_items.extend(
-                                item
-                                for item in result.get("items") or []
-                                if isinstance(item, dict) and item.get("alert_id")
-                            )
-                if raw_items:
-                    selected = raw_items[0]
-                    return {
-                        "action": "tool_call",
-                        "tool_name": "read_raw_alert_chunk",
-                        "arguments": {
-                            "alert_id": selected["alert_id"],
-                            "json_pointer": (
-                                "/original_log"
-                                if selected.get("original_log_present")
-                                else ""
-                            ),
-                            "offset": 0,
-                        },
-                        "rationale": (
-                            "读取一段受治理的原始告警，核对归一化过程中可能遗漏的证据。"
-                        ),
-                        "question": "",
-                        "plan_updates": [],
-                    }
+            required = self._completion_guard_decision(calls)
+            if required:
+                return required
             return {
                 "action": "finish",
                 "tool_name": "",
@@ -1089,7 +1042,128 @@ class ResponseInvestigationAgent:
                     error_type=type(exc).__name__,
                 )
             raise _SessionPaused from exc
-        return self._validate_decision(raw, session=session)
+        decision = self._validate_decision(raw, session=session)
+        if decision["action"] == "finish":
+            required = self._completion_guard_decision(calls)
+            if required:
+                return required
+        return decision
+
+    @staticmethod
+    def _completion_guard_decision(
+        calls: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        completed_calls = [
+            call for call in calls if call.get("status") == "completed"
+        ]
+        latest_raw_calls: dict[tuple[str, str], dict[str, Any]] = {}
+        for call in completed_calls:
+            if call.get("tool_name") != "read_raw_alert_chunk":
+                continue
+            result = call.get("result")
+            arguments = call.get("arguments")
+            if not isinstance(result, dict) or not isinstance(arguments, dict):
+                continue
+            stream = (
+                str(arguments.get("alert_id") or ""),
+                str(arguments.get("json_pointer") or ""),
+            )
+            offset = _integer(result.get("offset"), _integer(arguments.get("offset")))
+            existing = latest_raw_calls.get(stream)
+            existing_result = existing.get("result") if existing else {}
+            existing_arguments = existing.get("arguments") if existing else {}
+            existing_offset = _integer(
+                existing_result.get("offset")
+                if isinstance(existing_result, dict)
+                else None,
+                _integer(
+                    existing_arguments.get("offset")
+                    if isinstance(existing_arguments, dict)
+                    else None,
+                    -1,
+                ),
+            )
+            if offset >= existing_offset:
+                latest_raw_calls[stream] = call
+
+        for stream in sorted(latest_raw_calls):
+            call = latest_raw_calls[stream]
+            result = call["result"]
+            arguments = call["arguments"]
+            offset = _integer(result.get("offset"), _integer(arguments.get("offset")))
+            next_offset = _integer(result.get("next_offset"), offset)
+            if result.get("complete") is not False or next_offset <= offset:
+                continue
+            continuation = {
+                "alert_id": stream[0],
+                "json_pointer": stream[1],
+                "offset": next_offset,
+            }
+            if _integer(arguments.get("max_bytes")) > 0:
+                continuation["max_bytes"] = _integer(arguments["max_bytes"])
+            return {
+                "action": "tool_call",
+                "tool_name": "read_raw_alert_chunk",
+                "arguments": continuation,
+                "rationale": (
+                    "模型请求结束调查；控制器完成门禁要求先读取选定原始证据的下一分块。"
+                ),
+                "question": "",
+                "plan_updates": [],
+            }
+
+        completed = {
+            str(call.get("tool_name") or "") for call in completed_calls
+        }
+        for tool_name in MANDATORY_TOOLS:
+            if tool_name not in completed:
+                return {
+                    "action": "tool_call",
+                    "tool_name": tool_name,
+                    "arguments": {},
+                    "rationale": (
+                        "模型请求结束调查；控制器完成门禁要求先补齐下一项受治理基线证据。"
+                    ),
+                    "question": "",
+                    "plan_updates": [],
+                }
+
+        if "read_raw_alert_chunk" not in completed:
+            raw_items: list[dict[str, Any]] = []
+            for call in completed_calls:
+                if call.get("tool_name") not in {
+                    "query_case_raw_alerts",
+                    "search_related_alerts",
+                }:
+                    continue
+                result = call.get("result")
+                if isinstance(result, dict):
+                    raw_items.extend(
+                        item
+                        for item in result.get("items") or []
+                        if isinstance(item, dict) and item.get("alert_id")
+                    )
+            if raw_items:
+                selected = raw_items[0]
+                return {
+                    "action": "tool_call",
+                    "tool_name": "read_raw_alert_chunk",
+                    "arguments": {
+                        "alert_id": selected["alert_id"],
+                        "json_pointer": (
+                            "/original_log"
+                            if selected.get("original_log_present")
+                            else ""
+                        ),
+                        "offset": 0,
+                    },
+                    "rationale": (
+                        "模型请求结束调查；控制器完成门禁要求至少完整读取一条选定原始证据。"
+                    ),
+                    "question": "",
+                    "plan_updates": [],
+                }
+        return None
 
     def _model_observations(
         self, calls: list[dict[str, Any]]
@@ -2240,6 +2314,53 @@ class ResponseInvestigationAgent:
             if ref_id:
                 ref_manifest.setdefault(ref_id, dict(ref))
 
+        completed_calls = [
+            call
+            for call in session.get("tool_calls") or []
+            if call.get("status") == "completed"
+        ]
+        completed_tools = {
+            str(call.get("tool_name") or "") for call in completed_calls
+        }
+        missing_tools = [
+            tool_name
+            for tool_name in MANDATORY_TOOLS
+            if tool_name not in completed_tools
+        ]
+        if missing_tools:
+            errors.append(f"mandatory_tools_missing:{','.join(missing_tools)}")
+        raw_candidates = any(
+            isinstance(call.get("result"), dict)
+            and any(
+                isinstance(item, dict) and item.get("alert_id")
+                for item in (call.get("result") or {}).get("items") or []
+            )
+            for call in completed_calls
+            if call.get("tool_name")
+            in {"query_case_raw_alerts", "search_related_alerts"}
+        )
+        raw_streams: dict[tuple[str, str], dict[str, Any]] = {}
+        for call in completed_calls:
+            if call.get("tool_name") != "read_raw_alert_chunk":
+                continue
+            arguments = call.get("arguments")
+            result = call.get("result")
+            if not isinstance(arguments, dict) or not isinstance(result, dict):
+                continue
+            stream = (
+                str(arguments.get("alert_id") or ""),
+                str(arguments.get("json_pointer") or ""),
+            )
+            offset = _integer(result.get("offset"), _integer(arguments.get("offset")))
+            existing = raw_streams.get(stream)
+            if not existing or offset >= _integer(existing.get("offset"), -1):
+                raw_streams[stream] = result
+        raw_evidence_complete = bool(raw_streams) and all(
+            result.get("complete") is True for result in raw_streams.values()
+        )
+        if raw_candidates and not raw_evidence_complete:
+            errors.append("raw_evidence_read_incomplete")
+
         cited: list[tuple[str, str]] = []
         for claim in report.get("findings") or []:
             claim_id = str(claim.get("claim_id") or "")
@@ -2338,6 +2459,10 @@ class ResponseInvestigationAgent:
                         "snapshot" in item or "binding" in item for item in errors
                     ),
                     "controller_tools_only": "tool_outside_allowlist" not in errors,
+                    "mandatory_tools_completed": not missing_tools,
+                    "raw_evidence_complete": (
+                        not raw_candidates or raw_evidence_complete
+                    ),
                     "direct_execution_blocked": "direct_execution_not_blocked"
                     not in errors,
                     "direct_delivery_blocked": "direct_delivery_not_blocked"
