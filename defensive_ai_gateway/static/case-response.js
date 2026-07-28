@@ -589,16 +589,15 @@ function renderSummary() {
         </div>
       </div>
       <span>${escapeHtml(fmtTime(fact.occurred_at_ms))} · ${escapeHtml(timeBasisLabel(fact.time_basis))}</span>
-      ${refs(fact.evidence_refs)}
     </article>
   `, tr("noKnownFacts"));
   const gaps = list(summary.uncertainties, (item, index) => `<div class="case-response-line"><strong>${index + 1}.</strong> ${escapeHtml(item)}</div>`, tr("noUnknowns"));
   const decisions = list(summary.pending_decisions, (item, index) => `<div class="case-response-line"><strong>${index + 1}.</strong> ${escapeHtml(tr("decisionItem", item))}</div>`, tr("noApprovals"));
   container.innerHTML = `
     <div class="case-response-summary-grid">
-      <div><span>${escapeHtml(tr("facts"))}</span>${factBlock}</div>
-      <div><span>${escapeHtml(tr("uncertainties"))}</span>${gaps}</div>
-      <div><span>${escapeHtml(tr("pending"))}</span>${decisions}</div>
+      <div class="case-response-summary-panel case-response-summary-facts"><span>${escapeHtml(tr("facts"))}</span>${factBlock}</div>
+      <div class="case-response-summary-panel case-response-summary-uncertainties"><span>${escapeHtml(tr("uncertainties"))}</span>${gaps}</div>
+      <div class="case-response-summary-panel case-response-summary-pending"><span>${escapeHtml(tr("pending"))}</span>${decisions}</div>
     </div>
     ${refs(summary.headline_evidence_refs)}
   `;
@@ -671,7 +670,6 @@ function renderPlaybook() {
           <div><dt>${escapeHtml(tr("successCriteria"))}</dt><dd>${escapeHtml(step.success_criteria || "-")}</dd></div>
           ${step.rollback ? `<div><dt>${escapeHtml(tr("rollback"))}</dt><dd>${escapeHtml(step.rollback)}</dd></div>` : ""}
         </dl>
-        ${refs(step.evidence_refs)}
       </div>
     </article>
   `);
@@ -691,7 +689,6 @@ function communicationList(items, empty, { ordered = false, showTime = false } =
           ${showTime && value.occurred_at_ms ? `<span>${escapeHtml(fmtTime(value.occurred_at_ms))} · ${escapeHtml(timeBasisLabel(value.time_basis))}</span>` : ""}
           ${value.state ? `<span>${escapeHtml(enumLabel("state", value.state))}</span>` : ""}
         </div>
-        ${refs(value.evidence_refs)}
       </li>
     `;
   }).join("")}</${tag}>`;

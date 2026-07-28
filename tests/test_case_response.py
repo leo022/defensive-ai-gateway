@@ -237,6 +237,13 @@ class CaseResponseServiceTest(unittest.TestCase):
         self.assertIn('roles.includes("analyst")', script)
         self.assertIn("communicationList(draft.known_facts", script)
         self.assertIn('fact.claim_type === "analysis_finding"', script)
+        self.assertIn("${refs(summary.headline_evidence_refs)}", script)
+        self.assertNotIn("${refs(fact.evidence_refs)}", script)
+        self.assertNotIn("${refs(step.evidence_refs)}", script)
+        self.assertNotIn("${refs(value.evidence_refs)}", script)
+        self.assertIn("case-response-summary-facts", script)
+        self.assertIn("case-response-summary-uncertainties", script)
+        self.assertIn("case-response-summary-pending", script)
         self.assertIn("copyCommunicationReport", script)
         self.assertIn('addEventListener("click", copyCommunicationReport)', script)
         self.assertIn("timelinePageMustReset", script)
@@ -265,6 +272,21 @@ class CaseResponseServiceTest(unittest.TestCase):
         self.assertRegex(
             css,
             r"(?s)\.case-response-report-progress\s*\{[^}]*display: grid;",
+        )
+        self.assertRegex(
+            css,
+            r"(?s)\.case-response-summary-grid\s*\{[^}]*"
+            r"grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);",
+        )
+        self.assertRegex(
+            css,
+            r"(?s)\.case-response-summary-facts\s*\{[^}]*"
+            r"grid-column: 1 / -1;[^}]*border-bottom:",
+        )
+        self.assertRegex(
+            css,
+            r"(?s)\.case-response-summary-pending\s*\{[^}]*"
+            r"padding-left: 18px;[^}]*border-left:",
         )
         self.assertIn("response-pack-link", app_script)
         self.assertNotIn("direct_communication_delivery: true", script)
