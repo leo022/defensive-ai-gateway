@@ -366,6 +366,22 @@ class ResponseAgentTest(unittest.TestCase):
         )
         self.assertTrue(report["content"]["conclusion"]["statement"])
         self.assertTrue(report["content"]["findings"])
+        self.assertGreaterEqual(
+            len(report["content"]["hypothesis_assessment"]), 5
+        )
+        self.assertIn("cross_source_correlation", report["content"])
+        self.assertIn("scope_assessment", report["content"])
+        self.assertTrue(
+            all(
+                item.get("investigation_result", {}).get("assessment")
+                and item.get("investigation_result", {}).get("observations")
+                and item.get("investigation_result", {}).get(
+                    "alternative_explanations"
+                )
+                and item.get("investigation_result", {}).get("next_pivots")
+                for item in report["content"]["forensic_workstreams"]
+            )
+        )
         self.assertTrue(report["content"]["final_assessment"])
         self.assertTrue(
             all(
@@ -376,6 +392,57 @@ class ResponseAgentTest(unittest.TestCase):
         self.assertNotIn("source_snapshot", session)
         self.assertNotIn("source_json", session)
         self.assertFalse(session["freshness"]["is_stale"])
+
+    def test_english_session_localizes_controller_plan_and_forensic_results(self):
+        case_id = self._case("response-agent-english")
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        started = self.state.response_agent.create(
+            case_id,
+            artifact=artifact,
+            goal="Investigate the Case with hypothesis-driven forensics",
+            actor="analyst",
+            language="en",
+        )
+        session = self._wait(
+            self.state.response_agent,
+            started["session_id"],
+            {"completed", "review", "blocked", "failed", "budget_exhausted"},
+        )
+
+        self.assertEqual(session["status"], "completed")
+        self.assertEqual(session["model_metadata"]["report_language"], "en")
+        self.assertTrue(
+            all(
+                not any("\u4e00" <= character <= "\u9fff" for character in item["title"])
+                for item in session["plan"]
+            )
+        )
+        report = session["report"]["content"]
+        self.assertIn("deep response investigation report", report["title"])
+        self.assertTrue(
+            all(
+                not any(
+                    "\u4e00" <= character <= "\u9fff"
+                    for character in (
+                        item["title"]
+                        + item["coverage_summary"]
+                        + item["investigation_result"]["assessment"]
+                    )
+                )
+                for item in report["forensic_workstreams"]
+            )
+        )
+        self.assertTrue(
+            all(
+                not any(
+                    "\u4e00" <= character <= "\u9fff"
+                    for character in item["title"] + item["rationale"]
+                )
+                for item in report["hypothesis_assessment"]
+            )
+        )
 
     def test_active_session_is_reused_and_new_evidence_marks_it_stale(self):
         self.state.response_agent.stop()
@@ -1253,7 +1320,18 @@ class ResponseAgentTest(unittest.TestCase):
         self.assertIn('startResponseAgent({ rerun: true })', script)
         self.assertIn('classList.toggle("is-expanded", expanded)', script)
         self.assertIn("content.forensic_workstreams", script)
+        self.assertIn("content.hypothesis_assessment", script)
+        self.assertIn("content.cross_source_correlation", script)
+        self.assertIn("content.scope_assessment", script)
         self.assertIn('agentForensics: "深度取证流程"', script)
+        self.assertIn('body: JSON.stringify({ goal, language: language() })', script)
+        self.assertIn('items.slice(1)', script)
+        self.assertIn(
+            '<details class="response-agent-evidence-more">',
+            script,
+        )
+        self.assertNotIn("function compactAgentRefs(values, limit = 4)", script)
+        self.assertIn(".response-agent-evidence-more", css)
         self.assertIn("width: min(480px, 100vw)", css)
         self.assertIn(".response-agent-drawer.is-expanded", css)
         self.assertIn("width: min(960px, 100vw)", css)

@@ -99,7 +99,9 @@ function pretty(value) {
 
 function fmtTime(value) {
   const timestamp = typeof value === "number" ? value : Date.parse(String(value || ""));
-  return Number.isFinite(timestamp) && timestamp > 0 ? new Date(timestamp).toLocaleString() : "-";
+  return Number.isFinite(timestamp) && timestamp > 0
+    ? new Date(timestamp).toLocaleString(language() === "en" ? "en-US" : "zh-CN")
+    : "-";
 }
 
 function recordTypeLabel(record, copy) {

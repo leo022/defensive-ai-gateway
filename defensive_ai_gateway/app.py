@@ -4290,6 +4290,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     artifact=artifact,
                     goal=str(body.get("goal") or ""),
                     actor=str(body.get("_actor") or "soc-analyst"),
+                    language=str(body.get("language") or "zh"),
                 )
                 self._json(202, {"session": session})
             except _PayloadTooLarge:

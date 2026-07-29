@@ -35,6 +35,8 @@ let agentTraceExpanded = true;
 const COPY = {
   zh: {
     back: "返回 Case",
+    kicker: "AI 驱动响应",
+    agentKicker: "响应调查 Agent",
     workbenchTitle: "Case 响应工作台",
     loadingCase: "正在加载 Case…",
     refresh: "刷新",
@@ -161,10 +163,25 @@ const COPY = {
     agentGate: "报告门禁",
     agentConclusion: "完整结论",
     agentFindings: "关键发现",
+    agentHypotheses: "调查假设验证",
+    agentHypothesisSupport: "支持证据",
+    agentHypothesisAgainst: "反证/不一致证据",
+    agentHypothesisMissing: "仍缺证据",
+    agentCorrelation: "跨源关联分析",
+    agentCorrelationPivots: "关联支点",
+    agentScope: "影响范围界定",
+    agentObservedEntities: "已观测实体",
+    agentCoveredDomains: "已覆盖取证域",
+    agentUnresolvedDomains: "未解决取证域",
     agentImpact: "影响分析",
     agentForensics: "深度取证流程",
     agentForensicSources: "现有证据源",
     agentCollectionSteps: "补充采集步骤",
+    agentForensicAssessment: "调查判断",
+    agentForensicObservations: "已取得结果",
+    agentAlternativeExplanations: "替代解释",
+    agentNextPivots: "下一调查支点",
+    agentEvidenceMore: (count) => `→ 其余 ${count} 条`,
     agentGaps: "证据缺口",
     agentResponsePlan: "响应计划",
     agentFinalAssessment: "最终判断",
@@ -177,6 +194,8 @@ const COPY = {
   },
   en: {
     back: "Back to Case",
+    kicker: "Respond powered by AI",
+    agentKicker: "Response Agent",
     workbenchTitle: "Case Response Workbench",
     loadingCase: "Loading Case…",
     refresh: "Refresh",
@@ -303,10 +322,25 @@ const COPY = {
     agentGate: "Report gate",
     agentConclusion: "Conclusion",
     agentFindings: "Key findings",
+    agentHypotheses: "Investigation hypothesis testing",
+    agentHypothesisSupport: "Supporting evidence",
+    agentHypothesisAgainst: "Contradicting/inconsistent evidence",
+    agentHypothesisMissing: "Evidence still required",
+    agentCorrelation: "Cross-source correlation",
+    agentCorrelationPivots: "Correlation pivots",
+    agentScope: "Impact scope",
+    agentObservedEntities: "Observed entities",
+    agentCoveredDomains: "Covered forensic domains",
+    agentUnresolvedDomains: "Unresolved forensic domains",
     agentImpact: "Impact",
     agentForensics: "Deep forensic workstreams",
     agentForensicSources: "Available evidence sources",
     agentCollectionSteps: "Additional collection steps",
+    agentForensicAssessment: "Investigation assessment",
+    agentForensicObservations: "Results obtained",
+    agentAlternativeExplanations: "Alternative explanations",
+    agentNextPivots: "Next investigation pivots",
+    agentEvidenceMore: (count) => `→ ${count} more`,
     agentGaps: "Evidence gaps",
     agentResponsePlan: "Response plan",
     agentFinalAssessment: "Final assessment",
@@ -350,6 +384,22 @@ const ENUM_LABELS = {
       confirmed: "已确认",
       inferred: "推断",
       unverified: "未验证",
+    },
+    hypothesisDisposition: {
+      supported: "已支持",
+      partially_supported: "部分支持",
+      not_supported: "不支持",
+      unresolved: "未解决",
+    },
+    correlationStrength: {
+      multi_source: "多源交叉印证",
+      single_source: "单一来源",
+      no_correlation: "未取得关联结果",
+    },
+    forensicConclusion: {
+      corroborated: "已交叉印证",
+      single_source: "单源线索",
+      unresolved: "尚未解决",
     },
     kind: {
       security_event: "安全告警",
@@ -456,6 +506,22 @@ const ENUM_LABELS = {
       inferred: "Inferred",
       unverified: "Unverified",
     },
+    hypothesisDisposition: {
+      supported: "Supported",
+      partially_supported: "Partially supported",
+      not_supported: "Not supported",
+      unresolved: "Unresolved",
+    },
+    correlationStrength: {
+      multi_source: "Cross-source corroboration",
+      single_source: "Single source",
+      no_correlation: "No correlation result",
+    },
+    forensicConclusion: {
+      corroborated: "Corroborated",
+      single_source: "Single-source lead",
+      unresolved: "Unresolved",
+    },
     kind: {
       security_event: "Security alert",
       analysis_replay: "Analysis replay",
@@ -561,6 +627,7 @@ function enumLabel(group, value) {
 
 function applyLocalizedStaticText() {
   document.querySelector("#case-response-back").textContent = tr("back");
+  document.querySelector("#case-response-kicker").textContent = tr("kicker");
   document.querySelector("#case-response-title").textContent = tr("workbenchTitle");
   document.querySelector("#case-response-subtitle").textContent = tr("loadingCase");
   document.querySelector("#case-response-refresh").textContent = tr("refresh");
@@ -572,6 +639,7 @@ function applyLocalizedStaticText() {
   document.querySelector("#response-communication-heading").textContent = tr("communicationHeading");
   document.querySelector("#response-timeline-heading").textContent = tr("timelineHeading");
   document.querySelector("#case-response-agent-open").textContent = tr("agentOpen");
+  document.querySelector("#response-agent-kicker").textContent = tr("agentKicker");
   document.querySelector("#response-agent-title").textContent = tr("agentTitle");
   document.querySelector("#response-agent-expand").setAttribute("aria-label", tr("expandAgent"));
   document.querySelector("#response-agent-expand").title = tr("expandAgent");
@@ -1278,15 +1346,41 @@ function agentEvidenceRefs(values) {
   )).map(String).filter(Boolean);
 }
 
-function compactAgentRefs(values, limit = 4) {
+function compactAgentRefs(values) {
   const items = [...new Set(agentEvidenceRefs(values))];
   if (!items.length) return "";
-  const remaining = Math.max(0, items.length - limit);
-  const label = remaining ? `${tr("evidence")} · +${remaining}` : tr("evidence");
-  return `<div class="case-response-refs"><span>${escapeHtml(label)}</span>${items
-    .slice(0, limit)
-    .map((item) => `<code>${escapeHtml(item)}</code>`)
-    .join("")}</div>`;
+  const remaining = items.slice(1);
+  const collapsed = remaining.length
+    ? `<details class="response-agent-evidence-more">
+        <summary>${escapeHtml(tr("agentEvidenceMore", remaining.length))}</summary>
+        <div class="response-agent-evidence-more-list">
+          ${remaining.map((item) => `<code>${escapeHtml(item)}</code>`).join("")}
+        </div>
+      </details>`
+    : "";
+  return `<div class="case-response-refs response-agent-evidence-refs">
+    <span>${escapeHtml(tr("evidence"))}</span>
+    <code>${escapeHtml(items[0])}</code>
+    ${collapsed}
+  </div>`;
+}
+
+function compactAgentSources(values) {
+  const items = (values || [])
+    .map((source) => `${source.product || "-"} · ${source.alert_id || "-"}`);
+  if (!items.length) return "";
+  const remaining = items.slice(1);
+  return `<div class="response-agent-source-summary">
+    <small>${escapeHtml(tr("agentForensicSources"))}: ${escapeHtml(items[0])}</small>
+    ${remaining.length
+      ? `<details class="response-agent-evidence-more">
+          <summary>${escapeHtml(tr("agentEvidenceMore", remaining.length))}</summary>
+          <div class="response-agent-source-more-list">
+            ${remaining.map((item) => `<small>${escapeHtml(item)}</small>`).join("")}
+          </div>
+        </details>`
+      : ""}
+  </div>`;
 }
 
 function renderAgentPlan() {
@@ -1341,6 +1435,15 @@ function reportItems(items, renderItem, emptyText) {
   return `<ol class="response-agent-report-list">${items.map(renderItem).join("")}</ol>`;
 }
 
+function agentDetailList(label, values) {
+  const items = (values || []).filter(Boolean);
+  if (!items.length) return "";
+  return `<div class="response-agent-investigation-detail">
+    <strong>${escapeHtml(label)}</strong>
+    ${items.map((item) => `<small>${escapeHtml(item)}</small>`).join("")}
+  </div>`;
+}
+
 function renderAgentReport() {
   const band = document.querySelector("#response-agent-report-band");
   const target = document.querySelector("#response-agent-report");
@@ -1353,6 +1456,8 @@ function renderAgentReport() {
   band.hidden = false;
   const content = report.content;
   const conclusion = content.conclusion || {};
+  const correlation = content.cross_source_correlation || {};
+  const scope = content.scope_assessment || {};
   const validation = report.validation || {};
   target.innerHTML = `
     <article class="response-agent-report">
@@ -1376,15 +1481,50 @@ function renderAgentReport() {
         `, tr("agentEmptyFindings"))}
       </section>
       <section class="response-agent-report-section">
+        <h4>${escapeHtml(tr("agentHypotheses"))}</h4>
+        ${reportItems(content.hypothesis_assessment, (item) => `
+          <li>
+            <strong>${escapeHtml(item.title || item.hypothesis_id || "-")}</strong>
+            <small>${escapeHtml(enumLabel("hypothesisDisposition", item.disposition))} · ${escapeHtml(fmtConfidence(item.confidence))}</small>
+            <p>${escapeHtml(item.rationale || "-")}</p>
+            ${agentDetailList(tr("agentHypothesisMissing"), item.missing_evidence)}
+            ${(item.supporting_evidence_refs || []).length
+              ? `<small><strong>${escapeHtml(tr("agentHypothesisSupport"))}</strong></small>${compactAgentRefs(item.supporting_evidence_refs)}`
+              : ""}
+            ${(item.contradicting_evidence_refs || []).length
+              ? `<small><strong>${escapeHtml(tr("agentHypothesisAgainst"))}</strong></small>${compactAgentRefs(item.contradicting_evidence_refs)}`
+              : ""}
+          </li>
+        `, tr("agentEmptyFindings"))}
+      </section>
+      <section class="response-agent-report-section">
+        <h4>${escapeHtml(tr("agentCorrelation"))}</h4>
+        <p><strong>${escapeHtml(enumLabel("correlationStrength", correlation.strength))}</strong></p>
+        <p>${escapeHtml(correlation.summary || "-")}</p>
+        ${agentDetailList(
+          tr("agentCorrelationPivots"),
+          (correlation.correlation_pivots || []).map((item) => `${item.field || "-"}: ${item.value || "-"}`),
+        )}
+      </section>
+      <section class="response-agent-report-section">
+        <h4>${escapeHtml(tr("agentScope"))}</h4>
+        <p>${escapeHtml(scope.blast_radius_assessment || "-")}</p>
+        ${agentDetailList(
+          tr("agentObservedEntities"),
+          (scope.observed_entities || []).map((item) => `${item.type || "-"}: ${item.value || "-"}`),
+        )}
+        ${agentDetailList(tr("agentCoveredDomains"), scope.evidence_covered_domains)}
+        ${agentDetailList(tr("agentUnresolvedDomains"), scope.unresolved_domains)}
+        ${compactAgentRefs(scope.evidence_refs)}
+      </section>
+      <section class="response-agent-report-section">
         <h4>${escapeHtml(tr("agentImpact"))}</h4>
         <p>${escapeHtml(content.impact || "-")}</p>
       </section>
       <section class="response-agent-report-section">
         <h4>${escapeHtml(tr("agentForensics"))}</h4>
         ${reportItems(content.forensic_workstreams, (item) => {
-          const sources = (item.evidence_sources || [])
-            .map((source) => `${source.product || "-"} · ${source.alert_id || "-"}`)
-            .join(" / ");
+          const result = item.investigation_result || {};
           const steps = (item.collection_steps || [])
             .map((step) => `<small>${escapeHtml(step)}</small>`)
             .join("");
@@ -1392,7 +1532,12 @@ function renderAgentReport() {
             <li>
               <strong>${escapeHtml(item.title || item.workstream_id || "-")}</strong>
               <small>${escapeHtml(enumLabel("state", item.status))} · ${escapeHtml(item.coverage_summary || "-")}</small>
-              ${sources ? `<small>${escapeHtml(tr("agentForensicSources"))}: ${escapeHtml(sources)}</small>` : ""}
+              <small>${escapeHtml(enumLabel("forensicConclusion", result.conclusion_state))}</small>
+              ${compactAgentSources(item.evidence_sources)}
+              ${result.assessment ? `<div class="response-agent-investigation-detail"><strong>${escapeHtml(tr("agentForensicAssessment"))}</strong><small>${escapeHtml(result.assessment)}</small></div>` : ""}
+              ${agentDetailList(tr("agentForensicObservations"), result.observations)}
+              ${agentDetailList(tr("agentAlternativeExplanations"), result.alternative_explanations)}
+              ${agentDetailList(tr("agentNextPivots"), result.next_pivots)}
               ${steps ? `<small><strong>${escapeHtml(tr("agentCollectionSteps"))}</strong></small>${steps}` : ""}
               ${compactAgentRefs(item.evidence_refs)}
             </li>
@@ -1619,7 +1764,7 @@ async function startResponseAgent({ rerun = false } = {}) {
     const payload = await api(`/api/cases/${encodeURIComponent(caseId)}/response-agent/start`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ goal }),
+      body: JSON.stringify({ goal, language: language() }),
     });
     mergeAgentSession(payload.session, true);
     await loadAll();

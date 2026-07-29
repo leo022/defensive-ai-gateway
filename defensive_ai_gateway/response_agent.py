@@ -12,8 +12,8 @@ from .config import ResponseAgentConfig
 from .models import new_id, now_ms
 
 
-REPORT_SCHEMA_VERSION = "response-investigation-report-v2"
-AGENT_VERSION = "response-investigation-agent-v3"
+REPORT_SCHEMA_VERSION = "response-investigation-report-v3"
+AGENT_VERSION = "response-investigation-agent-v4"
 TOOL_VERSION = "3"
 ACTIVE_STATUSES = {
     "queued",
@@ -145,6 +145,9 @@ REPORT_SCHEMA = {
         "conclusion": {"type": "object"},
         "findings": {"type": "array", "items": {"type": "object"}},
         "attack_chain": {"type": "array", "items": {"type": "object"}},
+        "hypothesis_assessment": {"type": "array", "items": {"type": "object"}},
+        "cross_source_correlation": {"type": "object"},
+        "scope_assessment": {"type": "object"},
         "impact": {"type": "string"},
         "forensic_workstreams": {"type": "array", "items": {"type": "object"}},
         "evidence_gaps": {"type": "array", "items": {"type": "string"}},
@@ -156,6 +159,9 @@ REPORT_SCHEMA = {
         "executive_summary",
         "conclusion",
         "findings",
+        "hypothesis_assessment",
+        "cross_source_correlation",
+        "scope_assessment",
         "forensic_workstreams",
         "evidence_gaps",
         "response_plan",
@@ -246,6 +252,220 @@ FORENSIC_WORKSTREAMS = (
     },
 )
 
+FORENSIC_EN = {
+    "web-request-reconstruction": {
+        "title": "Web request and response reconstruction",
+        "collection_steps": (
+            "Collect raw request lines, query parameters, headers, bodies, response status and response bytes from WAF, reverse proxy and web access logs; correlate them with request/trace IDs and timestamps.",
+            "Verify request_message and response_message in raw RASP events. Empty or null values are source-capture gaps and must not be described as Agent truncation.",
+        ),
+        "alternatives": (
+            "A rule match may represent a blocked probe rather than successful exploitation.",
+            "Application routing, proxy rewriting or incomplete request capture may explain apparent inconsistencies.",
+        ),
+        "pivots": (
+            "Correlate request/trace ID across WAF, reverse proxy, application and RASP logs.",
+            "Verify the exact response status, response size and any application-side exception for the same request.",
+        ),
+    },
+    "server-runtime-forensics": {
+        "title": "Server and application runtime forensics",
+        "collection_steps": (
+            "Preserve time synchronization, host identity, application process tree, parent/child processes, command lines, working directories, network connections and login-session snapshots.",
+            "Collect raw application-server, web-container and RASP/EDR/HIPS logs in the incident window and correlate by host, process, request and timestamp.",
+        ),
+        "alternatives": (
+            "A suspicious runtime event may be normal application or administrative activity without a confirmed execution chain.",
+            "Host-name reuse or broad time-window correlation can produce a contextual rather than causal match.",
+        ),
+        "pivots": (
+            "Reconstruct the parent/child process tree around the first suspicious runtime event.",
+            "Compare process command lines, working directory and outbound connections with the host baseline.",
+        ),
+    },
+    "endpoint-process-forensics": {
+        "title": "Endpoint process and execution-chain forensics",
+        "collection_steps": (
+            "Query process creation, script interpreters, module loads, file writes, DNS and outbound connections in the incident window to reconstruct the parent/child execution chain.",
+            "Record path, hash, signature, owner and first/last-seen time for suspicious processes, scripts and dropped files; do not execute samples.",
+        ),
+        "alternatives": (
+            "A process-name match alone does not prove attacker-controlled execution.",
+            "Security tooling or deployment automation can produce process and file activity resembling exploitation.",
+        ),
+        "pivots": (
+            "Pivot from the suspicious process to its parent, command line, user, loaded modules and network activity.",
+            "Check whether the process/file hash appears on other endpoints inside the bounded time window.",
+        ),
+    },
+    "file-integrity-forensics": {
+        "title": "File integrity and webroot forensics",
+        "collection_steps": (
+            "Perform read-only inventory and baseline comparison of webroot, upload, temporary and application-configuration directories; record path, size, timestamps, permissions and cryptographic hashes.",
+            "Preserve suspected web shells, accessed files and neighboring files as controlled evidence; do not open or execute them on production hosts.",
+        ),
+        "alternatives": (
+            "A file-path reference in an alert does not prove that the file exists or was attacker-written.",
+            "Legitimate deployment or upload activity may explain recent file changes.",
+        ),
+        "pivots": (
+            "Compare suspicious paths and hashes with deployment manifests and the trusted file baseline.",
+            "Correlate file creation/modification time with process, account and request telemetry.",
+        ),
+    },
+    "network-perimeter-forensics": {
+        "title": "Network and perimeter forensics",
+        "collection_steps": (
+            "Query raw alerts and session logs from WAF, NDR, IDS/IPS, firewall, load balancer and DNS; correlate by source/destination address, port, domain and time window.",
+            "Compare inbound requests with server outbound traffic to identify scanning, exploitation, download, callback and lateral-movement patterns.",
+        ),
+        "alternatives": (
+            "A shared IP can represent NAT, proxy, scanner or unrelated tenant traffic.",
+            "An inbound detection without server egress or host execution may be only an attempted attack.",
+        ),
+        "pivots": (
+            "Build bidirectional flow history for the source, target and any newly observed domains.",
+            "Check for callbacks, unusual transfer volume and east-west connections after the initial event.",
+        ),
+    },
+    "identity-authentication-forensics": {
+        "title": "Identity and authentication forensics",
+        "collection_steps": (
+            "Query system, application, bastion, IAM/IdP login and privilege-audit events in the incident window; compare account, source address, session and authentication result.",
+            "Check new accounts, keys, token use, privilege changes and abnormal service-account activity; record only governed references and state for sensitive credentials.",
+        ),
+        "alternatives": (
+            "A matching user or source address can reflect normal administration or shared infrastructure.",
+            "Missing identity telemetry does not establish that no credential access occurred.",
+        ),
+        "pivots": (
+            "Review authentication, token issuance and privilege changes before and after the first event.",
+            "Compare the account's source, device, session and activity pattern with its baseline.",
+        ),
+    },
+    "persistence-forensics": {
+        "title": "Persistence and access-maintenance forensics",
+        "collection_steps": (
+            "Inspect change records for scheduled tasks, services, startup items, shell profiles, dynamic-loader settings and application auto-deployment directories.",
+            "Link persistence objects to suspicious processes, file hashes, accounts and network connections; deletion or isolation must use the approval path.",
+        ),
+        "alternatives": (
+            "Service, task or startup changes may originate from authorized deployment and patch workflows.",
+            "The absence of current persistence telemetry does not rule out short-lived or removed mechanisms.",
+        ),
+        "pivots": (
+            "Diff persistence locations against the last trusted baseline and approved change window.",
+            "Correlate each changed object with creator process, account, file hash and first-seen time.",
+        ),
+    },
+    "cloud-container-forensics": {
+        "title": "Cloud and container control-plane forensics",
+        "collection_steps": (
+            "If the asset uses cloud or containers, query control-plane audit, workload events, image digests, Pod/container lifecycle and secret-mount changes.",
+            "Verify security-group, network-policy, service-account and workload-identity changes; preserve read-only metadata snapshots for affected instances or containers.",
+        ),
+        "alternatives": (
+            "Workload recreation and control-plane changes may be normal orchestration activity.",
+            "Host-focused evidence may not identify an ephemeral container or replaced workload.",
+        ),
+        "pivots": (
+            "Correlate workload identity, image digest, node and control-plane actor for the incident window.",
+            "Compare secret mounts, service accounts, network policy and workload lifecycle with deployment history.",
+        ),
+    },
+}
+
+FORENSIC_ZH_ANALYSIS = {
+    "web-request-reconstruction": {
+        "alternatives": (
+            "规则命中可能只是已被阻断的探测，不等同于利用成功。",
+            "应用路由、代理改写或请求采集不完整也可能造成字段不一致。",
+        ),
+        "pivots": (
+            "以 request/trace ID 串联 WAF、反向代理、应用与 RASP 日志。",
+            "核对同一请求的精确响应状态、响应字节数和应用异常。",
+        ),
+    },
+    "server-runtime-forensics": {
+        "alternatives": (
+            "可疑运行时事件也可能是正常应用或运维活动，单点事件不能证明攻击执行链。",
+            "主机名复用或宽时间窗关联可能仅代表上下文相关，而非因果关系。",
+        ),
+        "pivots": (
+            "围绕首个可疑运行时事件重建父子进程树。",
+            "将进程命令行、工作目录与外联连接和主机基线比对。",
+        ),
+    },
+    "endpoint-process-forensics": {
+        "alternatives": (
+            "仅进程名匹配不能证明进程由攻击者控制。",
+            "安全工具或发布自动化也可能产生类似利用后的进程和文件活动。",
+        ),
+        "pivots": (
+            "从可疑进程追溯父进程、命令行、账号、加载模块与网络活动。",
+            "检查相同进程或文件哈希是否在时间窗内出现在其他端点。",
+        ),
+    },
+    "file-integrity-forensics": {
+        "alternatives": (
+            "告警中的文件路径引用不能证明文件真实存在或由攻击者写入。",
+            "正常发布或上传活动可能解释近期文件变化。",
+        ),
+        "pivots": (
+            "将可疑路径和哈希与发布清单、可信文件基线比对。",
+            "把文件创建或修改时间与进程、账号和请求遥测关联。",
+        ),
+    },
+    "network-perimeter-forensics": {
+        "alternatives": (
+            "共享 IP 可能来自 NAT、代理、扫描器或无关租户流量。",
+            "只有入站检测、没有服务器外联或主机执行时，可能只是攻击尝试。",
+        ),
+        "pivots": (
+            "为源、目标与新出现域名构建双向流量历史。",
+            "检查初始事件后的回连、异常传输量和东西向连接。",
+        ),
+    },
+    "identity-authentication-forensics": {
+        "alternatives": (
+            "相同账号或来源地址可能来自正常管理活动或共享基础设施。",
+            "身份遥测缺失不能证明未发生凭据访问。",
+        ),
+        "pivots": (
+            "检查首个事件前后的认证、令牌签发与权限变化。",
+            "将账号来源、设备、会话和行为模式与历史基线比对。",
+        ),
+    },
+    "persistence-forensics": {
+        "alternatives": (
+            "服务、任务或启动项变更可能来自已授权的发布和补丁流程。",
+            "当前没有持久化遥测，不能排除短时存在或已被删除的机制。",
+        ),
+        "pivots": (
+            "将持久化位置与最近可信基线及获批变更窗口做差异比对。",
+            "把每个变更对象与创建进程、账号、文件哈希和首次出现时间关联。",
+        ),
+    },
+    "cloud-container-forensics": {
+        "alternatives": (
+            "工作负载重建和控制面变更可能是正常编排行为。",
+            "仅主机侧证据可能无法识别短生命周期容器或已替换工作负载。",
+        ),
+        "pivots": (
+            "关联事件时间窗内的工作负载身份、镜像摘要、节点与控制面操作者。",
+            "把密钥挂载、服务账号、网络策略和工作负载生命周期与发布历史比对。",
+        ),
+    },
+}
+
+
+def _language(value: Any) -> str:
+    return "en" if str(value or "").casefold() == "en" else "zh"
+
+
+def _pick(language: str, zh: str, en: str) -> str:
+    return en if _language(language) == "en" else zh
+
 
 def _canonical_hash(value: Any) -> str:
     encoded = json.dumps(
@@ -326,59 +546,95 @@ def _utf8_chunk(text: str, offset: int, max_bytes: int) -> tuple[str, int, int, 
     return encoded[start:end].decode("utf-8"), start, end, total
 
 
-def _default_plan() -> list[dict[str, Any]]:
+def _default_plan(language: str = "zh") -> list[dict[str, Any]]:
     return [
         {
             "id": "case-baseline",
-            "title": "确认 Case 基线与当前研判",
+            "title": _pick(
+                language,
+                "确认 Case 基线与当前研判",
+                "Confirm the Case baseline and current assessment",
+            ),
             "tool": "query_case_snapshot",
             "status": "pending",
         },
         {
             "id": "evidence-review",
-            "title": "复核标准化证据与实体",
+            "title": _pick(
+                language,
+                "复核标准化证据与实体",
+                "Review normalized evidence and entities",
+            ),
             "tool": "query_case_evidence",
             "status": "pending",
         },
         {
             "id": "raw-evidence-review",
-            "title": "核对 Case 原始告警与完整 Syslog 字段目录",
+            "title": _pick(
+                language,
+                "核对 Case 原始告警与完整 Syslog 字段目录",
+                "Review Case-linked raw alerts and the complete Syslog field catalog",
+            ),
             "tool": "query_case_raw_alerts",
             "status": "pending",
         },
         {
             "id": "cross-product-correlation",
-            "title": "检索 WAF、EDR、HIPS 等跨产品关联原始告警",
+            "title": _pick(
+                language,
+                "检索 WAF、EDR、HIPS 等跨产品关联原始告警",
+                "Search cross-product WAF, EDR, HIPS and other related raw alerts",
+            ),
             "tool": "search_related_alerts",
             "status": "pending",
         },
         {
             "id": "forensic-coverage",
-            "title": "盘点服务器、端点、文件、网络、身份与云侧深度取证覆盖",
+            "title": _pick(
+                language,
+                "盘点服务器、端点、文件、网络、身份与云侧深度取证覆盖",
+                "Map deep-forensic coverage across server, endpoint, file, network, identity and cloud",
+            ),
             "tool": "query_forensic_coverage",
             "status": "pending",
         },
         {
             "id": "timeline-analysis",
-            "title": "重建事件与分析时间线",
+            "title": _pick(
+                language,
+                "重建事件与分析时间线",
+                "Reconstruct the incident and analysis timeline",
+            ),
             "tool": "query_case_timeline",
             "status": "pending",
         },
         {
             "id": "memory-correlation",
-            "title": "检索受治理的 Case 与产品记忆",
+            "title": _pick(
+                language,
+                "检索受治理的 Case 与产品记忆",
+                "Search governed Case and product memory",
+            ),
             "tool": "query_governed_memory",
             "status": "pending",
         },
         {
             "id": "response-review",
-            "title": "核验审批、响应任务与执行边界",
+            "title": _pick(
+                language,
+                "核验审批、响应任务与执行边界",
+                "Verify approvals, response tasks and execution boundaries",
+            ),
             "tool": "query_response_status",
             "status": "pending",
         },
         {
             "id": "report",
-            "title": "综合结论并通过确定性报告门禁",
+            "title": _pick(
+                language,
+                "综合结论并通过确定性报告门禁",
+                "Synthesize conclusions and pass the deterministic report gate",
+            ),
             "tool": "",
             "status": "pending",
         },
@@ -486,6 +742,7 @@ class ResponseInvestigationAgent:
         artifact: dict[str, Any],
         goal: str,
         actor: str,
+        language: str = "zh",
     ) -> dict[str, Any]:
         if not self.config.enabled:
             raise RuntimeError("Response Agent is disabled")
@@ -509,6 +766,7 @@ class ResponseInvestigationAgent:
         ):
             raise ValueError("Response Pack is stale; generate a current version first")
         created_at_ms = now_ms()
+        report_language = _language(language)
         session = {
             "session_id": new_id("response_agent"),
             "case_id": case_id,
@@ -517,10 +775,14 @@ class ResponseInvestigationAgent:
             "source_snapshot": source,
             "goal": _text(
                 goal
-                or "基于当前 Case 的受治理证据，完成深入调查并形成可审计的完整结论。",
+                or _pick(
+                    report_language,
+                    "基于当前 Case 的受治理证据，完成深入调查并形成可审计的完整结论。",
+                    "Investigate the governed Case evidence and produce a complete, auditable conclusion.",
+                ),
                 1_000,
             ),
-            "plan": _default_plan(),
+            "plan": _default_plan(report_language),
             "budget": {
                 "max_turns": self.config.max_turns,
                 "max_tool_calls": self.config.max_tool_calls,
@@ -542,6 +804,7 @@ class ResponseInvestigationAgent:
                 "controller_tools": list(CONTROLLER_TOOLS),
                 "database_access": "controller_scoped_read_only",
                 "direct_execution": False,
+                "report_language": report_language,
             },
             "created_by": _text(actor or "soc-analyst", 200),
             "created_at_ms": created_at_ms,
@@ -717,13 +980,16 @@ class ResponseInvestigationAgent:
 
     def _run_session(self, claimed: dict[str, Any]) -> None:
         session_id = claimed["session_id"]
+        report_language = _language(
+            (claimed.get("model_metadata") or {}).get("report_language")
+        )
         source = self.repo.get_response_agent_source(session_id)
         if not source:
             raise RuntimeError("immutable session source snapshot is missing")
         artifact = self.repo.get_case_response_artifact(claimed["artifact_id"])
         if not artifact:
             raise RuntimeError("bound Response Pack artifact is missing")
-        plan = list(claimed.get("plan") or _default_plan())
+        plan = list(claimed.get("plan") or _default_plan(report_language))
         usage = dict(claimed.get("usage") or {})
         run_started = time.monotonic()
         duplicate_count = 0
@@ -733,8 +999,16 @@ class ResponseInvestigationAgent:
             self._append_step(
                 session_id,
                 "plan",
-                "调查计划已冻结",
-                "控制器将 Case 范围、只读工具和预算固定在当前会话。",
+                _pick(
+                    report_language,
+                    "调查计划已冻结",
+                    "Investigation plan frozen",
+                ),
+                _pick(
+                    report_language,
+                    "控制器将 Case 范围、只读工具和预算固定在当前会话。",
+                    "The controller fixed the Case scope, read-only tools and budget for this session.",
+                ),
                 {
                     "plan": plan,
                     "budget": claimed["budget"],
@@ -783,8 +1057,16 @@ class ResponseInvestigationAgent:
                 self._append_step(
                     session_id,
                     "decision_rejected",
-                    "模型工具决策已被控制器拒绝",
-                    "控制器没有执行不符合工具契约或调查范围的参数。",
+                    _pick(
+                        report_language,
+                        "模型工具决策已被控制器拒绝",
+                        "Model tool decision rejected by the controller",
+                    ),
+                    _pick(
+                        report_language,
+                        "控制器没有执行不符合工具契约或调查范围的参数。",
+                        "The controller did not execute arguments outside the tool contract or investigation scope.",
+                    ),
                     {
                         "code": exc.code,
                         "message": str(exc),
@@ -819,7 +1101,11 @@ class ResponseInvestigationAgent:
                 self._append_step(
                     session_id,
                     "human_input_request",
-                    "需要分析员补充信息",
+                    _pick(
+                        report_language,
+                        "需要分析员补充信息",
+                        "Analyst input required",
+                    ),
                     decision["rationale"],
                     {"question": decision["question"]},
                     [],
@@ -846,7 +1132,11 @@ class ResponseInvestigationAgent:
                 self._append_step(
                     session_id,
                     "plan",
-                    "调查计划已修订",
+                    _pick(
+                        report_language,
+                        "调查计划已修订",
+                        "Investigation plan revised",
+                    ),
                     decision["rationale"],
                     {"plan": plan},
                     [],
@@ -860,7 +1150,11 @@ class ResponseInvestigationAgent:
                 self._append_step(
                     session_id,
                     "synthesis_decision",
-                    "进入报告综合",
+                    _pick(
+                        report_language,
+                        "进入报告综合",
+                        "Begin report synthesis",
+                    ),
                     decision["rationale"],
                     {},
                     [],
@@ -912,7 +1206,11 @@ class ResponseInvestigationAgent:
             step = self._append_step(
                 session_id,
                 "tool_decision",
-                f"调用只读工具：{tool_name}",
+                _pick(
+                    report_language,
+                    f"调用只读工具：{tool_name}",
+                    f"Run read-only tool: {tool_name}",
+                ),
                 decision["rationale"],
                 {"tool_name": tool_name, "arguments": arguments},
                 [],
@@ -940,8 +1238,16 @@ class ResponseInvestigationAgent:
                 self._append_step(
                     session_id,
                     "observation",
-                    f"复用既有观察：{tool_name}",
-                    "相同参数的只读查询已完成，控制器复用其不可变结果。",
+                    _pick(
+                        report_language,
+                        f"复用既有观察：{tool_name}",
+                        f"Reuse existing observation: {tool_name}",
+                    ),
+                    _pick(
+                        report_language,
+                        "相同参数的只读查询已完成，控制器复用其不可变结果。",
+                        "The identical read-only query was already complete, so the controller reused its immutable result.",
+                    ),
                     {
                         "call_id": call["call_id"],
                         "result_hash": call["result_hash"],
@@ -950,7 +1256,9 @@ class ResponseInvestigationAgent:
                     call["evidence_refs"],
                 )
                 if duplicate_count >= 2:
-                    required = self._completion_guard_decision(calls)
+                    required = self._completion_guard_decision(
+                        calls, report_language
+                    )
                     if not required:
                         synthesizing = self.repo.update_response_agent_session(
                             session_id,
@@ -973,7 +1281,11 @@ class ResponseInvestigationAgent:
                     step = self._append_step(
                         session_id,
                         "tool_decision",
-                        f"完成门禁补齐只读工具：{tool_name}",
+                        _pick(
+                            report_language,
+                            f"完成门禁补齐只读工具：{tool_name}",
+                            f"Completion gate requires read-only tool: {tool_name}",
+                        ),
                         required["rationale"],
                         {
                             "tool_name": tool_name,
@@ -1025,8 +1337,16 @@ class ResponseInvestigationAgent:
                 self._append_step(
                     session_id,
                     "tool_rejected",
-                    f"只读工具未执行：{tool_name}",
-                    "参数未通过控制器数据范围或原始证据定位校验。",
+                    _pick(
+                        report_language,
+                        f"只读工具未执行：{tool_name}",
+                        f"Read-only tool not executed: {tool_name}",
+                    ),
+                    _pick(
+                        report_language,
+                        "参数未通过控制器数据范围或原始证据定位校验。",
+                        "Arguments failed the controller's data-scope or raw-evidence location validation.",
+                    ),
                     {
                         "call_id": call["call_id"],
                         "code": exc.code,
@@ -1072,12 +1392,22 @@ class ResponseInvestigationAgent:
             self._append_step(
                 session_id,
                 "observation",
-                f"已完成：{tool_name}",
-                "工具结果已脱敏、限长并绑定证据引用。",
+                _pick(
+                    report_language,
+                    f"已完成：{tool_name}",
+                    f"Completed: {tool_name}",
+                ),
+                _pick(
+                    report_language,
+                    "工具结果已脱敏、限长并绑定证据引用。",
+                    "The tool result was redacted, size-bounded and bound to evidence references.",
+                ),
                 {
                     "call_id": call["call_id"],
                     "result_hash": finished["result_hash"] if finished else "",
-                    "summary": self._observation_summary(tool_name, result),
+                    "summary": self._observation_summary(
+                        tool_name, result, report_language
+                    ),
                 },
                 refs,
             )
@@ -1101,15 +1431,22 @@ class ResponseInvestigationAgent:
         calls: list[dict[str, Any]],
     ) -> dict[str, Any]:
         llm = self._current_llm()
+        report_language = _language(
+            (session.get("model_metadata") or {}).get("report_language")
+        )
         if llm.is_deterministic:
-            required = self._completion_guard_decision(calls)
+            required = self._completion_guard_decision(calls, report_language)
             if required:
                 return required
             return {
                 "action": "finish",
                 "tool_name": "",
                 "arguments": {},
-                "rationale": "所有第一阶段只读调查工具均已完成，可以综合报告。",
+                "rationale": _pick(
+                    report_language,
+                    "所有第一阶段只读调查工具均已完成，可以综合报告。",
+                    "All first-phase read-only investigation tools are complete; report synthesis can begin.",
+                ),
                 "question": "",
                 "plan_updates": [],
             }
@@ -1164,7 +1501,10 @@ class ResponseInvestigationAgent:
             "action; do not include hidden reasoning. Never request shell, arbitrary "
             "network access, credential "
             "access, or direct response execution. Do not reveal chain-of-thought; "
-            "provide only a brief decision rationale. Return one JSON object matching this "
+            "provide only a brief decision rationale. "
+            f"Write every operator-facing rationale or question in "
+            f"{'English' if report_language == 'en' else 'Simplified Chinese'}. "
+            "Return one JSON object matching this "
             f"contract: {json.dumps(TURN_SCHEMA, ensure_ascii=False)}\n"
             f"Tool contracts: {json.dumps(TOOL_CONTRACTS, ensure_ascii=False)}\n"
             f"CONTEXT={self.policy.truncate_prompt_payload(context)}"
@@ -1188,7 +1528,7 @@ class ResponseInvestigationAgent:
             raise _SessionPaused from exc
         decision = self._validate_decision(raw, session=session)
         if decision["action"] == "finish":
-            required = self._completion_guard_decision(calls)
+            required = self._completion_guard_decision(calls, report_language)
             if required:
                 return required
         return decision
@@ -1196,6 +1536,7 @@ class ResponseInvestigationAgent:
     @staticmethod
     def _completion_guard_decision(
         calls: list[dict[str, Any]],
+        language: str = "zh",
     ) -> dict[str, Any] | None:
         completed_calls = [
             call for call in calls if call.get("status") == "completed"
@@ -1250,7 +1591,11 @@ class ResponseInvestigationAgent:
                 "tool_name": "read_raw_alert_chunk",
                 "arguments": continuation,
                 "rationale": (
-                    "模型请求结束调查；控制器完成门禁要求先读取选定原始证据的下一分块。"
+                    _pick(
+                        language,
+                        "模型请求结束调查；控制器完成门禁要求先读取选定原始证据的下一分块。",
+                        "The model requested completion; the controller gate requires the next chunk of the selected raw evidence first.",
+                    )
                 ),
                 "question": "",
                 "plan_updates": [],
@@ -1266,7 +1611,11 @@ class ResponseInvestigationAgent:
                     "tool_name": tool_name,
                     "arguments": {},
                     "rationale": (
-                        "模型请求结束调查；控制器完成门禁要求先补齐下一项受治理基线证据。"
+                        _pick(
+                            language,
+                            "模型请求结束调查；控制器完成门禁要求先补齐下一项受治理基线证据。",
+                            "The model requested completion; the controller gate requires the next governed baseline observation first.",
+                        )
                     ),
                     "question": "",
                     "plan_updates": [],
@@ -1302,8 +1651,11 @@ class ResponseInvestigationAgent:
                     "offset": 0,
                 },
                 "rationale": (
-                    "模型请求结束调查；深度取证门禁要求完整读取下一条高优先级"
-                    "关联原始证据。"
+                    _pick(
+                        language,
+                        "模型请求结束调查；深度取证门禁要求完整读取下一条高优先级关联原始证据。",
+                        "The model requested completion; the deep-forensics gate requires a complete read of the next high-priority related raw-evidence stream.",
+                    )
                 ),
                 "question": "",
                 "plan_updates": [],
@@ -1339,7 +1691,11 @@ class ResponseInvestigationAgent:
                         "offset": 0,
                     },
                     "rationale": (
-                        "模型请求结束调查；控制器完成门禁要求至少完整读取一条选定原始证据。"
+                        _pick(
+                            language,
+                            "模型请求结束调查；控制器完成门禁要求至少完整读取一条选定原始证据。",
+                            "The model requested completion; the controller gate requires at least one selected raw-evidence stream to be read completely.",
+                        )
                     ),
                     "question": "",
                     "plan_updates": [],
@@ -1690,8 +2046,18 @@ class ResponseInvestigationAgent:
                 "product": str(item.get("product") or ""),
                 "event_type": str(item.get("event_type") or ""),
                 "severity": str(item.get("severity") or ""),
+                "timestamp": str(item.get("timestamp") or ""),
                 "relation": str(item.get("relation") or ""),
                 "correlation_score": _integer(item.get("correlation_score"), 0),
+                "time_delta_ms": _integer(item.get("time_delta_ms"), 0),
+                "matched_entities": [
+                    {
+                        "field": str(match.get("field") or ""),
+                        "value": _text(match.get("value"), 256),
+                    }
+                    for match in item.get("matched_entities") or []
+                    if isinstance(match, dict) and match.get("field")
+                ][:16],
                 "forensic_domains": list(item.get("forensic_domains") or []),
                 "syslog_message_present": bool(
                     item.get("syslog_message_present")
@@ -1851,6 +2217,40 @@ class ResponseInvestigationAgent:
                     if status == "evidence_available"
                     else "已发现单一来源的关联遥测，仍需按步骤补充独立证据源。"
                 )
+            products = sorted(
+                {
+                    str(item.get("product") or "")
+                    for item in sources
+                    if item.get("product")
+                }
+            )
+            linked_count = sum(
+                1 for item in sources if item.get("relation") == "linked_to_case"
+            )
+            correlated_count = len(sources) - linked_count
+            verified_integrity_count = sum(
+                1
+                for item in sources
+                if item.get("syslog_message_integrity") == "verified"
+            )
+            capture_gaps: list[str] = []
+            observed_response_statuses: list[str] = []
+            matched_pivots: list[dict[str, str]] = []
+            for item in sources:
+                for diagnostic in item.get("capture_diagnostics") or []:
+                    if not isinstance(diagnostic, dict):
+                        continue
+                    field = str(diagnostic.get("field") or "")
+                    state = str(diagnostic.get("state") or "")
+                    if field == "http_response_status" and diagnostic.get(
+                        "observed_value"
+                    ):
+                        observed_response_statuses.append(
+                            str(diagnostic["observed_value"])
+                        )
+                    if state in {"captured_null", "captured_empty", "not_observed"}:
+                        capture_gaps.append(f"{field}:{state}")
+                matched_pivots.extend(item.get("matched_entities") or [])
             workstreams.append(
                 {
                     "workstream_id": definition["workstream_id"],
@@ -1879,6 +2279,34 @@ class ResponseInvestigationAgent:
                         for item in sources
                         if item.get("evidence_ref")
                     ],
+                    "analysis_metrics": {
+                        "source_count": len(sources),
+                        "products": products,
+                        "product_count": len(products),
+                        "linked_count": linked_count,
+                        "correlated_count": correlated_count,
+                        "independent_product_corroboration": len(products) >= 2,
+                        "verified_syslog_integrity_count": (
+                            verified_integrity_count
+                        ),
+                        "capture_gaps": list(dict.fromkeys(capture_gaps))[:16],
+                        "observed_response_statuses": list(
+                            dict.fromkeys(observed_response_statuses)
+                        )[:8],
+                        "correlation_pivots": list(
+                            {
+                                (
+                                    str(item.get("field") or ""),
+                                    str(item.get("value") or ""),
+                                ): {
+                                    "field": str(item.get("field") or ""),
+                                    "value": str(item.get("value") or ""),
+                                }
+                                for item in matched_pivots
+                                if item.get("field") and item.get("value")
+                            }.values()
+                        )[:16],
+                    },
                 }
             )
 
@@ -1919,6 +2347,30 @@ class ResponseInvestigationAgent:
                             if item.get("product")
                         }
                     ),
+                    "linked_candidate_count": sum(
+                        1
+                        for item in projected_sources
+                        if item.get("relation") == "linked_to_case"
+                    ),
+                    "correlated_candidate_count": sum(
+                        1
+                        for item in projected_sources
+                        if item.get("relation") != "linked_to_case"
+                    ),
+                    "correlation_pivots": list(
+                        {
+                            (
+                                str(match.get("field") or ""),
+                                str(match.get("value") or ""),
+                            ): {
+                                "field": str(match.get("field") or ""),
+                                "value": str(match.get("value") or ""),
+                            }
+                            for item in projected_sources
+                            for match in item.get("matched_entities") or []
+                            if match.get("field") and match.get("value")
+                        }.values()
+                    )[:24],
                     "scan_truncated": bool(related.get("scan_truncated")),
                 },
                 "required_reads": required_reads,
@@ -2217,57 +2669,86 @@ class ResponseInvestigationAgent:
         raise ValueError("unknown controller tool")
 
     @staticmethod
-    def _observation_summary(tool_name: str, result: dict[str, Any]) -> str:
+    def _observation_summary(
+        tool_name: str,
+        result: dict[str, Any],
+        language: str = "en",
+    ) -> str:
         if tool_name == "query_case_snapshot":
-            return (
-                f"Case baseline loaded; {int(result.get('event_count') or 0)} "
-                "normalized events are in the frozen snapshot."
+            count = int(result.get("event_count") or 0)
+            return _pick(
+                language,
+                f"已加载 Case 基线；冻结快照中包含 {count} 条标准化事件。",
+                f"Case baseline loaded; {count} normalized events are in the frozen snapshot.",
             )
         if tool_name == "query_case_evidence":
-            return (
-                f"Reviewed {len(result.get('events') or [])} events and "
-                f"{int(result.get('evidence_count') or 0)} evidence items."
+            events = len(result.get("events") or [])
+            evidence = int(result.get("evidence_count") or 0)
+            return _pick(
+                language,
+                f"已复核 {events} 条事件与 {evidence} 项证据。",
+                f"Reviewed {events} events and {evidence} evidence items.",
             )
         if tool_name == "query_case_raw_alerts":
-            return (
-                f"Indexed {len(result.get('items') or [])} of "
-                f"{int(result.get('total') or 0)} Case-linked raw alerts."
+            indexed = len(result.get("items") or [])
+            total = int(result.get("total") or 0)
+            return _pick(
+                language,
+                f"已索引 {total} 条 Case 关联原始告警中的 {indexed} 条。",
+                f"Indexed {indexed} of {total} Case-linked raw alerts.",
             )
         if tool_name == "search_related_alerts":
-            suffix = (
-                " The bounded scan stopped at its byte limit."
-                if result.get("scan_truncated")
-                else ""
-            )
+            total = int(result.get("total") or 0)
+            scanned = int(result.get("scanned") or 0)
+            if _language(language) == "zh":
+                suffix = " 有界扫描已达到字节上限。" if result.get("scan_truncated") else ""
+                return f"扫描 {scanned} 条候选后发现 {total} 条关联原始告警。{suffix}"
+            suffix = " The bounded scan stopped at its byte limit." if result.get("scan_truncated") else ""
             return (
-                f"Found {int(result.get('total') or 0)} related raw alerts after "
-                f"scanning {int(result.get('scanned') or 0)} candidates.{suffix}"
+                f"Found {total} related raw alerts after scanning {scanned} "
+                f"candidates.{suffix}"
             )
         if tool_name == "query_forensic_coverage":
             inventory = result.get("inventory") or {}
-            return (
-                f"Mapped {len(result.get('workstreams') or [])} forensic domains, "
-                f"selected {len(result.get('required_reads') or [])} mandatory raw "
-                f"streams from {int(inventory.get('candidate_count') or 0)} "
-                "linked or correlated candidates."
+            domains = len(result.get("workstreams") or [])
+            streams = len(result.get("required_reads") or [])
+            candidates = int(inventory.get("candidate_count") or 0)
+            return _pick(
+                language,
+                f"已映射 {domains} 个取证域，并从 {candidates} 条关联候选中选出 {streams} 条强制完整读取的原始证据流。",
+                f"Mapped {domains} forensic domains and selected {streams} mandatory raw streams from {candidates} linked or correlated candidates.",
             )
         if tool_name == "read_raw_alert_chunk":
-            return (
-                f"Read raw alert {result.get('alert_id') or ''} bytes "
-                f"{int(result.get('offset') or 0)}.."
-                f"{int(result.get('next_offset') or result.get('total_bytes') or 0)} "
-                f"of {int(result.get('total_bytes') or 0)}."
+            alert_id = result.get("alert_id") or ""
+            start = int(result.get("offset") or 0)
+            end = int(result.get("next_offset") or result.get("total_bytes") or 0)
+            total = int(result.get("total_bytes") or 0)
+            return _pick(
+                language,
+                f"已读取原始告警 {alert_id} 的 {start}..{end} 字节，共 {total} 字节。",
+                f"Read raw alert {alert_id} bytes {start}..{end} of {total}.",
             )
         if tool_name == "query_case_timeline":
-            return f"Reconstructed {len(result.get('timeline') or [])} timeline entries."
-        if tool_name == "query_governed_memory":
-            return (
-                f"Loaded {len(result.get('case_memory') or [])} Case memories and "
-                f"{len(result.get('active_product_memory') or [])} approved product memories."
+            count = len(result.get("timeline") or [])
+            return _pick(
+                language,
+                f"已重建 {count} 条时间线记录。",
+                f"Reconstructed {count} timeline entries.",
             )
-        return (
-            f"Reviewed {len(result.get('approvals') or [])} approvals and "
-            f"{len(result.get('response_tasks') or [])} response tasks."
+        if tool_name == "query_governed_memory":
+            cases = len(result.get("case_memory") or [])
+            products = len(result.get("active_product_memory") or [])
+            return _pick(
+                language,
+                f"已加载 {cases} 条 Case 记忆与 {products} 条获批产品记忆。",
+                f"Loaded {cases} Case memories and {products} approved product memories.",
+            )
+        approvals = len(result.get("approvals") or [])
+        tasks = len(result.get("response_tasks") or [])
+        return _pick(
+            language,
+            f"已复核 {approvals} 项审批与 {tasks} 个响应任务。",
+            f"Reviewed {approvals} approvals and {tasks} response tasks.",
         )
 
     def _synthesize_report(
@@ -2280,6 +2761,9 @@ class ResponseInvestigationAgent:
         current = self.repo.get_response_agent_session(session_id)
         if not current or current["status"] != "synthesizing":
             return
+        report_language = _language(
+            (current.get("model_metadata") or {}).get("report_language")
+        )
         base = self._base_report(current, source, artifact)
         llm = self._current_llm()
         candidate: dict[str, Any] = {}
@@ -2302,12 +2786,17 @@ class ResponseInvestigationAgent:
                     "goal": current["goal"],
                     "case": source["case"],
                     "response_pack": artifact["content"],
-                    "forensic_workstreams": base["forensic_workstreams"],
+                    "investigation_notes": self._investigation_notes(current),
                     "observations": {
                         "details": observation_context.get("details") or [],
                         "ledger": observation_context.get("ledger") or [],
                     },
-                    "investigation_notes": self._investigation_notes(current),
+                    "forensic_workstreams": base["forensic_workstreams"],
+                    "controller_hypotheses": base["hypothesis_assessment"],
+                    "cross_source_correlation": base[
+                        "cross_source_correlation"
+                    ],
+                    "scope_assessment": base["scope_assessment"],
                     "report_outline": REPORT_SCHEMA,
                 },
                 self.policy.config.max_context_bytes,
@@ -2319,7 +2808,14 @@ class ResponseInvestigationAgent:
                 "claims. Incorporate relevant raw-log and cross-product correlation "
                 "observations, but distinguish the frozen Case snapshot from live "
                 "read-only database observations by their hashes and retrieval time. "
-                "Use every controller-provided forensic workstream. If capture "
+                "Add investigative value beyond the earlier LLM triage: test "
+                "alternative hypotheses, state what supports and contradicts each "
+                "hypothesis, bound the blast radius, identify cross-source pivots, "
+                "and separate an attack attempt from successful execution or impact. "
+                "Use every controller-provided forensic workstream. For each "
+                "workstream, preserve the controller status and provide an "
+                "evidence-based assessment, concrete observations, viable alternative "
+                "explanations and next pivots. If capture "
                 "diagnostics say an HTTP field is captured_null, captured_empty or "
                 "not_observed, describe it as a source-capture limitation and retain "
                 "the specific collection steps; never call it Agent truncation. If "
@@ -2330,6 +2826,10 @@ class ResponseInvestigationAgent:
                 "Cite only provided evidence ref_id values. Do not claim "
                 "that a response action ran unless the response status proves it. "
                 "Any proposed production action must be observe or approve_required. "
+                f"Write all operator-facing report prose in "
+                f"{'English' if report_language == 'en' else 'Simplified Chinese'}; "
+                "do not mix interface languages except for source-native alert values, "
+                "identifiers and security product names. "
                 "Do not expose chain-of-thought. Return only one JSON object "
                 f"matching this schema: {json.dumps(REPORT_SCHEMA, ensure_ascii=False)}\n"
                 f"CONTEXT={self.policy.truncate_prompt_payload(context)}"
@@ -2368,6 +2868,7 @@ class ResponseInvestigationAgent:
             **dict(llm.runtime_metadata),
             "agent_version": AGENT_VERSION,
             "deterministic_validation": True,
+            "report_language": report_language,
         }
         terminal_status = {
             "passed": "completed",
@@ -2422,12 +2923,551 @@ class ResponseInvestigationAgent:
                 _commit=False,
             )
 
+    @staticmethod
+    def _localized_forensic_workstreams(
+        workstreams: list[dict[str, Any]],
+        language: str,
+    ) -> list[dict[str, Any]]:
+        localized: list[dict[str, Any]] = []
+        for item in workstreams:
+            rendered = copy.deepcopy(item)
+            workstream_id = str(rendered.get("workstream_id") or "")
+            metrics = rendered.get("analysis_metrics") or {}
+            source_count = _integer(metrics.get("source_count"), 0)
+            products = [
+                str(value) for value in metrics.get("products") or [] if value
+            ]
+            linked_count = _integer(metrics.get("linked_count"), 0)
+            correlated_count = _integer(metrics.get("correlated_count"), 0)
+            verified_count = _integer(
+                metrics.get("verified_syslog_integrity_count"), 0
+            )
+            response_statuses = [
+                str(value)
+                for value in metrics.get("observed_response_statuses") or []
+                if value
+            ]
+            capture_gaps = [
+                str(value) for value in metrics.get("capture_gaps") or [] if value
+            ]
+            pivots = [
+                f"{entry.get('field')}: {entry.get('value')}"
+                for entry in metrics.get("correlation_pivots") or []
+                if isinstance(entry, dict)
+                and entry.get("field")
+                and entry.get("value")
+            ]
+            if _language(language) == "en":
+                copy_block = FORENSIC_EN.get(workstream_id) or {}
+                rendered["title"] = str(
+                    copy_block.get("title") or rendered.get("title") or workstream_id
+                )
+                rendered["collection_steps"] = list(
+                    copy_block.get("collection_steps")
+                    or rendered.get("collection_steps")
+                    or []
+                )
+                if rendered.get("status") == "evidence_available":
+                    rendered["coverage_summary"] = (
+                        "Multiple independent product sources are available for cross-validation."
+                    )
+                elif rendered.get("status") == "partial":
+                    rendered["coverage_summary"] = (
+                        "Related telemetry exists, but coverage is single-source or capture-incomplete."
+                    )
+                else:
+                    rendered["coverage_summary"] = (
+                        "No related raw telemetry for this forensic domain was found in the governed database."
+                    )
+                observations = [
+                    (
+                        f"{source_count} related raw source(s): {linked_count} Case-linked "
+                        f"and {correlated_count} correlation-derived; products: "
+                        f"{', '.join(products) if products else 'none'}."
+                    )
+                ]
+                if verified_count:
+                    observations.append(
+                        f"{verified_count} source(s) have verified collector-to-record Syslog integrity."
+                    )
+                if response_statuses:
+                    observations.append(
+                        "Observed HTTP response status: "
+                        + ", ".join(response_statuses)
+                        + "."
+                    )
+                if capture_gaps:
+                    observations.append(
+                        "Source-capture gaps: " + ", ".join(capture_gaps) + "."
+                    )
+                if pivots:
+                    observations.append(
+                        "Correlation pivots: " + "; ".join(pivots) + "."
+                    )
+                if source_count >= 2 and len(products) >= 2:
+                    assessment = (
+                        "This domain has independent cross-product corroboration. "
+                        "It strengthens the association but does not, by itself, prove causation or impact."
+                    )
+                    conclusion_state = "corroborated"
+                elif source_count:
+                    assessment = (
+                        "This domain currently rests on limited or single-source telemetry. "
+                        "Treat the observation as a lead until the next pivots produce an independent source."
+                    )
+                    conclusion_state = "single_source"
+                else:
+                    assessment = (
+                        "This domain remains unresolved because the governed evidence set contains no related telemetry; absence of telemetry is not negative evidence."
+                    )
+                    conclusion_state = "unresolved"
+                rendered["investigation_result"] = {
+                    "conclusion_state": conclusion_state,
+                    "assessment": assessment,
+                    "observations": observations,
+                    "alternative_explanations": list(
+                        copy_block.get("alternatives") or []
+                    ),
+                    "next_pivots": list(copy_block.get("pivots") or []),
+                }
+            else:
+                analysis_copy = FORENSIC_ZH_ANALYSIS.get(workstream_id) or {}
+                observations = [
+                    (
+                        f"发现 {source_count} 条关联原始证据源，其中 {linked_count} 条直接关联 "
+                        f"Case、{correlated_count} 条由关联检索得到；产品："
+                        f"{'、'.join(products) if products else '无'}。"
+                    )
+                ]
+                if verified_count:
+                    observations.append(
+                        f"{verified_count} 条来源通过采集器到入库记录的 Syslog 完整性校验。"
+                    )
+                if response_statuses:
+                    observations.append(
+                        "已观测 HTTP 响应状态：" + "、".join(response_statuses) + "。"
+                    )
+                if capture_gaps:
+                    observations.append(
+                        "源端采集缺口：" + "、".join(capture_gaps) + "。"
+                    )
+                if pivots:
+                    observations.append("关联支点：" + "；".join(pivots) + "。")
+                if source_count >= 2 and len(products) >= 2:
+                    assessment = (
+                        "该取证域具有独立的跨产品交叉印证，可增强事件关联性；"
+                        "但仅凭关联本身仍不能证明因果关系或业务影响。"
+                    )
+                    conclusion_state = "corroborated"
+                elif source_count:
+                    assessment = (
+                        "该取证域目前依赖有限或单一来源，应作为调查线索；"
+                        "需通过下一步支点取得独立证据后再提升结论强度。"
+                    )
+                    conclusion_state = "single_source"
+                else:
+                    assessment = (
+                        "受治理证据集中未发现该域关联遥测，因此该方向仍未解决；"
+                        "没有遥测不等同于不存在相关活动。"
+                    )
+                    conclusion_state = "unresolved"
+                rendered["investigation_result"] = {
+                    "conclusion_state": conclusion_state,
+                    "assessment": assessment,
+                    "observations": observations,
+                    "alternative_explanations": list(
+                        analysis_copy.get("alternatives") or []
+                    ),
+                    "next_pivots": list(analysis_copy.get("pivots") or []),
+                }
+            high_priority = rendered.get("domain") in {
+                "web_request",
+                "server_runtime",
+                "endpoint_process",
+                "network_perimeter",
+            }
+            rendered["priority"] = "high" if high_priority else "medium"
+            localized.append(rendered)
+        return localized
+
+    @staticmethod
+    def _hypothesis_assessment(
+        workstreams: list[dict[str, Any]],
+        language: str,
+    ) -> list[dict[str, Any]]:
+        by_domain = {
+            str(item.get("domain") or ""): item for item in workstreams
+        }
+
+        def refs(*domains: str) -> list[str]:
+            return list(
+                dict.fromkeys(
+                    str(ref)
+                    for domain in domains
+                    for ref in (by_domain.get(domain) or {}).get(
+                        "evidence_refs", []
+                    )
+                    if ref
+                )
+            )[:32]
+
+        def source_count(*domains: str) -> int:
+            return sum(
+                _integer(
+                    ((by_domain.get(domain) or {}).get("analysis_metrics") or {}).get(
+                        "source_count"
+                    ),
+                    0,
+                )
+                for domain in domains
+            )
+
+        web = by_domain.get("web_request") or {}
+        web_metrics = web.get("analysis_metrics") or {}
+        response_statuses = [
+            str(value)
+            for value in web_metrics.get("observed_response_statuses") or []
+        ]
+        blocked_statuses = [
+            value
+            for value in response_statuses
+            if value[:1].isdigit() and int(value[:1]) >= 4
+        ]
+        successful_statuses = [
+            value
+            for value in response_statuses
+            if value[:1].isdigit() and int(value[:1]) in {2, 3}
+        ]
+        web_count = source_count("web_request")
+        host_count = source_count(
+            "server_runtime",
+            "endpoint_process",
+            "file_integrity",
+            "persistence",
+        )
+        expansion_count = source_count(
+            "network_perimeter",
+            "identity_authentication",
+            "cloud_container",
+        )
+        if _language(language) == "en":
+            return [
+                {
+                    "hypothesis_id": "malicious-entry-attempt",
+                    "title": "A malicious entry attempt reached the protected application",
+                    "disposition": (
+                        "partially_supported" if web_count else "unresolved"
+                    ),
+                    "confidence": 0.72 if web_count else 0.2,
+                    "rationale": (
+                        "Related web-layer raw telemetry supports an attempted or detected request, but it does not by itself establish successful exploitation."
+                        if web_count
+                        else "No related web request/response telemetry is present in the governed evidence set."
+                    ),
+                    "supporting_evidence_refs": refs("web_request"),
+                    "contradicting_evidence_refs": [],
+                    "missing_evidence": [
+                        "A complete request/response exchange and application-side outcome for the same request or trace ID."
+                    ],
+                },
+                {
+                    "hypothesis_id": "preventive-control-contained-request",
+                    "title": "A preventive control contained the observed request",
+                    "disposition": (
+                        "supported"
+                        if blocked_statuses
+                        else (
+                            "not_supported"
+                            if successful_statuses
+                            else "unresolved"
+                        )
+                    ),
+                    "confidence": 0.82 if blocked_statuses else 0.35,
+                    "rationale": (
+                        f"Observed response status {', '.join(blocked_statuses)} supports containment of the specific request; it does not rule out other attempts."
+                        if blocked_statuses
+                        else (
+                            f"Observed response status {', '.join(successful_statuses)} does not support a claim that this request was blocked."
+                            if successful_statuses
+                            else "No verifiable response status was captured for the relevant request."
+                        )
+                    ),
+                    "supporting_evidence_refs": refs("web_request"),
+                    "contradicting_evidence_refs": [],
+                    "missing_evidence": [
+                        "Control action, upstream/downstream response and application execution result for the same request."
+                    ],
+                },
+                {
+                    "hypothesis_id": "post-exploitation-host-impact",
+                    "title": "The event progressed to host-side execution or file impact",
+                    "disposition": (
+                        "partially_supported" if host_count else "unresolved"
+                    ),
+                    "confidence": 0.58 if host_count else 0.18,
+                    "rationale": (
+                        "Host/runtime/process/file telemetry provides post-exploitation leads, but causal execution and impact still require process-tree and file-baseline validation."
+                        if host_count
+                        else "No host/runtime/process/file telemetry in the governed evidence set can confirm or refute post-exploitation."
+                    ),
+                    "supporting_evidence_refs": refs(
+                        "server_runtime",
+                        "endpoint_process",
+                        "file_integrity",
+                        "persistence",
+                    ),
+                    "contradicting_evidence_refs": [],
+                    "missing_evidence": [
+                        "Parent/child process chain, command line, file hash and trusted-baseline comparison."
+                    ],
+                },
+                {
+                    "hypothesis_id": "scope-expansion-or-lateral-movement",
+                    "title": "The activity expanded to identities, other assets or outbound channels",
+                    "disposition": (
+                        "partially_supported" if expansion_count else "unresolved"
+                    ),
+                    "confidence": 0.5 if expansion_count else 0.15,
+                    "rationale": (
+                        "Network, identity or cloud telemetry provides expansion leads, but affected assets and causality remain unconfirmed."
+                        if expansion_count
+                        else "No governed identity, cloud or independent expansion telemetry is available; this hypothesis cannot be ruled out."
+                    ),
+                    "supporting_evidence_refs": refs(
+                        "network_perimeter",
+                        "identity_authentication",
+                        "cloud_container",
+                    ),
+                    "contradicting_evidence_refs": [],
+                    "missing_evidence": [
+                        "Bidirectional flows, authentication/privilege audit and workload control-plane history."
+                    ],
+                },
+                {
+                    "hypothesis_id": "benign-or-false-positive",
+                    "title": "The detections are benign activity or a false positive",
+                    "disposition": "unresolved",
+                    "confidence": 0.3,
+                    "rationale": (
+                        "A blocked response or single-source detection remains compatible with a false positive, but no allowlist, business-context or baseline evidence currently proves it."
+                    ),
+                    "supporting_evidence_refs": refs("web_request"),
+                    "contradicting_evidence_refs": refs(
+                        "server_runtime", "endpoint_process", "network_perimeter"
+                    ),
+                    "missing_evidence": [
+                        "Asset-owner context, approved change history, trusted behavior baseline and rule-specific false-positive evidence."
+                    ],
+                },
+            ]
+        return [
+            {
+                "hypothesis_id": "malicious-entry-attempt",
+                "title": "恶意入口尝试到达受保护应用",
+                "disposition": "partially_supported" if web_count else "unresolved",
+                "confidence": 0.72 if web_count else 0.2,
+                "rationale": (
+                    "Web 层关联原始遥测支持存在攻击尝试或检测命中，但不能单独证明利用成功。"
+                    if web_count
+                    else "当前受治理证据集中没有关联的 Web 请求与响应遥测。"
+                ),
+                "supporting_evidence_refs": refs("web_request"),
+                "contradicting_evidence_refs": [],
+                "missing_evidence": [
+                    "同一 request/trace ID 的完整请求、响应与应用侧执行结果。"
+                ],
+            },
+            {
+                "hypothesis_id": "preventive-control-contained-request",
+                "title": "防护控制已遏制本次已观测请求",
+                "disposition": (
+                    "supported"
+                    if blocked_statuses
+                    else ("not_supported" if successful_statuses else "unresolved")
+                ),
+                "confidence": 0.82 if blocked_statuses else 0.35,
+                "rationale": (
+                    f"已观测响应状态 {'、'.join(blocked_statuses)}，支持该特定请求被遏制；但不能排除其他请求。"
+                    if blocked_statuses
+                    else (
+                        f"已观测响应状态 {'、'.join(successful_statuses)}，不支持“该请求已被阻断”的判断。"
+                        if successful_statuses
+                        else "相关请求未采集可验证的响应状态。"
+                    )
+                ),
+                "supporting_evidence_refs": refs("web_request"),
+                "contradicting_evidence_refs": [],
+                "missing_evidence": [
+                    "同一请求的防护动作、上下游响应与应用执行结果。"
+                ],
+            },
+            {
+                "hypothesis_id": "post-exploitation-host-impact",
+                "title": "事件已推进到主机执行或文件影响",
+                "disposition": "partially_supported" if host_count else "unresolved",
+                "confidence": 0.58 if host_count else 0.18,
+                "rationale": (
+                    "主机、运行时、进程或文件遥测提供了利用后线索，但仍需用进程树和文件基线确认因果与影响。"
+                    if host_count
+                    else "当前证据无法确认或反驳利用后的主机执行与文件影响。"
+                ),
+                "supporting_evidence_refs": refs(
+                    "server_runtime",
+                    "endpoint_process",
+                    "file_integrity",
+                    "persistence",
+                ),
+                "contradicting_evidence_refs": [],
+                "missing_evidence": [
+                    "父子进程链、命令行、文件哈希与可信基线差异。"
+                ],
+            },
+            {
+                "hypothesis_id": "scope-expansion-or-lateral-movement",
+                "title": "活动已扩展到身份、其他资产或外联通道",
+                "disposition": (
+                    "partially_supported" if expansion_count else "unresolved"
+                ),
+                "confidence": 0.5 if expansion_count else 0.15,
+                "rationale": (
+                    "网络、身份或云侧遥测提供了范围扩展线索，但受影响资产与因果关系尚未确认。"
+                    if expansion_count
+                    else "当前没有身份、云侧或独立扩展遥测，不能据此排除范围扩展。"
+                ),
+                "supporting_evidence_refs": refs(
+                    "network_perimeter",
+                    "identity_authentication",
+                    "cloud_container",
+                ),
+                "contradicting_evidence_refs": [],
+                "missing_evidence": [
+                    "双向流量、认证与权限审计、工作负载控制面历史。"
+                ],
+            },
+            {
+                "hypothesis_id": "benign-or-false-positive",
+                "title": "检测来自正常业务或误报",
+                "disposition": "unresolved",
+                "confidence": 0.3,
+                "rationale": (
+                    "阻断响应或单一来源检测仍可能与误报相容，但当前没有白名单、业务上下文或基线证据能够证明。"
+                ),
+                "supporting_evidence_refs": refs("web_request"),
+                "contradicting_evidence_refs": refs(
+                    "server_runtime", "endpoint_process", "network_perimeter"
+                ),
+                "missing_evidence": [
+                    "资产负责人业务说明、获批变更记录、可信行为基线与规则专项误报证据。"
+                ],
+            },
+        ]
+
+    @staticmethod
+    def _scope_assessment(
+        source: dict[str, Any],
+        workstreams: list[dict[str, Any]],
+        default_refs: list[str],
+        language: str,
+    ) -> dict[str, Any]:
+        observed: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for event in source.get("events") or []:
+            for entity_type, entity_value in (event.get("entities") or {}).items():
+                values = entity_value if isinstance(entity_value, list) else [entity_value]
+                for value in values:
+                    rendered = _text(value, 256)
+                    key = (str(entity_type), rendered)
+                    if not rendered or key in seen:
+                        continue
+                    seen.add(key)
+                    observed.append({"type": key[0], "value": key[1]})
+                    if len(observed) >= 32:
+                        break
+        covered = [
+            str(item.get("domain") or "")
+            for item in workstreams
+            if _integer((item.get("analysis_metrics") or {}).get("source_count"), 0)
+        ]
+        unresolved = [
+            str(item.get("domain") or "")
+            for item in workstreams
+            if not _integer(
+                (item.get("analysis_metrics") or {}).get("source_count"), 0
+            )
+        ]
+        return {
+            "observed_entities": observed,
+            "evidence_covered_domains": covered,
+            "unresolved_domains": unresolved,
+            "blast_radius_assessment": _pick(
+                language,
+                (
+                    "当前只能将范围界定到证据中已观测的实体和产品；"
+                    "未覆盖域仍需补采，不能把“未发现”解释为“未受影响”。"
+                ),
+                (
+                    "Scope is limited to entities and products observed in the evidence. "
+                    "Uncovered domains still require collection; not observed must not be interpreted as not affected."
+                ),
+            ),
+            "evidence_refs": [str(ref) for ref in default_refs if ref][:32],
+        }
+
+    @staticmethod
+    def _cross_source_correlation(
+        forensic_coverage: dict[str, Any],
+        language: str,
+    ) -> dict[str, Any]:
+        inventory = forensic_coverage.get("inventory") or {}
+        products = [
+            str(value) for value in inventory.get("products") or [] if value
+        ]
+        linked = _integer(inventory.get("linked_candidate_count"), 0)
+        correlated = _integer(inventory.get("correlated_candidate_count"), 0)
+        pivots = [
+            {
+                "field": str(item.get("field") or ""),
+                "value": str(item.get("value") or ""),
+            }
+            for item in inventory.get("correlation_pivots") or []
+            if isinstance(item, dict) and item.get("field") and item.get("value")
+        ]
+        strength = (
+            "multi_source"
+            if len(products) >= 2 and (correlated or linked >= 2)
+            else ("single_source" if products else "no_correlation")
+        )
+        return {
+            "strength": strength,
+            "products": products,
+            "linked_alert_count": linked,
+            "correlated_alert_count": correlated,
+            "correlation_pivots": pivots,
+            "summary": _pick(
+                language,
+                (
+                    f"调查盘点 {linked} 条 Case 直接关联与 {correlated} 条关联检索告警，"
+                    f"覆盖 {len(products)} 个产品。关联支点用于扩大调查范围，"
+                    "但不自动等同于因果关系。"
+                ),
+                (
+                    f"The investigation mapped {linked} Case-linked and {correlated} "
+                    f"correlation-derived alerts across {len(products)} products. "
+                    "Correlation pivots expand scope but do not automatically establish causation."
+                ),
+            ),
+            "scan_truncated": bool(inventory.get("scan_truncated")),
+        }
+
     def _base_report(
         self,
         session: dict[str, Any],
         source: dict[str, Any],
         artifact: dict[str, Any],
     ) -> dict[str, Any]:
+        report_language = _language(
+            (session.get("model_metadata") or {}).get("report_language")
+        )
         pack = artifact.get("content") or {}
         summary = pack.get("case_summary") or {}
         facts = list(summary.get("key_facts") or [])
@@ -2464,7 +3504,11 @@ class ResponseInvestigationAgent:
                 {
                     "claim_id": "finding-1",
                     "claim_state": "unverified",
-                    "statement": "当前快照没有足够的已确认事实形成确定性攻击结论。",
+                    "statement": _pick(
+                        report_language,
+                        "当前快照没有足够的已确认事实形成确定性攻击结论。",
+                        "The current snapshot does not contain enough confirmed facts for a deterministic attack conclusion.",
+                    ),
                     "evidence_refs": default_refs[:32],
                 }
             )
@@ -2512,6 +3556,10 @@ class ResponseInvestigationAgent:
             for item in forensic_coverage.get("workstreams") or []
             if isinstance(item, dict)
         ][: len(FORENSIC_WORKSTREAMS)]
+        forensic_workstreams = self._localized_forensic_workstreams(
+            forensic_workstreams,
+            report_language,
+        )
         source_limits = [
             _text(item, 1_500)
             for item in forensic_coverage.get("source_limits") or []
@@ -2542,12 +3590,34 @@ class ResponseInvestigationAgent:
         )
         impact = _text(
             (pack.get("incident_communication") or {}).get("business_impact")
-            or "业务影响仍需结合资产、主机与应用侧证据继续确认。",
+            or _pick(
+                report_language,
+                "业务影响仍需结合资产、主机与应用侧证据继续确认。",
+                "Business impact still requires validation against asset, host and application evidence.",
+            ),
             2_500,
+        )
+        hypothesis_assessment = self._hypothesis_assessment(
+            forensic_workstreams,
+            report_language,
+        )
+        scope_assessment = self._scope_assessment(
+            source,
+            forensic_workstreams,
+            [str(ref) for ref in default_refs],
+            report_language,
+        )
+        cross_source_correlation = self._cross_source_correlation(
+            forensic_coverage,
+            report_language,
         )
         return {
             "schema_version": REPORT_SCHEMA_VERSION,
-            "title": f"Case {session['case_id']} 深度响应调查报告",
+            "title": _pick(
+                report_language,
+                f"Case {session['case_id']} 深度响应调查报告",
+                f"Case {session['case_id']} deep response investigation report",
+            ),
             "executive_summary": _text(
                 summary.get("headline")
                 or source["case"].get("summary")
@@ -2574,7 +3644,11 @@ class ResponseInvestigationAgent:
                 "confidence": confidence,
                 "statement": _text(
                     summary.get("current_assessment")
-                    or "当前证据不足以形成更高置信度结论。",
+                    or _pick(
+                        report_language,
+                        "当前证据不足以形成更高置信度结论。",
+                        "Current evidence is insufficient for a higher-confidence conclusion.",
+                    ),
                     3_000,
                 ),
                 "basis": [item["statement"] for item in findings[:5]],
@@ -2584,6 +3658,9 @@ class ResponseInvestigationAgent:
                 ][:30],
             },
             "findings": findings,
+            "hypothesis_assessment": hypothesis_assessment,
+            "cross_source_correlation": cross_source_correlation,
+            "scope_assessment": scope_assessment,
             "attack_chain": [
                 {
                     "sequence": index,
@@ -2619,10 +3696,22 @@ class ResponseInvestigationAgent:
                 for index, call in enumerate(calls, start=1)
             ],
             "final_assessment": (
-                f"{_text(summary.get('current_assessment'), 2_000)} "
-                f"本结论基于冻结快照 {session['source_snapshot_hash'][:12]} "
-                "及调查日志中按哈希审计的只读数据库观察，"
-                "所有生产处置仍需进入既有审批与响应执行链。"
+                _pick(
+                    report_language,
+                    (
+                        f"{_text(summary.get('current_assessment'), 2_000)} "
+                        f"本结论基于冻结快照 {session['source_snapshot_hash'][:12]} "
+                        "及调查日志中按哈希审计的只读数据库观察，"
+                        "所有生产处置仍需进入既有审批与响应执行链。"
+                    ),
+                    (
+                        f"{_text(summary.get('current_assessment'), 2_000)} "
+                        f"This conclusion is based on frozen snapshot "
+                        f"{session['source_snapshot_hash'][:12]} and hash-audited "
+                        "read-only database observations in the investigation log. "
+                        "All production actions remain subject to the established approval and response workflow."
+                    ),
+                )
             ).strip(),
             "execution_boundary": {
                 "direct_execution": False,
@@ -2696,6 +3785,10 @@ class ResponseInvestigationAgent:
         )
         if findings:
             normalized["findings"] = findings
+        normalized["hypothesis_assessment"] = self._normalize_hypotheses(
+            candidate.get("hypothesis_assessment"),
+            base["hypothesis_assessment"],
+        )
         attack_chain = self._normalize_attack_chain(candidate.get("attack_chain"))
         if attack_chain:
             normalized["attack_chain"] = attack_chain
@@ -2713,12 +3806,153 @@ class ResponseInvestigationAgent:
         if response_plan:
             normalized["response_plan"] = response_plan
         normalized["scope"] = base["scope"]
-        normalized["forensic_workstreams"] = base["forensic_workstreams"]
+        normalized["cross_source_correlation"] = base[
+            "cross_source_correlation"
+        ]
+        normalized["scope_assessment"] = base["scope_assessment"]
+        normalized["forensic_workstreams"] = self._merge_forensic_workstreams(
+            candidate.get("forensic_workstreams"),
+            base["forensic_workstreams"],
+        )
         normalized["investigation_log"] = base["investigation_log"]
         normalized["execution_boundary"] = base["execution_boundary"]
         normalized["schema_version"] = REPORT_SCHEMA_VERSION
         normalized["scope"]["session_id"] = session["session_id"]
         return normalized
+
+    @staticmethod
+    def _normalize_hypotheses(
+        value: Any,
+        base: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        result = copy.deepcopy(base)
+        if not isinstance(value, list):
+            return result
+        by_id = {
+            str(item.get("hypothesis_id") or ""): item
+            for item in result
+            if item.get("hypothesis_id")
+        }
+        allowed_dispositions = {
+            "supported",
+            "partially_supported",
+            "not_supported",
+            "unresolved",
+        }
+        for index, candidate in enumerate(value[:12], start=1):
+            if not isinstance(candidate, dict):
+                continue
+            hypothesis_id = _text(
+                candidate.get("hypothesis_id") or f"additional-{index}",
+                128,
+            )
+            target = by_id.get(hypothesis_id)
+            if target is None:
+                target = {
+                    "hypothesis_id": hypothesis_id,
+                    "title": _text(candidate.get("title"), 500),
+                    "disposition": "unresolved",
+                    "confidence": 0.0,
+                    "rationale": "",
+                    "supporting_evidence_refs": [],
+                    "contradicting_evidence_refs": [],
+                    "missing_evidence": [],
+                }
+                if not target["title"]:
+                    continue
+                result.append(target)
+                by_id[hypothesis_id] = target
+            title = _text(candidate.get("title"), 500)
+            rationale = _text(candidate.get("rationale"), 2_500)
+            disposition = str(candidate.get("disposition") or "")
+            if title:
+                target["title"] = title
+            if rationale:
+                target["rationale"] = rationale
+            if disposition in allowed_dispositions:
+                target["disposition"] = disposition
+            target["confidence"] = max(
+                0.0,
+                min(_number(candidate.get("confidence"), target["confidence"]), 1.0),
+            )
+            for key in (
+                "supporting_evidence_refs",
+                "contradicting_evidence_refs",
+            ):
+                target[key] = list(
+                    dict.fromkeys(
+                        [
+                            *target.get(key, []),
+                            *[
+                                str(ref)
+                                for ref in candidate.get(key) or []
+                                if str(ref).strip()
+                            ],
+                        ]
+                    )
+                )[:64]
+            candidate_missing = [
+                _text(item, 1_000)
+                for item in candidate.get("missing_evidence") or []
+                if _text(item, 1_000)
+            ]
+            target["missing_evidence"] = list(
+                dict.fromkeys(
+                    [*target.get("missing_evidence", []), *candidate_missing]
+                )
+            )[:20]
+        return result[:12]
+
+    @staticmethod
+    def _merge_forensic_workstreams(
+        value: Any,
+        base: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        result = copy.deepcopy(base)
+        if not isinstance(value, list):
+            return result
+        candidates = {
+            str(item.get("workstream_id") or ""): item
+            for item in value
+            if isinstance(item, dict) and item.get("workstream_id")
+        }
+        for target in result:
+            candidate = candidates.get(str(target.get("workstream_id") or ""))
+            if not candidate:
+                continue
+            candidate_result = candidate.get("investigation_result")
+            if not isinstance(candidate_result, dict):
+                candidate_result = candidate
+            investigation_result = target.get("investigation_result") or {}
+            assessment = _text(candidate_result.get("assessment"), 3_000)
+            if assessment:
+                investigation_result["assessment"] = assessment
+            for key in (
+                "observations",
+                "alternative_explanations",
+                "next_pivots",
+            ):
+                values = [
+                    _text(item, 1_500)
+                    for item in candidate_result.get(key) or []
+                    if _text(item, 1_500)
+                ]
+                if values:
+                    investigation_result[key] = values[:16]
+            target["investigation_result"] = investigation_result
+            target["evidence_refs"] = list(
+                dict.fromkeys(
+                    [
+                        *target.get("evidence_refs", []),
+                        *[
+                            str(ref)
+                            for ref in candidate.get("evidence_refs") or []
+                            if str(ref).strip()
+                        ],
+                    ]
+                )
+            )[:64]
+        return result
 
     @staticmethod
     def _normalize_claims(value: Any, *, prefix: str) -> list[dict[str, Any]]:
@@ -2971,6 +4205,25 @@ class ResponseInvestigationAgent:
                 item.get("collection_steps")
             ):
                 errors.append(f"forensic_collection_steps_missing:{workstream_id}")
+            investigation_result = item.get("investigation_result") or {}
+            if not _text(investigation_result.get("assessment")) or not (
+                investigation_result.get("observations")
+            ):
+                errors.append(
+                    f"forensic_investigation_result_missing:{workstream_id}"
+                )
+
+        hypotheses = [
+            item
+            for item in report.get("hypothesis_assessment") or []
+            if isinstance(item, dict)
+        ]
+        if len(hypotheses) < 4:
+            errors.append("hypothesis_assessment_incomplete")
+        if not isinstance(report.get("cross_source_correlation"), dict):
+            errors.append("cross_source_correlation_missing")
+        if not isinstance(report.get("scope_assessment"), dict):
+            errors.append("scope_assessment_missing")
 
         cited: list[tuple[str, str]] = []
         for claim in report.get("findings") or []:
@@ -2991,6 +4244,38 @@ class ResponseInvestigationAgent:
                 claim["claim_state"] = "unverified"
                 warnings.append(f"uncited_claim_downgraded:{claim_id}")
             cited.extend((claim_id, ref) for ref in valid_refs)
+
+        for item in hypotheses:
+            claim_id = str(item.get("hypothesis_id") or "hypothesis")
+            supporting = [
+                str(ref)
+                for ref in item.get("supporting_evidence_refs") or []
+                if str(ref) in ref_manifest
+            ]
+            contradicting = [
+                str(ref)
+                for ref in item.get("contradicting_evidence_refs") or []
+                if str(ref) in ref_manifest
+            ]
+            item["supporting_evidence_refs"] = supporting
+            item["contradicting_evidence_refs"] = contradicting
+            if (
+                item.get("disposition") in {"supported", "partially_supported"}
+                and not supporting
+            ):
+                item["disposition"] = "unresolved"
+                warnings.append(f"uncited_hypothesis_downgraded:{claim_id}")
+            cited.extend((claim_id, ref) for ref in supporting)
+            cited.extend((claim_id, ref) for ref in contradicting)
+
+        scope_assessment = report.get("scope_assessment") or {}
+        scope_refs = [
+            str(ref)
+            for ref in scope_assessment.get("evidence_refs") or []
+            if str(ref) in ref_manifest
+        ]
+        scope_assessment["evidence_refs"] = scope_refs
+        cited.extend(("scope-assessment", ref) for ref in scope_refs)
 
         for index, item in enumerate(report.get("attack_chain") or [], start=1):
             claim_id = f"attack-chain-{index}"
@@ -3072,7 +4357,7 @@ class ResponseInvestigationAgent:
         return (
             {
                 "status": status,
-                "validator": "deterministic-response-report-gate-v2",
+                "validator": "deterministic-response-report-gate-v3",
                 "errors": errors,
                 "warnings": warnings,
                 "checks": {
@@ -3088,6 +4373,21 @@ class ResponseInvestigationAgent:
                         missing_required_streams or incomplete_required_streams
                     ),
                     "forensic_workstreams_complete": not missing_workstreams,
+                    "forensic_investigation_results_complete": not any(
+                        item.startswith(
+                            "forensic_investigation_result_missing:"
+                        )
+                        for item in errors
+                    ),
+                    "hypothesis_assessment_complete": (
+                        "hypothesis_assessment_incomplete" not in errors
+                    ),
+                    "scope_assessment_complete": (
+                        "scope_assessment_missing" not in errors
+                    ),
+                    "cross_source_correlation_complete": (
+                        "cross_source_correlation_missing" not in errors
+                    ),
                     "direct_execution_blocked": "direct_execution_not_blocked"
                     not in errors,
                     "direct_delivery_blocked": "direct_delivery_not_blocked"

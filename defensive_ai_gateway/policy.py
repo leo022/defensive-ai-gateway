@@ -150,15 +150,20 @@ def _fit_json_value(value: Any, budget: int, *, top_level: bool = False) -> Any:
     if isinstance(value, dict):
         result: dict[str, Any] = {}
         priority = {
-            "result_contract_version": 0,
-            "product": 1,
-            "severity": 2,
-            "event_type": 3,
-            "entities": 4,
-            "evidence": 5,
-            "memory": 6,
-            "focus": 7,
-            "report_outline": 8,
+            "active_raw_observation": 0,
+            "scope": 1,
+            "execution_boundary": 2,
+            "investigation_notes": 3,
+            "observations": 4,
+            "result_contract_version": 5,
+            "product": 6,
+            "severity": 7,
+            "event_type": 8,
+            "entities": 9,
+            "evidence": 10,
+            "memory": 11,
+            "focus": 12,
+            "report_outline": 13,
         }
         keys = sorted(
             value,

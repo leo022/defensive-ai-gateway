@@ -291,6 +291,12 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertIn('btn.setAttribute("aria-current", "page")', JS)
         self.assertIn(".nav-group.active .nav-subbutton.active", CSS)
         self.assertIn("grid-template-columns: repeat(2, minmax(0, 1fr))", CSS)
+        self.assertIn('workspaceEyebrow: "安全运营"', JS)
+        self.assertIn('dashboardEyebrow: "安全运营实时概览"', JS)
+        self.assertIn('languageAria: "切换到英文"', JS)
+        self.assertIn('languageAria: "Switch to Chinese"', JS)
+        self.assertEqual(JS.count("footer:"), 2)
+        self.assertIn('data-i18n="footer"', HTML)
 
     def test_response_workbench_keeps_secrets_out_of_forms_and_separates_roles(self):
         self.assertIn('id="automation-view"', HTML)
