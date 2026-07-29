@@ -333,11 +333,17 @@ class _SyslogPointerGuessAgentLLM:
     def generate_structured(self, prompt, context, schema=None):  # noqa: ANN001
         self.planner_calls += 1
         if self.planner_calls > len(MANDATORY_TOOLS):
+            read_turn = self.planner_calls - len(MANDATORY_TOOLS)
+            guessed_alert_id = (
+                f"{self.alert_id[:8]}{'0' * (len(self.alert_id) - 8)}"
+                if read_turn == 1
+                else self.alert_id[:8]
+            )
             return {
                 "action": "tool_call",
                 "tool_name": "read_raw_alert_chunk",
                 "arguments": {
-                    "alert_id": self.alert_id,
+                    "alert_id": guessed_alert_id,
                     "json_pointer": "/syslog_envelope/raw_message",
                     "offset": 0,
                 },
@@ -1442,7 +1448,7 @@ class ResponseAgentTest(unittest.TestCase):
         )
 
     def test_syslog_pointer_guess_uses_authoritative_manifest_before_persistence(self):
-        alert = _waf_alert("response-agent-syslog-pointer-alias")
+        alert = _waf_alert("e466ef7bdafd4140a51cbd5d225639f3")
         alert.payload["request_context"] = {
             "password": "alpha beta gamma",
             "credential": 'first,second "quoted" credential',
@@ -1501,6 +1507,10 @@ class ResponseAgentTest(unittest.TestCase):
         ]
         self.assertEqual(len(raw_calls), 1)
         self.assertEqual(
+            raw_calls[0]["arguments"]["alert_id"],
+            alert.alert_id,
+        )
+        self.assertEqual(
             raw_calls[0]["arguments"]["json_pointer"],
             "/_syslog_envelope/raw_message",
         )
@@ -1548,11 +1558,15 @@ class ResponseAgentTest(unittest.TestCase):
                 "action": "tool_call",
                 "tool_name": "read_raw_alert_chunk",
                 "arguments": {
-                    "alert_id": alert.alert_id,
+                    "alert_id": alert.alert_id[:8],
                     "json_pointer": "/original_log/http/raw_message",
                 },
             },
             session=stored,
+        )
+        self.assertEqual(
+            preserved["arguments"]["alert_id"],
+            alert.alert_id[:8],
         )
         self.assertEqual(
             preserved["arguments"]["json_pointer"],
@@ -1571,6 +1585,42 @@ class ResponseAgentTest(unittest.TestCase):
         )
         self.assertEqual(
             other_alert["arguments"]["json_pointer"],
+            "/syslog_envelope/raw_message",
+        )
+        ambiguous_session = {
+            "tool_calls": [
+                {
+                    "status": "completed",
+                    "tool_name": "query_case_raw_alerts",
+                    "result": {
+                        "items": [
+                            {
+                                "alert_id": "e466ef7baaaaaaaaaaaaaaaaaaaaaaaa",
+                                "syslog_message_pointer": "/_syslog_envelope/raw_message",
+                            },
+                            {
+                                "alert_id": "e466ef7bbbbbbbbbbbbbbbbbbbbbbbbb",
+                                "syslog_message_pointer": "/syslog_envelope/raw_message",
+                            },
+                        ]
+                    },
+                }
+            ]
+        }
+        ambiguous = self.state.response_agent._validate_decision(
+            {
+                "action": "tool_call",
+                "tool_name": "read_raw_alert_chunk",
+                "arguments": {
+                    "alert_id": "e466ef7b",
+                    "json_pointer": "/syslog_envelope/raw_message",
+                },
+            },
+            session=ambiguous_session,
+        )
+        self.assertEqual(ambiguous["arguments"]["alert_id"], "e466ef7b")
+        self.assertEqual(
+            ambiguous["arguments"]["json_pointer"],
             "/syslog_envelope/raw_message",
         )
 

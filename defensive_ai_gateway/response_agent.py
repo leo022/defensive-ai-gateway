@@ -2168,7 +2168,7 @@ class ResponseInvestigationAgent:
                     "invalid_json_pointer",
                     "json_pointer must be empty or an RFC 6901 pointer",
                 )
-            pointer = self._canonicalize_syslog_message_pointer(
+            alert_id, pointer = self._canonicalize_syslog_read_target(
                 session,
                 alert_id,
                 pointer,
@@ -2194,16 +2194,16 @@ class ResponseInvestigationAgent:
         )
 
     @staticmethod
-    def _canonicalize_syslog_message_pointer(
+    def _canonicalize_syslog_read_target(
         session: dict[str, Any],
-        alert_id: str,
+        requested_alert_id: str,
         requested_pointer: str,
-    ) -> str:
-        """Resolve a model's Syslog-envelope alias through prior manifests."""
+    ) -> tuple[str, str]:
+        """Resolve a Syslog stream only through a unique authoritative manifest."""
         if not _is_syslog_raw_message_pointer(requested_pointer):
-            return requested_pointer
+            return requested_alert_id, requested_pointer
 
-        authoritative: set[str] = set()
+        authoritative: dict[str, set[str]] = {}
         for call in session.get("tool_calls") or []:
             if not isinstance(call, dict) or call.get("status") != "completed":
                 continue
@@ -2220,18 +2220,42 @@ class ResponseInvestigationAgent:
             else:
                 continue
             for item in items:
-                if (
-                    not isinstance(item, dict)
-                    or str(item.get("alert_id") or "") != alert_id
-                ):
+                if not isinstance(item, dict):
                     continue
+                alert_id = str(item.get("alert_id") or "")
                 pointer = str(item.get(pointer_field) or "")
-                if _is_syslog_raw_message_pointer(pointer):
-                    authoritative.add(pointer)
+                if alert_id and _is_syslog_raw_message_pointer(pointer):
+                    authoritative.setdefault(alert_id, set()).add(pointer)
 
-        if requested_pointer in authoritative or len(authoritative) != 1:
-            return requested_pointer
-        return next(iter(authoritative))
+        alert_id = requested_alert_id
+        if alert_id not in authoritative:
+            requested_folded = alert_id.casefold()
+            if len(requested_folded) >= 8 and all(
+                character in "0123456789abcdef"
+                for character in requested_folded
+            ):
+                matches = []
+                for candidate in authoritative:
+                    candidate_folded = candidate.casefold()
+                    if not candidate_folded or any(
+                        character not in "0123456789abcdef"
+                        for character in candidate_folded
+                    ):
+                        continue
+                    shared = 0
+                    for left, right in zip(requested_folded, candidate_folded):
+                        if left != right:
+                            break
+                        shared += 1
+                    if shared >= 8:
+                        matches.append(candidate)
+                if len(matches) == 1:
+                    alert_id = matches[0]
+
+        pointers = authoritative.get(alert_id) or set()
+        if requested_pointer in pointers or len(pointers) != 1:
+            return alert_id, requested_pointer
+        return alert_id, next(iter(pointers))
 
     def _forensic_linked_inventory(
         self,
