@@ -12,7 +12,7 @@ from .models import (
     ValidationResult,
     new_id,
 )
-from .policy import PolicyEngine, SECRET_PATTERNS
+from .policy import PolicyEngine, SECRET_PATTERNS, is_sensitive_field_name
 from .skills import SkillManifest
 
 
@@ -28,10 +28,30 @@ _MAX_PROMPT_INJECTION_SCAN_LEAVES = 512
 _MAX_PROMPT_INJECTION_DEPTH = 16
 _MAX_PROMPT_INJECTION_EXCERPT_CHARS = 240
 
+_SHA256_HEX = re.compile(r"[0-9a-fA-F]{64}")
+_TRUSTED_RASP_INTEGRITY_DIGEST_FIELDS = frozenset(
+    {"raw_log_sha256", "syslog_raw_message_sha256"}
+)
+_TRUSTED_RASP_PROJECTION_EVIDENCE_TYPES = frozenset(
+    {"hook_data", "rasp_items_context", "request_context", "request_parameters"}
+)
 # A prompt-injection marker means that untrusted telemetry may have attempted to
 # influence the analysis model. It can be reviewed by a human, but it is not a
 # generic bypass for evidence, output-contract, or action-policy failures.
 MANUAL_REVIEW_CONTINUATION_CODES = frozenset({"prompt_injection_detected"})
+
+
+def _canonical_output_key(value: Any) -> str:
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(value).strip())
+    return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+
+
+def _is_sensitive_output_key(value: Any, configured: set[str]) -> bool:
+    return is_sensitive_field_name(value, configured)
+
+
+def _matches_sensitive_text(value: str) -> bool:
+    return any(pattern.search(value) for pattern in SECRET_PATTERNS)
 
 
 def can_continue_after_manual_review(validation: ValidationResult) -> bool:
@@ -54,7 +74,7 @@ def can_continue_after_manual_review(validation: ValidationResult) -> bool:
 
 class Validator:
     name = "evidence_policy_validator"
-    version = "2.1.0"
+    version = "2.2.0"
 
     def __init__(self, policy: PolicyEngine):
         self.policy = policy
@@ -118,8 +138,20 @@ class Validator:
                 checks["action_policy"] = False
                 findings.append(ValidationFinding("unknown_action_mode", "block", f"未知动作模式：{action.mode}"))
 
-        serialized_output = json.dumps(result.to_dict(), ensure_ascii=False, sort_keys=True)
-        if any(pattern.search(serialized_output) for pattern in SECRET_PATTERNS):
+        structured_output = result.to_dict()
+        trusted_digests = (
+            self._trusted_evidence_digest_paths(event)
+            if checks["evidence_grounded"]
+            else {}
+        )
+        if (
+            self.policy.redact(
+                structured_output,
+                trusted_digest_paths=trusted_digests,
+            )
+            != structured_output
+            or self._contains_sensitive_output(structured_output, trusted_digests)
+        ):
             checks["sensitive_output"] = False
             findings.append(ValidationFinding("sensitive_output_detected", "block", "Agent 输出疑似包含未脱敏凭证或敏感标识。"))
 
@@ -165,6 +197,112 @@ class Validator:
             findings=findings,
             checks=checks,
         )
+
+    def _trusted_evidence_digest_paths(
+        self,
+        event: NormalizedEvent,
+    ) -> dict[tuple[str | int, ...], str]:
+        """Return controller evidence digests at explicit result paths only."""
+        configured = {
+            _canonical_output_key(field)
+            for field in self.policy.config.redact_fields
+        }
+        trusted: dict[tuple[str | int, ...], str] = {}
+        stack: list[tuple[tuple[str | int, ...], Any, str]] = []
+        for index, evidence in enumerate(event.evidence):
+            if not isinstance(evidence, dict) or "value" not in evidence:
+                continue
+            stack.append(
+                (
+                    ("evidence", index, "value"),
+                    evidence["value"],
+                    str(evidence.get("type") or "").casefold(),
+                )
+            )
+
+        while stack:
+            path, value, evidence_type = stack.pop()
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    key_text = str(key)
+                    item_path = (*path, key_text)
+                    field = _canonical_output_key(key_text)
+                    relative_path = item_path[3:]
+                    controller_integrity_digest = (
+                        evidence_type == "rasp_evidence_integrity"
+                        and len(relative_path) == 1
+                        and field in _TRUSTED_RASP_INTEGRITY_DIGEST_FIELDS
+                    )
+                    controller_projection_digest = (
+                        evidence_type
+                        in _TRUSTED_RASP_PROJECTION_EVIDENCE_TYPES
+                        and field == "evidence_sha256"
+                        and "selected_evidence" in relative_path
+                        and "entries" in relative_path
+                    )
+                    if (
+                        (
+                            controller_integrity_digest
+                            or controller_projection_digest
+                        )
+                        and isinstance(item, str)
+                        and _SHA256_HEX.fullmatch(item) is not None
+                        and not any(
+                            isinstance(segment, str)
+                            and _is_sensitive_output_key(segment, configured)
+                            for segment in item_path
+                        )
+                    ):
+                        trusted[item_path] = item
+                    else:
+                        stack.append((item_path, item, evidence_type))
+            elif isinstance(value, list):
+                stack.extend(
+                    ((*path, index), item, evidence_type)
+                    for index, item in enumerate(value)
+                )
+        return trusted
+
+    def _contains_sensitive_output(
+        self,
+        value: Any,
+        trusted_digest_paths: dict[tuple[str | int, ...], str],
+    ) -> bool:
+        """Scan output keys and scalar values independently from redaction."""
+        configured = {
+            _canonical_output_key(field)
+            for field in self.policy.config.redact_fields
+        }
+        stack: list[tuple[tuple[str | int, ...], Any]] = [((), value)]
+        while stack:
+            path, item = stack.pop()
+            if isinstance(item, dict):
+                for key, child in item.items():
+                    key_text = str(key)
+                    if _matches_sensitive_text(key_text):
+                        return True
+                    if _is_sensitive_output_key(key_text, configured):
+                        if child != "[REDACTED]":
+                            return True
+                        continue
+                    stack.append(((*path, key_text), child))
+                continue
+            if isinstance(item, list):
+                stack.extend(
+                    ((*path, index), child)
+                    for index, child in enumerate(item)
+                )
+                continue
+            if isinstance(item, str):
+                if trusted_digest_paths.get(path) == item:
+                    continue
+                if _matches_sensitive_text(item):
+                    return True
+                continue
+            if isinstance(item, (int, float)) and not isinstance(item, bool):
+                if _matches_sensitive_text(str(item)):
+                    return True
+        return False
 
     def _prompt_injection_clues(self, event: NormalizedEvent) -> list[ValidationEvidenceClue]:
         """Locate prompt-injection patterns without re-emitting raw telemetry."""

@@ -326,6 +326,121 @@ class PolicyBoundaryTest(unittest.TestCase):
         self.assertNotIn("abc123", redacted["message"])
         self.assertEqual(redacted["id_card"], "[REDACTED]")
 
+    def test_digest_redaction_requires_an_exact_trusted_path(self):
+        digest_with_phone = "a" * 20 + "13800138000" + "b" * 33
+        self.assertEqual(len(digest_with_phone), 64)
+        policy = _policy()
+        value = {
+            "hash": digest_with_phone,
+            "nested": {"artifact_hash": digest_with_phone},
+            "scope": {"source_snapshot_hash": digest_with_phone},
+            "message": f"stored digest={digest_with_phone}",
+            "token_hash": digest_with_phone,
+        }
+
+        redacted = policy.redact(value)
+        self.assertIn("[REDACTED]", redacted["hash"])
+        self.assertIn("[REDACTED]", redacted["nested"]["artifact_hash"])
+        self.assertIn("[REDACTED]", redacted["scope"]["source_snapshot_hash"])
+        self.assertIn("[REDACTED]", redacted["message"])
+        self.assertEqual(redacted["token_hash"], "[REDACTED]")
+
+        trusted_path = {
+            ("scope", "source_snapshot_hash"): digest_with_phone,
+            ("token_hash",): digest_with_phone,
+        }
+        trusted = policy.redact(
+            value,
+            trusted_digest_paths=trusted_path,
+        )
+        self.assertEqual(
+            trusted["scope"]["source_snapshot_hash"],
+            digest_with_phone,
+        )
+        self.assertIn("[REDACTED]", trusted["hash"])
+        self.assertIn("[REDACTED]", trusted["nested"]["artifact_hash"])
+        self.assertIn("[REDACTED]", trusted["message"])
+        self.assertEqual(trusted["token_hash"], "[REDACTED]")
+
+        sanitized = policy.sanitize_json_value(
+            {
+                "scope": {"source_snapshot_hash": digest_with_phone},
+                "artifact_hash": digest_with_phone,
+            },
+            20_000,
+            trusted_digest_paths={
+                ("scope", "source_snapshot_hash"): digest_with_phone,
+            },
+        )
+        self.assertEqual(
+            sanitized["scope"]["source_snapshot_hash"],
+            digest_with_phone,
+        )
+        self.assertIn("[REDACTED]", sanitized["artifact_hash"])
+
+        config = GatewayConfig()
+        config.policy.redact_fields.append("source_snapshot_hash")
+        configured_sensitive = PolicyEngine(config.policy).redact(
+            {"sourceSnapshotHash": digest_with_phone},
+            trusted_digest_paths={
+                ("sourceSnapshotHash",): digest_with_phone,
+            },
+        )
+        self.assertEqual(
+            configured_sensitive["sourceSnapshotHash"],
+            "[REDACTED]",
+        )
+
+        config = GatewayConfig()
+        config.policy.redact_fields.append("tenant_id")
+        configured_derived = PolicyEngine(config.policy).redact(
+            {"tenant_id_hash": "f" * 64}
+        )
+        self.assertEqual(configured_derived["tenant_id_hash"], "[REDACTED]")
+
+    def test_sensitive_material_in_mapping_keys_is_redacted_before_model_input(self):
+        sanitized = _policy().sanitize_context(
+            {
+                "evidence": [
+                    {
+                        "type": "request_context",
+                        "value": {
+                            "owner@example.com": "visible",
+                            "api_key=sk-live-123": "visible",
+                        },
+                    }
+                ]
+            }
+        )
+
+        rendered = json.dumps(sanitized, ensure_ascii=False, sort_keys=True)
+        self.assertNotIn("owner@example.com", rendered)
+        self.assertNotIn("sk-live-123", rendered)
+        self.assertGreaterEqual(rendered.count("[REDACTED]"), 2)
+
+    def test_compound_sensitive_fields_are_redacted_without_hiding_metrics(self):
+        redacted = _policy().sanitize_context(
+            {
+                "entities": {
+                    "password_value": "hunter2",
+                    "token_value": "opaque-token-material",
+                    "credential_value": "raw-credential-material",
+                    "proxy_authorization_header": "opaque-auth-material",
+                    "session_count": 7,
+                }
+            }
+        )
+
+        entities = redacted["entities"]
+        self.assertEqual(entities["password_value"], "[REDACTED]")
+        self.assertEqual(entities["token_value"], "[REDACTED]")
+        self.assertEqual(entities["credential_value"], "[REDACTED]")
+        self.assertEqual(
+            entities["proxy_authorization_header"],
+            "[REDACTED]",
+        )
+        self.assertEqual(entities["session_count"], 7)
+
     def test_sanitized_context_has_strict_utf8_byte_bound(self):
         policy = _policy(600)
         context = {

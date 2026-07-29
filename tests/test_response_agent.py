@@ -30,6 +30,7 @@ from defensive_ai_gateway.response_agent import (
     MANDATORY_TOOLS,
     _raw_stream_progress,
 )
+from defensive_ai_gateway.syslog_router import SyslogPortRouter
 from scripts.clean_alerts_and_memory import _delete
 
 
@@ -227,6 +228,25 @@ class _RecoverableToolAgentLLM:
         return {
             "action": "finish",
             "rationale": "The refused read is recorded and no retry is required.",
+        }
+
+
+class _PersistentToolRejectingAgentLLM:
+    is_deterministic = False
+    runtime_metadata = {
+        "provider": "test",
+        "model": "persistent-tool-rejecting-agent-model",
+        "endpoint_host": "",
+    }
+
+    def generate_structured(self, prompt, context, schema=None):  # noqa: ANN001
+        if prompt.startswith("Write a complete"):
+            return {}
+        return {
+            "action": "tool_call",
+            "tool_name": "read_raw_alert_chunk",
+            "arguments": {"alert_id": "alert_not_correlated_to_this_case"},
+            "rationale": "Repeat a refused out-of-scope raw evidence read.",
         }
 
 
@@ -608,6 +628,38 @@ class ResponseAgentTest(unittest.TestCase):
         self.assertEqual(paused["status"], "paused")
         self.assertEqual(paused["last_error"], "model_error:RuntimeError")
         self.assertEqual(paused["usage"]["tool_calls"], 0)
+        self.assertGreater(paused["usage"]["active_seconds"], 0.0)
+
+    def test_unexpected_tool_failure_records_active_duration(self):
+        case_id = self._case("response-agent-tool-crash-duration")
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+
+        def fail_tool(*_args, **_kwargs):
+            time.sleep(0.01)
+            raise RuntimeError("synthetic tool crash")
+
+        with patch.object(
+            self.state.response_agent,
+            "_execute_tool",
+            side_effect=fail_tool,
+        ):
+            started = self.state.response_agent.create(
+                case_id,
+                artifact=artifact,
+                goal="Record failed worker duration",
+                actor="analyst",
+            )
+            failed = self._wait(
+                self.state.response_agent,
+                started["session_id"],
+                {"failed"},
+            )
+
+        self.assertEqual(failed["status"], "failed")
+        self.assertIn("synthetic tool crash", failed["last_error"])
+        self.assertGreater(failed["usage"]["active_seconds"], 0.0)
 
     def test_redundant_matching_case_scope_is_normalized_not_failed(self):
         llm = _ScopeEchoAgentLLM()
@@ -635,7 +687,7 @@ class ResponseAgentTest(unittest.TestCase):
         )
         self.assertEqual(stored["tool_calls"][0]["arguments"], {})
         self.assertEqual(
-            stored["usage"]["model_calls"], len(CONTROLLER_TOOLS) + 2
+            stored["usage"]["model_calls"], len(CONTROLLER_TOOLS) + 1
         )
         self.assertNotIn("override controller scope", stored["last_error"])
 
@@ -972,6 +1024,7 @@ class ResponseAgentTest(unittest.TestCase):
         self.assertTrue(
             session["report"]["validation"]["checks"]["raw_evidence_complete"]
         )
+        self.assertGreater(session["usage"]["active_seconds"], 0.0)
 
     def test_mismatched_case_scope_pauses_after_bounded_retries(self):
         self.state.response_agent.set_llm(_ScopeAttackAgentLLM())
@@ -998,6 +1051,7 @@ class ResponseAgentTest(unittest.TestCase):
         )
         self.assertEqual(session["usage"]["model_calls"], 3)
         self.assertEqual(session["usage"]["tool_calls"], 0)
+        self.assertGreater(session["usage"]["active_seconds"], 0.0)
         rejected = [
             step
             for step in session["steps"]
@@ -1031,6 +1085,7 @@ class ResponseAgentTest(unittest.TestCase):
         )
         self.assertEqual(session["usage"]["tool_calls"], 0)
         self.assertFalse(session["tool_calls"])
+        self.assertGreater(session["usage"]["active_seconds"], 0.0)
 
     def test_out_of_scope_raw_read_is_recoverable_and_audited(self):
         self.state.response_agent.set_llm(_RecoverableToolAgentLLM())
@@ -1061,6 +1116,44 @@ class ResponseAgentTest(unittest.TestCase):
         )
         self.assertTrue(
             any(step["phase"] == "tool_rejected" for step in stored["steps"])
+        )
+
+    def test_repeated_tool_rejections_pause_with_active_duration(self):
+        self.state.response_agent.set_llm(_PersistentToolRejectingAgentLLM())
+        case_id = self._case("response-agent-tool-rejection-pause")
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        started = self.state.response_agent.create(
+            case_id,
+            artifact=artifact,
+            goal="Pause after repeated out-of-scope raw evidence reads",
+            actor="analyst",
+        )
+
+        session = self._wait(
+            self.state.response_agent,
+            started["session_id"],
+            {"paused", "failed"},
+        )
+
+        self.assertEqual(session["status"], "paused")
+        self.assertEqual(
+            session["last_error"],
+            "tool_contract_error:raw_alert_outside_scope",
+        )
+        self.assertEqual(session["usage"]["model_calls"], 3)
+        self.assertEqual(session["usage"]["tool_calls"], 3)
+        self.assertGreater(session["usage"]["active_seconds"], 0.0)
+        self.assertEqual(
+            len(
+                [
+                    step
+                    for step in session["steps"]
+                    if step["phase"] == "tool_rejected"
+                ]
+            ),
+            3,
         )
 
     def test_raw_syslog_can_be_read_completely_in_redacted_chunks(self):
@@ -1307,6 +1400,188 @@ class ResponseAgentTest(unittest.TestCase):
             report["validation"]["checks"]["forensic_workstreams_complete"]
         )
 
+    def test_native_waf_syslog_http_fields_drive_forensic_diagnostics(self):
+        raw = Path("samples_syslog/waf/waf_alert.json").read_bytes()
+        router = SyslogPortRouter(
+            self.state.config.syslog.product_ports,
+            self.state.config.syslog.gateway_profiles,
+        )
+        routed = router.route(
+            self.state.config.syslog.product_ports["waf"],
+            raw,
+            hostname="waf-gw-prod-01",
+            appname="waf",
+            protocol="tcp",
+        )
+        alert = self.state.alert_from_routed_syslog(routed)
+        case_id = self.state.orchestrator.handle_alert(alert).case_id
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        source = self.state.repo.get_case_response_source(case_id)
+
+        manifest, _ = self.state.response_agent._execute_tool(
+            "query_case_raw_alerts",
+            {},
+            source,
+            artifact,
+        )
+        linked = next(
+            item for item in manifest["items"] if item["alert_id"] == alert.alert_id
+        )
+        diagnostics = {
+            item["field"]: item for item in linked["capture_diagnostics"]
+        }
+
+        self.assertEqual(linked["syslog_message_integrity"], "verified")
+        self.assertEqual(linked["syslog_message_decode_status"], "decoded_json")
+        self.assertIn(
+            "http_response_status",
+            {
+                item["field"] for item in linked["capture_mapping_gaps"]
+            },
+        )
+        self.assertEqual(
+            diagnostics["http_response_status"]["state"],
+            "captured_nonempty",
+        )
+        self.assertEqual(
+            diagnostics["http_response_status"]["observed_value"],
+            "403",
+        )
+        self.assertEqual(
+            diagnostics["http_response_status"]["provenance"],
+            "syslog_raw_message",
+        )
+        self.assertEqual(
+            diagnostics["http_request_payload"]["method"],
+            "POST",
+        )
+
+        coverage, _ = self.state.response_agent._execute_tool(
+            "query_forensic_coverage",
+            {},
+            source,
+            artifact,
+        )
+        web_workstream = next(
+            item
+            for item in coverage["workstreams"]
+            if item["domain"] == "web_request"
+        )
+        self.assertEqual(
+            web_workstream["analysis_metrics"]["observed_response_statuses"],
+            ["403"],
+        )
+        self.assertFalse(
+            any(
+                f"原始告警 {alert.alert_id} 未采集可验证的 HTTP 响应状态"
+                in item
+                for item in coverage["source_limits"]
+            ),
+            coverage["source_limits"],
+        )
+
+    def test_raw_syslog_recovers_http_fields_dropped_by_mapping(self):
+        raw_message = json.dumps(
+            {
+                "http": {
+                    "method": "GET",
+                    "uri": "/health",
+                    "status": 204,
+                }
+            },
+            separators=(",", ":"),
+        )
+        raw_bytes = raw_message.encode("utf-8")
+        alert = RawAlert(
+            source="mapping-gap-waf",
+            product="waf",
+            event_type="health_probe",
+            severity="medium",
+            timestamp="2026-07-29T10:00:00Z",
+            payload={
+                "_syslog_envelope": {
+                    "collector": "syslog-port-router",
+                    "destination_port": 15140,
+                    "protocol": "tcp",
+                    "raw_message": raw_message,
+                    "raw_message_bytes": len(raw_bytes),
+                    "raw_message_sha256": hashlib.sha256(raw_bytes).hexdigest(),
+                },
+                "adapter": {
+                    "profile_id": "mapping-gap-profile",
+                    "mapping_status": "passed",
+                },
+            },
+            alert_id="response-agent-syslog-mapping-gap",
+        )
+        case_id = self.state.orchestrator.handle_alert(alert).case_id
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        source = self.state.repo.get_case_response_source(case_id)
+
+        manifest, _ = self.state.response_agent._execute_tool(
+            "query_case_raw_alerts",
+            {},
+            source,
+            artifact,
+        )
+        linked = next(
+            item for item in manifest["items"] if item["alert_id"] == alert.alert_id
+        )
+        diagnostics = {
+            item["field"]: item for item in linked["capture_diagnostics"]
+        }
+        self.assertEqual(
+            diagnostics["http_response_status"]["observed_value"],
+            "204",
+        )
+        self.assertEqual(
+            diagnostics["http_response_status"]["provenance"],
+            "syslog_raw_message",
+        )
+        self.assertEqual(
+            diagnostics["http_response_status"]["mapped_state"],
+            "not_observed",
+        )
+        self.assertEqual(
+            diagnostics["http_request_payload"]["state"],
+            "captured_empty",
+        )
+        gap_fields = {
+            item["field"] for item in linked["capture_mapping_gaps"]
+        }
+        self.assertIn("http_response_status", gap_fields)
+        self.assertIn("http_request_payload", gap_fields)
+
+        coverage, _ = self.state.response_agent._execute_tool(
+            "query_forensic_coverage",
+            {},
+            source,
+            artifact,
+        )
+        web_workstream = next(
+            item
+            for item in coverage["workstreams"]
+            if item["domain"] == "web_request"
+        )
+        metrics = web_workstream["analysis_metrics"]
+        self.assertEqual(metrics["observed_response_statuses"], ["204"])
+        self.assertNotIn(
+            "http_response_status:not_observed",
+            metrics["capture_gaps"],
+        )
+        self.assertTrue(metrics["capture_mapping_gaps"])
+        self.assertTrue(
+            any(
+                "原始证据层与映射投影状态不一致" in item
+                for item in coverage["source_limits"]
+            ),
+            coverage["source_limits"],
+        )
+
     def test_zero_http_status_is_a_capture_gap_not_an_observed_response(self):
         alert = _waf_alert("response-agent-zero-http-status")
         alert.payload["status"] = 0
@@ -1505,7 +1780,228 @@ class ResponseAgentTest(unittest.TestCase):
             "request_target_not_observed",
         )
 
-    def test_llm_sees_every_complete_raw_chunk_and_report_gets_rolling_notes(self):
+    def test_ecs_http_paths_are_supported_without_generic_status_confusion(self):
+        payload = {
+            "http": {
+                "request": {
+                    "method": "POST",
+                    "body": {"content": '{"query":"value"}'},
+                    "headers": {"content-length": "17"},
+                },
+                "response": {
+                    "status_code": 201,
+                    "body": {"content": '{"ok":true}'},
+                },
+            },
+            "url": {"original": "https://example.test/search"},
+        }
+        diagnostics = {
+            item["field"]: item
+            for item in self.state.repo._response_agent_capture_diagnostics(payload)
+        }
+        self.assertEqual(
+            diagnostics["http_request_payload"]["state"],
+            "captured_nonempty",
+        )
+        self.assertEqual(
+            diagnostics["http_request_payload"]["method"],
+            "POST",
+        )
+        self.assertEqual(
+            diagnostics["http_response_status"]["observed_value"],
+            "201",
+        )
+        self.assertEqual(
+            diagnostics["http_response_body"]["state"],
+            "captured_nonempty",
+        )
+
+        non_http = {
+            "status": 403,
+            "process": {"name": "java"},
+        }
+        diagnostics = {
+            item["field"]: item
+            for item in self.state.repo._response_agent_capture_diagnostics(non_http)
+        }
+        self.assertEqual(
+            diagnostics["http_response_status"]["state"],
+            "not_observed",
+        )
+
+    def test_model_cannot_override_any_controller_report_fact(self):
+        base = {
+            "schema_version": "test",
+            "title": "Controller report",
+            "executive_summary": "Summary",
+            "conclusion": {
+                "classification": "insufficient_evidence",
+                "confidence": 0.4,
+                "statement": "Controller conclusion",
+                "basis": [],
+                "limitations": ["controller-confirmed-gap"],
+            },
+            "findings": [],
+            "hypothesis_assessment": [],
+            "attack_chain": [],
+            "impact": "Unknown",
+            "evidence_gaps": ["controller-confirmed-gap"],
+            "response_plan": [],
+            "scope": {},
+            "cross_source_correlation": {},
+            "scope_assessment": {},
+            "forensic_workstreams": [
+                {
+                    "workstream_id": "web-request-reconstruction",
+                    "analysis_metrics": {
+                        "request_payload_profiles": [
+                            {
+                                "alert_id": "alert-explicit-empty",
+                                "state": "captured_empty",
+                            }
+                        ]
+                    },
+                }
+            ],
+            "prior_analysis_context": {
+                "authority": "non_authoritative_prior_llm"
+            },
+            "investigation_log": [],
+            "final_assessment": "Assessment",
+            "execution_boundary": {
+                "direct_execution": False,
+                "direct_communication_delivery": False,
+            },
+        }
+        false_gap = (
+            "The initial HTTP request payloads for the arbitrary file read and "
+            "webshell execution are not fully captured in the available raw-log observations."
+        )
+        paraphrased_false_gaps = [
+            "The request body is absent from the source log.",
+            "No request content was recorded by the source.",
+        ]
+        candidate = {
+            "title": "Model title claiming compromise",
+            "executive_summary": paraphrased_false_gaps[0],
+            "conclusion": {
+                "classification": "malicious",
+                "confidence": 1.0,
+                "statement": paraphrased_false_gaps[1],
+                "basis": [false_gap],
+                "limitations": [false_gap],
+            },
+            "findings": [
+                {
+                    "claim_id": "false-gap",
+                    "claim_state": "confirmed",
+                    "statement": false_gap,
+                    "evidence_refs": [],
+                }
+            ],
+            "hypothesis_assessment": [
+                {
+                    "hypothesis_id": "false-gap",
+                    "title": "False gap",
+                    "rationale": false_gap,
+                    "missing_evidence": [false_gap],
+                }
+            ],
+            "impact": false_gap,
+            "forensic_workstreams": [
+                {
+                    "workstream_id": "false-gap",
+                    "investigation_result": {
+                        "assessment": false_gap,
+                        "observations": [false_gap],
+                    },
+                }
+            ],
+            "evidence_gaps": [false_gap],
+            "response_plan": [
+                {
+                    "step_id": "model-step",
+                    "action": "Act on the invented missing body.",
+                }
+            ],
+            "final_assessment": false_gap,
+        }
+
+        normalized = self.state.response_agent._normalize_report(
+            candidate,
+            base,
+            {"session_id": "response_agent_gap_authority"},
+        )
+
+        self.assertEqual(
+            normalized["conclusion"]["limitations"],
+            ["controller-confirmed-gap"],
+        )
+        self.assertEqual(
+            normalized["evidence_gaps"],
+            ["controller-confirmed-gap"],
+        )
+        self.assertEqual(normalized["executive_summary"], "Summary")
+        self.assertEqual(
+            normalized["conclusion"]["statement"],
+            "Controller conclusion",
+        )
+        self.assertEqual(normalized["final_assessment"], "Assessment")
+        self.assertEqual(
+            normalized["scope"]["model_synthesis_disposition"],
+            "advisory_not_applied_to_controller_report",
+        )
+        self.assertEqual(
+            normalized["scope"]["session_id"],
+            "response_agent_gap_authority",
+        )
+        self.assertEqual(normalized["title"], "Controller report")
+        self.assertEqual(
+            normalized["conclusion"]["classification"],
+            "insufficient_evidence",
+        )
+        self.assertEqual(normalized["impact"], "Unknown")
+        self.assertEqual(normalized["response_plan"], [])
+        self.assertEqual(
+            normalized["forensic_workstreams"],
+            base["forensic_workstreams"],
+        )
+
+    def test_prior_llm_uncertainties_are_not_controller_evidence_gaps(self):
+        case_id = self._case("response-agent-prior-uncertainty")
+        source = self.state.repo.get_case_response_source(case_id)
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        artifact = json.loads(json.dumps(artifact))
+        artifact["content"]["case_summary"]["uncertainties"] = [
+            "The explicitly empty request body was not captured."
+        ]
+        report = self.state.response_agent._base_report(
+            {
+                "case_id": case_id,
+                "goal": "Separate prior uncertainty authority",
+                "source_snapshot_hash": artifact["source_snapshot_hash"],
+                "artifact_id": artifact["artifact_id"],
+                "model_metadata": {"report_language": "en"},
+                "tool_calls": [],
+            },
+            source,
+            artifact,
+        )
+
+        self.assertEqual(report["evidence_gaps"], [])
+        self.assertEqual(report["conclusion"]["limitations"], [])
+        self.assertEqual(
+            report["prior_analysis_context"]["authority"],
+            "non_authoritative_prior_llm",
+        )
+        self.assertEqual(
+            report["prior_analysis_context"]["uncertainty_count"],
+            1,
+        )
+
+    def test_llm_sees_every_complete_raw_chunk_and_controller_retains_notes(self):
         alert = _waf_alert("response-agent-llm-raw-loop")
         alert.payload["original_log"] = "BEGIN-" + ('evidence-"\\-' * 900) + "END"
         llm = _ChunkAwareAgentLLM(alert.alert_id)
@@ -1532,7 +2028,7 @@ class ResponseAgentTest(unittest.TestCase):
         self.assertTrue(reconstructed.startswith("BEGIN-"))
         self.assertTrue(reconstructed.endswith("END"))
         self.assertGreater(len(llm.seen_chunks), 2)
-        notes = llm.report_context.get("investigation_notes") or []
+        notes = self.state.response_agent._investigation_notes(session)
         self.assertTrue(any("final raw chunk END" in item["note"] for item in notes))
         raw_calls = [
             call
@@ -1576,9 +2072,16 @@ class ResponseAgentTest(unittest.TestCase):
             severity="medium",
             timestamp=timestamp,
             payload={
-                "original_log": {
-                    "client_ip": shared_ip,
-                    "destination": "application-server",
+                "_syslog_envelope": {
+                    "raw_message": json.dumps(
+                        {
+                            "source": {"ip": shared_ip},
+                            "destination": {"domain": "application-server"},
+                        },
+                        separators=(",", ":"),
+                    ),
+                    "protocol": "tcp",
+                    "destination_port": 15141,
                 }
             },
             alert_id="response-agent-related-edr-raw-only",
@@ -1644,6 +2147,78 @@ class ResponseAgentTest(unittest.TestCase):
             )
         )
 
+    def test_required_raw_reads_preserve_cross_product_coverage(self):
+        case_id = self._case("response-agent-product-diversity-anchor")
+        source = self.state.repo.get_case_response_source(case_id)
+        timestamp = source["events"][0]["timestamp"]
+        shared_ip = "43.154.138.159"
+        for index in range(24):
+            self.state.repo.insert_raw_alert(
+                RawAlert(
+                    source=f"rasp-sensor-{index}",
+                    product="rasp",
+                    event_type="runtime_detection",
+                    severity="high",
+                    timestamp=timestamp,
+                    payload={
+                        "src_ip": shared_ip,
+                        "original_log": {
+                            "file_path": f"/tmp/suspect-{index}.jsp"
+                        },
+                    },
+                    alert_id=f"response-agent-diversity-rasp-{index:02d}",
+                )
+            )
+        hips = RawAlert(
+            source="hips-sensor",
+            product="hips",
+            event_type="file_integrity",
+            severity="low",
+            timestamp=timestamp,
+            payload={
+                "src_ip": shared_ip,
+                "original_log": {"file_path": "/var/www/html/suspect.jsp"},
+            },
+            alert_id="response-agent-diversity-hips",
+        )
+        self.state.repo.insert_raw_alert(hips)
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+
+        coverage, _ = self.state.response_agent._execute_tool(
+            "query_forensic_coverage",
+            {},
+            source,
+            artifact,
+        )
+
+        required = coverage["required_reads"]
+        self.assertEqual(len(required), 8)
+        self.assertIn(hips.alert_id, {item["alert_id"] for item in required})
+        self.assertTrue(
+            {"waf", "rasp", "hips"}.issubset(
+                {item["product"] for item in required}
+            )
+        )
+        file_workstream = next(
+            item
+            for item in coverage["workstreams"]
+            if item["domain"] == "file_integrity"
+        )
+        self.assertIn(
+            hips.alert_id,
+            {
+                item["alert_id"]
+                for item in file_workstream["evidence_sources"]
+            },
+        )
+        self.assertTrue(
+            {"rasp", "hips"}.issubset(
+                set(file_workstream["analysis_metrics"]["products"])
+            )
+        )
+
     def test_related_search_stops_at_bounded_raw_byte_budget(self):
         case_id = self._case("response-agent-scan-budget")
         source = self.state.repo.get_case_response_source(case_id)
@@ -1673,9 +2248,147 @@ class ResponseAgentTest(unittest.TestCase):
         )
 
         self.assertTrue(related["scan_truncated"])
+        self.assertEqual(related["scan_truncation_reasons"], ["byte_limit"])
         self.assertEqual(related["scanned"], 1)
         self.assertLessEqual(related["scanned_bytes"], 1_000_000)
         self.assertEqual(len(related["items"]), 1)
+
+    def test_related_search_rejects_oversized_first_payload_before_loading_it(self):
+        case_id = self._case("response-agent-first-oversized")
+        source = self.state.repo.get_case_response_source(case_id)
+        timestamp = source["events"][0]["timestamp"]
+        candidates = [
+            RawAlert(
+                source="oversized-first-edr",
+                product="edr",
+                event_type="large_raw_event",
+                severity="medium",
+                timestamp=timestamp,
+                payload={
+                    "src_ip": "43.154.138.159",
+                    "original_log": "x" * 1_100_000,
+                },
+                alert_id="response-agent-first-oversized-000",
+            ),
+            RawAlert(
+                source="small-second-edr",
+                product="edr",
+                event_type="network_connection",
+                severity="medium",
+                timestamp=timestamp,
+                payload={"src_ip": "43.154.138.159"},
+                alert_id="response-agent-first-oversized-001",
+            ),
+        ]
+        for alert in candidates:
+            self.state.repo.insert_raw_alert(alert)
+
+        with patch.object(
+            self.state.repo,
+            "_response_agent_candidate_json_locked",
+            wraps=self.state.repo._response_agent_candidate_json_locked,
+        ) as load_candidate_json:
+            related = self.state.repo.query_response_agent_related_alerts(
+                case_id,
+                products=["edr"],
+                window_ms=60 * 60 * 1_000,
+                scan_limit=100,
+                scan_max_bytes=1_000_000,
+                limit=20,
+            )
+
+        load_candidate_json.assert_not_called()
+        self.assertTrue(related["scan_truncated"])
+        self.assertEqual(related["scan_truncation_reasons"], ["byte_limit"])
+        self.assertEqual(related["scanned"], 0)
+        self.assertEqual(related["scanned_bytes"], 0)
+        self.assertLessEqual(related["scanned_bytes"], 1_000_000)
+        self.assertEqual(related["items"], [])
+        self.assertEqual(related["total"], 0)
+        self.assertIsNone(related["next_offset"])
+
+        for index in range(2, 101):
+            self.state.repo.insert_raw_alert(
+                RawAlert(
+                    source=f"later-edr-{index}",
+                    product="edr",
+                    event_type="network_connection",
+                    severity="medium",
+                    timestamp=timestamp,
+                    payload={
+                        "src_ip": "43.154.138.159",
+                        "sequence": index,
+                    },
+                    alert_id=f"response-agent-first-oversized-{index:03d}",
+                )
+            )
+
+        with patch.object(
+            self.state.repo,
+            "_response_agent_candidate_json_locked",
+            wraps=self.state.repo._response_agent_candidate_json_locked,
+        ) as load_candidate_json:
+            related = self.state.repo.query_response_agent_related_alerts(
+                case_id,
+                products=["edr"],
+                window_ms=60 * 60 * 1_000,
+                scan_limit=100,
+                scan_max_bytes=1_000_000,
+                limit=20,
+            )
+
+        load_candidate_json.assert_not_called()
+        self.assertTrue(related["scan_truncated"])
+        self.assertEqual(
+            related["scan_truncation_reasons"],
+            ["row_limit", "byte_limit"],
+        )
+        self.assertEqual(related["scanned"], 0)
+        self.assertEqual(related["scanned_bytes"], 0)
+        self.assertLessEqual(related["scanned_bytes"], 1_000_000)
+
+    def test_related_search_reports_sql_row_limit_truncation(self):
+        case_id = self._case("response-agent-scan-row-limit")
+        source = self.state.repo.get_case_response_source(case_id)
+        timestamp = source["events"][0]["timestamp"]
+        for index in range(101):
+            self.state.repo.insert_raw_alert(
+                RawAlert(
+                    source=f"row-limit-edr-{index}",
+                    product="edr",
+                    event_type="network_connection",
+                    severity="medium",
+                    timestamp=timestamp,
+                    payload={
+                        "src_ip": "43.154.138.159",
+                        "sequence": index,
+                    },
+                    alert_id=f"response-agent-row-limit-{index:03d}",
+                )
+            )
+
+        related = self.state.repo.query_response_agent_related_alerts(
+            case_id,
+            products=["edr"],
+            window_ms=60 * 60 * 1_000,
+            scan_limit=100,
+            scan_max_bytes=2_000_000,
+            limit=25,
+            offset=75,
+        )
+
+        self.assertTrue(related["scan_truncated"])
+        self.assertEqual(related["scan_truncation_reasons"], ["row_limit"])
+        self.assertEqual(related["scanned"], 100)
+        self.assertLess(related["scanned_bytes"], 2_000_000)
+        self.assertEqual(related["total"], 100)
+        self.assertEqual(len(related["items"]), 25)
+        self.assertIsNone(related["next_offset"])
+        summary = self.state.response_agent._observation_summary(
+            "search_related_alerts", related, "en"
+        )
+        self.assertIn("candidate row limit", summary)
+        self.assertNotIn("byte limit", summary)
 
     def test_cancel_during_planning_cannot_resurrect_session(self):
         llm = _BlockingAgentLLM("planner")
@@ -1702,7 +2415,7 @@ class ResponseAgentTest(unittest.TestCase):
         self.assertIsNone(final["report"])
         self.assertFalse(llm.report_called.is_set())
 
-    def test_cancel_during_report_generation_cannot_commit_report(self):
+    def test_controller_report_compilation_does_not_call_model_again(self):
         llm = _BlockingAgentLLM("report")
         self.state.response_agent.set_llm(llm)
         case_id = self._case("response-agent-cancel-report")
@@ -1710,26 +2423,27 @@ class ResponseAgentTest(unittest.TestCase):
             case_id, actor="analyst"
         )["artifact"]
         started = self.state.response_agent.create(
-            case_id, artifact=artifact, goal="cancel report", actor="analyst"
+            case_id,
+            artifact=artifact,
+            goal="compile controller report without a second model call",
+            actor="analyst",
         )
-        self.assertTrue(llm.entered.wait(timeout=2))
-
-        cancelled = self.state.response_agent.cancel(
-            started["session_id"], actor="analyst"
+        final = self._wait(
+            self.state.response_agent,
+            started["session_id"],
+            {"completed", "review", "blocked", "failed", "paused"},
         )
-        self.assertEqual(cancelled["status"], "cancelled")
-        llm.release.set()
-        self.assertTrue(llm.returned.wait(timeout=2))
-        time.sleep(0.1)
 
-        final = self.state.response_agent.get(started["session_id"])
-        self.assertEqual(final["status"], "cancelled")
-        self.assertIsNone(final["report"])
-        report_count = self.state.repo.conn.execute(
-            "SELECT COUNT(*) FROM response_agent_reports WHERE session_id = ?",
-            (started["session_id"],),
-        ).fetchone()[0]
-        self.assertEqual(report_count, 0)
+        self.assertEqual(final["status"], "completed")
+        self.assertIsNotNone(final["report"])
+        self.assertFalse(llm.report_called.is_set())
+        self.assertFalse(
+            final["report"]["model_metadata"]["model_synthesis_applied"]
+        )
+        self.assertEqual(
+            final["report"]["model_metadata"]["report_compiler"],
+            "deterministic_controller",
+        )
 
     def test_schema_and_static_workbench_contract(self):
         self.assertEqual(SCHEMA_VERSION, 18)

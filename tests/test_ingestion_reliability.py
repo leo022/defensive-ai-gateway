@@ -971,6 +971,89 @@ class SyslogDemoScriptTest(unittest.TestCase):
 
 
 class SyslogEnvelopeTest(unittest.TestCase):
+    def test_invalid_utf8_uses_persisted_text_hash_for_integrity(self):
+        raw = b'{"trace_id":"invalid-\xff-utf8","severity":"high"}'
+        routed = SyslogPortRouter({"waf": 15140}).route(
+            15140,
+            raw,
+            protocol="tcp",
+        )
+        envelope = routed.envelope
+        persisted = raw.decode("utf-8", errors="replace")
+        persisted_hash = hashlib.sha256(persisted.encode("utf-8")).hexdigest()
+
+        self.assertEqual(envelope["raw_message"], persisted)
+        self.assertEqual(envelope["raw_message_bytes"], len(raw))
+        self.assertEqual(
+            envelope["raw_message_sha256"],
+            hashlib.sha256(raw).hexdigest(),
+        )
+        self.assertEqual(envelope["raw_message_text_sha256"], persisted_hash)
+        self.assertNotEqual(
+            envelope["raw_message_sha256"],
+            envelope["raw_message_text_sha256"],
+        )
+
+        descriptor = Repository._response_agent_syslog_descriptor(
+            {"syslog_route": envelope}
+        )
+        self.assertEqual(descriptor["syslog_message_sha256"], persisted_hash)
+        self.assertEqual(descriptor["syslog_recorded_sha256"], persisted_hash)
+        self.assertEqual(descriptor["syslog_message_integrity"], "verified")
+
+        tampered = dict(envelope)
+        tampered["raw_message"] = persisted.replace("invalid", "changed")
+        descriptor = Repository._response_agent_syslog_descriptor(
+            {"syslog_route": tampered}
+        )
+        self.assertEqual(descriptor["syslog_message_integrity"], "mismatch")
+
+    def test_legacy_syslog_hash_remains_compatible_for_valid_utf8(self):
+        raw_message = '{"trace_id":"legacy-valid-utf8"}'
+        descriptor = Repository._response_agent_syslog_descriptor(
+            {
+                "syslog_route": {
+                    "raw_message": raw_message,
+                    "raw_message_sha256": hashlib.sha256(
+                        raw_message.encode("utf-8")
+                    ).hexdigest(),
+                }
+            }
+        )
+
+        self.assertEqual(descriptor["syslog_message_integrity"], "verified")
+
+    def test_legacy_lossy_utf8_is_unverified_instead_of_mismatched(self):
+        raw = b'{"trace_id":"legacy-\xff-lossy"}'
+        persisted = raw.decode("utf-8", errors="replace")
+        descriptor = Repository._response_agent_syslog_descriptor(
+            {
+                "syslog_route": {
+                    "raw_message": persisted,
+                    "raw_message_bytes": len(raw),
+                    "raw_message_sha256": hashlib.sha256(raw).hexdigest(),
+                }
+            }
+        )
+
+        self.assertEqual(descriptor["syslog_message_integrity"], "unverified")
+        self.assertEqual(
+            descriptor["syslog_message_integrity_reason"],
+            "legacy_lossy_utf8",
+        )
+
+        tampered_text = '{"trace_id":"\ufffd-tampered"}'
+        descriptor = Repository._response_agent_syslog_descriptor(
+            {
+                "syslog_route": {
+                    "raw_message": tampered_text,
+                    "raw_message_bytes": len(tampered_text.encode("utf-8")),
+                    "raw_message_sha256": "0" * 64,
+                }
+            }
+        )
+        self.assertEqual(descriptor["syslog_message_integrity"], "mismatch")
+
     def test_router_rejects_excessive_json_structure(self):
         router = SyslogPortRouter({"waf": 15140})
         nested = "{}"

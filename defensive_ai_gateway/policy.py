@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+from collections.abc import Mapping
 from typing import Any
 
 from .config import PolicyConfig
@@ -30,6 +31,7 @@ _BUILTIN_SENSITIVE_FIELDS = {
     "bank_card",
     "card_number",
     "credential",
+    "credentials",
     "customer_id",
     "email",
     "id_card",
@@ -52,8 +54,52 @@ _BUILTIN_SENSITIVE_FIELDS = {
     "cookie",
     "set_cookie",
     "session",
+    "session_id",
 }
 
+_SENSITIVE_FIELD_MARKERS = frozenset(
+    {
+        "account",
+        "authorization",
+        "card",
+        "cookie",
+        "credential",
+        "credentials",
+        "customer",
+        "email",
+        "identity",
+        "mobile",
+        "passwd",
+        "password",
+        "phone",
+        "secret",
+        "session",
+        "ssn",
+        "token",
+    }
+)
+_SENSITIVE_FIELD_QUALIFIERS = frozenset(
+    {
+        "card",
+        "credential",
+        "credentials",
+        "email",
+        "hash",
+        "header",
+        "id",
+        "identifier",
+        "key",
+        "mobile",
+        "number",
+        "phone",
+        "secret",
+        "sha256",
+        "token",
+        "value",
+    }
+)
+
+_SHA256_HEX = re.compile(r"[0-9a-fA-F]{64}")
 _OMIT = object()
 
 
@@ -115,6 +161,77 @@ _DEFAULT_EVIDENCE_CONTEXT_ITEM_CAP = 320
 def _canonical_field_name(value: Any) -> str:
     text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(value).strip())
     return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+
+
+def _is_sensitive_derived_field(
+    field: str,
+    configured_fields: set[str] | None = None,
+) -> bool:
+    if not (
+        field.endswith("_hash")
+        or field.endswith("_sha256")
+        or field in {"hash", "sha256"}
+    ):
+        return False
+    sensitive_fields = set(_BUILTIN_SENSITIVE_FIELDS)
+    sensitive_fields.update(configured_fields or set())
+    return any(
+        field == sensitive
+        or field.startswith(f"{sensitive}_")
+        or field.endswith(f"_{sensitive}")
+        or f"_{sensitive}_" in field
+        for sensitive in sensitive_fields
+    )
+
+
+def is_sensitive_field_name(
+    value: Any,
+    configured_fields: set[str] | None = None,
+) -> bool:
+    """Classify secret/identifier fields without treating metric prefixes as IDs."""
+    field = _canonical_field_name(value)
+    configured = {
+        _canonical_field_name(item) for item in configured_fields or set()
+    }
+    if (
+        field in configured
+        or field in _BUILTIN_SENSITIVE_FIELDS
+        or _is_sensitive_derived_field(field, configured)
+    ):
+        return True
+    parts = field.split("_") if field else []
+    if (
+        len(parts) > 1
+        and parts[-1] in _SENSITIVE_FIELD_QUALIFIERS
+        and any(marker in parts[:-1] for marker in _SENSITIVE_FIELD_MARKERS)
+    ):
+        return True
+    for marker in _SENSITIVE_FIELD_MARKERS:
+        if field.endswith(f"_{marker}"):
+            return True
+        prefix = f"{marker}_"
+        if not field.startswith(prefix):
+            continue
+        remainder = field[len(prefix) :]
+        if remainder.split("_")[-1] in _SENSITIVE_FIELD_QUALIFIERS:
+            return True
+    return False
+
+
+def _is_digest_field(field: str) -> bool:
+    return field in {"hash", "sha256"} or field.endswith(("_hash", "_sha256"))
+
+
+def _redact_sensitive_text(value: str) -> str:
+    text = value
+    for pattern in SECRET_PATTERNS:
+        text = pattern.sub(
+            lambda match: (
+                f"{match.group(1) if match.groups() else ''}[REDACTED]"
+            ),
+            text,
+        )
+    return text
 
 
 def _json_size(value: Any) -> int:
@@ -255,28 +372,97 @@ class PolicyEngine:
     def __init__(self, config: PolicyConfig):
         self.config = config
 
-    def redact(self, value: Any) -> Any:
-        cloned = copy.deepcopy(value)
-        return self._redact_any(cloned)
+    def redact(
+        self,
+        value: Any,
+        *,
+        trusted_digest_paths: Mapping[tuple[str | int, ...], str] | None = None,
+    ) -> Any:
+        """Redact a value, preserving only caller-attested digest path/value pairs.
 
-    def _redact_any(self, value: Any) -> Any:
+        A trusted digest must be an exact SHA-256 value at an explicit hash field
+        path. Callers are responsible for supplying only controller-owned,
+        immutable digests. Entries below sensitive keys are ignored.
+        """
+        cloned = copy.deepcopy(value)
+        trusted = self._validated_trusted_digest_paths(trusted_digest_paths)
+        return self._redact_any(cloned, (), trusted)
+
+    def _validated_trusted_digest_paths(
+        self,
+        trusted_digest_paths: Mapping[tuple[str | int, ...], str] | None,
+    ) -> dict[tuple[str | int, ...], str]:
+        if not trusted_digest_paths:
+            return {}
+        configured = {
+            _canonical_field_name(field) for field in self.config.redact_fields
+        }
+        trusted: dict[tuple[str | int, ...], str] = {}
+        for raw_path, digest in trusted_digest_paths.items():
+            path = tuple(raw_path)
+            if (
+                not path
+                or not isinstance(digest, str)
+                or _SHA256_HEX.fullmatch(digest) is None
+                or not isinstance(path[-1], str)
+            ):
+                continue
+            leaf = _canonical_field_name(path[-1])
+            if not _is_digest_field(leaf):
+                continue
+            sensitive_path = False
+            for segment in path:
+                if not isinstance(segment, str):
+                    continue
+                field = _canonical_field_name(segment)
+                if is_sensitive_field_name(field, configured) or any(
+                    pattern.search(segment) for pattern in SECRET_PATTERNS
+                ):
+                    sensitive_path = True
+                    break
+            if not sensitive_path:
+                trusted[path] = digest
+        return trusted
+
+    def _redact_any(
+        self,
+        value: Any,
+        path: tuple[str | int, ...],
+        trusted_digest_paths: Mapping[tuple[str | int, ...], str],
+    ) -> Any:
         if isinstance(value, dict):
             redacted: dict[str, Any] = {}
             configured = {_canonical_field_name(field) for field in self.config.redact_fields}
             for key, item in value.items():
                 field = _canonical_field_name(key)
-                if field in configured or field in _BUILTIN_SENSITIVE_FIELDS:
-                    redacted[key] = "[REDACTED]"
+                item_path = (*path, key)
+                redacted_key = (
+                    _redact_sensitive_text(key) if isinstance(key, str) else key
+                )
+                if redacted_key in redacted and redacted_key != key:
+                    base_key = str(redacted_key)
+                    suffix = 2
+                    while f"{base_key}_{suffix}" in redacted:
+                        suffix += 1
+                    redacted_key = f"{base_key}_{suffix}"
+                if is_sensitive_field_name(field, configured):
+                    redacted[redacted_key] = "[REDACTED]"
                 else:
-                    redacted[key] = self._redact_any(item)
+                    redacted[redacted_key] = self._redact_any(
+                        item,
+                        item_path,
+                        trusted_digest_paths,
+                    )
             return redacted
         if isinstance(value, list):
-            return [self._redact_any(item) for item in value]
+            return [
+                self._redact_any(item, (*path, index), trusted_digest_paths)
+                for index, item in enumerate(value)
+            ]
         if isinstance(value, str):
-            text = value
-            for pattern in SECRET_PATTERNS:
-                text = pattern.sub(lambda m: f"{m.group(1) if m.groups() else ''}[REDACTED]", text)
-            return text
+            if trusted_digest_paths.get(path) == value:
+                return value
+            return _redact_sensitive_text(value)
         return value
 
     def action_mode(self, action: str) -> str:
@@ -339,10 +525,19 @@ class PolicyEngine:
             return "{}"
         return json.dumps(fitted, ensure_ascii=False, sort_keys=True)
 
-    def sanitize_json_value(self, value: Any, max_bytes: int) -> Any:
+    def sanitize_json_value(
+        self,
+        value: Any,
+        max_bytes: int,
+        *,
+        trusted_digest_paths: Mapping[tuple[str | int, ...], str] | None = None,
+    ) -> Any:
         """Redact and structurally fit a tool/report value to an exact byte cap."""
         budget = max(2, int(max_bytes))
-        redacted = self.redact(value)
+        redacted = self.redact(
+            value,
+            trusted_digest_paths=trusted_digest_paths,
+        )
         fitted = _fit_json_value(redacted, budget, top_level=isinstance(redacted, dict))
         if fitted is _OMIT:
             return {} if isinstance(redacted, dict) else []

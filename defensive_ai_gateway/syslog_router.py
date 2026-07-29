@@ -167,6 +167,7 @@ class SyslogPortRouter:
         protocol: str,
         route_reason: str,
     ) -> dict[str, Any]:
+        raw_message_text_bytes = raw_message.encode("utf-8")
         return {
             "collector": "syslog-port-router",
             "destination_port": int(port),
@@ -178,7 +179,13 @@ class SyslogPortRouter:
             "message_format": message_format,
             "raw_message": raw_message,
             "raw_message_bytes": len(raw_message_bytes),
+            # Keep the wire digest stable for transport forensics, while also
+            # authenticating the UTF-8 text that can be persisted in JSON/SQLite.
+            # These differ when invalid UTF-8 bytes were decoded with replacement.
             "raw_message_sha256": hashlib.sha256(raw_message_bytes).hexdigest(),
+            "raw_message_text_sha256": hashlib.sha256(
+                raw_message_text_bytes
+            ).hexdigest(),
             "received_at_ms": int(time.time() * 1000),
             "received_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "warnings": list(warnings),

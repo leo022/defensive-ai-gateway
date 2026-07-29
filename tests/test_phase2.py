@@ -160,6 +160,148 @@ class ValidatorTest(unittest.TestCase):
         self.assertEqual(validation.status, "blocked")
         self.assertIn("untraceable_high_risk_evidence", [item.code for item in validation.findings])
 
+    def test_controller_evidence_sha256_is_exempt_only_at_its_exact_path(self):
+        digest = "a" * 20 + "13800138000" + "b" * 33
+        self.assertEqual(len(digest), 64)
+        event = _event()
+        event.evidence[0]["type"] = "rasp_evidence_integrity"
+        event.evidence[0]["value"] = {"raw_log_sha256": digest}
+        result = _result()
+        result.evidence = event.evidence
+
+        validation = self.validator.validate(
+            result.case_id,
+            event,
+            result,
+            self.registry.for_product("waf"),
+        )
+
+        self.assertEqual(validation.status, "passed")
+        self.assertTrue(validation.checks["sensitive_output"])
+
+    def test_generic_hash_fields_and_sensitive_digest_parent_are_not_exempt(self):
+        digest = "a" * 20 + "13800138000" + "b" * 33
+        for label, evidence_value in (
+            ("artifact_hash", {"artifact_hash": digest}),
+            ("hash", {"hash": digest}),
+            ("untrusted_evidence_sha", {"evidence_sha256": digest}),
+            ("sensitive_derived_hash", {"customer_email_hash": "f" * 64}),
+            (
+                "sensitive_parent",
+                {"token": {"evidence_sha256": digest}},
+            ),
+        ):
+            with self.subTest(label=label):
+                event = _event()
+                event.evidence[0]["value"] = evidence_value
+                result = _result()
+                result.evidence = event.evidence
+
+                validation = self.validator.validate(
+                    result.case_id,
+                    event,
+                    result,
+                    self.registry.for_product("waf"),
+                )
+
+                self.assertEqual(validation.status, "blocked")
+                self.assertFalse(validation.checks["sensitive_output"])
+
+    def test_controller_selected_evidence_digest_is_path_bound(self):
+        digest = "a" * 20 + "13800138000" + "b" * 33
+        event = _event()
+        event.evidence[0]["type"] = "hook_data"
+        event.evidence[0]["value"] = {
+            "selected_evidence": {
+                "entries": [{"evidence_sha256": digest}]
+            }
+        }
+        result = _result()
+        result.evidence = event.evidence
+
+        validation = self.validator.validate(
+            result.case_id,
+            event,
+            result,
+            self.registry.for_product("rasp"),
+        )
+
+        self.assertEqual(validation.status, "passed")
+        self.assertTrue(validation.checks["sensitive_output"])
+
+    def test_sensitive_output_scans_dict_keys(self):
+        for key in ("owner@example.com", "leaked_credential"):
+            with self.subTest(key=key):
+                event = _event()
+                result = _result()
+                result.dashboard_cards = [{key: "visible"}]
+                validation = self.validator.validate(
+                    result.case_id,
+                    event,
+                    result,
+                    self.registry.for_product("waf"),
+                )
+
+                self.assertEqual(validation.status, "blocked")
+                self.assertFalse(validation.checks["sensitive_output"])
+
+    def test_metric_key_with_session_prefix_is_not_sensitive_identifier(self):
+        event = _event()
+        event.evidence[0]["value"] = {"session_count": 2}
+        result = _result()
+        result.evidence = event.evidence
+
+        validation = self.validator.validate(
+            result.case_id,
+            event,
+            result,
+            self.registry.for_product("waf"),
+        )
+
+        self.assertEqual(validation.status, "passed")
+        self.assertTrue(validation.checks["sensitive_output"])
+
+    def test_session_identifier_key_remains_sensitive(self):
+        event = _event()
+        event.evidence[0]["value"] = {"session_id": "opaque-session"}
+        result = _result()
+        result.evidence = event.evidence
+
+        validation = self.validator.validate(
+            result.case_id,
+            event,
+            result,
+            self.registry.for_product("waf"),
+        )
+
+        self.assertEqual(validation.status, "blocked")
+        self.assertFalse(validation.checks["sensitive_output"])
+
+    def test_unredacted_phone_and_pid_values_trigger_sensitive_output_block(self):
+        for text in (
+            "customer phone 13800138000",
+            "customer id 123456789012345",
+        ):
+            with self.subTest(text=text):
+                event = _event()
+                event.evidence[0]["value"] = text
+                result = _result()
+                result.evidence = event.evidence
+
+                validation = self.validator.validate(
+                    result.case_id,
+                    event,
+                    result,
+                    self.registry.for_product("waf"),
+                )
+
+                self.assertEqual(validation.status, "blocked")
+                self.assertFalse(validation.checks["sensitive_output"])
+                self.assertIn(
+                    "sensitive_output_detected",
+                    {finding.code for finding in validation.findings},
+                )
+
 
 class ControlledApprovalFlowTest(unittest.TestCase):
     def test_analysis_persists_validation_and_non_executable_approval(self):

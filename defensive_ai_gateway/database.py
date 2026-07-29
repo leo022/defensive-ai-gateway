@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -9,7 +10,15 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from .models import AgentResult, NormalizedEvent, RawAlert, ValidationResult, now_ms
+from .json_safety import loads_bounded_json
+from .models import (
+    SERVER_OWNED_ALERT_PAYLOAD_FIELDS,
+    AgentResult,
+    NormalizedEvent,
+    RawAlert,
+    ValidationResult,
+    now_ms,
+)
 from .validation import can_continue_after_manual_review
 
 
@@ -17,6 +26,7 @@ _RESPONSE_AGENT_CORRELATION_ALIASES = {
     "agent_host": "host",
     "app": "app",
     "application": "app",
+    "application_name": "app",
     "asset": "host",
     "asset_name": "host",
     "account": "user",
@@ -33,9 +43,11 @@ _RESPONSE_AGENT_CORRELATION_ALIASES = {
     "dst_ip": "dst_ip",
     "fqdn": "host",
     "host": "host",
+    "host_name": "host",
     "hostname": "host",
     "image": "process",
     "process": "process",
+    "process_executable": "process",
     "process_name": "process",
     "request_id": "request_id",
     "request_uri": "url",
@@ -43,9 +55,11 @@ _RESPONSE_AGENT_CORRELATION_ALIASES = {
     "route": "url",
     "rule": "rule",
     "rule_id": "rule",
+    "rule_name": "rule",
     "server": "host",
     "server_ip": "dst_ip",
     "service": "app",
+    "service_name": "app",
     "signature": "rule",
     "source_ip": "src_ip",
     "source_host": "host",
@@ -54,6 +68,7 @@ _RESPONSE_AGENT_CORRELATION_ALIASES = {
     "trace_id": "trace_id",
     "uri": "url",
     "url": "url",
+    "url_original": "url",
     "user": "user",
     "user_name": "user",
     "username": "user",
@@ -83,6 +98,25 @@ _RESPONSE_AGENT_CORRELATION_WEIGHTS = {
     "url": 2,
 }
 _RESPONSE_AGENT_MIN_CORRELATION_SCORE = 5
+_RESPONSE_AGENT_HTTP_METHODS = frozenset(
+    {
+        "CONNECT",
+        "DELETE",
+        "GET",
+        "HEAD",
+        "OPTIONS",
+        "PATCH",
+        "POST",
+        "PROPFIND",
+        "PUT",
+        "TRACE",
+    }
+)
+_RESPONSE_AGENT_SYSLOG_ENVELOPE_PATHS = (
+    ("/_syslog_envelope", ("_syslog_envelope",)),
+    ("/syslog_route", ("syslog_route",)),
+    ("/syslog_envelope", ("syslog_envelope",)),
+)
 
 
 SCHEMA = """
@@ -3628,9 +3662,14 @@ class Repository:
 
     @staticmethod
     def _response_agent_canonical_field(value: Any) -> str:
+        source = re.sub(
+            r"([a-z0-9])([A-Z])",
+            r"\1_\2",
+            str(value or "").strip(),
+        )
         rendered = "".join(
             character.lower() if character.isalnum() else "_"
-            for character in str(value or "")
+            for character in source
         )
         while "__" in rendered:
             rendered = rendered.replace("__", "_")
@@ -3642,22 +3681,46 @@ class Repository:
         value: Any,
         *,
         max_nodes: int = 10_000,
+        _decode_syslog_envelopes: bool = True,
     ) -> dict[str, set[str]]:
         """Extract only allowlisted correlation values from normalized or raw JSON."""
         result = {field: set() for field in _RESPONSE_AGENT_CORRELATION_FIELDS}
-        stack: list[tuple[Any, str]] = [(value, "")]
+        stack: list[tuple[Any, str, tuple[str, ...]]] = [(value, "", ())]
         visited = 0
         while stack and visited < max(1, int(max_nodes)):
-            item, inherited_field = stack.pop()
+            item, inherited_field, path = stack.pop()
             visited += 1
             if isinstance(item, dict):
                 for key, nested in reversed(list(item.items())):
                     canonical = cls._response_agent_canonical_field(key)
-                    mapped = _RESPONSE_AGENT_CORRELATION_ALIASES.get(canonical)
-                    stack.append((nested, mapped or inherited_field))
+                    nested_path = (*path, canonical)[-4:]
+                    candidates = [
+                        canonical,
+                        "_".join(nested_path[-2:]),
+                        "_".join(nested_path[-3:]),
+                    ]
+                    mapped = next(
+                        (
+                            _RESPONSE_AGENT_CORRELATION_ALIASES[candidate]
+                            for candidate in candidates
+                            if candidate in _RESPONSE_AGENT_CORRELATION_ALIASES
+                        ),
+                        "",
+                    )
+                    # A field merely named raw_message is untrusted application
+                    # data. Only the exact server-owned envelope paths below may
+                    # introduce decoded Syslog values into a correlation pivot.
+                    if canonical == "raw_message":
+                        continue
+                    stack.append(
+                        (nested, mapped or inherited_field, nested_path)
+                    )
                 continue
             if isinstance(item, list):
-                stack.extend((nested, inherited_field) for nested in reversed(item[:2_000]))
+                stack.extend(
+                    (nested, inherited_field, path)
+                    for nested in reversed(item[:2_000])
+                )
                 continue
             if not inherited_field or item in (None, ""):
                 continue
@@ -3669,6 +3732,23 @@ class Repository:
                 and len(result[inherited_field]) < 128
             ):
                 result[inherited_field].add(rendered)
+        if _decode_syslog_envelopes and isinstance(value, dict):
+            records = cls._response_agent_syslog_records(value)
+            decoded_budget = max(1, int(max_nodes) // max(1, len(records)))
+            for descriptor, decoded in records:
+                if (
+                    descriptor["syslog_message_integrity"] == "mismatch"
+                    or not isinstance(decoded, dict)
+                ):
+                    continue
+                cls._merge_response_agent_values(
+                    result,
+                    cls._response_agent_collect_values(
+                        decoded,
+                        max_nodes=decoded_budget,
+                        _decode_syslog_envelopes=False,
+                    ),
+                )
         return result
 
     @staticmethod
@@ -3962,9 +4042,20 @@ class Repository:
                         ("original_log", "event", "request_message", "method"),
                     ),
                     (
+                        "/original_log/http/request/method",
+                        ("original_log", "http", "request", "method"),
+                    ),
+                    (
+                        "/original_log/http/method",
+                        ("original_log", "http", "method"),
+                    ),
+                    (
                         "/event/request_message/method",
                         ("event", "request_message", "method"),
                     ),
+                    ("/http/request/method", ("http", "request", "method")),
+                    ("/http/method", ("http", "method")),
+                    ("/request/method", ("request", "method")),
                     ("/request_message/method", ("request_message", "method")),
                     ("/method", ("method",)),
                     ("/http_method", ("http_method",)),
@@ -3980,9 +4071,31 @@ class Repository:
                     ("original_log", "event", "request_message", "url"),
                 ),
                 (
+                    "/original_log/http/request/url",
+                    ("original_log", "http", "request", "url"),
+                ),
+                (
+                    "/original_log/http/request/uri",
+                    ("original_log", "http", "request", "uri"),
+                ),
+                (
+                    "/original_log/http/uri",
+                    ("original_log", "http", "uri"),
+                ),
+                (
+                    "/original_log/url/original",
+                    ("original_log", "url", "original"),
+                ),
+                (
                     "/event/request_message/url",
                     ("event", "request_message", "url"),
                 ),
+                ("/http/request/url", ("http", "request", "url")),
+                ("/http/request/uri", ("http", "request", "uri")),
+                ("/http/uri", ("http", "uri")),
+                ("/request/url", ("request", "url")),
+                ("/request/uri", ("request", "uri")),
+                ("/url/original", ("url", "original")),
                 ("/request_message/url", ("request_message", "url")),
                 ("/url", ("url",)),
                 ("/uri", ("uri",)),
@@ -4008,6 +4121,10 @@ class Repository:
                         ("original_log", "event", "request_message", "headers"),
                     ),
                     (
+                        "/original_log/http/request/headers",
+                        ("original_log", "http", "request", "headers"),
+                    ),
+                    (
                         "/event/request_message/header",
                         ("event", "request_message", "header"),
                     ),
@@ -4015,6 +4132,8 @@ class Repository:
                         "/event/request_message/headers",
                         ("event", "request_message", "headers"),
                     ),
+                    ("/http/request/headers", ("http", "request", "headers")),
+                    ("/request/headers", ("request", "headers")),
                     ("/request_headers", ("request_headers",)),
                     ("/headers", ("headers",)),
                 ),
@@ -4047,6 +4166,17 @@ class Repository:
                 content_length_invalid = True
         elif content_length_present:
             content_length_invalid = True
+        if (
+            not content_length_present
+            and body.get("metadata_only")
+            and body.get("declared_bytes") is not None
+        ):
+            try:
+                content_length = int(body["declared_bytes"])
+            except (TypeError, ValueError, OverflowError):
+                content_length = None
+                content_length_invalid = True
+            content_length_present = True
         transfer_encoding = str(
             normalized_headers.get("transfer-encoding") or ""
         ).strip()
@@ -4124,11 +4254,146 @@ class Repository:
             status = value
         elif isinstance(value, float) and value.is_integer():
             status = int(value)
-        elif isinstance(value, str) and value.strip().isdigit():
-            status = int(value.strip())
+        elif isinstance(value, str):
+            matched = re.fullmatch(
+                r"\s*([1-5]\d{2})(?:\s+[^\r\n]{1,128})?\s*",
+                value,
+            )
+            if not matched:
+                return ""
+            status = int(matched.group(1))
         else:
             return ""
         return str(status) if 100 <= status <= 599 else ""
+
+    @classmethod
+    def _response_agent_has_http_context(cls, payload: Any) -> bool:
+        found, _pointer, _value = cls._response_agent_path_value(
+            payload,
+            (
+                ("/original_log/http", ("original_log", "http")),
+                (
+                    "/original_log/event/request_message",
+                    ("original_log", "event", "request_message"),
+                ),
+                (
+                    "/original_log/event/response_message",
+                    ("original_log", "event", "response_message"),
+                ),
+                ("/http", ("http",)),
+                ("/request_message", ("request_message",)),
+                ("/response_message", ("response_message",)),
+                ("/http_method", ("http_method",)),
+            ),
+        )
+        if found:
+            return True
+        if isinstance(payload, dict):
+            top_level = {
+                cls._response_agent_canonical_field(key): value
+                for key, value in payload.items()
+            }
+            method = str(top_level.get("method") or "").strip().upper()
+            if method in _RESPONSE_AGENT_HTTP_METHODS and set(top_level).intersection(
+                {
+                    "headers",
+                    "request_body",
+                    "request_parameters",
+                    "uri",
+                    "url",
+                }
+            ):
+                return True
+        request = payload.get("request") if isinstance(payload, dict) else None
+        if not isinstance(request, dict):
+            return False
+        for key, value in request.items():
+            field = cls._response_agent_canonical_field(key)
+            if field == "method":
+                if str(value or "").strip().upper() in _RESPONSE_AGENT_HTTP_METHODS:
+                    return True
+                continue
+            if field in {
+                "body",
+                "headers",
+                "parameter",
+                "parameters",
+                "query",
+                "uri",
+                "url",
+            }:
+                return True
+        return False
+
+    @classmethod
+    def _response_agent_http_body_metadata(
+        cls,
+        value: Any,
+    ) -> tuple[bool, int | None]:
+        if not isinstance(value, dict) or not value:
+            return False, None
+        metadata_fields = {
+            "bytes",
+            "content_length",
+            "hash",
+            "length",
+            "sha256",
+            "size",
+            "truncated",
+        }
+        canonical_values = {
+            cls._response_agent_canonical_field(key): item
+            for key, item in value.items()
+        }
+        fields = set(canonical_values)
+        if not fields or not fields.issubset(metadata_fields):
+            return False, None
+        declared_bytes: int | None = None
+        for name in ("bytes", "size", "length", "content_length"):
+            raw = canonical_values.get(name)
+            if isinstance(raw, bool):
+                continue
+            try:
+                candidate = int(raw)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if candidate >= 0:
+                declared_bytes = candidate
+                break
+        return True, declared_bytes
+
+    @classmethod
+    def _response_agent_http_status_candidate(
+        cls,
+        payload: Any,
+        paths: tuple[tuple[str, tuple[str, ...]], ...],
+    ) -> tuple[bool, str, Any, str]:
+        fallback: tuple[bool, str, Any] = (False, "", None)
+        has_http_context = cls._response_agent_has_http_context(payload)
+        for pointer, keys in paths:
+            found, _matched_pointer, value = cls._response_agent_path_value(
+                payload,
+                ((pointer, keys),),
+            )
+            if not found:
+                continue
+            if (
+                pointer
+                in {
+                    "/status",
+                    "/status_code",
+                    "/response_code",
+                    "/response_status",
+                }
+                and not has_http_context
+            ):
+                continue
+            observed_status = cls._response_agent_http_status(value)
+            if observed_status:
+                return True, pointer, value, observed_status
+            if not fallback[0]:
+                fallback = (True, pointer, value)
+        return (*fallback, "")
 
     @classmethod
     def _response_agent_capture_diagnostics(
@@ -4144,9 +4409,23 @@ class Repository:
                         ("original_log", "event", "request_message", "body"),
                     ),
                     (
+                        "/original_log/http/request/body/content",
+                        ("original_log", "http", "request", "body", "content"),
+                    ),
+                    (
+                        "/original_log/http/request/body",
+                        ("original_log", "http", "request", "body"),
+                    ),
+                    (
                         "/event/request_message/body",
                         ("event", "request_message", "body"),
                     ),
+                    (
+                        "/http/request/body/content",
+                        ("http", "request", "body", "content"),
+                    ),
+                    ("/http/request/body", ("http", "request", "body")),
+                    ("/request/body", ("request", "body")),
                     ("/request_message/body", ("request_message", "body")),
                     ("/request_body", ("request_body",)),
                     ("/payload/request_body", ("payload", "request_body")),
@@ -4160,6 +4439,18 @@ class Repository:
                         ("original_log", "event", "request_message", "parameter"),
                     ),
                     (
+                        "/original_log/http/request/parameters",
+                        ("original_log", "http", "request", "parameters"),
+                    ),
+                    (
+                        "/original_log/http/request/query",
+                        ("original_log", "http", "request", "query"),
+                    ),
+                    (
+                        "/original_log/url/query",
+                        ("original_log", "url", "query"),
+                    ),
+                    (
                         "/event/request_message/parameter",
                         ("event", "request_message", "parameter"),
                     ),
@@ -4167,6 +4458,14 @@ class Repository:
                         "/request_message/parameter",
                         ("request_message", "parameter"),
                     ),
+                    (
+                        "/http/request/parameters",
+                        ("http", "request", "parameters"),
+                    ),
+                    ("/http/request/query", ("http", "request", "query")),
+                    ("/request/parameters", ("request", "parameters")),
+                    ("/request/query", ("request", "query")),
+                    ("/url/query", ("url", "query")),
                     ("/request_parameters", ("request_parameters",)),
                     ("/query", ("query",)),
                 ),
@@ -4183,6 +4482,10 @@ class Repository:
                         ("original_log", "event", "request_message", "headers"),
                     ),
                     (
+                        "/original_log/http/request/headers",
+                        ("original_log", "http", "request", "headers"),
+                    ),
+                    (
                         "/event/request_message/header",
                         ("event", "request_message", "header"),
                     ),
@@ -4190,6 +4493,8 @@ class Repository:
                         "/event/request_message/headers",
                         ("event", "request_message", "headers"),
                     ),
+                    ("/http/request/headers", ("http", "request", "headers")),
+                    ("/request/headers", ("request", "headers")),
                     ("/request_headers", ("request_headers",)),
                     ("/headers", ("headers",)),
                 ),
@@ -4211,10 +4516,29 @@ class Repository:
                         ("event", "response_message", "status_code"),
                     ),
                     (
+                        "/original_log/http/response/status_code",
+                        ("original_log", "http", "response", "status_code"),
+                    ),
+                    (
+                        "/original_log/http/status",
+                        ("original_log", "http", "status"),
+                    ),
+                    (
+                        "/original_log/response/status_code",
+                        ("original_log", "response", "status_code"),
+                    ),
+                    (
                         "/response_message/status_code",
                         ("response_message", "status_code"),
                     ),
+                    (
+                        "/http/response/status_code",
+                        ("http", "response", "status_code"),
+                    ),
+                    ("/http/status", ("http", "status")),
+                    ("/response/status_code", ("response", "status_code")),
                     ("/response_status", ("response_status",)),
+                    ("/response_code", ("response_code",)),
                     ("/status_code", ("status_code",)),
                     ("/status", ("status",)),
                 ),
@@ -4227,9 +4551,23 @@ class Repository:
                         ("original_log", "event", "response_message", "body"),
                     ),
                     (
+                        "/original_log/http/response/body/content",
+                        ("original_log", "http", "response", "body", "content"),
+                    ),
+                    (
+                        "/original_log/http/response/body",
+                        ("original_log", "http", "response", "body"),
+                    ),
+                    (
                         "/event/response_message/body",
                         ("event", "response_message", "body"),
                     ),
+                    (
+                        "/http/response/body/content",
+                        ("http", "response", "body", "content"),
+                    ),
+                    ("/http/response/body", ("http", "response", "body")),
+                    ("/response/body", ("response", "body")),
                     ("/response_message/body", ("response_message", "body")),
                     ("/response_body", ("response_body",)),
                 ),
@@ -4237,7 +4575,23 @@ class Repository:
         )
         diagnostics: list[dict[str, Any]] = []
         for field, paths in fields:
-            found, pointer, value = cls._response_agent_path_value(payload, paths)
+            observed_status = ""
+            body_metadata_only = False
+            declared_body_bytes: int | None = None
+            if field == "http_response_status":
+                (
+                    found,
+                    pointer,
+                    value,
+                    observed_status,
+                ) = cls._response_agent_http_status_candidate(payload, paths)
+            else:
+                found, pointer, value = cls._response_agent_path_value(payload, paths)
+                if field in {"http_request_body", "http_response_body"} and found:
+                    (
+                        body_metadata_only,
+                        declared_body_bytes,
+                    ) = cls._response_agent_http_body_metadata(value)
             rendered = (
                 json.dumps(
                     value,
@@ -4254,11 +4608,20 @@ class Repository:
                 "json_pointer": pointer,
                 "bytes": len(rendered.encode("utf-8")) if found else 0,
             }
+            if body_metadata_only:
+                item["state"] = (
+                    "captured_empty"
+                    if declared_body_bytes == 0
+                    else "captured_incomplete"
+                )
+                item["metadata_only"] = True
+                item["bytes"] = 0
+                if declared_body_bytes is not None:
+                    item["declared_bytes"] = declared_body_bytes
             if (
                 field == "http_response_status"
                 and item["state"] == "captured_nonempty"
             ):
-                observed_status = cls._response_agent_http_status(value)
                 if observed_status:
                     item["observed_value"] = observed_status
                 else:
@@ -4272,25 +4635,41 @@ class Repository:
         )
         return diagnostics
 
+    @staticmethod
+    def _response_agent_decode_syslog_message(
+        raw_message: str,
+    ) -> tuple[dict[str, Any] | None, str]:
+        encoded = raw_message.encode("utf-8")
+        if len(encoded) > 10_000_000:
+            return None, "too_large"
+        text = raw_message.strip()
+        if not text:
+            return None, "empty"
+        try:
+            decoded = loads_bounded_json(text)
+        except (TypeError, ValueError, RecursionError):
+            decoded = None
+        if isinstance(decoded, dict):
+            return decoded, "decoded_json"
+        start = text.find("{")
+        end = text.rfind("}")
+        if 0 <= start < end:
+            try:
+                decoded = loads_bounded_json(text[start : end + 1])
+            except (TypeError, ValueError, RecursionError):
+                decoded = None
+            if isinstance(decoded, dict):
+                return decoded, "decoded_embedded_json"
+        return None, "not_decodable_as_object"
+
     @classmethod
-    def _response_agent_syslog_descriptor(
+    def _response_agent_syslog_records(
         cls,
         payload: Any,
-    ) -> dict[str, Any]:
-        paths = (
-            ("/_syslog_envelope", ("_syslog_envelope",)),
-            ("/syslog_route", ("syslog_route",)),
-            ("/syslog_envelope", ("syslog_envelope",)),
-            (
-                "/original_log/_syslog_envelope",
-                ("original_log", "_syslog_envelope"),
-            ),
-            (
-                "/original_log/syslog_route",
-                ("original_log", "syslog_route"),
-            ),
-        )
-        for pointer, keys in paths:
+    ) -> list[tuple[dict[str, Any], dict[str, Any] | None]]:
+        records: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for pointer, keys in _RESPONSE_AGENT_SYSLOG_ENVELOPE_PATHS:
             found, _matched_pointer, envelope = cls._response_agent_path_value(
                 payload,
                 ((pointer, keys),),
@@ -4302,35 +4681,395 @@ class Repository:
                 continue
             encoded = raw_message.encode("utf-8")
             computed_hash = hashlib.sha256(encoded).hexdigest()
-            recorded_hash = str(envelope.get("raw_message_sha256") or "")
+            wire_hash = (
+                str(envelope.get("raw_message_sha256") or "").strip().casefold()
+            )
+            text_hash = (
+                str(envelope.get("raw_message_text_sha256") or "")
+                .strip()
+                .casefold()
+            )
+            # New envelopes authenticate the persisted text separately from the
+            # original wire bytes. Legacy envelopes used one digest for both and
+            # remain verifiable whenever their raw bytes were valid UTF-8.
+            recorded_hash = text_hash or wire_hash
+            try:
+                recorded_wire_bytes = int(envelope.get("raw_message_bytes") or 0)
+            except (TypeError, ValueError, OverflowError):
+                recorded_wire_bytes = 0
+            legacy_lossy = bool(
+                not text_hash
+                and wire_hash
+                and wire_hash != computed_hash
+                and "\ufffd" in raw_message
+                and recorded_wire_bytes > 0
+                and recorded_wire_bytes != len(encoded)
+            )
+            if recorded_hash and recorded_hash == computed_hash:
+                integrity = "verified"
+                integrity_reason = (
+                    "persisted_text_hash_verified"
+                    if text_hash
+                    else "legacy_wire_hash_matches_utf8_text"
+                )
+            elif legacy_lossy:
+                integrity = "unverified"
+                integrity_reason = "legacy_lossy_utf8"
+            elif recorded_hash:
+                integrity = "mismatch"
+                integrity_reason = (
+                    "persisted_text_hash_mismatch"
+                    if text_hash
+                    else "legacy_wire_hash_mismatch"
+                )
+            else:
+                integrity = "unverified"
+                integrity_reason = "hash_not_recorded"
+            identity = (computed_hash, recorded_hash, wire_hash)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            decoded, decode_status = cls._response_agent_decode_syslog_message(
+                raw_message
+            )
             try:
                 destination_port = int(envelope.get("destination_port") or 0)
             except (TypeError, ValueError, OverflowError):
                 destination_port = 0
-            return {
-                "syslog_message_present": True,
-                "syslog_message_pointer": f"{pointer}/raw_message",
-                "syslog_message_bytes": len(encoded),
-                "syslog_message_sha256": computed_hash,
-                "syslog_recorded_sha256": recorded_hash,
-                "syslog_message_integrity": (
-                    "verified"
-                    if recorded_hash and recorded_hash == computed_hash
-                    else ("mismatch" if recorded_hash else "unverified")
+            records.append(
+                (
+                    {
+                        "syslog_message_present": True,
+                        "syslog_message_pointer": f"{pointer}/raw_message",
+                        "syslog_message_bytes": len(encoded),
+                        "syslog_message_sha256": computed_hash,
+                        "syslog_recorded_sha256": recorded_hash,
+                        "syslog_message_integrity": integrity,
+                        "syslog_message_integrity_reason": integrity_reason,
+                        "syslog_message_decode_status": decode_status,
+                        "syslog_protocol": str(envelope.get("protocol") or ""),
+                        "syslog_destination_port": destination_port,
+                    },
+                    decoded,
+                )
+            )
+        return records
+
+    @classmethod
+    def _response_agent_syslog_record(
+        cls,
+        payload: Any,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        records = cls._response_agent_syslog_records(payload)
+        if records:
+            integrity_rank = {"mismatch": 0, "unverified": 1, "verified": 2}
+            return max(
+                records,
+                key=lambda record: (
+                    integrity_rank.get(
+                        str(record[0].get("syslog_message_integrity") or ""),
+                        -1,
+                    ),
+                    isinstance(record[1], dict),
                 ),
-                "syslog_protocol": str(envelope.get("protocol") or ""),
-                "syslog_destination_port": destination_port,
-            }
+            )
+        return (
+            {
+                "syslog_message_present": False,
+                "syslog_message_pointer": "",
+                "syslog_message_bytes": 0,
+                "syslog_message_sha256": "",
+                "syslog_recorded_sha256": "",
+                "syslog_message_integrity": "not_observed",
+                "syslog_message_integrity_reason": "not_observed",
+                "syslog_message_decode_status": "not_observed",
+                "syslog_protocol": "",
+                "syslog_destination_port": 0,
+            },
+            None,
+        )
+
+    @classmethod
+    def _response_agent_syslog_descriptor(
+        cls,
+        payload: Any,
+    ) -> dict[str, Any]:
+        descriptor, _decoded = cls._response_agent_syslog_record(payload)
+        return descriptor
+
+    @classmethod
+    def _response_agent_mapped_projection(cls, payload: Any) -> Any:
+        if not isinstance(payload, dict):
+            return payload
+        original_log = payload.get("original_log")
+        adapted = isinstance(payload.get("adapter"), dict)
+        projection: dict[str, Any] = {}
+        for key, value in payload.items():
+            if str(key).casefold() in SERVER_OWNED_ALERT_PAYLOAD_FIELDS:
+                continue
+            if (
+                adapted
+                and isinstance(original_log, dict)
+                and key in original_log
+                and value == original_log[key]
+            ):
+                # Non-RASP adapters retain a top-level copy of the vendor log.
+                # It is raw evidence, not proof that a profile mapped the field.
+                continue
+            projection[key] = value
+        mapped_entities = payload.get("mapped_entities")
+        if isinstance(mapped_entities, dict):
+            for key, value in mapped_entities.items():
+                projection.setdefault(str(key), value)
+        return projection
+
+    @staticmethod
+    def _response_agent_diagnostics_by_field(
+        diagnostics: list[dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
         return {
-            "syslog_message_present": False,
-            "syslog_message_pointer": "",
-            "syslog_message_bytes": 0,
-            "syslog_message_sha256": "",
-            "syslog_recorded_sha256": "",
-            "syslog_message_integrity": "not_observed",
-            "syslog_protocol": "",
-            "syslog_destination_port": 0,
+            str(item.get("field") or ""): item
+            for item in diagnostics
+            if isinstance(item, dict)
         }
+
+    @staticmethod
+    def _response_agent_original_pointer(pointer: Any) -> str:
+        rendered = str(pointer or "")
+        return f"/original_log{rendered}" if rendered else ""
+
+    @classmethod
+    def _response_agent_capture_layers(
+        cls,
+        payload: Any,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, str]]]:
+        descriptor, raw_payload = cls._response_agent_syslog_record(payload)
+        mapped_payload = cls._response_agent_mapped_projection(payload)
+        original_payload = (
+            payload.get("original_log") if isinstance(payload, dict) else None
+        )
+        mapped_by_field = cls._response_agent_diagnostics_by_field(
+            cls._response_agent_capture_diagnostics(mapped_payload)
+        )
+        original_by_field = cls._response_agent_diagnostics_by_field(
+            cls._response_agent_capture_diagnostics(original_payload)
+            if isinstance(original_payload, dict)
+            else []
+        )
+        syslog_by_field = cls._response_agent_diagnostics_by_field(
+            cls._response_agent_capture_diagnostics(raw_payload)
+            if isinstance(raw_payload, dict)
+            else []
+        )
+        effective: list[dict[str, Any]] = []
+        mapping_gaps: list[dict[str, str]] = []
+        original_available = isinstance(original_payload, dict)
+        syslog_available = isinstance(raw_payload, dict)
+        syslog_integrity = str(
+            descriptor.get("syslog_message_integrity") or "not_observed"
+        )
+        syslog_usable = syslog_available and syslog_integrity in {
+            "verified",
+            "unverified",
+        }
+        default_item = {
+            "state": "not_observed",
+            "json_pointer": "",
+            "bytes": 0,
+        }
+        for field, mapped_item in mapped_by_field.items():
+            mapped = {"field": field, **default_item, **mapped_item}
+            original = {
+                "field": field,
+                **default_item,
+                **original_by_field.get(field, {}),
+            }
+            syslog = {
+                "field": field,
+                **default_item,
+                **syslog_by_field.get(field, {}),
+            }
+            mapped_state = str(mapped.get("state") or "not_observed")
+            original_state = str(original.get("state") or "not_observed")
+            syslog_state = str(syslog.get("state") or "not_observed")
+            candidates = [
+                {
+                    "item": mapped,
+                    "provenance": "mapped_projection",
+                    "confidence": "projection",
+                    "authority": 0,
+                }
+            ]
+            if original_available:
+                candidates.append(
+                    {
+                        "item": original,
+                        "provenance": "stored_original_log",
+                        "confidence": "stored",
+                        "authority": 2,
+                    }
+                )
+            if syslog_usable:
+                candidates.append(
+                    {
+                        "item": syslog,
+                        "provenance": "syslog_raw_message",
+                        "confidence": syslog_integrity,
+                        "authority": 3 if syslog_integrity == "verified" else 1,
+                    }
+                )
+            selected_source = max(
+                candidates,
+                key=lambda candidate: (
+                    str(candidate["item"].get("state") or "not_observed")
+                    != "not_observed",
+                    int(candidate["authority"]),
+                ),
+            )
+            selected = selected_source["item"]
+            provenance = str(selected_source["provenance"])
+            mapped_observed = str(mapped.get("observed_value") or "")
+            original_observed = str(original.get("observed_value") or "")
+            syslog_observed = str(syslog.get("observed_value") or "")
+
+            raw_candidates: list[dict[str, Any]] = []
+            if original_available:
+                raw_candidates.append(
+                    {"item": original, "authority": 2, "source": "original_log"}
+                )
+            if syslog_usable:
+                raw_candidates.append(
+                    {
+                        "item": syslog,
+                        "authority": 3 if syslog_integrity == "verified" else 1,
+                        "source": "syslog",
+                    }
+                )
+            raw_reference = (
+                max(
+                    raw_candidates,
+                    key=lambda candidate: (
+                        str(
+                            candidate["item"].get("state")
+                            or "not_observed"
+                        )
+                        != "not_observed",
+                        int(candidate["authority"]),
+                    ),
+                )
+                if raw_candidates
+                else None
+            )
+            raw_item = raw_reference["item"] if raw_reference else default_item
+            raw_state = str(raw_item.get("state") or "not_observed")
+            raw_observed = str(raw_item.get("observed_value") or "")
+            if syslog_integrity == "mismatch" and syslog_state != "not_observed":
+                consistency = "syslog_integrity_mismatch"
+            elif not raw_candidates:
+                consistency = "raw_not_available"
+            elif raw_state == "not_observed" and mapped_state != "not_observed":
+                consistency = "mapped_projection_only"
+            elif mapped_state == "not_observed" and raw_state != "not_observed":
+                consistency = "raw_evidence_only"
+            elif mapped_state != raw_state:
+                consistency = "state_mismatch"
+            elif (
+                mapped_observed
+                and raw_observed
+                and mapped_observed != raw_observed
+            ):
+                consistency = "value_mismatch"
+            else:
+                consistency = "consistent"
+
+            merged = dict(selected)
+            if provenance == "stored_original_log":
+                merged["json_pointer"] = cls._response_agent_original_pointer(
+                    selected.get("json_pointer")
+                )
+            merged.update(
+                {
+                    "provenance": provenance,
+                    "provenance_confidence": str(
+                        selected_source["confidence"]
+                    ),
+                    "mapped_state": mapped_state,
+                    "original_log_state": original_state,
+                    "syslog_state": syslog_state,
+                    "syslog_integrity": syslog_integrity,
+                    "syslog_usable": syslog_usable,
+                    "mapping_consistency": consistency,
+                    "mapped_json_pointer": str(
+                        mapped.get("json_pointer") or ""
+                    ),
+                    "original_log_json_pointer": (
+                        cls._response_agent_original_pointer(
+                            original.get("json_pointer")
+                        )
+                    ),
+                    "syslog_json_pointer": str(
+                        syslog.get("json_pointer") or ""
+                    ),
+                }
+            )
+            if mapped_observed:
+                merged["mapped_observed_value"] = mapped_observed
+            if original_observed:
+                merged["original_log_observed_value"] = original_observed
+            if syslog_observed:
+                merged["syslog_observed_value"] = syslog_observed
+            effective.append(merged)
+
+            integrity_conflict = (
+                syslog_integrity == "mismatch"
+                and syslog_state != "not_observed"
+            )
+            critical_state_conflict = (
+                raw_state in {"captured_incomplete", "captured_invalid"}
+                and raw_state != mapped_state
+                and mapped_state
+                in {"not_observed", "captured_null", "captured_empty"}
+            )
+            value_conflict = (
+                raw_state == mapped_state == "captured_nonempty"
+                and raw_observed
+                and mapped_observed
+                and raw_observed != mapped_observed
+            )
+            raw_mapping_state_conflict = (
+                raw_state != "not_observed"
+                and raw_state != mapped_state
+            )
+            if (
+                integrity_conflict
+                or critical_state_conflict
+                or value_conflict
+                or raw_mapping_state_conflict
+            ):
+                if integrity_conflict:
+                    reason = "syslog_integrity_mismatch"
+                elif value_conflict:
+                    reason = "field_value_differs_from_raw_evidence"
+                elif critical_state_conflict:
+                    reason = "raw_capture_conflicts_with_mapped_projection"
+                elif (
+                    raw_state == "captured_nonempty"
+                    and mapped_state == "not_observed"
+                ):
+                    reason = "field_available_in_raw_evidence_not_mapped"
+                else:
+                    reason = "raw_capture_state_differs_from_mapped_projection"
+                mapping_gaps.append(
+                    {
+                        "field": field,
+                        "mapped_state": mapped_state,
+                        "original_log_state": original_state,
+                        "syslog_state": syslog_state,
+                        "syslog_integrity": syslog_integrity,
+                        "reason": reason,
+                    }
+                )
+        return descriptor, effective, mapping_gaps
 
     @staticmethod
     def _response_agent_forensic_domains(
@@ -4398,6 +5137,11 @@ class Repository:
             max_entries=120 if include_catalog else 80,
             include_sizes=include_catalog,
         )
+        (
+            syslog_descriptor,
+            capture_diagnostics,
+            capture_mapping_gaps,
+        ) = cls._response_agent_capture_layers(payload)
         return {
             "alert_id": str(row.get("alert_id") or ""),
             "event_id": str(row.get("event_id") or ""),
@@ -4433,8 +5177,9 @@ class Repository:
                 else 0
             ),
             "source_hash": cls._response_agent_raw_hash(row),
-            **cls._response_agent_syslog_descriptor(payload),
-            "capture_diagnostics": cls._response_agent_capture_diagnostics(payload),
+            **syslog_descriptor,
+            "capture_diagnostics": capture_diagnostics,
+            "capture_mapping_gaps": capture_mapping_gaps,
             "forensic_domains": cls._response_agent_forensic_domains(
                 str(row.get("product") or ""),
                 catalog,
@@ -4501,6 +5246,26 @@ class Repository:
                 "query_mode": "controller_scoped_raw_manifest",
             }
 
+    def _response_agent_candidate_json_locked(
+        self,
+        alert_id: str,
+        event_id: str | None,
+    ) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT ra.payload_json,
+                   (
+                       SELECT ne.entities_json
+                       FROM normalized_events ne
+                       WHERE ne.event_id = ?
+                   ) AS entities_json
+            FROM raw_alerts ra
+            WHERE ra.alert_id = ?
+            """,
+            (event_id, alert_id),
+        ).fetchone()
+        return dict(row) if row else None
+
     def query_response_agent_related_alerts(
         self,
         case_id: str,
@@ -4547,12 +5312,15 @@ class Repository:
                 placeholders = ",".join("?" for _ in selected_products)
                 product_clause = f" AND LOWER(ra.product) IN ({placeholders})"
                 parameters.extend(selected_products)
-            parameters.append(bounded_scan)
-            rows = self.conn.execute(
+            # Fetch one sentinel row so callers can distinguish a complete scan
+            # from one bounded by the SQL candidate-row limit.
+            parameters.append(bounded_scan + 1)
+            candidate_rows = self.conn.execute(
                 f"""
                 SELECT ra.alert_id, ra.source, ra.product, ra.event_type,
-                       ra.severity, ra.timestamp, ra.payload_json, ra.created_at_ms,
-                       ne.event_id, ne.entities_json, ne.event_at_ms
+                       ra.severity, ra.timestamp, ra.created_at_ms,
+                       LENGTH(CAST(ra.payload_json AS BLOB)) AS payload_bytes,
+                       ne.event_id, ne.event_at_ms
                 FROM raw_alerts ra
                 LEFT JOIN normalized_events ne ON ne.event_id = (
                     SELECT ne_latest.event_id
@@ -4572,45 +5340,72 @@ class Repository:
                 LIMIT ?
                 """,
                 parameters,
-            ).fetchall()
+            )
             matches: list[dict[str, Any]] = []
             seen_alerts: set[str] = set()
             scanned_alerts: set[str] = set()
             scanned_bytes = 0
-            scan_truncated = False
-            for sql_row in rows:
-                row = dict(sql_row)
-                alert_id = str(row["alert_id"])
-                if alert_id in seen_alerts or alert_id in scope["linked_alert_ids"]:
-                    continue
-                if alert_id not in scanned_alerts:
-                    payload_bytes = len(
-                        str(row.get("payload_json") or "").encode("utf-8")
-                    )
-                    if scanned_alerts and scanned_bytes + payload_bytes > bounded_scan_bytes:
-                        scan_truncated = True
+            row_limit_hit = False
+            byte_limit_hit = False
+            try:
+                for candidate_index, sql_row in enumerate(candidate_rows):
+                    if candidate_index >= bounded_scan:
+                        row_limit_hit = True
                         break
-                    scanned_alerts.add(alert_id)
-                    scanned_bytes += payload_bytes
-                matched, score = self._response_agent_match_candidate(scope, row)
-                if score < _RESPONSE_AGENT_MIN_CORRELATION_SCORE:
-                    continue
-                seen_alerts.add(alert_id)
-                event_at_ms = int(row.get("event_at_ms") or row["created_at_ms"] or 0)
-                time_delta_ms = min(
-                    abs(event_at_ms - int(scope["event_min_ms"])),
-                    abs(event_at_ms - int(scope["event_max_ms"])),
-                )
-                matches.append(
-                    self._response_agent_raw_manifest(
-                        row,
-                        relation="case_indicator_correlation",
-                        matched=matched,
-                        correlation_score=score,
-                        time_delta_ms=time_delta_ms,
-                        include_catalog=False,
+                    if byte_limit_hit:
+                        # Continue over payload-free metadata only so the SQL
+                        # row-limit sentinel remains independently observable.
+                        continue
+                    row = dict(sql_row)
+                    alert_id = str(row["alert_id"])
+                    if (
+                        alert_id in seen_alerts
+                        or alert_id in scope["linked_alert_ids"]
+                    ):
+                        continue
+                    if alert_id not in scanned_alerts:
+                        payload_bytes = int(row.get("payload_bytes") or 0)
+                        if scanned_bytes + payload_bytes > bounded_scan_bytes:
+                            byte_limit_hit = True
+                            continue
+                    candidate_json = self._response_agent_candidate_json_locked(
+                        alert_id,
+                        str(row["event_id"]) if row.get("event_id") else None,
                     )
-                )
+                    if candidate_json is None:
+                        continue
+                    row.update(candidate_json)
+                    if alert_id not in scanned_alerts:
+                        scanned_alerts.add(alert_id)
+                        scanned_bytes += int(row.get("payload_bytes") or 0)
+                    matched, score = self._response_agent_match_candidate(scope, row)
+                    if score < _RESPONSE_AGENT_MIN_CORRELATION_SCORE:
+                        continue
+                    seen_alerts.add(alert_id)
+                    event_at_ms = int(
+                        row.get("event_at_ms") or row["created_at_ms"] or 0
+                    )
+                    time_delta_ms = min(
+                        abs(event_at_ms - int(scope["event_min_ms"])),
+                        abs(event_at_ms - int(scope["event_max_ms"])),
+                    )
+                    matches.append(
+                        self._response_agent_raw_manifest(
+                            row,
+                            relation="case_indicator_correlation",
+                            matched=matched,
+                            correlation_score=score,
+                            time_delta_ms=time_delta_ms,
+                            include_catalog=False,
+                        )
+                    )
+            finally:
+                candidate_rows.close()
+            scan_truncation_reasons = []
+            if row_limit_hit:
+                scan_truncation_reasons.append("row_limit")
+            if byte_limit_hit:
+                scan_truncation_reasons.append("byte_limit")
             matches.sort(
                 key=lambda item: (
                     -int(item["correlation_score"]),
@@ -4634,7 +5429,8 @@ class Repository:
                 "scan_max_bytes": bounded_scan_bytes,
                 "scanned": len(scanned_alerts),
                 "scanned_bytes": scanned_bytes,
-                "scan_truncated": scan_truncated,
+                "scan_truncated": bool(scan_truncation_reasons),
+                "scan_truncation_reasons": scan_truncation_reasons,
                 "minimum_correlation_score": _RESPONSE_AGENT_MIN_CORRELATION_SCORE,
                 "anchor_fields": [
                     field for field, values in scope["values"].items() if values
