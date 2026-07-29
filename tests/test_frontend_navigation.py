@@ -500,6 +500,19 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertNotIn(".triage-detail-panel", CSS)
         self.assertIn(".detail-stack", CSS)
         self.assertIn("grid-template-columns: 1fr", CSS)
+        triage_header_css = CSS.split(".triage-page-header {", 1)[1].split(
+            "}", 1
+        )[0]
+        triage_content_css = CSS.split(".triage-page-content {", 1)[1].split(
+            "}", 1
+        )[0]
+        for rule in (
+            "width: min(1120px, 100%);",
+            "margin-right: auto;",
+            "margin-left: auto;",
+        ):
+            self.assertIn(rule, triage_header_css)
+            self.assertIn(rule, triage_content_css)
 
     def test_disposition_desk_keeps_triage_summary_without_duplicate_guidance(self):
         detail_renderer = JS.split("function renderDetail(detail)", 1)[1].split(
@@ -562,6 +575,19 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertNotIn("loadMemory", back_handler)
         self.assertIn("case-details-pagination", DETAIL_JS)
         self.assertIn(".case-details-pagination", CSS)
+        associations_header_css = CSS.split(
+            ".memory-associations-page-header {", 1
+        )[1].split("}", 1)[0]
+        associations_panel_css = CSS.split(
+            ".memory-associations-page-panel {", 1
+        )[1].split("}", 1)[0]
+        for rule in (
+            "width: min(1180px, 100%);",
+            "margin-right: auto;",
+            "margin-left: auto;",
+        ):
+            self.assertIn(rule, associations_header_css)
+            self.assertIn(rule, associations_panel_css)
 
     def test_ollama_model_picker_refreshes_current_model_list(self):
         self.assertNotIn("gemma3", HTML)

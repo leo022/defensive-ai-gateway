@@ -929,6 +929,13 @@ class ResponseInvestigationAgent:
         for call in payload.get("tool_calls") or []:
             call.pop("arguments", None)
             call.pop("result", None)
+        usage = dict(payload.get("usage") or {})
+        active_seconds = max(0.0, float(usage.get("active_seconds") or 0))
+        claimed_at_ms = int(payload.get("claimed_at_ms") or 0)
+        if payload.get("status") == "running" and claimed_at_ms > 0:
+            active_seconds += max(0.0, (now_ms() - claimed_at_ms) / 1_000)
+        usage["active_seconds"] = round(active_seconds, 3)
+        payload["usage"] = usage
         source = self.repo.get_case_response_source(payload["case_id"])
         current_hash = source_snapshot_hash(source) if source else ""
         payload["freshness"] = {

@@ -1666,7 +1666,7 @@ function renderAgentSession() {
   document.querySelector("#response-agent-metrics").innerHTML = `
     <div><dt>${escapeHtml(tr("agentTurns"))}</dt><dd>${Number(usage.turns || 0)} / ${Number(budget.max_turns || 0)}</dd></div>
     <div><dt>${escapeHtml(tr("agentTools"))}</dt><dd>${Number(usage.tool_calls || 0)} / ${Number(budget.max_tool_calls || 0)}</dd></div>
-    <div><dt>${escapeHtml(tr("agentElapsed"))}</dt><dd>${Math.round(Number(usage.active_seconds || 0))} ${escapeHtml(tr("agentSeconds"))}</dd></div>
+    <div><dt>${escapeHtml(tr("agentElapsed"))}</dt><dd>${formatAgentElapsed(usage.active_seconds)}</dd></div>
   `;
   renderAgentPlan();
   renderAgentTrace();
@@ -1698,6 +1698,14 @@ function renderAgentSession() {
   } else {
     setAgentNotice(tr("agentReadOnly"));
   }
+}
+
+function formatAgentElapsed(seconds) {
+  const value = Number(seconds);
+  const unit = escapeHtml(tr("agentSeconds"));
+  if (!Number.isFinite(value) || value <= 0) return `0 ${unit}`;
+  if (value < 1) return `&lt;1 ${unit}`;
+  return `${Math.max(1, Math.round(value))} ${unit}`;
 }
 
 function mergeAgentSession(next, replaceSteps = false) {

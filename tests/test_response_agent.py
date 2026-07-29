@@ -461,6 +461,32 @@ class ResponseAgentTest(unittest.TestCase):
         latest = self.state.response_agent.latest(case_id)
         self.assertTrue(latest["freshness"]["is_stale"])
 
+    def test_running_session_exposes_current_active_duration(self):
+        self.state.response_agent.stop()
+        case_id = self._case("response-agent-active-duration")
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        started = self.state.response_agent.create(
+            case_id, artifact=artifact, goal="measure active time", actor="analyst"
+        )
+        claimed = self.state.repo.claim_response_agent_session()
+        self.assertEqual(claimed["session_id"], started["session_id"])
+        claimed_at_ms = int(time.time() * 1_000) - 2_500
+        self.state.repo.conn.execute(
+            "UPDATE response_agent_sessions SET claimed_at_ms = ? WHERE session_id = ?",
+            (claimed_at_ms, started["session_id"]),
+        )
+        self.state.repo.conn.commit()
+
+        live = self.state.response_agent.get(started["session_id"])
+
+        self.assertEqual(live["status"], "running")
+        self.assertGreaterEqual(live["usage"]["active_seconds"], 2.4)
+        self.assertLess(live["usage"]["active_seconds"], 4.0)
+        stored = self.state.repo.get_response_agent_session(started["session_id"])
+        self.assertEqual(stored["usage"]["active_seconds"], 0.0)
+
     def test_terminal_session_can_be_rerun_as_a_new_session(self):
         self.state.response_agent.stop()
         case_id = self._case("response-agent-rerun")
@@ -1345,6 +1371,13 @@ class ResponseAgentTest(unittest.TestCase):
         self.assertIn(".response-agent-report-sublist", css)
         self.assertIn(".response-agent-trace-row-latest", css)
         self.assertIn(".response-agent-trace-middle", css)
+        self.assertIn("function formatAgentElapsed(seconds)", script)
+        self.assertIn("formatAgentElapsed(usage.active_seconds)", script)
+        self.assertIn('return `&lt;1 ${unit}`;', script)
+        self.assertNotIn(
+            "Math.round(Number(usage.active_seconds || 0))",
+            script,
+        )
         self.assertIn("justify-content: center", css)
         self.assertIn("flex: 0 1 150px", css)
         self.assertIn("width: min(480px, 100vw)", css)
