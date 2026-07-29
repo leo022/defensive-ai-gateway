@@ -441,6 +441,36 @@ class PolicyBoundaryTest(unittest.TestCase):
         )
         self.assertEqual(entities["session_count"], 7)
 
+    def test_sensitive_values_inside_raw_json_text_are_fully_redacted(self):
+        raw_message = (
+            '<134>1 gateway '
+            '{"password":"alpha beta gamma",'
+            '"credential":"first,second",'
+            '"authorization":"Custom opaque value",'
+            '"request":{"method":"POST"}}'
+        )
+
+        sanitized = _policy().sanitize_context(
+            {"observation": {"raw_message": raw_message}}
+        )
+        rendered = json.dumps(sanitized, ensure_ascii=False, sort_keys=True)
+
+        for secret in (
+            "alpha beta gamma",
+            "beta gamma",
+            "first,second",
+            "second",
+            "Custom opaque value",
+            "opaque value",
+        ):
+            self.assertNotIn(secret, rendered)
+        redacted_message = sanitized["observation"]["raw_message"]
+        embedded = json.loads(redacted_message[redacted_message.index("{") :])
+        self.assertEqual(embedded["password"], "[REDACTED]")
+        self.assertEqual(embedded["credential"], "[REDACTED]")
+        self.assertEqual(embedded["authorization"], "[REDACTED]")
+        self.assertEqual(embedded["request"], {"method": "POST"})
+
     def test_sanitized_context_has_strict_utf8_byte_bound(self):
         policy = _policy(600)
         context = {

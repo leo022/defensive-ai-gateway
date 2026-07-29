@@ -318,6 +318,37 @@ class _ChunkAwareAgentLLM:
         }
 
 
+class _SyslogPointerGuessAgentLLM:
+    is_deterministic = False
+    runtime_metadata = {
+        "provider": "test",
+        "model": "syslog-pointer-guess-agent-model",
+        "endpoint_host": "",
+    }
+
+    def __init__(self, alert_id: str):
+        self.alert_id = alert_id
+        self.planner_calls = 0
+
+    def generate_structured(self, prompt, context, schema=None):  # noqa: ANN001
+        self.planner_calls += 1
+        if self.planner_calls > len(MANDATORY_TOOLS):
+            return {
+                "action": "tool_call",
+                "tool_name": "read_raw_alert_chunk",
+                "arguments": {
+                    "alert_id": self.alert_id,
+                    "json_pointer": "/syslog_envelope/raw_message",
+                    "offset": 0,
+                },
+                "rationale": "Read the collector-preserved Syslog message.",
+            }
+        return {
+            "action": "finish",
+            "rationale": "Ask the controller to advance the governed evidence floor.",
+        }
+
+
 class ResponseAgentTest(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -1160,8 +1191,9 @@ class ResponseAgentTest(unittest.TestCase):
         alert = _waf_alert("response-agent-full-raw")
         alert.payload["original_log"] = {
             "message": "BEGIN-" + ("证据" * 4_000) + "-END",
-            "password": "bank-secret-password",
-            "authorization": "Bearer secret-token-value",
+            "password": "bank secret,password tail",
+            "credential": "first,second credential tail",
+            "authorization": "Custom authorization secret words",
         }
         case_id = self.state.orchestrator.handle_alert(alert).case_id
         artifact = self.state.case_response.generate(
@@ -1218,8 +1250,17 @@ class ResponseAgentTest(unittest.TestCase):
         raw_log = json.loads(reconstructed)
         self.assertTrue(raw_log["message"].endswith("-END"))
         self.assertEqual(raw_log["password"], "[REDACTED]")
+        self.assertEqual(raw_log["credential"], "[REDACTED]")
         self.assertEqual(raw_log["authorization"], "[REDACTED]")
-        self.assertNotIn("bank-secret-password", reconstructed)
+        for secret in (
+            "bank secret,password tail",
+            "password tail",
+            "first,second credential tail",
+            "credential tail",
+            "Custom authorization secret words",
+            "secret words",
+        ):
+            self.assertNotIn(secret, reconstructed)
         self.assertEqual(
             content_hash,
             hashlib.sha256(reconstructed.encode("utf-8")).hexdigest(),
@@ -1398,6 +1439,139 @@ class ResponseAgentTest(unittest.TestCase):
         )
         self.assertTrue(
             report["validation"]["checks"]["forensic_workstreams_complete"]
+        )
+
+    def test_syslog_pointer_guess_uses_authoritative_manifest_before_persistence(self):
+        alert = _waf_alert("response-agent-syslog-pointer-alias")
+        alert.payload["request_context"] = {
+            "password": "alpha beta gamma",
+            "credential": 'first,second "quoted" credential',
+            "authorization": "Custom opaque authorization value",
+            "method": "POST",
+        }
+        raw_message = json.dumps(
+            alert.payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        alert.payload["_syslog_envelope"] = {
+            "collector": "syslog-port-router",
+            "destination_port": 15140,
+            "protocol": "tcp",
+            "raw_message": raw_message,
+            "raw_message_bytes": len(raw_message.encode("utf-8")),
+            "raw_message_sha256": hashlib.sha256(
+                raw_message.encode("utf-8")
+            ).hexdigest(),
+        }
+        case_id = self.state.orchestrator.handle_alert(alert).case_id
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        self.state.response_agent.set_llm(
+            _SyslogPointerGuessAgentLLM(alert.alert_id)
+        )
+        started = self.state.response_agent.create(
+            case_id,
+            artifact=artifact,
+            goal="Resolve the model's Syslog envelope pointer alias",
+            actor="analyst",
+        )
+
+        session = self._wait(
+            self.state.response_agent,
+            started["session_id"],
+            {"completed", "review", "blocked", "failed", "paused"},
+        )
+
+        self.assertEqual(
+            session["status"],
+            "completed",
+            (session.get("report") or {}).get("validation")
+            or session.get("last_error"),
+        )
+        stored = self.state.repo.get_response_agent_session(
+            started["session_id"]
+        )
+        raw_calls = [
+            call
+            for call in stored["tool_calls"]
+            if call["tool_name"] == "read_raw_alert_chunk"
+        ]
+        self.assertEqual(len(raw_calls), 1)
+        self.assertEqual(
+            raw_calls[0]["arguments"]["json_pointer"],
+            "/_syslog_envelope/raw_message",
+        )
+        self.assertTrue(raw_calls[0]["result"]["complete"])
+        raw_message_text = json.loads(raw_calls[0]["result"]["content"])
+        raw_observation = json.loads(raw_message_text)
+        self.assertEqual(
+            raw_observation["request_context"],
+            {
+                "authorization": "[REDACTED]",
+                "credential": "[REDACTED]",
+                "method": "POST",
+                "password": "[REDACTED]",
+            },
+        )
+        for secret_tail in (
+            "beta gamma",
+            "second",
+            "quoted",
+            "opaque authorization value",
+        ):
+            self.assertNotIn(secret_tail, raw_calls[0]["result"]["content"])
+        self.assertTrue(
+            session["report"]["validation"]["checks"][
+                "forensic_required_reads_complete"
+            ]
+        )
+        raw_decisions = [
+            step
+            for step in stored["steps"]
+            if (step.get("detail") or {}).get("tool_name")
+            == "read_raw_alert_chunk"
+        ]
+        self.assertGreaterEqual(len(raw_decisions), 3)
+        self.assertEqual(
+            {
+                step["detail"]["arguments"].get("json_pointer")
+                for step in raw_decisions
+            },
+            {"/_syslog_envelope/raw_message"},
+        )
+
+        preserved = self.state.response_agent._validate_decision(
+            {
+                "action": "tool_call",
+                "tool_name": "read_raw_alert_chunk",
+                "arguments": {
+                    "alert_id": alert.alert_id,
+                    "json_pointer": "/original_log/http/raw_message",
+                },
+            },
+            session=stored,
+        )
+        self.assertEqual(
+            preserved["arguments"]["json_pointer"],
+            "/original_log/http/raw_message",
+        )
+        other_alert = self.state.response_agent._validate_decision(
+            {
+                "action": "tool_call",
+                "tool_name": "read_raw_alert_chunk",
+                "arguments": {
+                    "alert_id": "alert-outside-this-manifest",
+                    "json_pointer": "/syslog_envelope/raw_message",
+                },
+            },
+            session=stored,
+        )
+        self.assertEqual(
+            other_alert["arguments"]["json_pointer"],
+            "/syslog_envelope/raw_message",
         )
 
     def test_native_waf_syslog_http_fields_drive_forensic_diagnostics(self):

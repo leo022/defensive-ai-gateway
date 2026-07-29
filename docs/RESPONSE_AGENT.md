@@ -160,6 +160,7 @@ flowchart LR
 - 与服务端固定范围一致的冗余 `case_id/session_id/source_snapshot_hash` 会被校验并移除；任何不一致值均会拒绝。
 - 参数不得包含 SQL、表名、数据库路径、URL、endpoint、Shell 或 command。
 - 每个工具使用独立参数契约；未知参数被丢弃，数值、列表和游标由控制器归一化和限界。
+- 当模型把 `_syslog_envelope/syslog_envelope/syslog_route` 的 `raw_message` 路径写成别名时，控制器只按同一告警已完成 manifest 中的唯一权威指针纠偏，并在步骤、幂等键和工具调用持久化前完成规范化；没有唯一权威指针时不猜测。
 - 同一工具和参数通过幂等键复用既有结果。
 - 模型返回 `finish` 只是综合请求：控制器会先补齐八项基线只读工具，并按照 `query_forensic_coverage` 的强制读取集，把最多 8 条高优先级原始 Syslog、`/original_log` 或完整原始告警逐条从 offset 0 连续读取到末尾。
 - 确定性报告门禁会独立检查上述证据下限；缺少基线工具或原始分段未完成的报告只能进入 `blocked`，不能得到 `passed`。
@@ -221,7 +222,7 @@ flowchart LR
 
 所有工具结果依次经过：
 
-1. `PolicyEngine.redact()` 深度脱敏；
+1. `PolicyEngine.redact()` 深度脱敏；序列化原文中带引号的敏感字段值会整体替换，值内空格、逗号和转义引号不会造成尾部泄露；
 2. 结构化字节上限裁剪；
 3. SHA-256 结果哈希；
 4. 引用清单绑定；

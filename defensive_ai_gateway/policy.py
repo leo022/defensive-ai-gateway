@@ -9,6 +9,16 @@ from typing import Any
 from .config import PolicyConfig
 
 
+_QUOTED_SENSITIVE_ASSIGNMENT = re.compile(
+    r"(?i)(?P<prefix>[\"']?(?:api[_-]?key|x-api-key|access[_-]?token|"
+    r"refresh[_-]?token|id[_-]?token|token|client[_-]?secret|secret|credential|"
+    r"password|passwd|authorization|proxy[_-]?authorization|cookie|set[_-]?cookie|"
+    r"session(?:[_-]?id)?|jsessionid|customer[_-]?id|email|phone|mobile|"
+    r"account[_-]?number|card[_-]?number|bank[_-]?card)[\"']?\s*[:=]\s*)"
+    r"(?P<quote>[\"'])(?:\\.|(?!(?P=quote)).)*(?P=quote)"
+)
+
+
 SECRET_PATTERNS = [
     re.compile(r"(?i)(\bhttps?://)[^/@\s:]+:[^/@\s]+(?=@)"),
     re.compile(r"(?i)(\b(?:cookie|set-cookie)\s*[:=]\s*[\"']?)[^\"'\r\n]+"),
@@ -223,7 +233,13 @@ def _is_digest_field(field: str) -> bool:
 
 
 def _redact_sensitive_text(value: str) -> str:
-    text = value
+    text = _QUOTED_SENSITIVE_ASSIGNMENT.sub(
+        lambda match: (
+            f"{match.group('prefix')}{match.group('quote')}"
+            f"[REDACTED]{match.group('quote')}"
+        ),
+        value,
+    )
     for pattern in SECRET_PATTERNS:
         text = pattern.sub(
             lambda match: (

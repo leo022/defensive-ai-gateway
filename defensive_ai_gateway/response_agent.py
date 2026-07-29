@@ -533,6 +533,21 @@ def _resolve_json_pointer(value: Any, pointer: str) -> Any:
     return current
 
 
+def _is_syslog_raw_message_pointer(pointer: Any) -> bool:
+    rendered = str(pointer or "")
+    if not rendered.startswith("/"):
+        return False
+    parts = [
+        part.replace("~1", "/").replace("~0", "~")
+        for part in rendered.split("/")[1:]
+    ]
+    if len(parts) != 2:
+        return False
+    envelope = parts[0].strip().casefold().replace("-", "_").lstrip("_")
+    message = parts[1].strip().casefold().replace("-", "_")
+    return envelope in {"syslog_envelope", "syslog_route"} and message == "raw_message"
+
+
 def _utf8_chunk(text: str, offset: int, max_bytes: int) -> tuple[str, int, int, int]:
     encoded = text.encode("utf-8")
     total = len(encoded)
@@ -2153,6 +2168,11 @@ class ResponseInvestigationAgent:
                     "invalid_json_pointer",
                     "json_pointer must be empty or an RFC 6901 pointer",
                 )
+            pointer = self._canonicalize_syslog_message_pointer(
+                session,
+                alert_id,
+                pointer,
+            )
             return {
                 "alert_id": alert_id,
                 "json_pointer": pointer,
@@ -2172,6 +2192,46 @@ class ResponseInvestigationAgent:
             "tool_not_allowed",
             "agent selected a tool outside the controller allowlist",
         )
+
+    @staticmethod
+    def _canonicalize_syslog_message_pointer(
+        session: dict[str, Any],
+        alert_id: str,
+        requested_pointer: str,
+    ) -> str:
+        """Resolve a model's Syslog-envelope alias through prior manifests."""
+        if not _is_syslog_raw_message_pointer(requested_pointer):
+            return requested_pointer
+
+        authoritative: set[str] = set()
+        for call in session.get("tool_calls") or []:
+            if not isinstance(call, dict) or call.get("status") != "completed":
+                continue
+            result = call.get("result")
+            if not isinstance(result, dict):
+                continue
+            tool_name = str(call.get("tool_name") or "")
+            pointer_field = "syslog_message_pointer"
+            if tool_name in {"query_case_raw_alerts", "search_related_alerts"}:
+                items = result.get("items") or []
+            elif tool_name == "query_forensic_coverage":
+                items = result.get("required_reads") or []
+                pointer_field = "json_pointer"
+            else:
+                continue
+            for item in items:
+                if (
+                    not isinstance(item, dict)
+                    or str(item.get("alert_id") or "") != alert_id
+                ):
+                    continue
+                pointer = str(item.get(pointer_field) or "")
+                if _is_syslog_raw_message_pointer(pointer):
+                    authoritative.add(pointer)
+
+        if requested_pointer in authoritative or len(authoritative) != 1:
+            return requested_pointer
+        return next(iter(authoritative))
 
     def _forensic_linked_inventory(
         self,
