@@ -2443,7 +2443,6 @@ class ResponseInvestigationAgent:
                         )
                     if state in {
                         "captured_null",
-                        "captured_empty",
                         "captured_invalid",
                         "captured_incomplete",
                         "not_observed",

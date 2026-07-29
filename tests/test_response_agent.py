@@ -1310,6 +1310,10 @@ class ResponseAgentTest(unittest.TestCase):
     def test_zero_http_status_is_a_capture_gap_not_an_observed_response(self):
         alert = _waf_alert("response-agent-zero-http-status")
         alert.payload["status"] = 0
+        alert.payload["method"] = "GET"
+        alert.payload["uri"] = "/files/list"
+        alert.payload["query"] = "{}"
+        alert.payload["request_body"] = None
         case_id = self.state.orchestrator.handle_alert(alert).case_id
         artifact = self.state.case_response.generate(
             case_id, actor="analyst"
@@ -1331,6 +1335,10 @@ class ResponseAgentTest(unittest.TestCase):
         response_status = diagnostics["http_response_status"]
         self.assertEqual(response_status["state"], "captured_invalid")
         self.assertNotIn("observed_value", response_status)
+        self.assertEqual(
+            diagnostics["http_request_payload"]["state"],
+            "captured_empty",
+        )
 
         coverage, _ = self.state.response_agent._execute_tool(
             "query_forensic_coverage",
@@ -1347,6 +1355,10 @@ class ResponseAgentTest(unittest.TestCase):
         self.assertEqual(metrics["observed_response_statuses"], [])
         self.assertIn(
             "http_response_status:captured_invalid",
+            metrics["capture_gaps"],
+        )
+        self.assertNotIn(
+            "http_request_payload:captured_empty",
             metrics["capture_gaps"],
         )
         localized = self.state.response_agent._localized_forensic_workstreams(
