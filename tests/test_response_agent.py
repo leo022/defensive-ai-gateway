@@ -25,7 +25,11 @@ from defensive_ai_gateway.llm import (
     parse_structured_gateway_response,
 )
 from defensive_ai_gateway.models import RawAlert
-from defensive_ai_gateway.response_agent import CONTROLLER_TOOLS, MANDATORY_TOOLS
+from defensive_ai_gateway.response_agent import (
+    CONTROLLER_TOOLS,
+    MANDATORY_TOOLS,
+    _raw_stream_progress,
+)
 from scripts.clean_alerts_and_memory import _delete
 
 
@@ -727,7 +731,18 @@ class ResponseAgentTest(unittest.TestCase):
                     "json_pointer": "/original_log",
                     "offset": 0,
                 },
-                "result": {"complete": False, "next_offset": 4_096},
+                "result": {
+                    "alert_id": "raw-report-floor",
+                    "json_pointer": "/original_log",
+                    "offset": 0,
+                    "next_offset": 4,
+                    "total_bytes": 8,
+                    "complete": False,
+                    "content": "abcd",
+                    "content_sha256": hashlib.sha256(b"abcdefgh").hexdigest(),
+                    "chunk_sha256": hashlib.sha256(b"abcd").hexdigest(),
+                    "source_hash": "source-report-floor",
+                },
                 "evidence_refs": [],
             }
         )
@@ -741,6 +756,179 @@ class ResponseAgentTest(unittest.TestCase):
         )
         self.assertIn("raw_evidence_read_incomplete", raw_validation["errors"])
         self.assertFalse(raw_validation["checks"]["raw_evidence_complete"])
+
+        source_changed_calls = json.loads(
+            json.dumps(complete_calls[:-1], ensure_ascii=False)
+        )
+        for call in source_changed_calls:
+            if call["tool_name"] == "query_forensic_coverage":
+                call["result"] = {
+                    "required_reads": [
+                        {
+                            "alert_id": "raw-report-floor",
+                            "json_pointer": "/original_log",
+                            "source_hash": "expected-source-hash",
+                        }
+                    ],
+                    "workstreams": [],
+                }
+                break
+        source_changed_calls.append(
+            {
+                "tool_name": "read_raw_alert_chunk",
+                "status": "completed",
+                "arguments": {
+                    "alert_id": "raw-report-floor",
+                    "json_pointer": "/original_log",
+                    "offset": 0,
+                },
+                "result": {
+                    "alert_id": "raw-report-floor",
+                    "json_pointer": "/original_log",
+                    "offset": 0,
+                    "next_offset": None,
+                    "total_bytes": 4,
+                    "complete": True,
+                    "content": "abcd",
+                    "content_sha256": hashlib.sha256(b"abcd").hexdigest(),
+                    "chunk_sha256": hashlib.sha256(b"abcd").hexdigest(),
+                    "source_hash": "changed-source-hash",
+                },
+                "evidence_refs": [],
+            }
+        )
+        changed_source_session = {
+            **session,
+            "tool_calls": source_changed_calls,
+        }
+        changed_source_validation, _ = self.state.response_agent._validate_report(
+            report,
+            changed_source_session,
+            source,
+            artifact,
+        )
+        self.assertEqual(changed_source_validation["status"], "blocked")
+        self.assertTrue(
+            any(
+                error.startswith("forensic_required_source_changed:")
+                for error in changed_source_validation["errors"]
+            )
+        )
+        self.assertFalse(
+            changed_source_validation["checks"][
+                "forensic_required_reads_complete"
+            ]
+        )
+
+    def test_raw_stream_requires_prefix_continuity_and_recomputed_content_hash(self):
+        def raw_call(
+            *,
+            offset: int,
+            content: str,
+            next_offset: int | None,
+            total_bytes: int,
+            complete: bool,
+            content_sha256: str,
+        ) -> dict:
+            return {
+                "tool_name": "read_raw_alert_chunk",
+                "status": "completed",
+                "arguments": {
+                    "alert_id": "raw-stream-integrity",
+                    "json_pointer": "/original_log",
+                    "offset": offset,
+                },
+                "result": {
+                    "alert_id": "raw-stream-integrity",
+                    "json_pointer": "/original_log",
+                    "offset": offset,
+                    "next_offset": next_offset,
+                    "total_bytes": total_bytes,
+                    "complete": complete,
+                    "content": content,
+                    "content_sha256": content_sha256,
+                    "chunk_sha256": hashlib.sha256(
+                        content.encode("utf-8")
+                    ).hexdigest(),
+                    "source_hash": "stable-source-hash",
+                },
+            }
+
+        expected_hash = hashlib.sha256(b"abcd").hexdigest()
+        skipped_prefix = _raw_stream_progress(
+            [
+                raw_call(
+                    offset=2,
+                    content="cd",
+                    next_offset=None,
+                    total_bytes=4,
+                    complete=True,
+                    content_sha256=expected_hash,
+                )
+            ]
+        )
+        self.assertFalse(skipped_prefix["complete"])
+        self.assertFalse(skipped_prefix["invalid"])
+        self.assertEqual(skipped_prefix["next_offset"], 0)
+
+        decision = self.state.response_agent._completion_guard_decision(
+            [
+                raw_call(
+                    offset=2,
+                    content="cd",
+                    next_offset=None,
+                    total_bytes=4,
+                    complete=True,
+                    content_sha256=expected_hash,
+                )
+            ]
+        )
+        self.assertEqual(decision["tool_name"], "read_raw_alert_chunk")
+        self.assertEqual(decision["arguments"]["offset"], 0)
+
+        mismatched_content = _raw_stream_progress(
+            [
+                raw_call(
+                    offset=0,
+                    content="ab",
+                    next_offset=2,
+                    total_bytes=4,
+                    complete=False,
+                    content_sha256=expected_hash,
+                ),
+                raw_call(
+                    offset=2,
+                    content="XY",
+                    next_offset=None,
+                    total_bytes=4,
+                    complete=True,
+                    content_sha256=expected_hash,
+                ),
+            ]
+        )
+        self.assertFalse(mismatched_content["complete"])
+        self.assertTrue(mismatched_content["invalid"])
+        self.assertEqual(
+            mismatched_content["reason"],
+            "raw_stream_content_hash_mismatch",
+        )
+
+        identity_mismatch_call = raw_call(
+            offset=0,
+            content="abcd",
+            next_offset=None,
+            total_bytes=4,
+            complete=True,
+            content_sha256=expected_hash,
+        )
+        identity_mismatch_call["result"]["alert_id"] = "other-alert"
+        identity_mismatch = _raw_stream_progress([identity_mismatch_call])
+        self.assertFalse(identity_mismatch["complete"])
+        self.assertTrue(identity_mismatch["invalid"])
+        self.assertEqual(
+            identity_mismatch["reason"],
+            "raw_stream_identity_mismatch",
+        )
 
     def test_duplicate_tool_loop_advances_required_evidence_before_synthesis(self):
         self.state.response_agent.set_llm(_DuplicateToolAgentLLM())
@@ -1019,6 +1207,10 @@ class ResponseAgentTest(unittest.TestCase):
             "captured_null",
         )
         self.assertEqual(
+            diagnostics["http_request_payload"]["state"],
+            "captured_nonempty",
+        )
+        self.assertEqual(
             diagnostics["http_response_status"]["observed_value"],
             "403",
         )
@@ -1044,11 +1236,12 @@ class ResponseAgentTest(unittest.TestCase):
                 for item in coverage["workstreams"]
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             any(
-                "不是 Agent 分块读取或 prompt 截断" in item
+                f"原始告警 {alert.alert_id} 的 HTTP 请求载荷" in item
                 for item in coverage["source_limits"]
-            )
+            ),
+            coverage["source_limits"],
         )
         self.assertEqual(
             {item["ref_id"] for item in coverage_refs},
@@ -1163,6 +1356,141 @@ class ResponseAgentTest(unittest.TestCase):
         observations = localized["investigation_result"]["observations"]
         self.assertFalse(
             any("已观测 HTTP 响应状态：0" in item for item in observations)
+        )
+
+    def test_json_encoded_empty_request_payload_uses_http_semantics(self):
+        payload = {
+            "original_log": {
+                "event": {
+                    "request_message": {
+                        "method": "GET",
+                        "url": "http://example.test/list",
+                        "parameter": "{}",
+                        "body": None,
+                        "header": {},
+                    },
+                    "response_message": {
+                        "status_code": 0,
+                        "body": "",
+                    },
+                }
+            }
+        }
+
+        diagnostics = {
+            item["field"]: item
+            for item in self.state.repo._response_agent_capture_diagnostics(payload)
+        }
+        self.assertEqual(
+            diagnostics["http_request_parameters"]["state"],
+            "captured_empty",
+        )
+        self.assertEqual(
+            diagnostics["http_request_payload"]["state"],
+            "captured_empty",
+        )
+        self.assertEqual(
+            diagnostics["http_request_payload"]["reason"],
+            "method_without_body_or_query",
+        )
+
+        request = payload["original_log"]["event"]["request_message"]
+        request["method"] = "POST"
+        request["header"] = {"content-length": 0}
+        diagnostics = {
+            item["field"]: item
+            for item in self.state.repo._response_agent_capture_diagnostics(payload)
+        }
+        self.assertEqual(
+            diagnostics["http_request_payload"]["state"],
+            "captured_empty",
+        )
+        self.assertEqual(
+            diagnostics["http_request_payload"]["reason"],
+            "content_length_zero",
+        )
+        self.assertEqual(
+            diagnostics["http_request_payload"]["content_length"],
+            0,
+        )
+
+        request["method"] = "GET"
+        request["url"] = "http://example.test/list?path=/usr"
+        request["header"] = {}
+        diagnostics = {
+            item["field"]: item
+            for item in self.state.repo._response_agent_capture_diagnostics(payload)
+        }
+        self.assertEqual(
+            diagnostics["http_request_payload"]["state"],
+            "captured_nonempty",
+        )
+        self.assertEqual(
+            diagnostics["http_request_payload"]["reason"],
+            "query_string_present",
+        )
+
+        request["url"] = "http://example.test/list"
+        request["header"] = {"Content-Length": "10"}
+        diagnostics = {
+            item["field"]: item
+            for item in self.state.repo._response_agent_capture_diagnostics(payload)
+        }
+        self.assertEqual(
+            diagnostics["http_request_payload"]["state"],
+            "captured_incomplete",
+        )
+        self.assertEqual(
+            diagnostics["http_request_payload"]["reason"],
+            "declared_request_body_missing",
+        )
+
+        request["parameter"] = "captured=query-value"
+        diagnostics = {
+            item["field"]: item
+            for item in self.state.repo._response_agent_capture_diagnostics(payload)
+        }
+        self.assertEqual(
+            diagnostics["http_request_payload"]["state"],
+            "captured_incomplete",
+        )
+        self.assertEqual(
+            diagnostics["http_request_payload"]["reason"],
+            "declared_request_body_missing",
+        )
+
+        request["parameter"] = "{}"
+        request["header"] = {"Content-Length": "9" * 5_000}
+        diagnostics = {
+            item["field"]: item
+            for item in self.state.repo._response_agent_capture_diagnostics(payload)
+        }
+        self.assertEqual(
+            diagnostics["http_request_payload"]["state"],
+            "captured_incomplete",
+        )
+        self.assertEqual(
+            diagnostics["http_request_payload"]["reason"],
+            "invalid_content_length",
+        )
+        self.assertEqual(
+            diagnostics["http_request_payload"]["content_length_state"],
+            "invalid",
+        )
+
+        request.pop("url")
+        request["header"] = {}
+        diagnostics = {
+            item["field"]: item
+            for item in self.state.repo._response_agent_capture_diagnostics(payload)
+        }
+        self.assertEqual(
+            diagnostics["http_request_payload"]["state"],
+            "captured_incomplete",
+        )
+        self.assertEqual(
+            diagnostics["http_request_payload"]["reason"],
+            "request_target_not_observed",
         )
 
     def test_llm_sees_every_complete_raw_chunk_and_report_gets_rolling_notes(self):

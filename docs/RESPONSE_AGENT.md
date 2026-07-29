@@ -1,7 +1,7 @@
 # Defensive AI Response Agent 方案与迭代记录
 
 更新日期：2026-07-29
-当前状态：第一阶段 v3 已实现（含完整 Syslog 读取门禁与多域深度取证）
+当前状态：第一阶段 v4 已实现（含原始证据连续读取校验、HTTP 载荷语义诊断与多域深度取证）
 
 ## 1. 目标与原则
 
@@ -37,6 +37,24 @@ v2 的处理规则为：
 - v3 在 manifest 中明确返回原始 Syslog 指针、字节数、计算哈希、采集信封记录哈希和完整性状态，并对请求体、参数、请求头、响应状态与响应体输出 `captured_nonempty/captured_empty/captured_null/not_observed` 诊断。
 - v3 从 Case 关联和跨产品相关告警中选择最多 8 条高优先级原始证据作为强制读取集。控制器逐条续读到 `complete=true`，报告门禁再次独立校验。
 - 源字段为 null、空值或未观察到时，报告必须表述为“源端采集缺失”，并保留补采步骤；不得描述为 Agent 分块读取或 prompt 截断。已采集的响应状态必须直接用于结论。
+
+### 1.3 生产案例复核与 v4 语义修正
+
+针对 Case `case_rasp_VM-0-7-centos_cloudrasp_list_file_102`、会话 `response_agent_385664f739d94f08` 的复核结论：
+
+- Agent 对 4 条入选 RASP 原始 Syslog 共执行 9 次分块读取，各流均从 offset 0 连续读到末尾，分块内容没有被 prompt 截断。
+- 告警 `82ae6aa8af954b89a2e8582ed71b2f9e` 是无查询串的 GET，请求体为 `null`、参数为 JSON 字符串 `"{}"`；告警 `f3574556fc954b1f976a2f9ae013398d` 是 `Content-Length: 0` 的 POST，字段状态相同。两者均为协议语义明确的空载荷，旧报告 9.2/9.5 属于诊断假阳性。
+- 4 条告警的 `response_message.status_code` 均为整数 `0`，采集器保存的原始 Syslog 与数据库 `original_log` 对应内容一致。HTTP 合法状态范围是 100-599，因此旧报告 9.1/9.3/9.4/9.6 所述“未采集可验证响应状态”是真实源端缺口。
+- 4 条采集信封均未提供可比对的 `raw_message_sha256`，所以 `syslog_message_integrity=unverified`。这不表示已发现篡改，但不能据此宣称源端到采集器的传输完整性已验证。
+- `complete=true` 只证明本次选择的、脱敏后的数据库序列化内容已读到末尾；它不能单独证明发送端、Syslog 传输或供应商采集完整。传输结论必须单独引用 `syslog_message_integrity`。
+
+v4 增加以下确定性规则：
+
+- JSON 字符串形式的空对象、空数组、空字符串与 `null` 分别归一为 `captured_empty` 或 `captured_null`，不再一律视为非空文本。
+- 新增组合字段 `http_request_payload`，综合请求体、参数、URL 查询串、HTTP 方法、`Content-Length` 和 `Transfer-Encoding` 判断 `captured_nonempty`、`captured_empty`、`captured_incomplete` 或 `not_observed`。
+- URL 查询串本身属于已采集请求内容；GET/HEAD 在请求 URL 已观测且无查询串时可判定明确空载荷；`Content-Length: 0` 可判定明确空载荷；声明正长度或分块传输但正文缺失时必须判定不完整。
+- 原始读取门禁要求每个证据流从 offset 0 连续覆盖到总长度，逐块复算 SHA-256，保持总长度、完整内容哈希和来源哈希一致，将读取时的来源哈希绑定到取证盘点，并在末块对拼接内容重新计算完整 SHA-256。跳读、断档、身份错配、源记录变化、元数据漂移或哈希不一致均不能通过报告门禁。
+- 历史完成报告保持不可变；部署 v4 后通过“重新执行”创建的新会话才会使用新诊断与门禁。
 
 ## 2. 第一阶段实现范围
 
@@ -124,7 +142,7 @@ flowchart LR
 - 参数不得包含 SQL、表名、数据库路径、URL、endpoint、Shell 或 command。
 - 每个工具使用独立参数契约；未知参数被丢弃，数值、列表和游标由控制器归一化和限界。
 - 同一工具和参数通过幂等键复用既有结果。
-- 模型返回 `finish` 只是综合请求：控制器会先补齐八项基线只读工具，并按照 `query_forensic_coverage` 的强制读取集，把最多 8 条高优先级原始 Syslog、`/original_log` 或完整原始告警逐条读取到 `complete=true`。
+- 模型返回 `finish` 只是综合请求：控制器会先补齐八项基线只读工具，并按照 `query_forensic_coverage` 的强制读取集，把最多 8 条高优先级原始 Syslog、`/original_log` 或完整原始告警逐条从 offset 0 连续读取到末尾。
 - 确定性报告门禁会独立检查上述证据下限；缺少基线工具或原始分段未完成的报告只能进入 `blocked`，不能得到 `passed`。
 - 连续重复且没有新观察时，若证据下限仍有缺项，控制器直接推进下一项必需只读工具；只有下限完整时才进入报告综合。
 - 达到轮次、工具调用或活动时间预算时进入 `budget_exhausted`。
@@ -162,7 +180,8 @@ flowchart LR
 2. 控制器优先选择采集器保存的 `/_syslog_envelope/raw_message` 或 `/syslog_route/raw_message`，其次选择 `/original_log`，最后选择完整受控原始告警；
 3. 控制器在完整对象上先执行深度脱敏，再按 UTF-8 位元组游标分段；默认单段 4096 bytes，保证最新分段能完整进入当前模型 prompt，而不是在工具完成后再次被静默裁剪；
 4. `next_offset` 可连续读取到 `complete=true`，避免 prompt 截断导致尾部证据丢失；
-5. 每段提供 chunk SHA-256，所有分段共享脱敏后完整内容 SHA-256 与原始来源哈希。
+5. 每段提供 chunk SHA-256，所有分段共享脱敏后完整内容 SHA-256 与原始来源哈希；
+6. 完成门禁从 offset 0 验证连续偏移、逐块 SHA-256、稳定的总长度与来源元数据，并对拼接内容重算完整 SHA-256。`complete=true` 不代替 `syslog_message_integrity`，也不代表供应商已经采集所有 HTTP 字段。
 
 最新原始分段在 planner/report context 中具有最高优先级。模型继续下一段或进入报告前，必须在公开的短 `rationale` 中保留本段事实摘要；控制器把最近 40 条摘要作为滚动调查笔记传入后续轮次和报告综合。这里只保存可审计事实，不保存隐式思维链。若模型在分段尚未完成时请求 `finish`，控制器自动续读 `next_offset`；若任一强制读取流在轮次或工具预算内仍未读到 `complete=true`，会话进入明确的预算终态或报告门禁 `blocked`，不能把抽查单条或未完成读取表述为完整取证。
 
@@ -278,7 +297,7 @@ POST /api/response-agent/sessions/{session_id}/input
 - 无引用的 confirmed/inferred claim 自动降为 unverified；
 - 无直接执行或直接发送能力；
 - 响应模式仅为 `observe` 或 `approve_required`；
-- 强制原始读取集全部完成，且八类取证工作流及其控制器状态未被模型删除或改写；
+- 强制原始读取集全部从 offset 0 连续完成且分块/整流哈希一致，八类取证工作流及其控制器状态未被模型删除或改写；
 - 无敏感信息泄漏；
 - 继承原 Case Validator 的 `passed/review/blocked` 约束。
 

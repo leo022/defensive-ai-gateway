@@ -13,8 +13,8 @@ from .models import new_id, now_ms
 
 
 REPORT_SCHEMA_VERSION = "response-investigation-report-v3"
-AGENT_VERSION = "response-investigation-agent-v4"
-TOOL_VERSION = "3"
+AGENT_VERSION = "response-investigation-agent-v5"
+TOOL_VERSION = "4"
 ACTIVE_STATUSES = {
     "queued",
     "running",
@@ -544,6 +544,151 @@ def _utf8_chunk(text: str, offset: int, max_bytes: int) -> tuple[str, int, int, 
         while end < total and encoded[end] & 0xC0 == 0x80:
             end += 1
     return encoded[start:end].decode("utf-8"), start, end, total
+
+
+def _raw_stream_progress(
+    calls: list[dict[str, Any]],
+) -> dict[str, Any]:
+    by_offset: dict[int, dict[str, Any]] = {}
+    for call in calls:
+        if call.get("status") != "completed":
+            continue
+        arguments = call.get("arguments")
+        result = call.get("result")
+        if not isinstance(arguments, dict) or not isinstance(result, dict):
+            continue
+        argument_alert_id = str(arguments.get("alert_id") or "")
+        argument_pointer = str(arguments.get("json_pointer") or "")
+        if (
+            str(result.get("alert_id") or "") != argument_alert_id
+            or str(result.get("json_pointer") or "") != argument_pointer
+        ):
+            return {
+                "complete": False,
+                "next_offset": 0,
+                "invalid": True,
+                "reason": "raw_stream_identity_mismatch",
+                "covered_offsets": [],
+            }
+        offset = _integer(result.get("offset"), _integer(arguments.get("offset"), -1))
+        if offset < 0:
+            continue
+        by_offset[offset] = result
+
+    expected_offset = 0
+    total_bytes: int | None = None
+    content_sha256 = ""
+    source_hash = ""
+    assembled_hasher = hashlib.sha256()
+    covered_offsets: list[int] = []
+    while expected_offset in by_offset:
+        result = by_offset[expected_offset]
+        content = result.get("content")
+        if not isinstance(content, str):
+            return {
+                "complete": False,
+                "next_offset": expected_offset,
+                "invalid": True,
+                "reason": "raw_chunk_content_missing",
+                "covered_offsets": covered_offsets,
+            }
+        chunk_bytes = content.encode("utf-8")
+        recorded_chunk_hash = str(result.get("chunk_sha256") or "")
+        if (
+            not recorded_chunk_hash
+            or recorded_chunk_hash != hashlib.sha256(chunk_bytes).hexdigest()
+        ):
+            return {
+                "complete": False,
+                "next_offset": expected_offset,
+                "invalid": True,
+                "reason": "raw_chunk_hash_mismatch",
+                "covered_offsets": covered_offsets,
+            }
+
+        current_total = _integer(result.get("total_bytes"), -1)
+        current_content_hash = str(result.get("content_sha256") or "")
+        current_source_hash = str(result.get("source_hash") or "")
+        if current_total < 0 or not current_content_hash or not current_source_hash:
+            return {
+                "complete": False,
+                "next_offset": expected_offset,
+                "invalid": True,
+                "reason": "raw_stream_metadata_missing",
+                "covered_offsets": covered_offsets,
+            }
+        if total_bytes is None:
+            total_bytes = current_total
+            content_sha256 = current_content_hash
+            source_hash = current_source_hash
+        elif (
+            current_total != total_bytes
+            or current_content_hash != content_sha256
+            or current_source_hash != source_hash
+        ):
+            return {
+                "complete": False,
+                "next_offset": expected_offset,
+                "invalid": True,
+                "reason": "raw_stream_metadata_changed",
+                "covered_offsets": covered_offsets,
+            }
+
+        end_offset = expected_offset + len(chunk_bytes)
+        assembled_hasher.update(chunk_bytes)
+        covered_offsets.append(expected_offset)
+        if result.get("complete") is True:
+            if end_offset != total_bytes or result.get("next_offset") not in {
+                None,
+                total_bytes,
+            }:
+                return {
+                    "complete": False,
+                    "next_offset": expected_offset,
+                    "invalid": True,
+                    "reason": "raw_stream_terminal_offset_mismatch",
+                    "covered_offsets": covered_offsets,
+                }
+            if assembled_hasher.hexdigest() != content_sha256:
+                return {
+                    "complete": False,
+                    "next_offset": expected_offset,
+                    "invalid": True,
+                    "reason": "raw_stream_content_hash_mismatch",
+                    "covered_offsets": covered_offsets,
+                }
+            return {
+                "complete": True,
+                "next_offset": None,
+                "invalid": False,
+                "reason": "",
+                "covered_offsets": covered_offsets,
+                "total_bytes": total_bytes,
+                "content_sha256": content_sha256,
+                "source_hash": source_hash,
+            }
+
+        next_offset = _integer(result.get("next_offset"), -1)
+        if next_offset != end_offset or next_offset <= expected_offset:
+            return {
+                "complete": False,
+                "next_offset": expected_offset,
+                "invalid": True,
+                "reason": "raw_stream_noncontiguous",
+                "covered_offsets": covered_offsets,
+            }
+        expected_offset = next_offset
+
+    return {
+        "complete": False,
+        "next_offset": expected_offset,
+        "invalid": False,
+        "reason": "",
+        "covered_offsets": covered_offsets,
+        "total_bytes": total_bytes,
+        "content_sha256": content_sha256,
+        "source_hash": source_hash,
+    }
 
 
 def _default_plan(language: str = "zh") -> list[dict[str, Any]]:
@@ -1514,8 +1659,13 @@ class ResponseInvestigationAgent:
             "query_forensic_coverage to obtain the mandatory evidence streams and "
             "the server/endpoint/network/identity forensic acquisition plan. Use "
             "read_raw_alert_chunk with next_offset until a decisive selected field "
-            "is complete. A captured null or empty HTTP field is a source-capture "
-            "limitation, not a tool truncation. When active_raw_observation is "
+            "is complete. complete=true proves only that the selected stored, redacted "
+            "serialization was read contiguously to its end; it does not prove source "
+            "or transport integrity. Use syslog_message_integrity for that separate "
+            "claim. A captured null, empty or incomplete HTTP field is a source-capture "
+            "state, not a tool truncation. An explicitly empty request established by "
+            "the HTTP method or Content-Length is not missing evidence. When "
+            "active_raw_observation is "
             "present, first preserve a "
             "concise factual evidence note in rationale before selecting the next "
             "action; do not include hidden reasoning. Never request shell, arbitrary "
@@ -1561,51 +1711,34 @@ class ResponseInvestigationAgent:
         completed_calls = [
             call for call in calls if call.get("status") == "completed"
         ]
-        latest_raw_calls: dict[tuple[str, str], dict[str, Any]] = {}
+        raw_calls_by_stream: dict[
+            tuple[str, str], list[dict[str, Any]]
+        ] = {}
         for call in completed_calls:
             if call.get("tool_name") != "read_raw_alert_chunk":
                 continue
-            result = call.get("result")
             arguments = call.get("arguments")
-            if not isinstance(result, dict) or not isinstance(arguments, dict):
+            if not isinstance(arguments, dict):
                 continue
             stream = (
                 str(arguments.get("alert_id") or ""),
                 str(arguments.get("json_pointer") or ""),
             )
-            offset = _integer(result.get("offset"), _integer(arguments.get("offset")))
-            existing = latest_raw_calls.get(stream)
-            existing_result = existing.get("result") if existing else {}
-            existing_arguments = existing.get("arguments") if existing else {}
-            existing_offset = _integer(
-                existing_result.get("offset")
-                if isinstance(existing_result, dict)
-                else None,
-                _integer(
-                    existing_arguments.get("offset")
-                    if isinstance(existing_arguments, dict)
-                    else None,
-                    -1,
-                ),
-            )
-            if offset >= existing_offset:
-                latest_raw_calls[stream] = call
+            raw_calls_by_stream.setdefault(stream, []).append(call)
+        raw_progress = {
+            stream: _raw_stream_progress(stream_calls)
+            for stream, stream_calls in raw_calls_by_stream.items()
+        }
 
-        for stream in sorted(latest_raw_calls):
-            call = latest_raw_calls[stream]
-            result = call["result"]
-            arguments = call["arguments"]
-            offset = _integer(result.get("offset"), _integer(arguments.get("offset")))
-            next_offset = _integer(result.get("next_offset"), offset)
-            if result.get("complete") is not False or next_offset <= offset:
+        for stream in sorted(raw_progress):
+            progress = raw_progress[stream]
+            if progress.get("complete") is True or progress.get("invalid"):
                 continue
             continuation = {
                 "alert_id": stream[0],
                 "json_pointer": stream[1],
-                "offset": next_offset,
+                "offset": _integer(progress.get("next_offset"), 0),
             }
-            if _integer(arguments.get("max_bytes")) > 0:
-                continuation["max_bytes"] = _integer(arguments["max_bytes"])
             return {
                 "action": "tool_call",
                 "tool_name": "read_raw_alert_chunk",
@@ -1658,9 +1791,10 @@ class ResponseInvestigationAgent:
                 str(required.get("alert_id") or ""),
                 str(required.get("json_pointer") or ""),
             )
-            latest = latest_raw_calls.get(stream)
-            latest_result = latest.get("result") if latest else {}
-            if isinstance(latest_result, dict) and latest_result.get("complete") is True:
+            progress = raw_progress.get(stream)
+            if progress and progress.get("complete") is True:
+                continue
+            if progress and progress.get("invalid"):
                 continue
             return {
                 "action": "tool_call",
@@ -1668,7 +1802,10 @@ class ResponseInvestigationAgent:
                 "arguments": {
                     "alert_id": stream[0],
                     "json_pointer": stream[1],
-                    "offset": 0,
+                    "offset": _integer(
+                        (progress or {}).get("next_offset"),
+                        0,
+                    ),
                 },
                 "rationale": (
                     _pick(
@@ -2151,6 +2288,14 @@ class ResponseInvestigationAgent:
                 source_limits.append(
                     f"原始告警 {item['alert_id']} 的 Syslog 内容哈希与采集信封记录不一致，必须核对采集器归档。"
                 )
+            elif (
+                item.get("syslog_message_present")
+                and item.get("syslog_message_integrity") == "unverified"
+            ):
+                source_limits.append(
+                    f"原始告警 {item['alert_id']} 的 Syslog 采集信封未提供可比对的原文哈希；"
+                    "当前只能验证入库后的存储内容，不能证明源端到采集器的传输完整性。"
+                )
             if "web_request" not in item.get("forensic_domains", []):
                 continue
             diagnostics = {
@@ -2166,13 +2311,18 @@ class ResponseInvestigationAgent:
                 (diagnostics.get("http_request_parameters") or {}).get("state")
                 or "not_observed"
             )
-            if (
-                body_state != "captured_nonempty"
-                or parameter_state != "captured_nonempty"
-            ):
+            request_payload = diagnostics.get("http_request_payload") or {}
+            request_payload_state = str(
+                request_payload.get("state") or "not_observed"
+            )
+            if request_payload_state in {
+                "captured_incomplete",
+                "not_observed",
+            }:
                 source_limits.append(
-                    f"原始告警 {item['alert_id']} 的 HTTP 请求载荷采集不完整"
-                    f"（body={body_state}, parameters={parameter_state}）；"
+                    f"原始告警 {item['alert_id']} 的 HTTP 请求载荷存在采集缺口"
+                    f"（payload={request_payload_state}, body={body_state}, "
+                    f"parameters={parameter_state}）；"
                     "这是源端采集状态，不是 Agent 分块读取或 prompt 截断。"
                 )
             response_status = diagnostics.get("http_response_status") or {}
@@ -2206,12 +2356,8 @@ class ResponseInvestigationAgent:
                     if (
                         diagnostic_states.get("http_response_status")
                         == "captured_nonempty"
-                        and (
-                            diagnostic_states.get("http_request_body")
-                            == "captured_nonempty"
-                            or diagnostic_states.get("http_request_parameters")
-                            == "captured_nonempty"
-                        )
+                        and diagnostic_states.get("http_request_payload")
+                        in {"captured_nonempty", "captured_empty"}
                     ):
                         complete_exchange = True
                         break
@@ -2255,13 +2401,40 @@ class ResponseInvestigationAgent:
             )
             capture_gaps: list[str] = []
             observed_response_statuses: list[str] = []
+            request_payload_profiles: list[dict[str, Any]] = []
             matched_pivots: list[dict[str, str]] = []
             for item in sources:
-                for diagnostic in item.get("capture_diagnostics") or []:
-                    if not isinstance(diagnostic, dict):
-                        continue
+                item_diagnostics = {
+                    str(diagnostic.get("field") or ""): diagnostic
+                    for diagnostic in item.get("capture_diagnostics") or []
+                    if isinstance(diagnostic, dict)
+                }
+                request_payload = item_diagnostics.get(
+                    "http_request_payload"
+                ) or {}
+                if request_payload:
+                    request_payload_profiles.append(
+                        {
+                            "alert_id": str(item.get("alert_id") or ""),
+                            "state": str(
+                                request_payload.get("state")
+                                or "not_observed"
+                            ),
+                            "method": str(request_payload.get("method") or ""),
+                            "reason": str(request_payload.get("reason") or ""),
+                            "content_length": request_payload.get(
+                                "content_length"
+                            ),
+                        }
+                    )
+                for diagnostic in item_diagnostics.values():
                     field = str(diagnostic.get("field") or "")
                     state = str(diagnostic.get("state") or "")
+                    if field in {
+                        "http_request_body",
+                        "http_request_parameters",
+                    }:
+                        continue
                     if field == "http_response_status" and diagnostic.get(
                         "observed_value"
                     ):
@@ -2272,6 +2445,7 @@ class ResponseInvestigationAgent:
                         "captured_null",
                         "captured_empty",
                         "captured_invalid",
+                        "captured_incomplete",
                         "not_observed",
                     }:
                         capture_gaps.append(f"{field}:{state}")
@@ -2315,6 +2489,7 @@ class ResponseInvestigationAgent:
                             verified_integrity_count
                         ),
                         "capture_gaps": list(dict.fromkeys(capture_gaps))[:16],
+                        "request_payload_profiles": request_payload_profiles[:8],
                         "observed_response_statuses": list(
                             dict.fromkeys(observed_response_statuses)
                         )[:8],
@@ -2841,10 +3016,14 @@ class ResponseInvestigationAgent:
                 "workstream, preserve the controller status and provide an "
                 "evidence-based assessment, concrete observations, viable alternative "
                 "explanations and next pivots. If capture "
-                "diagnostics say an HTTP field is captured_null, captured_empty, "
-                "captured_invalid or not_observed, describe it as a source-capture "
-                "limitation and retain "
-                "the specific collection steps; never call it Agent truncation. If "
+                "diagnostics say an HTTP field is captured_null, captured_invalid, "
+                "captured_incomplete or not_observed, describe it as a source-capture "
+                "limitation and retain the specific collection steps; never call it "
+                "Agent truncation. captured_empty on the composite request payload "
+                "means the HTTP method or Content-Length establishes an explicitly "
+                "empty request, not missing evidence. A raw chunk complete flag proves "
+                "only a contiguous read of the selected stored serialization, not "
+                "source or transport integrity. If "
                 "a response status is captured, use that observed value instead of "
                 "calling the status unverified. Do not imply live server access: "
                 "server, endpoint, file, network, identity, persistence and "
@@ -2976,6 +3155,11 @@ class ResponseInvestigationAgent:
             capture_gaps = [
                 str(value) for value in metrics.get("capture_gaps") or [] if value
             ]
+            request_payload_profiles = [
+                value
+                for value in metrics.get("request_payload_profiles") or []
+                if isinstance(value, dict) and value.get("alert_id")
+            ]
             pivots = [
                 f"{entry.get('field')}: {entry.get('value')}"
                 for entry in metrics.get("correlation_pivots") or []
@@ -3026,6 +3210,20 @@ class ResponseInvestigationAgent:
                     observations.append(
                         "Source-capture gaps: " + ", ".join(capture_gaps) + "."
                     )
+                for profile in request_payload_profiles:
+                    state = str(profile.get("state") or "not_observed")
+                    method = str(profile.get("method") or "HTTP")
+                    alert_id = str(profile.get("alert_id") or "")
+                    reason = str(profile.get("reason") or "")
+                    if state == "captured_empty":
+                        observations.append(
+                            f"Alert {alert_id} has an explicitly empty {method} request "
+                            f"payload ({reason}); this is not Agent truncation."
+                        )
+                    elif state == "captured_nonempty":
+                        observations.append(
+                            f"Alert {alert_id} contains a non-empty {method} request payload."
+                        )
                 if pivots:
                     observations.append(
                         "Correlation pivots: " + "; ".join(pivots) + "."
@@ -3077,6 +3275,28 @@ class ResponseInvestigationAgent:
                     observations.append(
                         "源端采集缺口：" + "、".join(capture_gaps) + "。"
                     )
+                reason_labels = {
+                    "content_length_zero": "Content-Length 为 0",
+                    "method_without_body_or_query": "方法语义且 URL 无查询串",
+                    "request_content_present": "已采集请求内容",
+                }
+                for profile in request_payload_profiles:
+                    state = str(profile.get("state") or "not_observed")
+                    method = str(profile.get("method") or "HTTP")
+                    alert_id = str(profile.get("alert_id") or "")
+                    reason = reason_labels.get(
+                        str(profile.get("reason") or ""),
+                        str(profile.get("reason") or ""),
+                    )
+                    if state == "captured_empty":
+                        observations.append(
+                            f"原始告警 {alert_id} 的 {method} 请求为明确空载荷"
+                            f"（{reason}），并非 Agent 截断。"
+                        )
+                    elif state == "captured_nonempty":
+                        observations.append(
+                            f"原始告警 {alert_id} 已采集非空 {method} 请求载荷。"
+                        )
                 if pivots:
                     observations.append("关联支点：" + "；".join(pivots) + "。")
                 if source_count >= 2 and len(products) >= 2:
@@ -4130,22 +4350,24 @@ class ResponseInvestigationAgent:
             if call.get("tool_name")
             in {"query_case_raw_alerts", "search_related_alerts"}
         )
-        raw_streams: dict[tuple[str, str], dict[str, Any]] = {}
+        raw_calls_by_stream: dict[
+            tuple[str, str], list[dict[str, Any]]
+        ] = {}
         for call in completed_calls:
             if call.get("tool_name") != "read_raw_alert_chunk":
                 continue
             arguments = call.get("arguments")
-            result = call.get("result")
-            if not isinstance(arguments, dict) or not isinstance(result, dict):
+            if not isinstance(arguments, dict):
                 continue
             stream = (
                 str(arguments.get("alert_id") or ""),
                 str(arguments.get("json_pointer") or ""),
             )
-            offset = _integer(result.get("offset"), _integer(arguments.get("offset")))
-            existing = raw_streams.get(stream)
-            if not existing or offset >= _integer(existing.get("offset"), -1):
-                raw_streams[stream] = result
+            raw_calls_by_stream.setdefault(stream, []).append(call)
+        raw_streams = {
+            stream: _raw_stream_progress(stream_calls)
+            for stream, stream_calls in raw_calls_by_stream.items()
+        }
         coverage_result: dict[str, Any] = {}
         for call in reversed(completed_calls):
             if call.get("tool_name") != "query_forensic_coverage":
@@ -4153,14 +4375,25 @@ class ResponseInvestigationAgent:
             if isinstance(call.get("result"), dict):
                 coverage_result = call["result"]
             break
+        required_items = [
+            item
+            for item in coverage_result.get("required_reads") or []
+            if isinstance(item, dict) and item.get("alert_id")
+        ]
         required_streams = [
             (
                 str(item.get("alert_id") or ""),
                 str(item.get("json_pointer") or ""),
             )
-            for item in coverage_result.get("required_reads") or []
-            if isinstance(item, dict) and item.get("alert_id")
+            for item in required_items
         ]
+        expected_source_hashes = {
+            (
+                str(item.get("alert_id") or ""),
+                str(item.get("json_pointer") or ""),
+            ): str(item.get("source_hash") or "")
+            for item in required_items
+        }
         missing_required_streams = [
             stream for stream in required_streams if stream not in raw_streams
         ]
@@ -4170,15 +4403,30 @@ class ResponseInvestigationAgent:
             if stream in raw_streams
             and raw_streams[stream].get("complete") is not True
         ]
+        invalid_streams = [
+            stream
+            for stream, progress in raw_streams.items()
+            if progress.get("invalid")
+        ]
+        changed_required_streams = [
+            stream
+            for stream in required_streams
+            if stream in raw_streams
+            and expected_source_hashes.get(stream)
+            and raw_streams[stream].get("source_hash")
+            != expected_source_hashes[stream]
+        ]
         selected_streams_complete = all(
-            result.get("complete") is True
-            for result in raw_streams.values()
+            progress.get("complete") is True
+            for progress in raw_streams.values()
         )
         if required_streams:
             raw_evidence_complete = (
                 selected_streams_complete
                 and not (
-                    missing_required_streams or incomplete_required_streams
+                    missing_required_streams
+                    or incomplete_required_streams
+                    or changed_required_streams
                 )
             )
         else:
@@ -4199,6 +4447,22 @@ class ResponseInvestigationAgent:
                 + ",".join(
                     f"{alert_id}|{pointer}"
                     for alert_id, pointer in incomplete_required_streams
+                )
+            )
+        if invalid_streams:
+            errors.append(
+                "raw_evidence_stream_invalid:"
+                + ",".join(
+                    f"{alert_id}|{pointer}|{raw_streams[(alert_id, pointer)].get('reason')}"
+                    for alert_id, pointer in invalid_streams
+                )
+            )
+        if changed_required_streams:
+            errors.append(
+                "forensic_required_source_changed:"
+                + ",".join(
+                    f"{alert_id}|{pointer}"
+                    for alert_id, pointer in changed_required_streams
                 )
             )
         if raw_candidates and not raw_evidence_complete:
@@ -4383,7 +4647,7 @@ class ResponseInvestigationAgent:
         return (
             {
                 "status": status,
-                "validator": "deterministic-response-report-gate-v3",
+                "validator": "deterministic-response-report-gate-v4",
                 "errors": errors,
                 "warnings": warnings,
                 "checks": {
@@ -4396,7 +4660,10 @@ class ResponseInvestigationAgent:
                         not raw_candidates or raw_evidence_complete
                     ),
                     "forensic_required_reads_complete": not (
-                        missing_required_streams or incomplete_required_streams
+                        missing_required_streams
+                        or incomplete_required_streams
+                        or invalid_streams
+                        or changed_required_streams
                     ),
                     "forensic_workstreams_complete": not missing_workstreams,
                     "forensic_investigation_results_complete": not any(

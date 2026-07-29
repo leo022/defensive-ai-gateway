@@ -7,6 +7,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from .models import AgentResult, NormalizedEvent, RawAlert, ValidationResult, now_ms
 from .validation import can_continue_after_manual_review
@@ -3919,9 +3920,201 @@ class Repository:
             return "not_observed"
         if value is None:
             return "captured_null"
-        if value == "" or value == [] or value == {}:
+        if value == [] or value == {}:
             return "captured_empty"
+        if isinstance(value, str):
+            rendered = value.strip()
+            if not rendered:
+                return "captured_empty"
+            if len(rendered) <= 64_000 and rendered[:1] in {'"', "{", "[", "n"}:
+                try:
+                    decoded = json.loads(rendered)
+                except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
+                    decoded = value
+                if decoded is None:
+                    return "captured_null"
+                if decoded == "" or decoded == [] or decoded == {}:
+                    return "captured_empty"
         return "captured_nonempty"
+
+    @classmethod
+    def _response_agent_request_payload_diagnostic(
+        cls,
+        payload: Any,
+        diagnostics: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        by_field = {
+            str(item.get("field") or ""): item
+            for item in diagnostics
+            if isinstance(item, dict)
+        }
+        body = by_field.get("http_request_body") or {}
+        parameters = by_field.get("http_request_parameters") or {}
+        body_state = str(body.get("state") or "not_observed")
+        parameter_state = str(parameters.get("state") or "not_observed")
+
+        _method_found, _method_pointer, method_value = (
+            cls._response_agent_path_value(
+                payload,
+                (
+                    (
+                        "/original_log/event/request_message/method",
+                        ("original_log", "event", "request_message", "method"),
+                    ),
+                    (
+                        "/event/request_message/method",
+                        ("event", "request_message", "method"),
+                    ),
+                    ("/request_message/method", ("request_message", "method")),
+                    ("/method", ("method",)),
+                    ("/http_method", ("http_method",)),
+                ),
+            )
+        )
+        method = str(method_value or "").strip().upper()
+        url_found, _url_pointer, url_value = cls._response_agent_path_value(
+            payload,
+            (
+                (
+                    "/original_log/event/request_message/url",
+                    ("original_log", "event", "request_message", "url"),
+                ),
+                (
+                    "/event/request_message/url",
+                    ("event", "request_message", "url"),
+                ),
+                ("/request_message/url", ("request_message", "url")),
+                ("/url", ("url",)),
+                ("/uri", ("uri",)),
+            ),
+        )
+        rendered_url = str(url_value or "").strip()
+        url_observed = bool(url_found and rendered_url)
+        try:
+            query_present = bool(urlsplit(rendered_url).query) if url_observed else False
+        except ValueError:
+            query_present = "?" in rendered_url
+
+        _headers_found, _headers_pointer, headers_value = (
+            cls._response_agent_path_value(
+                payload,
+                (
+                    (
+                        "/original_log/event/request_message/header",
+                        ("original_log", "event", "request_message", "header"),
+                    ),
+                    (
+                        "/original_log/event/request_message/headers",
+                        ("original_log", "event", "request_message", "headers"),
+                    ),
+                    (
+                        "/event/request_message/header",
+                        ("event", "request_message", "header"),
+                    ),
+                    (
+                        "/event/request_message/headers",
+                        ("event", "request_message", "headers"),
+                    ),
+                    ("/request_headers", ("request_headers",)),
+                    ("/headers", ("headers",)),
+                ),
+            )
+        )
+        normalized_headers = {
+            str(key).strip().casefold().replace("_", "-"): value
+            for key, value in (
+                headers_value.items() if isinstance(headers_value, dict) else ()
+            )
+        }
+        content_length: int | None = None
+        content_length_invalid = False
+        content_length_present = "content-length" in normalized_headers
+        raw_content_length = normalized_headers.get("content-length")
+        rendered_content_length = (
+            str(raw_content_length).strip()
+            if raw_content_length is not None
+            and not isinstance(raw_content_length, bool)
+            else ""
+        )
+        if (
+            content_length_present
+            and rendered_content_length.isdigit()
+            and len(rendered_content_length) <= 20
+        ):
+            content_length = int(rendered_content_length)
+            if content_length > 9_223_372_036_854_775_807:
+                content_length = None
+                content_length_invalid = True
+        elif content_length_present:
+            content_length_invalid = True
+        transfer_encoding = str(
+            normalized_headers.get("transfer-encoding") or ""
+        ).strip()
+
+        body_nonempty = body_state == "captured_nonempty"
+        parameters_nonempty = parameter_state == "captured_nonempty"
+        declared_body = bool(transfer_encoding) or (
+            content_length is not None and content_length > 0
+        )
+
+        if content_length_invalid:
+            state = "captured_incomplete"
+            reason = "invalid_content_length"
+        elif declared_body and not body_nonempty:
+            state = "captured_incomplete"
+            reason = "declared_request_body_missing"
+        elif content_length == 0 and body_nonempty:
+            state = "captured_incomplete"
+            reason = "content_length_body_conflict"
+        elif body_nonempty or parameters_nonempty:
+            state = "captured_nonempty"
+            reason = "request_content_present"
+        elif query_present:
+            state = "captured_nonempty"
+            reason = "query_string_present"
+        elif content_length == 0 and not transfer_encoding:
+            state = "captured_empty"
+            reason = "content_length_zero"
+        elif method in {"GET", "HEAD"} and url_observed:
+            state = "captured_empty"
+            reason = "method_without_body_or_query"
+        elif method in {"GET", "HEAD"}:
+            state = "captured_incomplete"
+            reason = "request_target_not_observed"
+        elif (
+            body_state == "captured_empty"
+            and parameter_state == "captured_empty"
+        ):
+            state = "captured_empty"
+            reason = "captured_empty_fields"
+        elif (
+            body_state == "not_observed"
+            and parameter_state == "not_observed"
+        ):
+            state = "not_observed"
+            reason = "request_payload_not_observed"
+        else:
+            state = "captured_incomplete"
+            reason = "request_payload_fields_empty_or_null"
+
+        item: dict[str, Any] = {
+            "field": "http_request_payload",
+            "state": state,
+            "json_pointer": "",
+            "bytes": int(body.get("bytes") or 0)
+            + int(parameters.get("bytes") or 0),
+            "method": method,
+            "url_observed": url_observed,
+            "query_present": query_present,
+            "reason": reason,
+        }
+        if content_length is not None:
+            item["content_length"] = content_length
+        if content_length_present:
+            item["content_length_state"] = (
+                "invalid" if content_length_invalid else "captured"
+            )
+        return item
 
     @staticmethod
     def _response_agent_http_status(value: Any) -> str:
@@ -4071,6 +4264,12 @@ class Repository:
                 else:
                     item["state"] = "captured_invalid"
             diagnostics.append(item)
+        diagnostics.append(
+            cls._response_agent_request_payload_diagnostic(
+                payload,
+                diagnostics,
+            )
+        )
         return diagnostics
 
     @classmethod
