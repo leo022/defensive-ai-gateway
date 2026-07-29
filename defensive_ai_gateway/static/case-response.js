@@ -31,6 +31,7 @@ let agentAbortController = null;
 let agentPollTimer = null;
 let agentDrawerOpen = false;
 let agentTraceExpanded = true;
+let agentTraceMiddleExpanded = false;
 
 const COPY = {
   zh: {
@@ -148,7 +149,12 @@ const COPY = {
     agentTraceCount: (count) => `${count} 步`,
     agentTraceShow: "展开调查轨迹",
     agentTraceHide: "收起调查轨迹",
+    agentTraceFirst: "首次轨迹",
+    agentTraceLatest: "最新轨迹",
+    agentTraceOnly: "首次轨迹 · 当前最新",
+    agentTraceMiddle: (count) => `中间 ${count} 条调查记录`,
     agentReport: "深度调查报告",
+    agentExecutiveSummary: "执行摘要",
     agentTurns: "轮次",
     agentTools: "工具调用",
     agentElapsed: "活动时长",
@@ -307,7 +313,12 @@ const COPY = {
     agentTraceCount: (count) => `${count} steps`,
     agentTraceShow: "Expand investigation trace",
     agentTraceHide: "Collapse investigation trace",
+    agentTraceFirst: "First trace",
+    agentTraceLatest: "Latest trace",
+    agentTraceOnly: "First trace · latest",
+    agentTraceMiddle: (count) => `${count} intermediate investigation records`,
     agentReport: "Deep investigation report",
+    agentExecutiveSummary: "Executive summary",
     agentTurns: "Turns",
     agentTools: "Tool calls",
     agentElapsed: "Active time",
@@ -1395,25 +1406,69 @@ function renderAgentPlan() {
   `).join("")}</div>` : `<p class="case-response-empty">${escapeHtml(tr("empty"))}</p>`;
 }
 
+function renderAgentTraceStep(step, role, roleLabel) {
+  const detail = step.detail || {};
+  const summary = detail.summary || detail.question || detail.message || "";
+  const liveAttributes = ["latest", "only"].includes(role)
+    ? ' aria-live="polite" aria-atomic="true"'
+    : "";
+  return `
+    <article
+      class="response-agent-trace-row response-agent-trace-row-${escapeHtml(role)}"
+      data-sequence="${Number(step.sequence || 0)}"
+      ${liveAttributes}
+    >
+      <div class="response-agent-trace-row-head">
+        ${roleLabel ? `<span class="response-agent-trace-role">${escapeHtml(roleLabel)}</span>` : ""}
+        <span class="response-agent-trace-time">${String(Number(step.sequence || 0)).padStart(2, "0")} · ${escapeHtml(fmtTime(step.created_at_ms))}</span>
+      </div>
+      <strong>${escapeHtml(step.title || step.phase)}</strong>
+      ${step.rationale ? `<p>${escapeHtml(step.rationale)}</p>` : ""}
+      ${summary ? `<p>${escapeHtml(summary)}</p>` : ""}
+      ${compactAgentRefs(step.evidence_refs)}
+    </article>
+  `;
+}
+
 function renderAgentTrace() {
   const target = document.querySelector("#response-agent-trace");
   document.querySelector("#response-agent-trace-count").textContent = tr(
     "agentTraceCount",
     agentSteps.length,
   );
-  target.innerHTML = agentSteps.length ? `<div class="response-agent-trace-list">${agentSteps.map((step) => {
-    const detail = step.detail || {};
-    const summary = detail.summary || detail.question || detail.message || "";
-    return `
-      <article class="response-agent-trace-row">
-        <span>${String(Number(step.sequence || 0)).padStart(2, "0")} · ${escapeHtml(fmtTime(step.created_at_ms))}</span>
-        <strong>${escapeHtml(step.title || step.phase)}</strong>
-        ${step.rationale ? `<p>${escapeHtml(step.rationale)}</p>` : ""}
-        ${summary ? `<p>${escapeHtml(summary)}</p>` : ""}
-        ${compactAgentRefs(step.evidence_refs)}
-      </article>
-    `;
-  }).join("")}</div>` : `<p class="case-response-empty">${escapeHtml(tr("empty"))}</p>`;
+  if (!agentSteps.length) {
+    target.innerHTML = `<p class="case-response-empty">${escapeHtml(tr("empty"))}</p>`;
+    setAgentTraceExpanded(agentTraceExpanded);
+    return;
+  }
+
+  const first = agentSteps[0];
+  const latest = agentSteps[agentSteps.length - 1];
+  const middle = agentSteps.slice(1, -1);
+  const firstRole = agentSteps.length === 1 ? "only" : "first";
+  const firstLabel = tr(agentSteps.length === 1 ? "agentTraceOnly" : "agentTraceFirst");
+  const middleMarkup = middle.length ? `
+    <details class="response-agent-trace-middle" ${agentTraceMiddleExpanded ? "open" : ""}>
+      <summary>
+        <span class="response-agent-trace-middle-chevron" aria-hidden="true"></span>
+        <span>${escapeHtml(tr("agentTraceMiddle", middle.length))}</span>
+      </summary>
+      <div class="response-agent-trace-middle-list">
+        ${middle.map((step) => renderAgentTraceStep(step, "middle", "")).join("")}
+      </div>
+    </details>
+  ` : "";
+  target.innerHTML = `
+    <div class="response-agent-trace-list">
+      ${renderAgentTraceStep(first, firstRole, firstLabel)}
+      ${middleMarkup}
+      ${agentSteps.length > 1 ? renderAgentTraceStep(latest, "latest", tr("agentTraceLatest")) : ""}
+    </div>
+  `;
+  const middleDetails = target.querySelector(".response-agent-trace-middle");
+  middleDetails?.addEventListener("toggle", () => {
+    agentTraceMiddleExpanded = middleDetails.open;
+  });
   setAgentTraceExpanded(agentTraceExpanded);
 }
 
@@ -1428,11 +1483,16 @@ function setAgentTraceExpanded(expanded) {
   target.hidden = !agentTraceExpanded;
 }
 
-function reportItems(items, renderItem, emptyText) {
+function reportItems(items, renderItem, emptyText, sectionNumber) {
   if (!Array.isArray(items) || !items.length) {
     return `<p class="case-response-empty">${escapeHtml(emptyText)}</p>`;
   }
-  return `<ol class="response-agent-report-list">${items.map(renderItem).join("")}</ol>`;
+  return `<ol class="response-agent-report-list">${items.map((item, index) => `
+    <li>
+      <span class="response-agent-report-item-number" aria-hidden="true">${sectionNumber}.${index + 1}</span>
+      <div class="response-agent-report-item-content">${renderItem(item, index)}</div>
+    </li>
+  `).join("")}</ol>`;
 }
 
 function agentDetailList(label, values) {
@@ -1440,8 +1500,22 @@ function agentDetailList(label, values) {
   if (!items.length) return "";
   return `<div class="response-agent-investigation-detail">
     <strong>${escapeHtml(label)}</strong>
-    ${items.map((item) => `<small>${escapeHtml(item)}</small>`).join("")}
+    <ol class="response-agent-report-sublist">
+      ${items.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}
+    </ol>
   </div>`;
+}
+
+function agentReportSection(number, title, body, extraClass = "") {
+  return `
+    <section class="response-agent-report-section ${escapeHtml(extraClass)}">
+      <div class="response-agent-report-section-heading">
+        <span class="response-agent-report-section-number" aria-hidden="true">${number}</span>
+        <h4>${escapeHtml(title)}</h4>
+      </div>
+      <div class="response-agent-report-section-content">${body}</div>
+    </section>
+  `;
 }
 
 function renderAgentReport() {
@@ -1461,29 +1535,27 @@ function renderAgentReport() {
   const validation = report.validation || {};
   target.innerHTML = `
     <article class="response-agent-report">
-      <section class="response-agent-report-section">
-        <h4>${escapeHtml(content.title || tr("agentReport"))}</h4>
+      ${agentReportSection(1, tr("agentExecutiveSummary"), `
+        <h5 class="response-agent-report-document-title">${escapeHtml(content.title || tr("agentReport"))}</h5>
         <p>${escapeHtml(content.executive_summary || "-")}</p>
-      </section>
-      <section class="response-agent-report-section response-agent-report-conclusion">
-        <h4>${escapeHtml(tr("agentConclusion"))}</h4>
+      `)}
+      ${agentReportSection(2, tr("agentConclusion"), `
         <p><strong>${escapeHtml(enumLabel("state", conclusion.classification))} · ${escapeHtml(fmtConfidence(conclusion.confidence))}</strong></p>
         <p>${escapeHtml(conclusion.statement || "-")}</p>
-      </section>
-      <section class="response-agent-report-section">
-        <h4>${escapeHtml(tr("agentFindings"))}</h4>
-        ${reportItems(content.findings, (item) => `
-          <li>
-            ${escapeHtml(item.statement || "-")}
+      `, "response-agent-report-conclusion")}
+      ${agentReportSection(3, tr("agentFindings"), reportItems(
+        content.findings,
+        (item) => `
+            <p>${escapeHtml(item.statement || "-")}</p>
             <small>${escapeHtml(enumLabel("claimState", item.claim_state))}</small>
             ${compactAgentRefs(item.evidence_refs)}
-          </li>
-        `, tr("agentEmptyFindings"))}
-      </section>
-      <section class="response-agent-report-section">
-        <h4>${escapeHtml(tr("agentHypotheses"))}</h4>
-        ${reportItems(content.hypothesis_assessment, (item) => `
-          <li>
+        `,
+        tr("agentEmptyFindings"),
+        3,
+      ))}
+      ${agentReportSection(4, tr("agentHypotheses"), reportItems(
+        content.hypothesis_assessment,
+        (item) => `
             <strong>${escapeHtml(item.title || item.hypothesis_id || "-")}</strong>
             <small>${escapeHtml(enumLabel("hypothesisDisposition", item.disposition))} · ${escapeHtml(fmtConfidence(item.confidence))}</small>
             <p>${escapeHtml(item.rationale || "-")}</p>
@@ -1494,20 +1566,19 @@ function renderAgentReport() {
             ${(item.contradicting_evidence_refs || []).length
               ? `<small><strong>${escapeHtml(tr("agentHypothesisAgainst"))}</strong></small>${compactAgentRefs(item.contradicting_evidence_refs)}`
               : ""}
-          </li>
-        `, tr("agentEmptyFindings"))}
-      </section>
-      <section class="response-agent-report-section">
-        <h4>${escapeHtml(tr("agentCorrelation"))}</h4>
+        `,
+        tr("agentEmptyFindings"),
+        4,
+      ))}
+      ${agentReportSection(5, tr("agentCorrelation"), `
         <p><strong>${escapeHtml(enumLabel("correlationStrength", correlation.strength))}</strong></p>
         <p>${escapeHtml(correlation.summary || "-")}</p>
         ${agentDetailList(
           tr("agentCorrelationPivots"),
           (correlation.correlation_pivots || []).map((item) => `${item.field || "-"}: ${item.value || "-"}`),
         )}
-      </section>
-      <section class="response-agent-report-section">
-        <h4>${escapeHtml(tr("agentScope"))}</h4>
+      `)}
+      ${agentReportSection(6, tr("agentScope"), `
         <p>${escapeHtml(scope.blast_radius_assessment || "-")}</p>
         ${agentDetailList(
           tr("agentObservedEntities"),
@@ -1516,20 +1587,15 @@ function renderAgentReport() {
         ${agentDetailList(tr("agentCoveredDomains"), scope.evidence_covered_domains)}
         ${agentDetailList(tr("agentUnresolvedDomains"), scope.unresolved_domains)}
         ${compactAgentRefs(scope.evidence_refs)}
-      </section>
-      <section class="response-agent-report-section">
-        <h4>${escapeHtml(tr("agentImpact"))}</h4>
+      `)}
+      ${agentReportSection(7, tr("agentImpact"), `
         <p>${escapeHtml(content.impact || "-")}</p>
-      </section>
-      <section class="response-agent-report-section">
-        <h4>${escapeHtml(tr("agentForensics"))}</h4>
-        ${reportItems(content.forensic_workstreams, (item) => {
+      `)}
+      ${agentReportSection(8, tr("agentForensics"), reportItems(
+        content.forensic_workstreams,
+        (item) => {
           const result = item.investigation_result || {};
-          const steps = (item.collection_steps || [])
-            .map((step) => `<small>${escapeHtml(step)}</small>`)
-            .join("");
           return `
-            <li>
               <strong>${escapeHtml(item.title || item.workstream_id || "-")}</strong>
               <small>${escapeHtml(enumLabel("state", item.status))} · ${escapeHtml(item.coverage_summary || "-")}</small>
               <small>${escapeHtml(enumLabel("forensicConclusion", result.conclusion_state))}</small>
@@ -1538,36 +1604,37 @@ function renderAgentReport() {
               ${agentDetailList(tr("agentForensicObservations"), result.observations)}
               ${agentDetailList(tr("agentAlternativeExplanations"), result.alternative_explanations)}
               ${agentDetailList(tr("agentNextPivots"), result.next_pivots)}
-              ${steps ? `<small><strong>${escapeHtml(tr("agentCollectionSteps"))}</strong></small>${steps}` : ""}
+              ${agentDetailList(tr("agentCollectionSteps"), item.collection_steps)}
               ${compactAgentRefs(item.evidence_refs)}
-            </li>
           `;
-        }, tr("agentEmptyForensics"))}
-      </section>
-      <section class="response-agent-report-section">
-        <h4>${escapeHtml(tr("agentGaps"))}</h4>
-        ${reportItems(content.evidence_gaps, (item) => `<li>${escapeHtml(item)}</li>`, tr("agentEmptyGaps"))}
-      </section>
-      <section class="response-agent-report-section">
-        <h4>${escapeHtml(tr("agentResponsePlan"))}</h4>
-        ${reportItems(content.response_plan, (item) => `
-          <li>
+        },
+        tr("agentEmptyForensics"),
+        8,
+      ))}
+      ${agentReportSection(9, tr("agentGaps"), reportItems(
+        content.evidence_gaps,
+        (item) => `<p>${escapeHtml(item)}</p>`,
+        tr("agentEmptyGaps"),
+        9,
+      ))}
+      ${agentReportSection(10, tr("agentResponsePlan"), reportItems(
+        content.response_plan,
+        (item) => `
             <strong>${escapeHtml(item.action || "-")}</strong>
             <small>${escapeHtml(enumLabel("mode", item.mode))} · ${escapeHtml(item.stage || "-")}</small>
             ${item.rationale ? `<small>${escapeHtml(item.rationale)}</small>` : ""}
             ${compactAgentRefs(item.evidence_refs)}
-          </li>
-        `, tr("agentEmptyPlan"))}
-      </section>
-      <section class="response-agent-report-section">
-        <h4>${escapeHtml(tr("agentFinalAssessment"))}</h4>
+        `,
+        tr("agentEmptyPlan"),
+        10,
+      ))}
+      ${agentReportSection(11, tr("agentFinalAssessment"), `
         <p>${escapeHtml(content.final_assessment || "-")}</p>
-      </section>
-      <section class="response-agent-report-section">
-        <h4>${escapeHtml(tr("agentGate"))}</h4>
+      `)}
+      ${agentReportSection(12, tr("agentGate"), `
         <p><span class="case-response-state ${stateTone(report.validation_status)}">${escapeHtml(enumLabel("state", report.validation_status))}</span></p>
         ${(validation.warnings || []).length ? `<small>${escapeHtml(validation.warnings.join(" · "))}</small>` : ""}
-      </section>
+      `)}
     </article>
   `;
 }
@@ -1635,14 +1702,9 @@ function renderAgentSession() {
 
 function mergeAgentSession(next, replaceSteps = false) {
   const previousSessionId = agentSession?.session_id || "";
-  const previousWasActive = AGENT_ACTIVE_STATUSES.has(agentSession?.status);
-  const nextIsActive = AGENT_ACTIVE_STATUSES.has(next.status);
   if (previousSessionId !== next.session_id) {
-    agentTraceExpanded = nextIsActive;
-  } else if (nextIsActive) {
     agentTraceExpanded = true;
-  } else if (previousWasActive) {
-    agentTraceExpanded = false;
+    agentTraceMiddleExpanded = false;
   }
   const incoming = Array.isArray(next.steps) ? next.steps : [];
   if (replaceSteps || !agentSession || agentSession.session_id !== next.session_id) {
@@ -1697,6 +1759,7 @@ async function refreshAgentSession({ incremental = false } = {}) {
       agentSteps = [];
       agentAfterSequence = 0;
       agentTraceExpanded = true;
+      agentTraceMiddleExpanded = false;
       renderAgentSession();
       setAgentNotice(tr("agentNoSession"));
     } else {
