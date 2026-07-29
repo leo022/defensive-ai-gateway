@@ -106,9 +106,47 @@
           <span id="response-agent-kicker">Response Agent</span>
           <h2 id="response-agent-title">深度响应调查</h2>
         </div>
-        <button id="response-agent-close" class="response-agent-close" type="button" aria-label="关闭" title="关闭">
-          ×
-        </button>
+        <div class="response-agent-header-actions">
+          <button
+            id="response-agent-expand"
+            class="response-agent-icon-button response-agent-expand"
+            type="button"
+            aria-label="展开"
+            aria-pressed="false"
+            title="展开"
+          >
+            <svg
+              class="response-agent-expand-icon response-agent-expand-icon-wide"
+              aria-hidden="true"
+              viewBox="0 0 24 24"
+            >
+              <path d="M15 3h6v6"></path>
+              <path d="m21 3-7 7"></path>
+              <path d="m3 21 7-7"></path>
+              <path d="M9 21H3v-6"></path>
+            </svg>
+            <svg
+              class="response-agent-expand-icon response-agent-expand-icon-narrow"
+              aria-hidden="true"
+              viewBox="0 0 24 24"
+              hidden
+            >
+              <path d="m14 10 7-7"></path>
+              <path d="M20 10h-6V4"></path>
+              <path d="m3 21 7-7"></path>
+              <path d="M4 14h6v6"></path>
+            </svg>
+          </button>
+          <button
+            id="response-agent-close"
+            class="response-agent-icon-button response-agent-close"
+            type="button"
+            aria-label="关闭"
+            title="关闭"
+          >
+            ×
+          </button>
+        </div>
       </header>
       <div class="response-agent-body">
         <div id="response-agent-notice" class="response-agent-notice" role="status" aria-live="polite"></div>

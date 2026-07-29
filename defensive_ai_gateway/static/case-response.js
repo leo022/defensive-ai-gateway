@@ -125,6 +125,8 @@ const COPY = {
     page: (current, total, count) => `第 ${current} / ${total} 页 · 共 ${count} 条`,
     agentOpen: "唤起调查 Agent",
     agentTitle: "深度响应调查",
+    expandAgent: "展开调查工作台",
+    collapseAgent: "收起为侧边栏",
     closeAgent: "关闭",
     agentGoal: "调查目标",
     agentDefaultGoal: "基于当前 Case 的受治理证据，完成深入调查并形成可审计的完整结论。",
@@ -256,6 +258,8 @@ const COPY = {
     page: (current, total, count) => `Page ${current} of ${total} · ${count} entries`,
     agentOpen: "Open investigation agent",
     agentTitle: "Deep response investigation",
+    expandAgent: "Expand investigation workbench",
+    collapseAgent: "Collapse to side panel",
     closeAgent: "Close",
     agentGoal: "Investigation goal",
     agentDefaultGoal: "Investigate the governed Case evidence and produce a complete, auditable conclusion.",
@@ -541,6 +545,8 @@ function applyLocalizedStaticText() {
   document.querySelector("#response-timeline-heading").textContent = tr("timelineHeading");
   document.querySelector("#case-response-agent-open").textContent = tr("agentOpen");
   document.querySelector("#response-agent-title").textContent = tr("agentTitle");
+  document.querySelector("#response-agent-expand").setAttribute("aria-label", tr("expandAgent"));
+  document.querySelector("#response-agent-expand").title = tr("expandAgent");
   document.querySelector("#response-agent-close").setAttribute("aria-label", tr("closeAgent"));
   document.querySelector("#response-agent-close").title = tr("closeAgent");
   document.querySelector("#response-agent-goal-label").textContent = tr("agentGoal");
@@ -1483,6 +1489,7 @@ async function openResponseAgent() {
   const drawer = document.querySelector("#response-agent-drawer");
   const backdrop = document.querySelector("#response-agent-backdrop");
   agentDrawerOpen = true;
+  setResponseAgentExpanded(false);
   drawer.hidden = false;
   backdrop.hidden = false;
   drawer.setAttribute("aria-hidden", "false");
@@ -1490,6 +1497,20 @@ async function openResponseAgent() {
   setAgentNotice(tr("agentLoading"));
   drawer.querySelector("#response-agent-close").focus();
   await refreshAgentSession();
+}
+
+function setResponseAgentExpanded(expanded) {
+  const drawer = document.querySelector("#response-agent-drawer");
+  const button = document.querySelector("#response-agent-expand");
+  const wideIcon = button.querySelector(".response-agent-expand-icon-wide");
+  const narrowIcon = button.querySelector(".response-agent-expand-icon-narrow");
+  const label = tr(expanded ? "collapseAgent" : "expandAgent");
+  drawer.classList.toggle("is-expanded", expanded);
+  button.setAttribute("aria-pressed", String(expanded));
+  button.setAttribute("aria-label", label);
+  button.title = label;
+  wideIcon.hidden = expanded;
+  narrowIcon.hidden = !expanded;
 }
 
 function closeResponseAgent() {
@@ -1562,6 +1583,10 @@ function initialize() {
   document.querySelector("#case-response-generate").addEventListener("click", generate);
   document.querySelector("#case-response-copy-report").addEventListener("click", copyCommunicationReport);
   document.querySelector("#case-response-agent-open").addEventListener("click", openResponseAgent);
+  document.querySelector("#response-agent-expand").addEventListener("click", () => {
+    const drawer = document.querySelector("#response-agent-drawer");
+    setResponseAgentExpanded(!drawer.classList.contains("is-expanded"));
+  });
   document.querySelector("#response-agent-close").addEventListener("click", closeResponseAgent);
   document.querySelector("#response-agent-backdrop").addEventListener("click", closeResponseAgent);
   document.querySelector("#response-agent-start").addEventListener("click", startResponseAgent);

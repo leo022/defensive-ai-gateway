@@ -4652,6 +4652,11 @@ button.memory-audit-row:hover {
   box-shadow: -18px 0 44px rgb(18 24 31 / 18%);
   color: var(--ink);
   overflow: hidden;
+  transition: width 180ms ease;
+}
+
+.response-agent-drawer.is-expanded {
+  width: min(960px, 100vw);
 }
 
 .response-agent-drawer[hidden],
@@ -4694,7 +4699,13 @@ button.memory-audit-row:hover {
   overflow-wrap: anywhere;
 }
 
-.response-agent-close {
+.response-agent-header-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 6px;
+}
+
+.response-agent-icon-button {
   display: grid;
   flex: 0 0 34px;
   place-items: center;
@@ -4702,8 +4713,25 @@ button.memory-audit-row:hover {
   height: 34px;
   padding: 0;
   color: var(--muted);
-  font-size: 22px;
   line-height: 1;
+}
+
+.response-agent-close {
+  font-size: 22px;
+}
+
+.response-agent-expand-icon {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentcolor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2;
+}
+
+.response-agent-expand-icon[hidden] {
+  display: none;
 }
 
 .response-agent-body {
@@ -4974,6 +5002,12 @@ button.memory-audit-row:hover {
 
 body.response-agent-open {
   overflow: hidden;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .response-agent-drawer {
+    transition: none;
+  }
 }
 
 @media (max-width: 1120px) {
@@ -5499,9 +5533,17 @@ body.response-agent-open {
     width: 100%;
   }
 
-  .response-agent-drawer {
+}
+
+@media (max-width: 720px) {
+  .response-agent-drawer,
+  .response-agent-drawer.is-expanded {
     width: 100vw;
     border-left: 0;
+  }
+
+  .response-agent-expand {
+    display: none;
   }
 
   .response-agent-header,
