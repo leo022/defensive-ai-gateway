@@ -3923,6 +3923,20 @@ class Repository:
             return "captured_empty"
         return "captured_nonempty"
 
+    @staticmethod
+    def _response_agent_http_status(value: Any) -> str:
+        if isinstance(value, bool):
+            return ""
+        if isinstance(value, int):
+            status = value
+        elif isinstance(value, float) and value.is_integer():
+            status = int(value)
+        elif isinstance(value, str) and value.strip().isdigit():
+            status = int(value.strip())
+        else:
+            return ""
+        return str(status) if 100 <= status <= 599 else ""
+
     @classmethod
     def _response_agent_capture_diagnostics(
         cls,
@@ -4049,10 +4063,13 @@ class Repository:
             }
             if (
                 field == "http_response_status"
-                and found
-                and isinstance(value, (str, int, float))
+                and item["state"] == "captured_nonempty"
             ):
-                item["observed_value"] = str(value)[:32]
+                observed_status = cls._response_agent_http_status(value)
+                if observed_status:
+                    item["observed_value"] = observed_status
+                else:
+                    item["state"] = "captured_invalid"
             diagnostics.append(item)
         return diagnostics
 

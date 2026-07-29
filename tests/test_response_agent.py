@@ -1066,6 +1066,57 @@ class ResponseAgentTest(unittest.TestCase):
             report["validation"]["checks"]["forensic_workstreams_complete"]
         )
 
+    def test_zero_http_status_is_a_capture_gap_not_an_observed_response(self):
+        alert = _waf_alert("response-agent-zero-http-status")
+        alert.payload["status"] = 0
+        case_id = self.state.orchestrator.handle_alert(alert).case_id
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        source = self.state.repo.get_case_response_source(case_id)
+
+        manifest, _ = self.state.response_agent._execute_tool(
+            "query_case_raw_alerts",
+            {},
+            source,
+            artifact,
+        )
+        linked = next(
+            item for item in manifest["items"] if item["alert_id"] == alert.alert_id
+        )
+        diagnostics = {
+            item["field"]: item for item in linked["capture_diagnostics"]
+        }
+        response_status = diagnostics["http_response_status"]
+        self.assertEqual(response_status["state"], "captured_invalid")
+        self.assertNotIn("observed_value", response_status)
+
+        coverage, _ = self.state.response_agent._execute_tool(
+            "query_forensic_coverage",
+            {},
+            source,
+            artifact,
+        )
+        web_workstream = next(
+            item
+            for item in coverage["workstreams"]
+            if item["domain"] == "web_request"
+        )
+        metrics = web_workstream["analysis_metrics"]
+        self.assertEqual(metrics["observed_response_statuses"], [])
+        self.assertIn(
+            "http_response_status:captured_invalid",
+            metrics["capture_gaps"],
+        )
+        localized = self.state.response_agent._localized_forensic_workstreams(
+            [web_workstream],
+            "zh",
+        )[0]
+        observations = localized["investigation_result"]["observations"]
+        self.assertFalse(
+            any("已观测 HTTP 响应状态：0" in item for item in observations)
+        )
+
     def test_llm_sees_every_complete_raw_chunk_and_report_gets_rolling_notes(self):
         alert = _waf_alert("response-agent-llm-raw-loop")
         alert.payload["original_log"] = "BEGIN-" + ('evidence-"\\-' * 900) + "END"

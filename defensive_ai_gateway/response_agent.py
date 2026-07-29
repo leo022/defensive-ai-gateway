@@ -2255,7 +2255,12 @@ class ResponseInvestigationAgent:
                         observed_response_statuses.append(
                             str(diagnostic["observed_value"])
                         )
-                    if state in {"captured_null", "captured_empty", "not_observed"}:
+                    if state in {
+                        "captured_null",
+                        "captured_empty",
+                        "captured_invalid",
+                        "not_observed",
+                    }:
                         capture_gaps.append(f"{field}:{state}")
                 matched_pivots.extend(item.get("matched_entities") or [])
             workstreams.append(
@@ -2823,8 +2828,9 @@ class ResponseInvestigationAgent:
                 "workstream, preserve the controller status and provide an "
                 "evidence-based assessment, concrete observations, viable alternative "
                 "explanations and next pivots. If capture "
-                "diagnostics say an HTTP field is captured_null, captured_empty or "
-                "not_observed, describe it as a source-capture limitation and retain "
+                "diagnostics say an HTTP field is captured_null, captured_empty, "
+                "captured_invalid or not_observed, describe it as a source-capture "
+                "limitation and retain "
                 "the specific collection steps; never call it Agent truncation. If "
                 "a response status is captured, use that observed value instead of "
                 "calling the status unverified. Do not imply live server access: "
