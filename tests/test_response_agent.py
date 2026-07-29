@@ -474,8 +474,12 @@ class ResponseAgentTest(unittest.TestCase):
         self.assertEqual(claimed["session_id"], started["session_id"])
         claimed_at_ms = int(time.time() * 1_000) - 2_500
         self.state.repo.conn.execute(
-            "UPDATE response_agent_sessions SET claimed_at_ms = ? WHERE session_id = ?",
-            (claimed_at_ms, started["session_id"]),
+            """
+            UPDATE response_agent_sessions
+            SET created_at_ms = ?, claimed_at_ms = ?
+            WHERE session_id = ?
+            """,
+            (claimed_at_ms, claimed_at_ms, started["session_id"]),
         )
         self.state.repo.conn.commit()
 
@@ -484,8 +488,52 @@ class ResponseAgentTest(unittest.TestCase):
         self.assertEqual(live["status"], "running")
         self.assertGreaterEqual(live["usage"]["active_seconds"], 2.4)
         self.assertLess(live["usage"]["active_seconds"], 4.0)
+        self.assertGreaterEqual(live["elapsed_seconds"], 2.4)
+        self.assertLess(live["elapsed_seconds"], 4.0)
         stored = self.state.repo.get_response_agent_session(started["session_id"])
         self.assertEqual(stored["usage"]["active_seconds"], 0.0)
+
+    def test_terminal_session_exposes_start_to_finish_elapsed_duration(self):
+        self.state.response_agent.stop()
+        case_id = self._case("response-agent-elapsed-duration")
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        started = self.state.response_agent.create(
+            case_id, artifact=artifact, goal="measure elapsed time", actor="analyst"
+        )
+        completed = self.state.repo.transition_response_agent_session(
+            started["session_id"], ("queued",), "completed"
+        )
+        self.assertEqual(completed["status"], "completed")
+        created_at_ms = int(time.time() * 1_000) - 231_250
+        completed_at_ms = created_at_ms + 231_125
+        self.state.repo.conn.execute(
+            """
+            UPDATE response_agent_sessions
+            SET created_at_ms = ?, completed_at_ms = ?, usage_json = ?
+            WHERE session_id = ?
+            """,
+            (
+                created_at_ms,
+                completed_at_ms,
+                json.dumps(
+                    {
+                        "turns": 31,
+                        "tool_calls": 20,
+                        "model_calls": 32,
+                        "active_seconds": 0.0,
+                    }
+                ),
+                started["session_id"],
+            ),
+        )
+        self.state.repo.conn.commit()
+
+        final = self.state.response_agent.get(started["session_id"])
+
+        self.assertEqual(final["usage"]["active_seconds"], 0.0)
+        self.assertEqual(final["elapsed_seconds"], 231.125)
 
     def test_terminal_session_can_be_rerun_as_a_new_session(self):
         self.state.response_agent.stop()
@@ -1437,7 +1485,7 @@ class ResponseAgentTest(unittest.TestCase):
         self.assertIn(".response-agent-trace-row-latest", css)
         self.assertIn(".response-agent-trace-middle", css)
         self.assertIn("function formatAgentElapsed(seconds)", script)
-        self.assertIn("formatAgentElapsed(usage.active_seconds)", script)
+        self.assertIn("formatAgentElapsed(agentSession.elapsed_seconds)", script)
         self.assertIn('return `&lt;1 ${unit}`;', script)
         self.assertNotIn(
             "Math.round(Number(usage.active_seconds || 0))",

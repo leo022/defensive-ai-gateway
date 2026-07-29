@@ -1666,7 +1666,7 @@ function renderAgentSession() {
   document.querySelector("#response-agent-metrics").innerHTML = `
     <div><dt>${escapeHtml(tr("agentTurns"))}</dt><dd>${Number(usage.turns || 0)} / ${Number(budget.max_turns || 0)}</dd></div>
     <div><dt>${escapeHtml(tr("agentTools"))}</dt><dd>${Number(usage.tool_calls || 0)} / ${Number(budget.max_tool_calls || 0)}</dd></div>
-    <div><dt>${escapeHtml(tr("agentElapsed"))}</dt><dd>${formatAgentElapsed(usage.active_seconds)}</dd></div>
+    <div><dt>${escapeHtml(tr("agentElapsed"))}</dt><dd>${formatAgentElapsed(agentSession.elapsed_seconds)}</dd></div>
   `;
   renderAgentPlan();
   renderAgentTrace();

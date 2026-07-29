@@ -936,6 +936,19 @@ class ResponseInvestigationAgent:
             active_seconds += max(0.0, (now_ms() - claimed_at_ms) / 1_000)
         usage["active_seconds"] = round(active_seconds, 3)
         payload["usage"] = usage
+        created_at_ms = int(payload.get("created_at_ms") or 0)
+        completed_at_ms = int(payload.get("completed_at_ms") or 0)
+        updated_at_ms = int(payload.get("updated_at_ms") or 0)
+        if str(payload.get("status") or "") in TERMINAL_STATUSES:
+            elapsed_until_ms = completed_at_ms or updated_at_ms
+        else:
+            elapsed_until_ms = now_ms()
+        payload["elapsed_seconds"] = round(
+            max(0, elapsed_until_ms - created_at_ms) / 1_000
+            if created_at_ms > 0
+            else 0.0,
+            3,
+        )
         source = self.repo.get_case_response_source(payload["case_id"])
         current_hash = source_snapshot_hash(source) if source else ""
         payload["freshness"] = {
