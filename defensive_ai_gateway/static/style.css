@@ -4866,6 +4866,54 @@ button.memory-audit-row:hover {
   font-size: 13px;
 }
 
+.response-agent-trace-toggle {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto 16px;
+  gap: 9px;
+  align-items: center;
+  width: 100%;
+  margin: 0 0 11px;
+  border: 0;
+  border-radius: 4px;
+  padding: 5px 4px;
+  background: transparent;
+  color: var(--ink-strong);
+  text-align: left;
+}
+
+.response-agent-trace-toggle:hover {
+  background: var(--surface-subtle);
+}
+
+.response-agent-trace-title {
+  margin: 0;
+  color: var(--ink-strong);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.response-agent-trace-count {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.response-agent-trace-chevron {
+  width: 8px;
+  height: 8px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: translateY(-2px) rotate(45deg);
+  transition: transform 140ms ease;
+}
+
+.response-agent-trace-toggle[aria-expanded="false"] .response-agent-trace-chevron {
+  transform: translateY(2px) rotate(-45deg);
+}
+
+.response-agent-trace-toggle[aria-expanded="false"] {
+  margin-bottom: 0;
+}
+
 .response-agent-plan-list,
 .response-agent-trace-list {
   display: grid;

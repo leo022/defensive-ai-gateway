@@ -168,9 +168,19 @@
             <h3 id="response-agent-plan-title">调查计划</h3>
             <div id="response-agent-plan"></div>
           </section>
-          <section class="response-agent-band" aria-labelledby="response-agent-trace-title">
-            <h3 id="response-agent-trace-title">调查轨迹</h3>
-            <div id="response-agent-trace"></div>
+          <section class="response-agent-band response-agent-trace-band" aria-labelledby="response-agent-trace-title">
+            <button
+              id="response-agent-trace-toggle"
+              class="response-agent-trace-toggle"
+              type="button"
+              aria-expanded="true"
+              aria-controls="response-agent-trace"
+            >
+              <span id="response-agent-trace-title" class="response-agent-trace-title" role="heading" aria-level="3">调查轨迹</span>
+              <span id="response-agent-trace-count" class="response-agent-trace-count">0 步</span>
+              <span class="response-agent-trace-chevron" aria-hidden="true"></span>
+            </button>
+            <div id="response-agent-trace" aria-live="polite"></div>
           </section>
           <form id="response-agent-input-form" class="response-agent-input-form" hidden>
             <label id="response-agent-input-label" for="response-agent-input">补充信息</label>
@@ -187,6 +197,7 @@
         <button id="response-agent-pause" type="button">暂停</button>
         <button id="response-agent-resume" type="button">继续</button>
         <button id="response-agent-cancel" class="danger" type="button">取消</button>
+        <button id="response-agent-rerun" class="primary" type="button" hidden>重新执行</button>
       </footer>
     </aside>
     <script src="/case-response.js"></script>

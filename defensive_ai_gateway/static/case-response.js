@@ -8,6 +8,9 @@ const AGENT_ACTIVE_STATUSES = new Set([
 const AGENT_POLL_STATUSES = new Set([
   "queued", "running", "synthesizing", "validating",
 ]);
+const AGENT_TERMINAL_STATUSES = new Set([
+  "completed", "review", "blocked", "failed", "cancelled", "budget_exhausted",
+]);
 
 let caseId = "";
 let artifact = null;
@@ -27,6 +30,7 @@ let agentRequestSequence = 0;
 let agentAbortController = null;
 let agentPollTimer = null;
 let agentDrawerOpen = false;
+let agentTraceExpanded = true;
 
 const COPY = {
   zh: {
@@ -132,11 +136,16 @@ const COPY = {
     agentDefaultGoal: "基于当前 Case 的受治理证据，完成深入调查并形成可审计的完整结论。",
     agentStart: "开始调查",
     agentStarting: "正在启动…",
+    agentRerun: "重新执行",
+    agentRerunning: "正在重新执行…",
     agentLoading: "正在加载调查会话…",
     agentNoSession: "当前 Case 尚无调查会话。",
     agentSession: "调查会话",
     agentPlan: "调查计划",
     agentTrace: "调查轨迹",
+    agentTraceCount: (count) => `${count} 步`,
+    agentTraceShow: "展开调查轨迹",
+    agentTraceHide: "收起调查轨迹",
     agentReport: "深度调查报告",
     agentTurns: "轮次",
     agentTools: "工具调用",
@@ -269,11 +278,16 @@ const COPY = {
     agentDefaultGoal: "Investigate the governed Case evidence and produce a complete, auditable conclusion.",
     agentStart: "Start investigation",
     agentStarting: "Starting…",
+    agentRerun: "Run again",
+    agentRerunning: "Starting a new run…",
     agentLoading: "Loading investigation session…",
     agentNoSession: "This Case has no investigation session.",
     agentSession: "Investigation session",
     agentPlan: "Investigation plan",
     agentTrace: "Investigation trace",
+    agentTraceCount: (count) => `${count} steps`,
+    agentTraceShow: "Expand investigation trace",
+    agentTraceHide: "Collapse investigation trace",
     agentReport: "Deep investigation report",
     agentTurns: "Turns",
     agentTools: "Tool calls",
@@ -566,6 +580,7 @@ function applyLocalizedStaticText() {
   document.querySelector("#response-agent-goal-label").textContent = tr("agentGoal");
   document.querySelector("#response-agent-goal").value = tr("agentDefaultGoal");
   document.querySelector("#response-agent-start").textContent = tr("agentStart");
+  document.querySelector("#response-agent-rerun").textContent = tr("agentRerun");
   document.querySelector("#response-agent-session-label").textContent = tr("agentSession");
   document.querySelector("#response-agent-plan-title").textContent = tr("agentPlan");
   document.querySelector("#response-agent-trace-title").textContent = tr("agentTrace");
@@ -1288,6 +1303,10 @@ function renderAgentPlan() {
 
 function renderAgentTrace() {
   const target = document.querySelector("#response-agent-trace");
+  document.querySelector("#response-agent-trace-count").textContent = tr(
+    "agentTraceCount",
+    agentSteps.length,
+  );
   target.innerHTML = agentSteps.length ? `<div class="response-agent-trace-list">${agentSteps.map((step) => {
     const detail = step.detail || {};
     const summary = detail.summary || detail.question || detail.message || "";
@@ -1301,6 +1320,18 @@ function renderAgentTrace() {
       </article>
     `;
   }).join("")}</div>` : `<p class="case-response-empty">${escapeHtml(tr("empty"))}</p>`;
+  setAgentTraceExpanded(agentTraceExpanded);
+}
+
+function setAgentTraceExpanded(expanded) {
+  const toggle = document.querySelector("#response-agent-trace-toggle");
+  const target = document.querySelector("#response-agent-trace");
+  agentTraceExpanded = Boolean(expanded);
+  toggle.setAttribute("aria-expanded", String(agentTraceExpanded));
+  const label = tr(agentTraceExpanded ? "agentTraceHide" : "agentTraceShow");
+  toggle.setAttribute("aria-label", label);
+  toggle.title = label;
+  target.hidden = !agentTraceExpanded;
 }
 
 function reportItems(items, renderItem, emptyText) {
@@ -1430,12 +1461,16 @@ function renderAgentSession() {
   renderAgentReport();
 
   const active = AGENT_ACTIVE_STATUSES.has(agentSession.status);
-  controls.hidden = !canGenerate || !active;
+  const rerunnable = AGENT_TERMINAL_STATUSES.has(agentSession.status);
+  controls.hidden = !canGenerate || (!active && !rerunnable);
   document.querySelector("#response-agent-pause").hidden = ![
     "queued", "running", "synthesizing", "validating",
   ].includes(agentSession.status);
   document.querySelector("#response-agent-resume").hidden = agentSession.status !== "paused";
   document.querySelector("#response-agent-cancel").hidden = !active;
+  document.querySelector("#response-agent-rerun").hidden = !(
+    canGenerate && rerunnable
+  );
   document.querySelector("#response-agent-input-form").hidden = !(
     canGenerate && agentSession.status === "waiting_input"
   );
@@ -1454,6 +1489,16 @@ function renderAgentSession() {
 }
 
 function mergeAgentSession(next, replaceSteps = false) {
+  const previousSessionId = agentSession?.session_id || "";
+  const previousWasActive = AGENT_ACTIVE_STATUSES.has(agentSession?.status);
+  const nextIsActive = AGENT_ACTIVE_STATUSES.has(next.status);
+  if (previousSessionId !== next.session_id) {
+    agentTraceExpanded = nextIsActive;
+  } else if (nextIsActive) {
+    agentTraceExpanded = true;
+  } else if (previousWasActive) {
+    agentTraceExpanded = false;
+  }
   const incoming = Array.isArray(next.steps) ? next.steps : [];
   if (replaceSteps || !agentSession || agentSession.session_id !== next.session_id) {
     agentSteps = incoming;
@@ -1506,6 +1551,7 @@ async function refreshAgentSession({ incremental = false } = {}) {
       agentSession = null;
       agentSteps = [];
       agentAfterSequence = 0;
+      agentTraceExpanded = true;
       renderAgentSession();
       setAgentNotice(tr("agentNoSession"));
     } else {
@@ -1558,17 +1604,22 @@ function closeResponseAgent() {
   document.querySelector("#case-response-agent-open").focus();
 }
 
-async function startResponseAgent() {
+async function startResponseAgent({ rerun = false } = {}) {
   if (!canGenerate) return;
-  const button = document.querySelector("#response-agent-start");
+  const button = document.querySelector(
+    rerun ? "#response-agent-rerun" : "#response-agent-start",
+  );
+  const goal = rerun
+    ? (agentSession?.goal || document.querySelector("#response-agent-goal").value)
+    : document.querySelector("#response-agent-goal").value;
   button.disabled = true;
-  button.textContent = tr("agentStarting");
-  setAgentNotice(tr("agentStarting"));
+  button.textContent = tr(rerun ? "agentRerunning" : "agentStarting");
+  setAgentNotice(tr(rerun ? "agentRerunning" : "agentStarting"));
   try {
     const payload = await api(`/api/cases/${encodeURIComponent(caseId)}/response-agent/start`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ goal: document.querySelector("#response-agent-goal").value }),
+      body: JSON.stringify({ goal }),
     });
     mergeAgentSession(payload.session, true);
     await loadAll();
@@ -1577,7 +1628,7 @@ async function startResponseAgent() {
     setAgentNotice(`${tr("agentCommandFailed")}: ${err.message}`, "error");
   } finally {
     button.disabled = false;
-    button.textContent = tr("agentStart");
+    button.textContent = tr(rerun ? "agentRerun" : "agentStart");
   }
 }
 
@@ -1624,6 +1675,12 @@ function initialize() {
   document.querySelector("#response-agent-close").addEventListener("click", closeResponseAgent);
   document.querySelector("#response-agent-backdrop").addEventListener("click", closeResponseAgent);
   document.querySelector("#response-agent-start").addEventListener("click", startResponseAgent);
+  document.querySelector("#response-agent-rerun").addEventListener("click", () => {
+    startResponseAgent({ rerun: true });
+  });
+  document.querySelector("#response-agent-trace-toggle").addEventListener("click", () => {
+    setAgentTraceExpanded(!agentTraceExpanded);
+  });
   document.querySelector("#response-agent-pause").addEventListener("click", () => agentCommand("pause"));
   document.querySelector("#response-agent-resume").addEventListener("click", () => agentCommand("resume"));
   document.querySelector("#response-agent-cancel").addEventListener("click", () => agentCommand("cancel"));

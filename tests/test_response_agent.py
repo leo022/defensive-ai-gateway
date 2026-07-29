@@ -394,6 +394,31 @@ class ResponseAgentTest(unittest.TestCase):
         latest = self.state.response_agent.latest(case_id)
         self.assertTrue(latest["freshness"]["is_stale"])
 
+    def test_terminal_session_can_be_rerun_as_a_new_session(self):
+        self.state.response_agent.stop()
+        case_id = self._case("response-agent-rerun")
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        first = self.state.response_agent.create(
+            case_id, artifact=artifact, goal="first run", actor="analyst"
+        )
+        completed = self.state.repo.transition_response_agent_session(
+            first["session_id"], ("queued",), "completed"
+        )
+        self.assertEqual(completed["status"], "completed")
+
+        second = self.state.response_agent.create(
+            case_id, artifact=artifact, goal="second run", actor="analyst"
+        )
+        self.assertNotEqual(first["session_id"], second["session_id"])
+        self.assertEqual(second["status"], "queued")
+        self.assertEqual(second["goal"], "second run")
+        self.assertEqual(
+            self.state.response_agent.latest(case_id)["session_id"],
+            second["session_id"],
+        )
+
     def test_commands_and_terminal_case_lifecycle_are_governed(self):
         self.state.response_agent.stop()
         case_id = self._case("response-agent-commands")
@@ -1215,11 +1240,17 @@ class ResponseAgentTest(unittest.TestCase):
         self.assertIn('id="case-response-agent-open"', html)
         self.assertIn('id="response-agent-drawer"', html)
         self.assertIn('id="response-agent-expand"', html)
+        self.assertIn('id="response-agent-rerun"', html)
+        self.assertIn('id="response-agent-trace-toggle"', html)
+        self.assertIn('aria-controls="response-agent-trace"', html)
         self.assertIn('aria-pressed="false"', html)
         self.assertIn("after_sequence", script)
         self.assertIn("AbortController", script)
         self.assertIn("AGENT_POLL_INTERVAL_MS", script)
         self.assertIn("setResponseAgentExpanded(false)", script)
+        self.assertIn("AGENT_TERMINAL_STATUSES", script)
+        self.assertIn("agentTraceExpanded = false", script)
+        self.assertIn('startResponseAgent({ rerun: true })', script)
         self.assertIn('classList.toggle("is-expanded", expanded)', script)
         self.assertIn("content.forensic_workstreams", script)
         self.assertIn('agentForensics: "深度取证流程"', script)
