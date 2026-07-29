@@ -2451,23 +2451,6 @@ function explanationBlock(explanation) {
   `;
 }
 
-function actionRows(actions) {
-  if (!actions || !actions.length) return `<p class="empty">${escapeHtml(tr("noActions"))}</p>`;
-  return actions
-    .map(
-      (item) => `
-        <li>
-          <div class="action-step-head">
-            <strong>${escapeHtml(actionStageLabel(item.stage))}</strong>
-            <span>${escapeHtml(item.action)}</span>
-          </div>
-          <small>${escapeHtml(item.rationale || "")}</small>
-        </li>
-      `,
-    )
-    .join("");
-}
-
 function actionStageLabel(stage) {
   const key = {
     verify: "actionStageVerify",
@@ -2937,7 +2920,6 @@ function renderDetail(detail) {
   const latestRun = latestRunRecord.result || {};
   const linked = detail.linked_alerts || [];
   const detailCounts = detail.detail_counts || {};
-  const missing = latestRun.missing_evidence || [];
   const validation = detail.validation_runs?.[0] || latestRun.explanation?.validation;
   const confidence = Math.round((detail.confidence || 0) * 100);
   const headline = caseFocusSummary(detail);
@@ -2979,22 +2961,11 @@ function renderDetail(detail) {
         ${approvalBlock(detail.approvals || [], detail.case_id, latestRunRecord.event_id || "")}
       </section>
 
-      <section class="detail-card">
+      <section class="detail-card triage-analysis-summary">
         <div class="section-title">
           <h3>${escapeHtml(tr("aiAnalysis"))}</h3>
-          <span>${escapeHtml(tr("recommendedActions"))}</span>
         </div>
         ${explanationBlock(latestRun.explanation)}
-        <h4>${escapeHtml(tr("recommendedActions"))}</h4>
-        <ol class="action-list">${actionRows(latestRun.recommended_actions)}</ol>
-        <h4>${escapeHtml(tr("missingEvidence"))}</h4>
-        <ul class="plain-list">
-          ${
-            missing.length
-              ? missing.map((item) => `<li>${escapeHtml(item)}</li>`).join("")
-              : `<li class="empty">${escapeHtml(tr("none"))}</li>`
-          }
-        </ul>
       </section>
 
       ${linkedAlertsBlock(linked, detail.alert_clusters || [])}

@@ -178,9 +178,7 @@ class CaseApprovalPlanRenderingTest(unittest.TestCase):
         self.assertIn("approvalHistorySummary", JS)
         self.assertIn("latestRunRecord.event_id", JS)
         self.assertIn("function actionStageLabel", JS)
-        self.assertIn('<ol class="action-list">', JS)
         self.assertIn(".approval-item.compact", CSS)
-        self.assertIn(".action-step-head", CSS)
 
 
 class PromptInjectionEvidenceRenderingTest(unittest.TestCase):
@@ -502,6 +500,24 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertNotIn(".triage-detail-panel", CSS)
         self.assertIn(".detail-stack", CSS)
         self.assertIn("grid-template-columns: 1fr", CSS)
+
+    def test_disposition_desk_keeps_triage_summary_without_duplicate_guidance(self):
+        detail_renderer = JS.split("function renderDetail(detail)", 1)[1].split(
+            "function responsePackLink", 1
+        )[0]
+
+        self.assertIn('class="detail-card triage-analysis-summary"', detail_renderer)
+        self.assertIn("explanationBlock(latestRun.explanation)", detail_renderer)
+        self.assertNotIn("latestRun.recommended_actions", detail_renderer)
+        self.assertNotIn("latestRun.missing_evidence", detail_renderer)
+        self.assertNotIn('tr("recommendedActions")', detail_renderer)
+        self.assertNotIn('tr("missingEvidence")', detail_renderer)
+
+        explanation_renderer = JS.split("function explanationBlock(explanation)", 1)[
+            1
+        ].split("function actionStageLabel", 1)[0]
+        self.assertIn('tr("verdict")', explanation_renderer)
+        self.assertIn('tr("dimensions")', explanation_renderer)
 
     def test_detailed_information_uses_dedicated_page_and_scoped_api(self):
         self.assertIn('src="/case-details.js"', DETAIL_HTML)

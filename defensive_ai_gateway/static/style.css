@@ -1763,7 +1763,6 @@ h4 {
   overflow-wrap: anywhere;
 }
 
-.action-list,
 .plain-list,
 .dimension-list {
   display: grid;
@@ -1799,37 +1798,6 @@ h4 {
   margin-top: 3px;
   color: var(--muted);
   line-height: 1.48;
-}
-
-.action-list li {
-  line-height: 1.45;
-}
-
-.action-list strong {
-  display: inline-block;
-  min-width: 70px;
-  margin-right: 8px;
-  color: var(--brand-strong);
-  font-size: 12px;
-  text-transform: uppercase;
-}
-
-.action-step-head {
-  display: grid;
-  grid-template-columns: minmax(82px, auto) minmax(0, 1fr);
-  gap: 8px;
-  align-items: start;
-}
-
-.action-step-head strong {
-  min-width: 0;
-  margin: 0;
-  text-transform: none;
-}
-
-.action-list small {
-  display: block;
-  color: var(--muted);
 }
 
 .review-tools {
