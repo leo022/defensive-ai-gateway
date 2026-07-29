@@ -1,7 +1,7 @@
 # Defensive AI Response Agent 方案与迭代记录
 
 更新日期：2026-07-29
-当前状态：第一阶段 v2 已实现（含受控原始证据与跨产品关联）
+当前状态：第一阶段 v3 已实现（含完整 Syslog 读取门禁与多域深度取证）
 
 ## 1. 目标与原则
 
@@ -27,6 +27,17 @@ v2 的处理规则为：
 - 决策或工具契约错误会记录安全错误码并让模型最多修正三次；连续失败后进入可恢复的 `paused`，不再直接落入 `failed`。
 - 旧失败会话保留为审计记录；部署新版本后应创建新会话重新调查。
 
+### 1.2 原始 Syslog 缺口问题与 v3 结论
+
+历史报告曾出现 “initial HTTP request payloads ... are not fully captured” 一类表述。复核工具调用与原始数据库后确认：
+
+- 采集器保存的 `_syslog_envelope.raw_message` 已完整持久化，可按 RFC 6901 指针和 UTF-8 位元组游标读取；历史关键记录的分块均到达 `complete=true`。
+- 部分 RASP 事件的 `request_message.body` 在源事件中就是 `null`，参数也可能为空；该信息无法通过扩大 prompt 或重复数据库查询重建。
+- 旧完成门禁只强制完整读取一条原始候选，因此即使关联搜索找到多条 RASP/EDR/HIPS 证据，也可能在未逐条读取时进入报告综合。
+- v3 在 manifest 中明确返回原始 Syslog 指针、字节数、计算哈希、采集信封记录哈希和完整性状态，并对请求体、参数、请求头、响应状态与响应体输出 `captured_nonempty/captured_empty/captured_null/not_observed` 诊断。
+- v3 从 Case 关联和跨产品相关告警中选择最多 8 条高优先级原始证据作为强制读取集。控制器逐条续读到 `complete=true`，报告门禁再次独立校验。
+- 源字段为 null、空值或未观察到时，报告必须表述为“源端采集缺失”，并保留补采步骤；不得描述为 Agent 分块读取或 prompt 截断。已采集的响应状态必须直接用于结论。
+
 ## 2. 第一阶段实现范围
 
 ### 2.1 已实现
@@ -37,8 +48,10 @@ v2 的处理规则为：
 - 启动时自动检查 Response Pack；缺失或过期时先生成当前版本。
 - 冻结标准化 Case 源快照和 Response Pack 制品，并把后续只读 DB 观察按检索时间、结果哈希和证据引用单独记录。
 - 查询 Case 关联原始告警清单、字段目录和原始载荷大小。
+- 验证采集器保存的原始 Syslog 指针、字节数、SHA-256 与信封完整性。
 - 使用 Case 自身实体检索 WAF、EDR、HIPS、RASP、NDR、SIEM 等相关的 normalized 或 raw-only 告警。
 - 对已关联或达到相关性门槛的告警，按 RFC 6901 字段和 UTF-8 位元组偏移读取脱敏后的完整原始内容。
+- 固定执行 Web 请求、服务器运行时、端点进程、文件完整性、网络边界、身份认证、持久化和云/容器八类取证覆盖盘点。
 - 后台持久化 worker；进程重启后将中断中的任务重新排队。
 - `queued -> running -> synthesizing -> validating -> completed/review/blocked` 状态链。
 - `waiting_input`、`paused`、`failed`、`cancelled`、`budget_exhausted` 分支。
@@ -71,9 +84,11 @@ flowchart LR
     TOOLS --> SNAPSHOT["冻结 Case / Response Pack"]
     TOOLS --> RAW["原始告警清单与分段读取"]
     TOOLS --> CORR["跨产品受限关联检索"]
+    TOOLS --> FORENSICS["多域取证覆盖与强制读取集"]
     SNAPSHOT --> OBS["脱敏、限长、结果哈希、证据引用"]
     RAW --> OBS
     CORR --> OBS
+    FORENSICS --> OBS
     OBS --> LOOP
     LOOP --> REPORT["深度调查报告"]
     REPORT --> GATE["确定性报告门禁"]
@@ -109,11 +124,11 @@ flowchart LR
 - 参数不得包含 SQL、表名、数据库路径、URL、endpoint、Shell 或 command。
 - 每个工具使用独立参数契约；未知参数被丢弃，数值、列表和游标由控制器归一化和限界。
 - 同一工具和参数通过幂等键复用既有结果。
-- 模型返回 `finish` 只是综合请求：控制器会先补齐七项基线只读工具；若 manifest 或关联搜索发现原始候选，还必须把至少一条选定原始记录或 `/original_log` 子树读取到 `complete=true`。
+- 模型返回 `finish` 只是综合请求：控制器会先补齐八项基线只读工具，并按照 `query_forensic_coverage` 的强制读取集，把最多 8 条高优先级原始 Syslog、`/original_log` 或完整原始告警逐条读取到 `complete=true`。
 - 确定性报告门禁会独立检查上述证据下限；缺少基线工具或原始分段未完成的报告只能进入 `blocked`，不能得到 `passed`。
 - 连续重复且没有新观察时，若证据下限仍有缺项，控制器直接推进下一项必需只读工具；只有下限完整时才进入报告综合。
 - 达到轮次、工具调用或活动时间预算时进入 `budget_exhausted`。
-- 配置下限为 9 轮、8 次工具调用；工具预算只阻止新的工具调用，不阻止已有观察进入报告综合。
+- 配置下限为 18 轮、16 次工具调用；默认仍为 48 轮、40 次工具调用。工具预算只阻止新的工具调用，不阻止已有观察进入报告综合。
 - 模型不可用时进入 `paused`，不会静默切换为本地规则结论。
 - 连续三次决策或工具契约拒绝后进入 `paused`；错误码、重试状态和审计事件均持久化。
 
@@ -127,6 +142,7 @@ flowchart LR
 | `query_case_evidence` | 冻结 Case | 标准化事件、实体和证据 | event、evidence |
 | `query_case_raw_alerts` | 当前 Case 链接 | 原始告警 manifest、大小、源哈希、无值字段目录 | raw_alert |
 | `search_related_alerts` | Case 派生实体、产品列表、时间窗 | normalized 与 raw-only 跨产品关联告警 | correlated_raw_alert |
+| `query_forensic_coverage` | 当前 Case 与控制器固定关联范围 | 八类取证覆盖、源字段采集诊断、最多 8 条强制原始读取流与补采步骤 | raw_alert、correlated_raw_alert |
 | `read_raw_alert_chunk` | manifest/search 返回的 alert_id、RFC 6901 pointer、位元组游标 | 脱敏 UTF-8 JSON 分段、完整内容哈希、分段哈希 | raw_alert |
 | `query_case_timeline` | 冻结 Case | 安全事件、研判、审批与响应时间线 | event、evidence |
 | `query_governed_memory` | 当前 Case/产品 | Case active memory、已批准 active product memory | memory |
@@ -142,13 +158,28 @@ flowchart LR
 
 完整原始日志读取采用 manifest + chunk：
 
-1. manifest 仅返回元数据、大小、源哈希和不含字段值的 JSON Pointer 目录；
-2. Agent 选择 `/original_log` 或其他必要子树；
+1. manifest 返回元数据、大小、源哈希、不含字段值的 JSON Pointer 目录，以及原始 Syslog 指针、字节数、SHA-256、完整性和 HTTP 采集状态；
+2. 控制器优先选择采集器保存的 `/_syslog_envelope/raw_message` 或 `/syslog_route/raw_message`，其次选择 `/original_log`，最后选择完整受控原始告警；
 3. 控制器在完整对象上先执行深度脱敏，再按 UTF-8 位元组游标分段；默认单段 4096 bytes，保证最新分段能完整进入当前模型 prompt，而不是在工具完成后再次被静默裁剪；
 4. `next_offset` 可连续读取到 `complete=true`，避免 prompt 截断导致尾部证据丢失；
 5. 每段提供 chunk SHA-256，所有分段共享脱敏后完整内容 SHA-256 与原始来源哈希。
 
-最新原始分段在 planner/report context 中具有最高优先级。模型继续下一段或进入报告前，必须在公开的短 `rationale` 中保留本段事实摘要；控制器把最近 40 条摘要作为滚动调查笔记传入后续轮次和报告综合。这里只保存可审计事实，不保存隐式思维链。若模型在分段尚未完成时请求 `finish`，控制器自动续读 `next_offset`；若原始日志在轮次或工具预算内仍未读到 `complete=true`，会话进入明确的预算终态或报告门禁 `blocked`，不能把未完成读取表述为完整取证。
+最新原始分段在 planner/report context 中具有最高优先级。模型继续下一段或进入报告前，必须在公开的短 `rationale` 中保留本段事实摘要；控制器把最近 40 条摘要作为滚动调查笔记传入后续轮次和报告综合。这里只保存可审计事实，不保存隐式思维链。若模型在分段尚未完成时请求 `finish`，控制器自动续读 `next_offset`；若任一强制读取流在轮次或工具预算内仍未读到 `complete=true`，会话进入明确的预算终态或报告门禁 `blocked`，不能把抽查单条或未完成读取表述为完整取证。
+
+### 5.1 深度取证工作流
+
+`query_forensic_coverage` 固定生成以下八个工作流，模型不能删除、改写状态或绕过补采步骤：
+
+1. Web 请求与响应重建：WAF、反向代理、Web 访问日志和 RASP 请求/响应字段。
+2. 服务器与应用运行时：主机标识、应用进程树、命令行、工作目录、网络连接、登录会话和容器运行时日志。
+3. 端点进程与执行链：EDR/HIPS/Sysmon/auditd 的进程、脚本、模块、文件与网络遥测。
+4. 文件完整性与 Webroot：Webroot、上传/临时目录、应用配置、疑似 WebShell 和被读取文件的元数据与哈希。
+5. 网络与边界设备：WAF、NDR、IDS/IPS、防火墙、负载均衡和 DNS 会话。
+6. 身份与认证：系统、应用、堡垒机、IAM/IdP 登录、提权、账号与权限变更。
+7. 持久化：计划任务、服务、启动项、Shell 配置、动态加载项和自动部署目录。
+8. 云与容器控制面：云审计、工作负载事件、镜像摘要、Pod/容器生命周期、服务账号和网络策略。
+
+每个工作流状态为 `evidence_available`、`partial` 或 `collection_required`。第一阶段仍不开放实时 Shell、任意网络访问或供应商凭据；当本地数据库证据不足时，报告给出只读保全与补采步骤，后续通过受控 EDR、SIEM、CMDB、对象存储等只读连接器落地。
 
 所有工具结果依次经过：
 
@@ -232,6 +263,7 @@ POST /api/response-agent/sessions/{session_id}/input
 - `confirmed`、`inferred`、`unverified` 分级发现；
 - 攻击链；
 - 影响分析；
+- 八类深度取证工作流、覆盖状态、证据源与补采步骤；
 - 证据缺口；
 - 只读或需审批的响应计划；
 - 调查工具日志；
@@ -246,6 +278,7 @@ POST /api/response-agent/sessions/{session_id}/input
 - 无引用的 confirmed/inferred claim 自动降为 unverified；
 - 无直接执行或直接发送能力；
 - 响应模式仅为 `observe` 或 `approve_required`；
+- 强制原始读取集全部完成，且八类取证工作流及其控制器状态未被模型删除或改写；
 - 无敏感信息泄漏；
 - 继承原 Case Validator 的 `passed/review/blocked` 约束。
 

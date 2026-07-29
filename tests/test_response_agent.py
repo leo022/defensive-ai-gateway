@@ -323,8 +323,8 @@ class ResponseAgentTest(unittest.TestCase):
         raise AssertionError(f"session did not reach {statuses}: {session}")
 
     def test_deterministic_loop_persists_tools_report_and_citations(self):
-        self.state.response_agent.config.max_turns = 9
-        self.state.response_agent.config.max_tool_calls = 8
+        self.state.response_agent.config.max_turns = 18
+        self.state.response_agent.config.max_tool_calls = 16
         case_id = self._case("response-agent-complete", injected=True)
         tasks_before = self.state.repo.count_response_tasks()
         artifact = self.state.case_response.generate(
@@ -779,6 +779,175 @@ class ResponseAgentTest(unittest.TestCase):
         )
         self.assertEqual(source_hash, item["source_hash"])
 
+    def test_forensic_coverage_reads_syslog_and_correlated_host_evidence(self):
+        alert = _waf_alert("response-agent-forensic-syslog")
+        alert.payload["request_body"] = None
+        raw_message = json.dumps(
+            alert.payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        raw_message_hash = hashlib.sha256(raw_message.encode("utf-8")).hexdigest()
+        alert.payload["_syslog_envelope"] = {
+            "collector": "syslog-port-router",
+            "destination_port": 15140,
+            "protocol": "tcp",
+            "raw_message": raw_message,
+            "raw_message_bytes": len(raw_message.encode("utf-8")),
+            "raw_message_sha256": raw_message_hash,
+        }
+        case_id = self.state.orchestrator.handle_alert(alert).case_id
+        source = self.state.repo.get_case_response_source(case_id)
+        timestamp = source["events"][0]["timestamp"]
+        hips = RawAlert(
+            source="host-sensor",
+            product="hips",
+            event_type="suspicious_process",
+            severity="high",
+            timestamp=timestamp,
+            payload={
+                "src_ip": "43.154.138.159",
+                "host": "application-server-01",
+                "process": "java",
+                "original_log": {
+                    "process_name": "java",
+                    "parent_process": "systemd",
+                    "file_path": "/srv/app/webroot/suspicious.jsp",
+                },
+            },
+            alert_id="response-agent-forensic-hips",
+        )
+        self.state.repo.insert_raw_alert(hips)
+        self.state.repo.insert_normalized_event(
+            self.state.normalizer.normalize(hips)
+        )
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        source = self.state.repo.get_case_response_source(case_id)
+
+        manifest, _ = self.state.response_agent._execute_tool(
+            "query_case_raw_alerts",
+            {},
+            source,
+            artifact,
+        )
+        linked = next(
+            item
+            for item in manifest["items"]
+            if item["alert_id"] == alert.alert_id
+        )
+        self.assertTrue(linked["syslog_message_present"])
+        self.assertEqual(
+            linked["syslog_message_pointer"],
+            "/_syslog_envelope/raw_message",
+        )
+        self.assertEqual(linked["syslog_message_sha256"], raw_message_hash)
+        self.assertEqual(linked["syslog_message_integrity"], "verified")
+        diagnostics = {
+            item["field"]: item for item in linked["capture_diagnostics"]
+        }
+        self.assertEqual(
+            diagnostics["http_request_body"]["state"],
+            "captured_null",
+        )
+        self.assertEqual(
+            diagnostics["http_response_status"]["observed_value"],
+            "403",
+        )
+
+        coverage, coverage_refs = self.state.response_agent._execute_tool(
+            "query_forensic_coverage",
+            {},
+            source,
+            artifact,
+        )
+        required_ids = {
+            item["alert_id"] for item in coverage["required_reads"]
+        }
+        self.assertEqual(
+            required_ids,
+            {alert.alert_id, hips.alert_id},
+        )
+        self.assertEqual(len(coverage["workstreams"]), 8)
+        self.assertTrue(
+            any(
+                item["workstream_id"] == "server-runtime-forensics"
+                and item["status"] in {"partial", "evidence_available"}
+                for item in coverage["workstreams"]
+            )
+        )
+        self.assertTrue(
+            any(
+                "不是 Agent 分块读取或 prompt 截断" in item
+                for item in coverage["source_limits"]
+            )
+        )
+        self.assertEqual(
+            {item["ref_id"] for item in coverage_refs},
+            {
+                f"raw-alert:{alert.alert_id}",
+                f"raw-alert:{hips.alert_id}",
+            },
+        )
+
+        self.state.response_agent.config.max_turns = 30
+        self.state.response_agent.config.max_tool_calls = 30
+        self.state.response_agent.config.tool_result_max_bytes = 32_000
+        started = self.state.response_agent.create(
+            case_id,
+            artifact=artifact,
+            goal="Complete the controller-governed deep forensic workflow",
+            actor="analyst",
+        )
+        session = self._wait(
+            self.state.response_agent,
+            started["session_id"],
+            {"completed", "review", "blocked", "failed", "budget_exhausted"},
+        )
+        self.assertEqual(
+            session["status"],
+            "completed",
+            session.get("report", {}).get("validation"),
+        )
+        stored = self.state.repo.get_response_agent_session(
+            started["session_id"]
+        )
+        raw_calls = [
+            call
+            for call in stored["tool_calls"]
+            if call["tool_name"] == "read_raw_alert_chunk"
+        ]
+        completed_streams = {
+            (
+                call["arguments"]["alert_id"],
+                call["arguments"].get("json_pointer", ""),
+            )
+            for call in raw_calls
+            if call["result"].get("complete") is True
+        }
+        self.assertEqual(
+            completed_streams,
+            {
+                (
+                    alert.alert_id,
+                    "/_syslog_envelope/raw_message",
+                ),
+                (hips.alert_id, "/original_log"),
+            },
+        )
+        report = session["report"]
+        self.assertEqual(len(report["content"]["forensic_workstreams"]), 8)
+        self.assertTrue(
+            report["validation"]["checks"][
+                "forensic_required_reads_complete"
+            ]
+        )
+        self.assertTrue(
+            report["validation"]["checks"]["forensic_workstreams_complete"]
+        )
+
     def test_llm_sees_every_complete_raw_chunk_and_report_gets_rolling_notes(self):
         alert = _waf_alert("response-agent-llm-raw-loop")
         alert.payload["original_log"] = "BEGIN-" + ('evidence-"\\-' * 900) + "END"
@@ -1052,6 +1221,8 @@ class ResponseAgentTest(unittest.TestCase):
         self.assertIn("AGENT_POLL_INTERVAL_MS", script)
         self.assertIn("setResponseAgentExpanded(false)", script)
         self.assertIn('classList.toggle("is-expanded", expanded)', script)
+        self.assertIn("content.forensic_workstreams", script)
+        self.assertIn('agentForensics: "深度取证流程"', script)
         self.assertIn("width: min(480px, 100vw)", css)
         self.assertIn(".response-agent-drawer.is-expanded", css)
         self.assertIn("width: min(960px, 100vw)", css)

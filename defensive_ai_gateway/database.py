@@ -3704,6 +3704,7 @@ class Repository:
         *,
         max_entries: int = 120,
         max_depth: int = 3,
+        include_sizes: bool = True,
     ) -> list[dict[str, Any]]:
         """Build a value-free JSON Pointer catalog for targeted raw-log reads."""
         entries: list[dict[str, Any]] = []
@@ -3712,7 +3713,9 @@ class Repository:
             pointer, item, depth = stack.pop()
             if pointer:
                 byte_size = None
-                if depth <= 1 or not isinstance(item, (dict, list)):
+                if include_sizes and (
+                    depth <= 1 or not isinstance(item, (dict, list))
+                ):
                     byte_size = len(
                         json.dumps(
                             item,
@@ -3893,6 +3896,274 @@ class Repository:
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
+    @staticmethod
+    def _response_agent_path_value(
+        payload: Any,
+        paths: tuple[tuple[str, tuple[str, ...]], ...],
+    ) -> tuple[bool, str, Any]:
+        for pointer, keys in paths:
+            current = payload
+            found = True
+            for key in keys:
+                if not isinstance(current, dict) or key not in current:
+                    found = False
+                    break
+                current = current[key]
+            if found:
+                return True, pointer, current
+        return False, "", None
+
+    @staticmethod
+    def _response_agent_capture_state(found: bool, value: Any) -> str:
+        if not found:
+            return "not_observed"
+        if value is None:
+            return "captured_null"
+        if value == "" or value == [] or value == {}:
+            return "captured_empty"
+        return "captured_nonempty"
+
+    @classmethod
+    def _response_agent_capture_diagnostics(
+        cls,
+        payload: Any,
+    ) -> list[dict[str, Any]]:
+        fields = (
+            (
+                "http_request_body",
+                (
+                    (
+                        "/original_log/event/request_message/body",
+                        ("original_log", "event", "request_message", "body"),
+                    ),
+                    (
+                        "/event/request_message/body",
+                        ("event", "request_message", "body"),
+                    ),
+                    ("/request_message/body", ("request_message", "body")),
+                    ("/request_body", ("request_body",)),
+                    ("/payload/request_body", ("payload", "request_body")),
+                ),
+            ),
+            (
+                "http_request_parameters",
+                (
+                    (
+                        "/original_log/event/request_message/parameter",
+                        ("original_log", "event", "request_message", "parameter"),
+                    ),
+                    (
+                        "/event/request_message/parameter",
+                        ("event", "request_message", "parameter"),
+                    ),
+                    (
+                        "/request_message/parameter",
+                        ("request_message", "parameter"),
+                    ),
+                    ("/request_parameters", ("request_parameters",)),
+                    ("/query", ("query",)),
+                ),
+            ),
+            (
+                "http_request_headers",
+                (
+                    (
+                        "/original_log/event/request_message/header",
+                        ("original_log", "event", "request_message", "header"),
+                    ),
+                    (
+                        "/original_log/event/request_message/headers",
+                        ("original_log", "event", "request_message", "headers"),
+                    ),
+                    (
+                        "/event/request_message/header",
+                        ("event", "request_message", "header"),
+                    ),
+                    (
+                        "/event/request_message/headers",
+                        ("event", "request_message", "headers"),
+                    ),
+                    ("/request_headers", ("request_headers",)),
+                    ("/headers", ("headers",)),
+                ),
+            ),
+            (
+                "http_response_status",
+                (
+                    (
+                        "/original_log/event/response_message/status_code",
+                        (
+                            "original_log",
+                            "event",
+                            "response_message",
+                            "status_code",
+                        ),
+                    ),
+                    (
+                        "/event/response_message/status_code",
+                        ("event", "response_message", "status_code"),
+                    ),
+                    (
+                        "/response_message/status_code",
+                        ("response_message", "status_code"),
+                    ),
+                    ("/response_status", ("response_status",)),
+                    ("/status_code", ("status_code",)),
+                    ("/status", ("status",)),
+                ),
+            ),
+            (
+                "http_response_body",
+                (
+                    (
+                        "/original_log/event/response_message/body",
+                        ("original_log", "event", "response_message", "body"),
+                    ),
+                    (
+                        "/event/response_message/body",
+                        ("event", "response_message", "body"),
+                    ),
+                    ("/response_message/body", ("response_message", "body")),
+                    ("/response_body", ("response_body",)),
+                ),
+            ),
+        )
+        diagnostics: list[dict[str, Any]] = []
+        for field, paths in fields:
+            found, pointer, value = cls._response_agent_path_value(payload, paths)
+            rendered = (
+                json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                if found
+                else ""
+            )
+            item: dict[str, Any] = {
+                "field": field,
+                "state": cls._response_agent_capture_state(found, value),
+                "json_pointer": pointer,
+                "bytes": len(rendered.encode("utf-8")) if found else 0,
+            }
+            if (
+                field == "http_response_status"
+                and found
+                and isinstance(value, (str, int, float))
+            ):
+                item["observed_value"] = str(value)[:32]
+            diagnostics.append(item)
+        return diagnostics
+
+    @classmethod
+    def _response_agent_syslog_descriptor(
+        cls,
+        payload: Any,
+    ) -> dict[str, Any]:
+        paths = (
+            ("/_syslog_envelope", ("_syslog_envelope",)),
+            ("/syslog_route", ("syslog_route",)),
+            ("/syslog_envelope", ("syslog_envelope",)),
+            (
+                "/original_log/_syslog_envelope",
+                ("original_log", "_syslog_envelope"),
+            ),
+            (
+                "/original_log/syslog_route",
+                ("original_log", "syslog_route"),
+            ),
+        )
+        for pointer, keys in paths:
+            found, _matched_pointer, envelope = cls._response_agent_path_value(
+                payload,
+                ((pointer, keys),),
+            )
+            if not found or not isinstance(envelope, dict):
+                continue
+            raw_message = envelope.get("raw_message")
+            if not isinstance(raw_message, str):
+                continue
+            encoded = raw_message.encode("utf-8")
+            computed_hash = hashlib.sha256(encoded).hexdigest()
+            recorded_hash = str(envelope.get("raw_message_sha256") or "")
+            try:
+                destination_port = int(envelope.get("destination_port") or 0)
+            except (TypeError, ValueError, OverflowError):
+                destination_port = 0
+            return {
+                "syslog_message_present": True,
+                "syslog_message_pointer": f"{pointer}/raw_message",
+                "syslog_message_bytes": len(encoded),
+                "syslog_message_sha256": computed_hash,
+                "syslog_recorded_sha256": recorded_hash,
+                "syslog_message_integrity": (
+                    "verified"
+                    if recorded_hash and recorded_hash == computed_hash
+                    else ("mismatch" if recorded_hash else "unverified")
+                ),
+                "syslog_protocol": str(envelope.get("protocol") or ""),
+                "syslog_destination_port": destination_port,
+            }
+        return {
+            "syslog_message_present": False,
+            "syslog_message_pointer": "",
+            "syslog_message_bytes": 0,
+            "syslog_message_sha256": "",
+            "syslog_recorded_sha256": "",
+            "syslog_message_integrity": "not_observed",
+            "syslog_protocol": "",
+            "syslog_destination_port": 0,
+        }
+
+    @staticmethod
+    def _response_agent_forensic_domains(
+        product: str,
+        catalog: list[dict[str, Any]],
+    ) -> list[str]:
+        product_name = str(product or "").casefold()
+        pointers = " ".join(
+            str(item.get("json_pointer") or "").casefold()
+            for item in catalog
+        )
+        domains: set[str] = set()
+        if product_name in {"waf", "rasp"} or any(
+            token in pointers
+            for token in ("request_message", "request_body", "/http", "/url")
+        ):
+            domains.add("web_request")
+        if product_name in {"rasp", "edr", "hips"} or any(
+            token in pointers
+            for token in ("/host", "/server", "/runtime", "/process")
+        ):
+            domains.update({"server_runtime", "endpoint_process"})
+        if product_name in {"rasp", "edr", "hips"} or any(
+            token in pointers
+            for token in ("/file", "/path", "/hash", "/webroot")
+        ):
+            domains.add("file_integrity")
+        if product_name in {"waf", "ndr", "siem", "firewall", "ids", "ips"} or any(
+            token in pointers
+            for token in ("/src_ip", "/dst_ip", "/network", "/connection")
+        ):
+            domains.add("network_perimeter")
+        if product_name in {"siem", "iam", "idp"} or any(
+            token in pointers
+            for token in ("/user", "/account", "/login", "/authentication")
+        ):
+            domains.add("identity_authentication")
+        if product_name in {"edr", "hips", "rasp"} or any(
+            token in pointers
+            for token in ("/service", "/cron", "/scheduled", "/autorun", "/startup")
+        ):
+            domains.add("persistence")
+        if product_name in {"cloud", "k8s", "kubernetes", "container"} or any(
+            token in pointers
+            for token in ("/container", "/pod", "/namespace", "/cloud")
+        ):
+            domains.add("cloud_container")
+        return sorted(domains)
+
     @classmethod
     def _response_agent_raw_manifest(
         cls,
@@ -3906,6 +4177,11 @@ class Repository:
     ) -> dict[str, Any]:
         payload = json.loads(row.get("payload_json") or "{}")
         original_log = payload.get("original_log") if isinstance(payload, dict) else None
+        catalog = cls._response_agent_json_catalog(
+            payload,
+            max_entries=120 if include_catalog else 80,
+            include_sizes=include_catalog,
+        )
         return {
             "alert_id": str(row.get("alert_id") or ""),
             "event_id": str(row.get("event_id") or ""),
@@ -3941,11 +4217,13 @@ class Repository:
                 else 0
             ),
             "source_hash": cls._response_agent_raw_hash(row),
-            "field_catalog": (
-                cls._response_agent_json_catalog(payload)
-                if include_catalog
-                else []
+            **cls._response_agent_syslog_descriptor(payload),
+            "capture_diagnostics": cls._response_agent_capture_diagnostics(payload),
+            "forensic_domains": cls._response_agent_forensic_domains(
+                str(row.get("product") or ""),
+                catalog,
             ),
+            "field_catalog": catalog if include_catalog else [],
         }
 
     def query_response_agent_case_raw_alerts(

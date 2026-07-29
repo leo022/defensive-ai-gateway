@@ -12,9 +12,9 @@ from .config import ResponseAgentConfig
 from .models import new_id, now_ms
 
 
-REPORT_SCHEMA_VERSION = "response-investigation-report-v1"
-AGENT_VERSION = "response-investigation-agent-v2"
-TOOL_VERSION = "2"
+REPORT_SCHEMA_VERSION = "response-investigation-report-v2"
+AGENT_VERSION = "response-investigation-agent-v3"
+TOOL_VERSION = "3"
 ACTIVE_STATUSES = {
     "queued",
     "running",
@@ -36,6 +36,7 @@ CONTROLLER_TOOLS = (
     "query_case_evidence",
     "query_case_raw_alerts",
     "search_related_alerts",
+    "query_forensic_coverage",
     "read_raw_alert_chunk",
     "query_case_timeline",
     "query_governed_memory",
@@ -78,6 +79,15 @@ TOOL_CONTRACTS = {
             "limit": "optional integer 1..50; default 20",
             "offset": "optional non-negative integer; use next_offset to paginate",
         },
+    },
+    "query_forensic_coverage": {
+        "purpose": (
+            "Build the controller-owned deep-forensics coverage map for web, "
+            "server, endpoint, file, network, identity, persistence and "
+            "cloud/container evidence. It also returns the bounded raw evidence "
+            "streams that must be read completely before synthesis."
+        ),
+        "arguments": {},
     },
     "read_raw_alert_chunk": {
         "purpose": (
@@ -136,6 +146,7 @@ REPORT_SCHEMA = {
         "findings": {"type": "array", "items": {"type": "object"}},
         "attack_chain": {"type": "array", "items": {"type": "object"}},
         "impact": {"type": "string"},
+        "forensic_workstreams": {"type": "array", "items": {"type": "object"}},
         "evidence_gaps": {"type": "array", "items": {"type": "string"}},
         "response_plan": {"type": "array", "items": {"type": "object"}},
         "final_assessment": {"type": "string"},
@@ -145,11 +156,95 @@ REPORT_SCHEMA = {
         "executive_summary",
         "conclusion",
         "findings",
+        "forensic_workstreams",
         "evidence_gaps",
         "response_plan",
         "final_assessment",
     ],
 }
+
+FORENSIC_WORKSTREAMS = (
+    {
+        "workstream_id": "web-request-reconstruction",
+        "title": "Web 请求与响应重建",
+        "domain": "web_request",
+        "preferred_products": ("waf", "rasp", "reverse_proxy", "web_server"),
+        "collection_steps": (
+            "从 WAF、反向代理与 Web 访问日志补采原始请求行、查询参数、请求头、请求体、响应状态与响应字节数，并使用 request/trace ID 和时间戳关联。",
+            "核对 RASP 原始事件中的 request_message 与 response_message；空值或 null 必须标记为采集源缺失，不得描述为 Agent 截断。",
+        ),
+    },
+    {
+        "workstream_id": "server-runtime-forensics",
+        "title": "服务器与应用运行时取证",
+        "domain": "server_runtime",
+        "preferred_products": ("rasp", "edr", "hips", "auditd", "osquery"),
+        "collection_steps": (
+            "保全目标服务器时间同步信息、主机标识、应用进程树、父子进程、命令行、工作目录、网络连接和登录会话快照。",
+            "采集应用服务器、Web 容器与 RASP/EDR/HIPS 在事件时间窗内的原始日志，并以主机、进程、请求和时间戳交叉关联。",
+        ),
+    },
+    {
+        "workstream_id": "endpoint-process-forensics",
+        "title": "端点进程与执行链取证",
+        "domain": "endpoint_process",
+        "preferred_products": ("edr", "hips", "sysmon", "auditd"),
+        "collection_steps": (
+            "查询事件时间窗内的进程创建、脚本解释器、模块加载、文件写入、DNS 与外联连接遥测，重建父子进程执行链。",
+            "对可疑进程、脚本与落地文件记录路径、哈希、签名、所有者和首次/末次出现时间，不直接执行样本。",
+        ),
+    },
+    {
+        "workstream_id": "file-integrity-forensics",
+        "title": "文件完整性与 Webroot 取证",
+        "domain": "file_integrity",
+        "preferred_products": ("fim", "edr", "hips", "rasp"),
+        "collection_steps": (
+            "对 Webroot、上传目录、临时目录和应用配置做只读文件清单与基线差异比对，记录路径、大小、时间戳、权限和加密哈希。",
+            "将疑似 WebShell、被读取文件及其邻近文件纳入受控证据保全，避免在生产主机上打开或执行。",
+        ),
+    },
+    {
+        "workstream_id": "network-perimeter-forensics",
+        "title": "网络与边界设备取证",
+        "domain": "network_perimeter",
+        "preferred_products": ("waf", "ndr", "ids", "ips", "firewall", "siem"),
+        "collection_steps": (
+            "查询 WAF、NDR、IDS/IPS、防火墙、负载均衡与 DNS 的原始告警和会话日志，按源/目的地址、端口、域名与时间窗关联。",
+            "核对入站请求与服务器外联流量，识别扫描、利用、下载、回连和横向移动迹象。",
+        ),
+    },
+    {
+        "workstream_id": "identity-authentication-forensics",
+        "title": "身份与认证取证",
+        "domain": "identity_authentication",
+        "preferred_products": ("siem", "iam", "idp", "auditd"),
+        "collection_steps": (
+            "查询事件时间窗内的系统、应用、堡垒机、IAM/IdP 登录与提权审计，核对账号、来源地址、会话和认证结果。",
+            "检查新增账号、密钥、令牌使用、权限变更和异常服务账号活动，敏感凭据仅记录引用和状态。",
+        ),
+    },
+    {
+        "workstream_id": "persistence-forensics",
+        "title": "持久化与权限维持取证",
+        "domain": "persistence",
+        "preferred_products": ("edr", "hips", "sysmon", "auditd"),
+        "collection_steps": (
+            "检查计划任务、服务、启动项、Shell 配置、动态链接加载项和应用自动部署目录的新增或变更记录。",
+            "将持久化对象与可疑进程、文件哈希、账号和网络连接建立证据引用，删除或隔离必须进入审批链。",
+        ),
+    },
+    {
+        "workstream_id": "cloud-container-forensics",
+        "title": "云与容器控制面取证",
+        "domain": "cloud_container",
+        "preferred_products": ("cloud", "k8s", "kubernetes", "container"),
+        "collection_steps": (
+            "若资产运行于云或容器环境，查询控制面审计、工作负载事件、镜像摘要、Pod/容器生命周期和密钥挂载变更。",
+            "核对安全组、网络策略、服务账号与工作负载身份变化，并保全受影响实例或容器的只读元数据快照。",
+        ),
+    },
+)
 
 
 def _canonical_hash(value: Any) -> str:
@@ -255,6 +350,12 @@ def _default_plan() -> list[dict[str, Any]]:
             "id": "cross-product-correlation",
             "title": "检索 WAF、EDR、HIPS 等跨产品关联原始告警",
             "tool": "search_related_alerts",
+            "status": "pending",
+        },
+        {
+            "id": "forensic-coverage",
+            "title": "盘点服务器、端点、文件、网络、身份与云侧深度取证覆盖",
+            "tool": "query_forensic_coverage",
             "status": "pending",
         },
         {
@@ -1053,8 +1154,12 @@ class ResponseInvestigationAgent:
             "inside tool arguments. Use only arguments documented for the selected "
             "tool. Use query_case_raw_alerts to discover linked raw evidence, "
             "search_related_alerts to find cross-product telemetry, and "
+            "query_forensic_coverage to obtain the mandatory evidence streams and "
+            "the server/endpoint/network/identity forensic acquisition plan. Use "
             "read_raw_alert_chunk with next_offset until a decisive selected field "
-            "is complete. When active_raw_observation is present, first preserve a "
+            "is complete. A captured null or empty HTTP field is a source-capture "
+            "limitation, not a tool truncation. When active_raw_observation is "
+            "present, first preserve a "
             "concise factual evidence note in rationale before selecting the next "
             "action; do not include hidden reasoning. Never request shell, arbitrary "
             "network access, credential "
@@ -1167,7 +1272,44 @@ class ResponseInvestigationAgent:
                     "plan_updates": [],
                 }
 
-        if "read_raw_alert_chunk" not in completed:
+        coverage_result: dict[str, Any] = {}
+        for call in reversed(completed_calls):
+            if call.get("tool_name") != "query_forensic_coverage":
+                continue
+            if isinstance(call.get("result"), dict):
+                coverage_result = call["result"]
+            break
+        required_reads = [
+            item
+            for item in coverage_result.get("required_reads") or []
+            if isinstance(item, dict) and item.get("alert_id")
+        ]
+        for required in required_reads:
+            stream = (
+                str(required.get("alert_id") or ""),
+                str(required.get("json_pointer") or ""),
+            )
+            latest = latest_raw_calls.get(stream)
+            latest_result = latest.get("result") if latest else {}
+            if isinstance(latest_result, dict) and latest_result.get("complete") is True:
+                continue
+            return {
+                "action": "tool_call",
+                "tool_name": "read_raw_alert_chunk",
+                "arguments": {
+                    "alert_id": stream[0],
+                    "json_pointer": stream[1],
+                    "offset": 0,
+                },
+                "rationale": (
+                    "模型请求结束调查；深度取证门禁要求完整读取下一条高优先级"
+                    "关联原始证据。"
+                ),
+                "question": "",
+                "plan_updates": [],
+            }
+
+        if not required_reads and "read_raw_alert_chunk" not in completed:
             raw_items: list[dict[str, Any]] = []
             for call in completed_calls:
                 if call.get("tool_name") not in {
@@ -1214,10 +1356,11 @@ class ResponseInvestigationAgent:
         ]
         priority = {
             "read_raw_alert_chunk": 0,
-            "search_related_alerts": 1,
-            "query_case_raw_alerts": 2,
-            "query_case_evidence": 3,
-            "query_case_snapshot": 4,
+            "query_forensic_coverage": 1,
+            "search_related_alerts": 2,
+            "query_case_raw_alerts": 3,
+            "query_case_evidence": 4,
+            "query_case_snapshot": 5,
         }
         ordered = sorted(
             completed,
@@ -1255,7 +1398,7 @@ class ResponseInvestigationAgent:
                     "evidence_refs": call.get("evidence_refs"),
                 }
             )
-            if len(details) >= 7:
+            if len(details) >= 8:
                 break
         ledger = [
             {
@@ -1411,6 +1554,7 @@ class ResponseInvestigationAgent:
             "query_case_timeline",
             "query_governed_memory",
             "query_response_status",
+            "query_forensic_coverage",
         }:
             return {}
         if tool_name == "query_case_raw_alerts":
@@ -1487,6 +1631,302 @@ class ResponseInvestigationAgent:
         raise _DecisionRejected(
             "tool_not_allowed",
             "agent selected a tool outside the controller allowlist",
+        )
+
+    def _build_forensic_coverage(
+        self,
+        source: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        case_id = str(source["case"]["case_id"])
+        linked = self.repo.query_response_agent_case_raw_alerts(
+            case_id,
+            limit=20,
+            offset=0,
+        )
+        related = self.repo.query_response_agent_related_alerts(
+            case_id,
+            window_ms=self.config.correlation_window_minutes * 60 * 1_000,
+            scan_limit=self.config.correlation_scan_limit,
+            scan_max_bytes=self.config.correlation_scan_max_bytes,
+            limit=50,
+            offset=0,
+        )
+        if linked is None or related is None:
+            raise _ToolRejected(
+                "case_scope_missing",
+                "controller Case no longer exists",
+            )
+
+        candidates: list[dict[str, Any]] = []
+        seen_alert_ids: set[str] = set()
+        for item in [*(linked.get("items") or []), *(related.get("items") or [])]:
+            if not isinstance(item, dict):
+                continue
+            alert_id = str(item.get("alert_id") or "")
+            if not alert_id or alert_id in seen_alert_ids:
+                continue
+            seen_alert_ids.add(alert_id)
+            candidates.append(item)
+        severity_order = {
+            "critical": 0,
+            "high": 1,
+            "medium": 2,
+            "low": 3,
+        }
+        candidates.sort(
+            key=lambda item: (
+                0 if item.get("relation") == "linked_to_case" else 1,
+                0 if item.get("syslog_message_present") else 1,
+                severity_order.get(str(item.get("severity") or "").casefold(), 4),
+                -_integer(item.get("correlation_score"), 0),
+                str(item.get("alert_id") or ""),
+            )
+        )
+
+        projected_sources = [
+            {
+                "alert_id": str(item.get("alert_id") or ""),
+                "event_id": str(item.get("event_id") or ""),
+                "product": str(item.get("product") or ""),
+                "event_type": str(item.get("event_type") or ""),
+                "severity": str(item.get("severity") or ""),
+                "relation": str(item.get("relation") or ""),
+                "correlation_score": _integer(item.get("correlation_score"), 0),
+                "forensic_domains": list(item.get("forensic_domains") or []),
+                "syslog_message_present": bool(
+                    item.get("syslog_message_present")
+                ),
+                "syslog_message_pointer": str(
+                    item.get("syslog_message_pointer") or ""
+                ),
+                "syslog_message_bytes": _integer(
+                    item.get("syslog_message_bytes"), 0
+                ),
+                "syslog_message_sha256": str(
+                    item.get("syslog_message_sha256") or ""
+                ),
+                "syslog_message_integrity": str(
+                    item.get("syslog_message_integrity") or "not_observed"
+                ),
+                "original_log_present": bool(item.get("original_log_present")),
+                "capture_diagnostics": list(
+                    item.get("capture_diagnostics") or []
+                ),
+                "source_hash": str(item.get("source_hash") or ""),
+                "evidence_ref": _raw_alert_ref(item.get("alert_id")),
+            }
+            for item in candidates
+        ]
+
+        required_reads = []
+        for item in projected_sources[:8]:
+            pointer = str(item.get("syslog_message_pointer") or "")
+            if not pointer and item.get("original_log_present"):
+                pointer = "/original_log"
+            required_reads.append(
+                {
+                    "alert_id": item["alert_id"],
+                    "json_pointer": pointer,
+                    "product": item["product"],
+                    "relation": item["relation"],
+                    "source_hash": item["source_hash"],
+                    "reason": (
+                        "完整读取采集器保存的原始 Syslog"
+                        if item.get("syslog_message_present")
+                        else (
+                            "完整读取供应商原始日志"
+                            if item.get("original_log_present")
+                            else "完整读取受控原始告警"
+                        )
+                    ),
+                }
+            )
+
+        source_limits: list[str] = []
+        if linked.get("next_offset") is not None:
+            source_limits.append(
+                "Case 关联原始告警超过单次 20 条盘点上限，未进入本次强制读取集的记录需按 manifest 游标继续复核。"
+            )
+        if related.get("next_offset") is not None:
+            source_limits.append(
+                "跨产品关联结果超过单次 50 条盘点上限，未进入本次强制读取集的记录需按关联游标继续复核。"
+            )
+        if related.get("scan_truncated"):
+            source_limits.append(
+                "跨产品关联扫描达到控制器字节预算；当前无结果不能证明相应遥测不存在。"
+            )
+        if len(projected_sources) > len(required_reads):
+            source_limits.append(
+                f"本次从 {len(projected_sources)} 条高相关原始告警中强制完整读取前 "
+                f"{len(required_reads)} 条；其余记录保留 manifest 与证据引用供后续调查。"
+            )
+        for item in projected_sources:
+            if item.get("syslog_message_integrity") == "mismatch":
+                source_limits.append(
+                    f"原始告警 {item['alert_id']} 的 Syslog 内容哈希与采集信封记录不一致，必须核对采集器归档。"
+                )
+            if "web_request" not in item.get("forensic_domains", []):
+                continue
+            diagnostics = {
+                str(entry.get("field") or ""): entry
+                for entry in item.get("capture_diagnostics") or []
+                if isinstance(entry, dict)
+            }
+            body_state = str(
+                (diagnostics.get("http_request_body") or {}).get("state")
+                or "not_observed"
+            )
+            parameter_state = str(
+                (diagnostics.get("http_request_parameters") or {}).get("state")
+                or "not_observed"
+            )
+            if (
+                body_state != "captured_nonempty"
+                or parameter_state != "captured_nonempty"
+            ):
+                source_limits.append(
+                    f"原始告警 {item['alert_id']} 的 HTTP 请求载荷采集不完整"
+                    f"（body={body_state}, parameters={parameter_state}）；"
+                    "这是源端采集状态，不是 Agent 分块读取或 prompt 截断。"
+                )
+            response_status = diagnostics.get("http_response_status") or {}
+            if response_status.get("state") != "captured_nonempty":
+                source_limits.append(
+                    f"原始告警 {item['alert_id']} 未采集可验证的 HTTP 响应状态；"
+                    "需从 Web/RASP/WAF 原始日志补采。"
+                )
+
+        workstreams = []
+        for definition in FORENSIC_WORKSTREAMS:
+            domain = str(definition["domain"])
+            sources = [
+                item
+                for item in projected_sources
+                if domain in item.get("forensic_domains", [])
+            ][:4]
+            if not sources:
+                status = "collection_required"
+                coverage_summary = "当前受治理数据库中未发现该取证域的关联原始遥测。"
+            elif domain == "web_request":
+                complete_exchange = False
+                for item in sources:
+                    diagnostic_states = {
+                        str(entry.get("field") or ""): str(
+                            entry.get("state") or ""
+                        )
+                        for entry in item.get("capture_diagnostics") or []
+                        if isinstance(entry, dict)
+                    }
+                    if (
+                        diagnostic_states.get("http_response_status")
+                        == "captured_nonempty"
+                        and (
+                            diagnostic_states.get("http_request_body")
+                            == "captured_nonempty"
+                            or diagnostic_states.get("http_request_parameters")
+                            == "captured_nonempty"
+                        )
+                    ):
+                        complete_exchange = True
+                        break
+                status = "evidence_available" if complete_exchange else "partial"
+                coverage_summary = (
+                    "已发现可重建请求与响应的原始遥测。"
+                    if complete_exchange
+                    else "已发现 Web/RASP 原始遥测，但关键请求或响应字段存在源端采集缺口。"
+                )
+            else:
+                distinct_products = {
+                    str(item.get("product") or "").casefold()
+                    for item in sources
+                    if item.get("product")
+                }
+                status = (
+                    "evidence_available"
+                    if len(distinct_products) >= 2
+                    else "partial"
+                )
+                coverage_summary = (
+                    "已发现多个独立产品的关联遥测，可进行交叉验证。"
+                    if status == "evidence_available"
+                    else "已发现单一来源的关联遥测，仍需按步骤补充独立证据源。"
+                )
+            workstreams.append(
+                {
+                    "workstream_id": definition["workstream_id"],
+                    "title": definition["title"],
+                    "domain": domain,
+                    "status": status,
+                    "coverage_summary": coverage_summary,
+                    "evidence_sources": [
+                        {
+                            key: item.get(key)
+                            for key in (
+                                "alert_id",
+                                "product",
+                                "event_type",
+                                "relation",
+                                "syslog_message_present",
+                                "syslog_message_integrity",
+                                "evidence_ref",
+                            )
+                        }
+                        for item in sources
+                    ],
+                    "collection_steps": list(definition["collection_steps"]),
+                    "evidence_refs": [
+                        str(item.get("evidence_ref") or "")
+                        for item in sources
+                        if item.get("evidence_ref")
+                    ],
+                }
+            )
+
+        source_limits = list(dict.fromkeys(source_limits))[:16]
+        refs = [
+            {
+                "ref_type": (
+                    "raw_alert"
+                    if item.get("relation") == "linked_to_case"
+                    else "correlated_raw_alert"
+                ),
+                "ref_id": str(item.get("evidence_ref") or ""),
+                "source_event_id": str(item.get("event_id") or ""),
+                "source_hash": str(item.get("source_hash") or ""),
+            }
+            for item in projected_sources
+            if item.get("evidence_ref")
+        ]
+        return (
+            {
+                "scope": {
+                    "mode": "controller_scoped_read_only",
+                    "live_shell": False,
+                    "arbitrary_sql": False,
+                    "external_connectors": False,
+                    "correlation_window_minutes": (
+                        self.config.correlation_window_minutes
+                    ),
+                },
+                "inventory": {
+                    "linked_total": _integer(linked.get("total"), 0),
+                    "related_total": _integer(related.get("total"), 0),
+                    "candidate_count": len(projected_sources),
+                    "products": sorted(
+                        {
+                            str(item.get("product") or "")
+                            for item in projected_sources
+                            if item.get("product")
+                        }
+                    ),
+                    "scan_truncated": bool(related.get("scan_truncated")),
+                },
+                "required_reads": required_reads,
+                "workstreams": workstreams,
+                "source_limits": source_limits,
+                "retrieved_at_ms": now_ms(),
+            },
+            refs,
         )
 
     def _execute_tool(
@@ -1611,6 +2051,8 @@ class ResponseInvestigationAgent:
                 if item.get("alert_id")
             ]
             return page, refs
+        if tool_name == "query_forensic_coverage":
+            return self._build_forensic_coverage(source)
         if tool_name == "read_raw_alert_chunk":
             raw = self.repo.get_response_agent_raw_alert(
                 str(source["case"]["case_id"]),
@@ -1801,6 +2243,14 @@ class ResponseInvestigationAgent:
                 f"Found {int(result.get('total') or 0)} related raw alerts after "
                 f"scanning {int(result.get('scanned') or 0)} candidates.{suffix}"
             )
+        if tool_name == "query_forensic_coverage":
+            inventory = result.get("inventory") or {}
+            return (
+                f"Mapped {len(result.get('workstreams') or [])} forensic domains, "
+                f"selected {len(result.get('required_reads') or [])} mandatory raw "
+                f"streams from {int(inventory.get('candidate_count') or 0)} "
+                "linked or correlated candidates."
+            )
         if tool_name == "read_raw_alert_chunk":
             return (
                 f"Read raw alert {result.get('alert_id') or ''} bytes "
@@ -1852,6 +2302,7 @@ class ResponseInvestigationAgent:
                     "goal": current["goal"],
                     "case": source["case"],
                     "response_pack": artifact["content"],
+                    "forensic_workstreams": base["forensic_workstreams"],
                     "observations": {
                         "details": observation_context.get("details") or [],
                         "ledger": observation_context.get("ledger") or [],
@@ -1868,6 +2319,14 @@ class ResponseInvestigationAgent:
                 "claims. Incorporate relevant raw-log and cross-product correlation "
                 "observations, but distinguish the frozen Case snapshot from live "
                 "read-only database observations by their hashes and retrieval time. "
+                "Use every controller-provided forensic workstream. If capture "
+                "diagnostics say an HTTP field is captured_null, captured_empty or "
+                "not_observed, describe it as a source-capture limitation and retain "
+                "the specific collection steps; never call it Agent truncation. If "
+                "a response status is captured, use that observed value instead of "
+                "calling the status unverified. Do not imply live server access: "
+                "server, endpoint, file, network, identity, persistence and "
+                "cloud/container steps are governed evidence-acquisition procedures. "
                 "Cite only provided evidence ref_id values. Do not claim "
                 "that a response action ran unless the response status proves it. "
                 "Any proposed production action must be observe or approve_required. "
@@ -2041,6 +2500,31 @@ class ResponseInvestigationAgent:
             for call in session.get("tool_calls") or []
             if call.get("status") == "completed"
         ]
+        forensic_coverage: dict[str, Any] = {}
+        for call in reversed(calls):
+            if call.get("tool_name") != "query_forensic_coverage":
+                continue
+            if isinstance(call.get("result"), dict):
+                forensic_coverage = call["result"]
+            break
+        forensic_workstreams = [
+            copy.deepcopy(item)
+            for item in forensic_coverage.get("workstreams") or []
+            if isinstance(item, dict)
+        ][: len(FORENSIC_WORKSTREAMS)]
+        source_limits = [
+            _text(item, 1_500)
+            for item in forensic_coverage.get("source_limits") or []
+            if _text(item, 1_500)
+        ][:30]
+        baseline_gaps = [
+            _text(item, 1_000)
+            for item in summary.get("uncertainties") or []
+            if _text(item, 1_000)
+        ][:20]
+        evidence_gaps = list(
+            dict.fromkeys([*source_limits, *baseline_gaps])
+        )[:40]
         classification = str(
             summary.get("classification")
             or source["case"].get("classification")
@@ -2095,10 +2579,9 @@ class ResponseInvestigationAgent:
                 ),
                 "basis": [item["statement"] for item in findings[:5]],
                 "limitations": [
-                    _text(item, 1_000)
-                    for item in summary.get("uncertainties") or []
-                    if _text(item, 1_000)
-                ][:20],
+                    *source_limits,
+                    *baseline_gaps,
+                ][:30],
             },
             "findings": findings,
             "attack_chain": [
@@ -2119,11 +2602,8 @@ class ResponseInvestigationAgent:
                 if isinstance(item, dict)
             ],
             "impact": impact,
-            "evidence_gaps": [
-                _text(item, 1_000)
-                for item in summary.get("uncertainties") or []
-                if _text(item, 1_000)
-            ][:20],
+            "forensic_workstreams": forensic_workstreams,
+            "evidence_gaps": evidence_gaps,
             "response_plan": playbook,
             "investigation_log": [
                 {
@@ -2198,11 +2678,19 @@ class ResponseInvestigationAgent:
                 for item in conclusion.get("basis") or []
                 if _text(item, 1_500)
             ][:20] or normalized["conclusion"]["basis"]
-            normalized["conclusion"]["limitations"] = [
+            candidate_limitations = [
                 _text(item, 1_500)
                 for item in conclusion.get("limitations") or []
                 if _text(item, 1_500)
-            ][:20] or normalized["conclusion"]["limitations"]
+            ][:20]
+            normalized["conclusion"]["limitations"] = list(
+                dict.fromkeys(
+                    [
+                        *normalized["conclusion"]["limitations"],
+                        *candidate_limitations,
+                    ]
+                )
+            )[:30]
         findings = self._normalize_claims(
             candidate.get("findings"), prefix="finding"
         )
@@ -2211,17 +2699,21 @@ class ResponseInvestigationAgent:
         attack_chain = self._normalize_attack_chain(candidate.get("attack_chain"))
         if attack_chain:
             normalized["attack_chain"] = attack_chain
-        gaps = [
+        candidate_gaps = [
             _text(item, 1_500)
             for item in candidate.get("evidence_gaps") or []
             if _text(item, 1_500)
         ][:30]
-        if gaps:
-            normalized["evidence_gaps"] = gaps
+        normalized["evidence_gaps"] = list(
+            dict.fromkeys(
+                [*normalized["evidence_gaps"], *candidate_gaps]
+            )
+        )[:40]
         response_plan = self._normalize_response_plan(candidate.get("response_plan"))
         if response_plan:
             normalized["response_plan"] = response_plan
         normalized["scope"] = base["scope"]
+        normalized["forensic_workstreams"] = base["forensic_workstreams"]
         normalized["investigation_log"] = base["investigation_log"]
         normalized["execution_boundary"] = base["execution_boundary"]
         normalized["schema_version"] = REPORT_SCHEMA_VERSION
@@ -2394,11 +2886,91 @@ class ResponseInvestigationAgent:
             existing = raw_streams.get(stream)
             if not existing or offset >= _integer(existing.get("offset"), -1):
                 raw_streams[stream] = result
-        raw_evidence_complete = bool(raw_streams) and all(
-            result.get("complete") is True for result in raw_streams.values()
+        coverage_result: dict[str, Any] = {}
+        for call in reversed(completed_calls):
+            if call.get("tool_name") != "query_forensic_coverage":
+                continue
+            if isinstance(call.get("result"), dict):
+                coverage_result = call["result"]
+            break
+        required_streams = [
+            (
+                str(item.get("alert_id") or ""),
+                str(item.get("json_pointer") or ""),
+            )
+            for item in coverage_result.get("required_reads") or []
+            if isinstance(item, dict) and item.get("alert_id")
+        ]
+        missing_required_streams = [
+            stream for stream in required_streams if stream not in raw_streams
+        ]
+        incomplete_required_streams = [
+            stream
+            for stream in required_streams
+            if stream in raw_streams
+            and raw_streams[stream].get("complete") is not True
+        ]
+        selected_streams_complete = all(
+            result.get("complete") is True
+            for result in raw_streams.values()
         )
+        if required_streams:
+            raw_evidence_complete = (
+                selected_streams_complete
+                and not (
+                    missing_required_streams or incomplete_required_streams
+                )
+            )
+        else:
+            raw_evidence_complete = (
+                bool(raw_streams) and selected_streams_complete
+            )
+        if missing_required_streams:
+            errors.append(
+                "forensic_required_reads_missing:"
+                + ",".join(
+                    f"{alert_id}|{pointer}"
+                    for alert_id, pointer in missing_required_streams
+                )
+            )
+        if incomplete_required_streams:
+            errors.append(
+                "forensic_required_reads_incomplete:"
+                + ",".join(
+                    f"{alert_id}|{pointer}"
+                    for alert_id, pointer in incomplete_required_streams
+                )
+            )
         if raw_candidates and not raw_evidence_complete:
             errors.append("raw_evidence_read_incomplete")
+
+        expected_workstreams = {
+            str(item.get("workstream_id") or ""): item
+            for item in coverage_result.get("workstreams") or []
+            if isinstance(item, dict) and item.get("workstream_id")
+        }
+        report_workstreams = {
+            str(item.get("workstream_id") or ""): item
+            for item in report.get("forensic_workstreams") or []
+            if isinstance(item, dict) and item.get("workstream_id")
+        }
+        missing_workstreams = sorted(
+            set(expected_workstreams) - set(report_workstreams)
+        )
+        if missing_workstreams:
+            errors.append(
+                f"forensic_workstreams_missing:{','.join(missing_workstreams)}"
+            )
+        for workstream_id, expected in expected_workstreams.items():
+            item = report_workstreams.get(workstream_id)
+            if not item:
+                continue
+            if item.get("status") != expected.get("status"):
+                errors.append(f"forensic_status_changed:{workstream_id}")
+            if expected.get("status") in {"partial", "collection_required"} and not (
+                item.get("collection_steps")
+            ):
+                errors.append(f"forensic_collection_steps_missing:{workstream_id}")
 
         cited: list[tuple[str, str]] = []
         for claim in report.get("findings") or []:
@@ -2422,6 +2994,16 @@ class ResponseInvestigationAgent:
 
         for index, item in enumerate(report.get("attack_chain") or [], start=1):
             claim_id = f"attack-chain-{index}"
+            valid_refs = [
+                str(ref)
+                for ref in item.get("evidence_refs") or []
+                if str(ref) in ref_manifest
+            ]
+            item["evidence_refs"] = valid_refs
+            cited.extend((claim_id, ref) for ref in valid_refs)
+
+        for item in report.get("forensic_workstreams") or []:
+            claim_id = str(item.get("workstream_id") or "forensic-workstream")
             valid_refs = [
                 str(ref)
                 for ref in item.get("evidence_refs") or []
@@ -2490,7 +3072,7 @@ class ResponseInvestigationAgent:
         return (
             {
                 "status": status,
-                "validator": "deterministic-response-report-gate-v1",
+                "validator": "deterministic-response-report-gate-v2",
                 "errors": errors,
                 "warnings": warnings,
                 "checks": {
@@ -2502,6 +3084,10 @@ class ResponseInvestigationAgent:
                     "raw_evidence_complete": (
                         not raw_candidates or raw_evidence_complete
                     ),
+                    "forensic_required_reads_complete": not (
+                        missing_required_streams or incomplete_required_streams
+                    ),
+                    "forensic_workstreams_complete": not missing_workstreams,
                     "direct_execution_blocked": "direct_execution_not_blocked"
                     not in errors,
                     "direct_delivery_blocked": "direct_delivery_not_blocked"

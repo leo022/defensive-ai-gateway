@@ -153,10 +153,14 @@ const COPY = {
     agentConclusion: "完整结论",
     agentFindings: "关键发现",
     agentImpact: "影响分析",
+    agentForensics: "深度取证流程",
+    agentForensicSources: "现有证据源",
+    agentCollectionSteps: "补充采集步骤",
     agentGaps: "证据缺口",
     agentResponsePlan: "响应计划",
     agentFinalAssessment: "最终判断",
     agentEmptyFindings: "暂无结构化发现。",
+    agentEmptyForensics: "暂无取证流程。",
     agentEmptyGaps: "暂无新增证据缺口。",
     agentEmptyPlan: "暂无响应步骤。",
     agentCommandFailed: "Agent 操作失败",
@@ -286,10 +290,14 @@ const COPY = {
     agentConclusion: "Conclusion",
     agentFindings: "Key findings",
     agentImpact: "Impact",
+    agentForensics: "Deep forensic workstreams",
+    agentForensicSources: "Available evidence sources",
+    agentCollectionSteps: "Additional collection steps",
     agentGaps: "Evidence gaps",
     agentResponsePlan: "Response plan",
     agentFinalAssessment: "Final assessment",
     agentEmptyFindings: "No structured findings.",
+    agentEmptyForensics: "No forensic workstreams.",
     agentEmptyGaps: "No additional evidence gaps.",
     agentEmptyPlan: "No response steps.",
     agentCommandFailed: "Agent operation failed",
@@ -394,6 +402,9 @@ const ENUM_LABELS = {
       rollback_retry: "等待回滚重试",
       rollback_failed: "回滚失败",
       completed: "已完成",
+      evidence_available: "证据可用",
+      partial: "部分覆盖",
+      collection_required: "需要补采",
       created: "已创建",
       success: "成功",
       error: "异常",
@@ -496,6 +507,9 @@ const ENUM_LABELS = {
       rollback_retry: "Rollback retry pending",
       rollback_failed: "Rollback failed",
       completed: "Completed",
+      evidence_available: "Evidence available",
+      partial: "Partial coverage",
+      collection_required: "Collection required",
       created: "Created",
       success: "Succeeded",
       error: "Error",
@@ -1333,6 +1347,26 @@ function renderAgentReport() {
       <section class="response-agent-report-section">
         <h4>${escapeHtml(tr("agentImpact"))}</h4>
         <p>${escapeHtml(content.impact || "-")}</p>
+      </section>
+      <section class="response-agent-report-section">
+        <h4>${escapeHtml(tr("agentForensics"))}</h4>
+        ${reportItems(content.forensic_workstreams, (item) => {
+          const sources = (item.evidence_sources || [])
+            .map((source) => `${source.product || "-"} · ${source.alert_id || "-"}`)
+            .join(" / ");
+          const steps = (item.collection_steps || [])
+            .map((step) => `<small>${escapeHtml(step)}</small>`)
+            .join("");
+          return `
+            <li>
+              <strong>${escapeHtml(item.title || item.workstream_id || "-")}</strong>
+              <small>${escapeHtml(enumLabel("state", item.status))} · ${escapeHtml(item.coverage_summary || "-")}</small>
+              ${sources ? `<small>${escapeHtml(tr("agentForensicSources"))}: ${escapeHtml(sources)}</small>` : ""}
+              ${steps ? `<small><strong>${escapeHtml(tr("agentCollectionSteps"))}</strong></small>${steps}` : ""}
+              ${compactAgentRefs(item.evidence_refs)}
+            </li>
+          `;
+        }, tr("agentEmptyForensics"))}
       </section>
       <section class="response-agent-report-section">
         <h4>${escapeHtml(tr("agentGaps"))}</h4>

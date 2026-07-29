@@ -497,7 +497,7 @@ def load_config(path: str | None = None) -> GatewayConfig:
             )
             in {"1", "true", "True", "yes"},
             max_turns=max(
-                9,
+                18,
                 min(
                     int(
                         os.getenv(
@@ -509,7 +509,7 @@ def load_config(path: str | None = None) -> GatewayConfig:
                 ),
             ),
             max_tool_calls=max(
-                8,
+                16,
                 min(
                     int(
                         os.getenv(
@@ -533,7 +533,7 @@ def load_config(path: str | None = None) -> GatewayConfig:
                 ),
             ),
             tool_result_max_bytes=max(
-                4096,
+                32_000,
                 min(
                     int(
                         os.getenv(
