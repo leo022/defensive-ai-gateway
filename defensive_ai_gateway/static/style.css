@@ -4760,6 +4760,16 @@ button.memory-audit-row:hover {
   display: none;
 }
 
+.response-agent-expand[data-action="expand"] .response-agent-expand-icon-expand,
+.response-agent-expand[data-action="collapse"] .response-agent-expand-icon-collapse {
+  display: block;
+}
+
+.response-agent-expand[data-action="expand"] .response-agent-expand-icon-collapse,
+.response-agent-expand[data-action="collapse"] .response-agent-expand-icon-expand {
+  display: none;
+}
+
 .response-agent-body {
   min-width: 0;
   overflow: auto;

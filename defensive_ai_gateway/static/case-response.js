@@ -1798,15 +1798,17 @@ async function openResponseAgent() {
 function setResponseAgentExpanded(expanded) {
   const drawer = document.querySelector("#response-agent-drawer");
   const button = document.querySelector("#response-agent-expand");
-  const wideIcon = button.querySelector(".response-agent-expand-icon-wide");
-  const narrowIcon = button.querySelector(".response-agent-expand-icon-narrow");
+  const expandIcon = button.querySelector(".response-agent-expand-icon-expand");
+  const collapseIcon = button.querySelector(".response-agent-expand-icon-collapse");
   const label = tr(expanded ? "collapseAgent" : "expandAgent");
   drawer.classList.toggle("is-expanded", expanded);
+  button.dataset.action = expanded ? "collapse" : "expand";
+  button.setAttribute("aria-expanded", String(expanded));
   button.setAttribute("aria-pressed", String(expanded));
   button.setAttribute("aria-label", label);
   button.title = label;
-  wideIcon.hidden = expanded;
-  narrowIcon.hidden = !expanded;
+  expandIcon.hidden = expanded;
+  collapseIcon.hidden = !expanded;
 }
 
 function closeResponseAgent() {

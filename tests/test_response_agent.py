@@ -1384,10 +1384,14 @@ class ResponseAgentTest(unittest.TestCase):
         self.assertIn('id="case-response-agent-open"', html)
         self.assertIn('id="response-agent-drawer"', html)
         self.assertIn('id="response-agent-expand"', html)
+        self.assertIn('aria-controls="response-agent-drawer"', html)
+        self.assertIn('aria-expanded="false"', html)
         self.assertIn('id="response-agent-rerun"', html)
         self.assertIn('id="response-agent-trace-toggle"', html)
         self.assertIn('aria-controls="response-agent-trace"', html)
         self.assertIn('aria-pressed="false"', html)
+        self.assertIn("response-agent-expand-icon-expand", html)
+        self.assertIn("response-agent-expand-icon-collapse", html)
         self.assertIn("after_sequence", script)
         self.assertIn("AbortController", script)
         self.assertIn("AGENT_POLL_INTERVAL_MS", script)
@@ -1402,6 +1406,16 @@ class ResponseAgentTest(unittest.TestCase):
         self.assertNotIn('id="response-agent-trace" aria-live="polite"', html)
         self.assertIn('startResponseAgent({ rerun: true })', script)
         self.assertIn('classList.toggle("is-expanded", expanded)', script)
+        self.assertIn(
+            'button.dataset.action = expanded ? "collapse" : "expand"',
+            script,
+        )
+        self.assertIn(
+            'button.setAttribute("aria-expanded", String(expanded))',
+            script,
+        )
+        self.assertIn("expandIcon.hidden = expanded", script)
+        self.assertIn("collapseIcon.hidden = !expanded", script)
         self.assertIn("content.forensic_workstreams", script)
         self.assertIn("content.hypothesis_assessment", script)
         self.assertIn("content.cross_source_correlation", script)
@@ -1434,6 +1448,16 @@ class ResponseAgentTest(unittest.TestCase):
         self.assertIn("width: min(480px, 100vw)", css)
         self.assertIn(".response-agent-drawer.is-expanded", css)
         self.assertIn("width: min(960px, 100vw)", css)
+        self.assertIn(
+            '.response-agent-expand[data-action="expand"] '
+            ".response-agent-expand-icon-expand",
+            css,
+        )
+        self.assertIn(
+            '.response-agent-expand[data-action="collapse"] '
+            ".response-agent-expand-icon-collapse",
+            css,
+        )
         self.assertIn("width: 100vw", css)
         self.assertIn("height: 100dvh", css)
 

@@ -112,29 +112,36 @@
             class="response-agent-icon-button response-agent-expand"
             type="button"
             aria-label="展开"
+            aria-controls="response-agent-drawer"
+            aria-expanded="false"
             aria-pressed="false"
+            data-action="expand"
             title="展开"
           >
             <svg
-              class="response-agent-expand-icon response-agent-expand-icon-wide"
+              class="response-agent-expand-icon response-agent-expand-icon-expand"
               aria-hidden="true"
               viewBox="0 0 24 24"
             >
-              <path d="M15 3h6v6"></path>
-              <path d="m21 3-7 7"></path>
-              <path d="m3 21 7-7"></path>
-              <path d="M9 21H3v-6"></path>
+              <path d="M8 3H3v5"></path>
+              <path d="M16 3h5v5"></path>
+              <path d="M21 16v5h-5"></path>
+              <path d="M8 21H3v-5"></path>
             </svg>
             <svg
-              class="response-agent-expand-icon response-agent-expand-icon-narrow"
+              class="response-agent-expand-icon response-agent-expand-icon-collapse"
               aria-hidden="true"
               viewBox="0 0 24 24"
               hidden
             >
-              <path d="m14 10 7-7"></path>
-              <path d="M20 10h-6V4"></path>
+              <path d="M10 4v6H4"></path>
+              <path d="m3 3 7 7"></path>
+              <path d="M14 4v6h6"></path>
+              <path d="m21 3-7 7"></path>
+              <path d="M14 20v-6h6"></path>
+              <path d="m21 21-7-7"></path>
+              <path d="M10 20v-6H4"></path>
               <path d="m3 21 7-7"></path>
-              <path d="M4 14h6v6"></path>
             </svg>
           </button>
           <button
