@@ -1976,9 +1976,18 @@ async function agentCommand(command, body = {}) {
   }
 }
 
+function returnToCase(section) {
+  const params = new URLSearchParams({
+    case_id: caseId,
+    case_section: section === "history" ? "history" : "pending",
+  });
+  window.location.replace(`/?${params.toString()}`);
+}
+
 function initialize() {
   const params = new URLSearchParams(window.location.search);
   caseId = params.get("case_id") || "";
+  const returnSection = params.get("return_section") === "history" ? "history" : "pending";
   document.documentElement.lang = language() === "en" ? "en" : "zh-CN";
   applyLocalizedStaticText();
   if (!caseId) {
@@ -1988,8 +1997,7 @@ function initialize() {
   }
   document.title = `${tr("workbenchTitle")} · ${caseId}`;
   document.querySelector("#case-response-back").addEventListener("click", () => {
-    if (window.history.length > 1) window.history.back();
-    else window.location.assign("/");
+    returnToCase(returnSection);
   });
   document.querySelector("#case-response-refresh").addEventListener("click", () => loadAll());
   document.querySelector("#case-response-generate").addEventListener("click", generate);

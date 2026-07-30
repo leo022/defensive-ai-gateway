@@ -378,6 +378,44 @@ class CaseResponseServiceTest(unittest.TestCase):
         ):
             self.assertEqual(script.count(f'{heading_key}: "'), 2)
 
+    def test_response_back_restores_the_same_case_without_guessing_browser_history(self):
+        script = Path("defensive_ai_gateway/static/case-response.js").read_text(
+            encoding="utf-8"
+        )
+        app_script = Path("defensive_ai_gateway/static/app.js").read_text(
+            encoding="utf-8"
+        )
+
+        return_handler = script.split("function returnToCase(section)", 1)[1].split(
+            "function initialize()", 1
+        )[0]
+        self.assertIn("case_id: caseId", return_handler)
+        self.assertIn('case_section: section === "history" ? "history" : "pending"', return_handler)
+        self.assertIn("window.location.replace", return_handler)
+        self.assertNotIn("window.history.back", script)
+        self.assertNotIn("window.history.length", script)
+
+        response_link = app_script.split("function responsePackLink(caseId)", 1)[1].split(
+            "function detailLink", 1
+        )[0]
+        self.assertIn("return_section: activeDashboardSection", response_link)
+
+        restore = app_script.split("async function restoreRequestedCaseNavigation()", 1)[1].split(
+            "function bindDetailActions", 1
+        )[0]
+        self.assertIn('setSecondaryView("dashboard", requested.section)', restore)
+        self.assertIn("await openCaseTriage(requested.caseId)", restore)
+        self.assertIn("clearRequestedCaseNavigation()", restore)
+
+        bootstrap = app_script.split("async function loadApplicationData()", 1)[1].split(
+            'document.querySelector("#auth-session")', 1
+        )[0]
+        self.assertIn("if (await restoreRequestedCaseNavigation()) return;", bootstrap)
+        self.assertLess(
+            bootstrap.index("restoreRequestedCaseNavigation"),
+            bootstrap.index("loadMonitorDashboard"),
+        )
+
     def test_v16_rejects_an_incomplete_v15_response_schema(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "incomplete.db"

@@ -2989,7 +2989,10 @@ function renderDetail(detail) {
 }
 
 function responsePackLink(caseId) {
-  const href = `/case-response.html?${new URLSearchParams({ case_id: caseId }).toString()}`;
+  const href = `/case-response.html?${new URLSearchParams({
+    case_id: caseId,
+    return_section: activeDashboardSection === "history" ? "history" : "pending",
+  }).toString()}`;
   return `
     <a class="detail-link-card response-pack-link" href="${escapeHtml(href)}">
       <span class="detail-link-copy">
@@ -3185,6 +3188,36 @@ async function openCaseTriage(caseId) {
   if (!caseId) return;
   setView("triage");
   await loadTriageCase(caseId);
+}
+
+function requestedCaseNavigation() {
+  const params = new URLSearchParams(window.location.search);
+  const caseId = (params.get("case_id") || "").trim();
+  if (!caseId) return null;
+  return {
+    caseId,
+    section: params.get("case_section") === "history" ? "history" : "pending",
+  };
+}
+
+function clearRequestedCaseNavigation() {
+  const url = new URL(window.location.href);
+  url.searchParams.delete("case_id");
+  url.searchParams.delete("case_section");
+  window.history.replaceState(
+    window.history.state,
+    "",
+    `${url.pathname}${url.search}${url.hash}`,
+  );
+}
+
+async function restoreRequestedCaseNavigation() {
+  const requested = requestedCaseNavigation();
+  if (!requested) return false;
+  setSecondaryView("dashboard", requested.section);
+  await openCaseTriage(requested.caseId);
+  clearRequestedCaseNavigation();
+  return true;
 }
 
 function bindDetailActions(panel, caseId) {
@@ -5195,6 +5228,7 @@ document.querySelectorAll(".nav-subbutton").forEach((btn) => {
 
 async function loadApplicationData() {
   await loadSession();
+  if (await restoreRequestedCaseNavigation()) return;
   try {
     return await loadMonitorDashboard({ refreshConfig: true });
   } finally {
