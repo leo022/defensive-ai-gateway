@@ -2125,6 +2125,119 @@ class ResponseAgentTest(unittest.TestCase):
             validation["checks"]["response_plan_operational"]
         )
 
+    def test_response_plan_backfills_placeholders_and_cites_each_entity(self):
+        plan = self.state.response_agent._normalize_response_plan(
+            [
+                {
+                    "step_id": "RP-01",
+                    "stage": "containment",
+                    "mode": "approve_required",
+                    "action": "阻断 43.154.138.159 和 116.49.193.58",
+                    "rationale": "N/A",
+                    "success_criteria": "none",
+                    "rollback": "无。",
+                    "evidence_refs": ["raw-alert:first"],
+                }
+            ],
+            language="zh",
+        )
+        related = [
+            {
+                "alert_id": "first",
+                "source": "43.154.138.159",
+                "target": "106.53.107.29:8080",
+                "evidence_refs": ["raw-alert:first"],
+            },
+            {
+                "alert_id": "second",
+                "source": "116.49.193.58",
+                "target": "106.53.107.29:8080",
+                "evidence_refs": ["raw-alert:second"],
+            },
+        ]
+
+        augmented = self.state.response_agent._augment_response_plan_entity_refs(
+            plan,
+            related,
+        )
+
+        self.assertNotIn(
+            augmented[0]["rationale"].casefold(),
+            {"n/a", "none"},
+        )
+        self.assertNotEqual(augmented[0]["success_criteria"].casefold(), "none")
+        self.assertNotEqual(augmented[0]["rollback"], "无。")
+        self.assertEqual(
+            set(augmented[0]["evidence_refs"]),
+            {"raw-alert:first", "raw-alert:second"},
+        )
+
+    def test_response_plan_gate_rejects_missing_entity_specific_evidence(self):
+        self.state.response_agent.stop()
+        case_id = self._case("response-agent-plan-entity-citations")
+        source = self.state.repo.get_case_response_source(case_id)
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        started = self.state.response_agent.create(
+            case_id,
+            artifact=artifact,
+            goal="Validate entity-specific response evidence",
+            actor="analyst",
+        )
+        session = self.state.repo.get_response_agent_session(
+            started["session_id"]
+        )
+        report = self.state.response_agent._base_report(
+            session,
+            source,
+            artifact,
+        )
+        artifact_refs = [
+            str(item.get("ref_id") or "")
+            for item in artifact.get("evidence_refs") or []
+            if item.get("ref_id")
+        ]
+        self.assertGreaterEqual(len(artifact_refs), 2)
+        report["related_activity"] = [
+            {
+                "alert_id": "first",
+                "source": "43.154.138.159",
+                "target": "",
+                "evidence_refs": [artifact_refs[0]],
+            },
+            {
+                "alert_id": "second",
+                "source": "116.49.193.58",
+                "target": "",
+                "evidence_refs": [artifact_refs[1]],
+            },
+        ]
+        report["response_plan"] = [
+            {
+                "step_id": "RP-01",
+                "stage": "containment",
+                "mode": "approve_required",
+                "action": "阻断 43.154.138.159 和 116.49.193.58",
+                "rationale": "两个地址均有攻击活动。",
+                "success_criteria": "审批后阻断规则命中。",
+                "rollback": "按审批单移除阻断规则并验证流量。",
+                "evidence_refs": [artifact_refs[0]],
+            }
+        ]
+
+        validation, _refs = self.state.response_agent._validate_report(
+            report,
+            session,
+            source,
+            artifact,
+        )
+
+        self.assertIn(
+            "response_plan_entity_evidence_missing:RP-01:116.49.193.58",
+            validation["errors"],
+        )
+
     def test_llm_synthesis_uses_react_dossier_and_preserves_controller_timestamps(self):
         llm = _NarrativeAgentLLM()
         self.state.response_agent.set_llm(llm)

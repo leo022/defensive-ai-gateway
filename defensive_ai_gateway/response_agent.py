@@ -13,8 +13,8 @@ from .llm import LLMResponseContractError
 from .models import new_id, now_ms
 
 
-REPORT_SCHEMA_VERSION = "response-investigation-report-v6"
-AGENT_VERSION = "response-investigation-agent-v8"
+REPORT_SCHEMA_VERSION = "response-investigation-report-v7"
+AGENT_VERSION = "response-investigation-agent-v9"
 TOOL_VERSION = "7"
 FORENSIC_INVENTORY_MAX_ALERTS = 200
 ACTIVE_STATUSES = {
@@ -4226,7 +4226,10 @@ class ResponseInvestigationAgent:
                 "in the report. Keep controller facts, identifiers and timestamps exact. "
                 "Every confirmed or inferred finding, attack-chain event, related event, "
                 "risk assessment and proposed response must cite provided evidence ref_id "
-                "values. Proposed production actions must use observe or approve_required. "
+                "values. Every source or target identifier named in a proposed response "
+                "must cite evidence for that specific identifier. Do not use placeholders "
+                "such as none, N/A or 无 for rationale, success criteria or rollback. "
+                "Proposed production actions must use observe or approve_required. "
                 "Do not discuss snapshots, hashes, tool allowlists or controller mechanics "
                 "in the executive summary or final assessment. Do not expose chain-of-thought. "
                 f"Write all operator-facing prose in "
@@ -5688,6 +5691,11 @@ class ResponseInvestigationAgent:
                 base["forensic_workstreams"],
             )
 
+        normalized["response_plan"] = self._augment_response_plan_entity_refs(
+            normalized.get("response_plan") or [],
+            base.get("related_activity") or [],
+        )
+
         # Capture states, immutable scope, correlation inventory and execution
         # boundaries remain controller-owned. The model interprets these facts
         # but cannot add or rewrite them.
@@ -6268,6 +6276,85 @@ class ResponseInvestigationAgent:
             target["evidence_refs"] = list(target.get("evidence_refs") or [])[:64]
         return result
 
+    @staticmethod
+    def _plan_detail_is_placeholder(value: Any) -> bool:
+        text = _text(value, 1_000).strip()
+        if not text:
+            return True
+        folded = text.casefold().strip(" \t\r\n.!?。！？；;:-_()[]{}")
+        return folded in {
+            "n/a",
+            "na",
+            "none",
+            "nil",
+            "not applicable",
+            "无",
+            "没有",
+            "不适用",
+            "无需",
+            "无需回滚",
+        }
+
+    @staticmethod
+    def _response_plan_entity_ref_map(
+        related_activity: list[dict[str, Any]],
+    ) -> dict[str, set[str]]:
+        entity_refs: dict[str, set[str]] = {}
+        for activity in related_activity:
+            if not isinstance(activity, dict):
+                continue
+            refs = {
+                str(ref)
+                for ref in activity.get("evidence_refs") or []
+                if str(ref).strip()
+            }
+            if not refs:
+                continue
+            for value in (
+                activity.get("alert_id"),
+                activity.get("source"),
+                activity.get("target"),
+            ):
+                entity = _text(value, 800).strip()
+                if (
+                    len(entity) < 4
+                    or entity.casefold()
+                    in {"none", "null", "unknown", "未知", "无"}
+                ):
+                    continue
+                entity_refs.setdefault(entity.casefold(), set()).update(refs)
+        return entity_refs
+
+    @classmethod
+    def _augment_response_plan_entity_refs(
+        cls,
+        response_plan: list[dict[str, Any]],
+        related_activity: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        entity_refs = cls._response_plan_entity_ref_map(related_activity)
+        for item in response_plan:
+            if not isinstance(item, dict):
+                continue
+            narrative = " ".join(
+                _text(item.get(key), 1_500)
+                for key in (
+                    "action",
+                    "rationale",
+                    "success_criteria",
+                    "rollback",
+                )
+            ).casefold()
+            refs = [
+                str(ref)
+                for ref in item.get("evidence_refs") or []
+                if str(ref).strip()
+            ]
+            for entity, supporting_refs in entity_refs.items():
+                if entity in narrative:
+                    refs.extend(sorted(supporting_refs))
+            item["evidence_refs"] = list(dict.fromkeys(refs))[:64]
+        return response_plan
+
     def _normalize_response_plan(
         self,
         value: Any,
@@ -6292,9 +6379,9 @@ class ResponseInvestigationAgent:
                     if self.policy.requires_approval(action)
                     else "observe"
                 )
-            rationale = _model_narrative_text(
-                item.get("rationale"), 1_000
-            ) or _pick(
+            rationale = _model_narrative_text(item.get("rationale"), 1_000)
+            if self._plan_detail_is_placeholder(rationale):
+                rationale = _pick(
                 language,
                 (
                     "在审批边界内降低已识别风险，并保留可审计的执行记录。"
@@ -6309,7 +6396,9 @@ class ResponseInvestigationAgent:
             )
             success_criteria = _model_narrative_text(
                 item.get("success_criteria"), 1_000
-            ) or _pick(
+            )
+            if self._plan_detail_is_placeholder(success_criteria):
+                success_criteria = _pick(
                 language,
                 (
                     "审批、执行结果和影响范围均已回写当前 Case，且关键服务与监控验证正常。"
@@ -6322,9 +6411,9 @@ class ResponseInvestigationAgent:
                     else "A verifiable result is bound to the current Case and no unapproved production change occurred."
                 ),
             )
-            rollback = _model_narrative_text(
-                item.get("rollback"), 1_000
-            ) or _pick(
+            rollback = _model_narrative_text(item.get("rollback"), 1_000)
+            if self._plan_detail_is_placeholder(rollback):
+                rollback = _pick(
                 language,
                 (
                     "按审批变更单恢复执行前配置，并验证服务、流量与监控恢复正常。"
@@ -6714,7 +6803,7 @@ class ResponseInvestigationAgent:
                     "success_criteria",
                     "rollback",
                 )
-                if not _text(item.get(key))
+                if self._plan_detail_is_placeholder(item.get(key))
             ]
             if missing_detail:
                 errors.append(
@@ -6723,6 +6812,32 @@ class ResponseInvestigationAgent:
             if not valid_refs:
                 errors.append(f"response_plan_evidence_missing:{claim_id}")
             cited.extend((claim_id, ref) for ref in valid_refs)
+
+        entity_refs = self._response_plan_entity_ref_map(
+            report.get("related_activity") or []
+        )
+        for index, item in enumerate(report.get("response_plan") or [], start=1):
+            claim_id = str(item.get("step_id") or f"response-{index}")
+            narrative = " ".join(
+                _text(item.get(key), 1_500)
+                for key in (
+                    "action",
+                    "rationale",
+                    "success_criteria",
+                    "rollback",
+                )
+            ).casefold()
+            cited_refs = {
+                str(ref) for ref in item.get("evidence_refs") or [] if str(ref)
+            }
+            for entity, supporting_refs in entity_refs.items():
+                if entity in narrative and not cited_refs.intersection(
+                    supporting_refs
+                ):
+                    errors.append(
+                        "response_plan_entity_evidence_missing:"
+                        f"{claim_id}:{entity[:128]}"
+                    )
 
         boundary = report.get("execution_boundary") or {}
         if boundary.get("direct_execution") is not False:
@@ -6778,7 +6893,7 @@ class ResponseInvestigationAgent:
         return (
             {
                 "status": status,
-                "validator": "deterministic-response-report-gate-v6",
+                "validator": "deterministic-response-report-gate-v7",
                 "errors": errors,
                 "warnings": warnings,
                 "checks": {
