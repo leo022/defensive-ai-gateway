@@ -43,6 +43,17 @@ class _ElementCollector(HTMLParser):
 
 
 class DashboardQueueMetricTest(unittest.TestCase):
+    def test_dashboard_status_panels_share_an_alignment_contract(self):
+        self.assertEqual(HTML.count("dashboard-status-panel"), 2)
+        self.assertIn("dashboard-status-panel health-panel", HTML)
+        self.assertIn("dashboard-status-panel intake-panel", HTML)
+        self.assertIn("grid-template-rows: 88px minmax(0, 1fr);", CSS)
+        self.assertIn(".dashboard-status-panel .panel-heading {", CSS)
+        self.assertIn("white-space: nowrap;", CSS)
+        self.assertGreater(CSS.rfind(".dashboard-grid > .panel {"), CSS.rfind(".panel + .panel,"))
+        self.assertIn(".dashboard-status-panel .health-checks", CSS)
+        self.assertIn(".dashboard-status-panel .intake-health", CSS)
+
     def test_dashboard_uses_all_unfinished_alerts_and_refreshes_during_demo(self):
         self.assertIn("processing.unfinished", JS)
         self.assertIn('unfinishedAlertCount(processing)', JS)

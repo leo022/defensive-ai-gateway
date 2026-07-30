@@ -6398,6 +6398,10 @@ main {
   margin-top: 12px;
 }
 
+.dashboard-grid > .panel {
+  margin-top: 0;
+}
+
 .panel-heading {
   min-height: 64px;
   padding: 14px 16px;
@@ -6409,6 +6413,111 @@ main {
   font-size: 14px;
   font-weight: 720;
   letter-spacing: -0.01em;
+}
+
+.dashboard-status-panel {
+  display: grid;
+  grid-template-rows: 88px minmax(0, 1fr);
+  overflow: hidden;
+}
+
+.dashboard-status-panel.health-panel {
+  box-shadow: inset 0 2px 0 var(--success-line);
+}
+
+.dashboard-status-panel.intake-panel {
+  box-shadow: inset 0 2px 0 var(--brand-line);
+}
+
+.dashboard-status-panel .panel-heading {
+  height: 88px;
+  min-height: 88px;
+  align-items: center;
+}
+
+.dashboard-status-panel .panel-heading > div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.dashboard-status-panel .panel-heading p {
+  max-width: 50ch;
+  line-height: 1.45;
+}
+
+.dashboard-status-panel .health-score {
+  min-width: 0;
+  min-height: 28px;
+  flex: 0 0 auto;
+  padding: 4px 10px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.dashboard-status-panel .health-checks,
+.dashboard-status-panel .intake-health {
+  display: grid;
+  min-height: 0;
+  height: 100%;
+  align-content: stretch;
+  gap: 0;
+  padding: 6px 16px 14px;
+}
+
+.dashboard-status-panel .health-checks {
+  grid-auto-rows: minmax(64px, 1fr);
+}
+
+.dashboard-status-panel .intake-health {
+  grid-auto-rows: minmax(48px, 1fr);
+}
+
+.dashboard-status-panel .health-check,
+.dashboard-status-panel .intake-health-row {
+  height: 100%;
+  align-items: center;
+}
+
+.dashboard-status-panel .health-check > div,
+.dashboard-status-panel .intake-health-row > span {
+  min-width: 0;
+}
+
+.dashboard-status-panel .health-check small {
+  font-size: 10px;
+  font-weight: 720;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.dashboard-status-panel .intake-health-row strong {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.dashboard-status-panel .intake-health-row strong::before {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: var(--success);
+  content: "";
+}
+
+.dashboard-status-panel .intake-health-row.warn strong::before {
+  background: var(--warning);
+}
+
+.dashboard-status-panel .intake-health-row code {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--ink);
+  padding: 3px 7px;
+  font-size: 11px;
+  white-space: nowrap;
 }
 
 .health-checks,
@@ -6546,6 +6655,20 @@ textarea {
     border-color: var(--sidebar-line);
     border-radius: 8px;
   }
+
+  .dashboard-status-panel {
+    grid-template-rows: auto auto;
+  }
+
+  .dashboard-status-panel .panel-heading {
+    height: auto;
+    min-height: 76px;
+  }
+
+  .dashboard-status-panel .health-checks,
+  .dashboard-status-panel .intake-health {
+    height: auto;
+  }
 }
 
 @media (max-width: 720px) {
@@ -6663,9 +6786,19 @@ textarea {
     min-height: 0;
   }
 
+  .dashboard-status-panel .panel-heading {
+    min-height: 72px;
+  }
+
   .panel-heading {
     min-height: 60px;
     padding: 13px 14px;
+  }
+
+  .dashboard-status-panel .health-checks,
+  .dashboard-status-panel .intake-health {
+    padding-right: 14px;
+    padding-left: 14px;
   }
 
   .health-checks,
