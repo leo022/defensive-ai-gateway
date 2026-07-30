@@ -4286,7 +4286,10 @@ function setView(name) {
   document.querySelectorAll(".view").forEach((view) => view.classList.remove("active"));
   target.classList.add("active");
   document.querySelectorAll(".nav-button").forEach((btn) => {
-    btn.classList.toggle("active", btn.dataset.view === navigationView);
+    const current = btn.dataset.view === navigationView;
+    btn.classList.toggle("active", current);
+    if (current) btn.setAttribute("aria-current", "page");
+    else btn.removeAttribute("aria-current");
   });
   document.querySelectorAll(".nav-group").forEach((group) => {
     group.classList.toggle("active", group.dataset.viewGroup === navigationView);
