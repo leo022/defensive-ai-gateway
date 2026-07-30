@@ -444,9 +444,11 @@ class _SyslogPointerGuessAgentLLM:
         self.planner_calls = 0
 
     def generate_structured(self, prompt, context, schema=None):  # noqa: ANN001
+        if prompt.startswith("Write a complete"):
+            return {}
         self.planner_calls += 1
-        if self.planner_calls > len(MANDATORY_TOOLS):
-            read_turn = self.planner_calls - len(MANDATORY_TOOLS)
+        if self.planner_calls <= 2:
+            read_turn = self.planner_calls
             guessed_alert_id = (
                 f"{self.alert_id[:8]}{'0' * (len(self.alert_id) - 8)}"
                 if read_turn == 1
@@ -734,6 +736,116 @@ class ResponseAgentTest(unittest.TestCase):
             second["session_id"],
         )
 
+    def test_completed_rerun_retains_only_latest_report(self):
+        case_id = self._case("response-agent-latest-report")
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        first_started = self.state.response_agent.create(
+            case_id, artifact=artifact, goal="first report", actor="analyst"
+        )
+        first = self._wait(
+            self.state.response_agent,
+            first_started["session_id"],
+            {"completed", "review", "blocked", "failed", "budget_exhausted"},
+        )
+        self.assertEqual(first["status"], "completed")
+        self.assertEqual(first["report"]["version"], 1)
+        first_report_id = first["report"]["report_id"]
+        first_step_ids = [item["step_id"] for item in first["steps"]]
+        first_call_ids = [item["call_id"] for item in first["tool_calls"]]
+
+        second_started = self.state.response_agent.create(
+            case_id, artifact=artifact, goal="replacement report", actor="analyst"
+        )
+        second = self._wait(
+            self.state.response_agent,
+            second_started["session_id"],
+            {"completed", "review", "blocked", "failed", "budget_exhausted"},
+        )
+
+        self.assertEqual(second["status"], "completed")
+        self.assertEqual(second["report"]["version"], 2)
+        self.assertNotEqual(first_report_id, second["report"]["report_id"])
+        reports = self.state.repo.conn.execute(
+            """
+            SELECT report_id, session_id, version
+            FROM response_agent_reports WHERE case_id = ?
+            """,
+            (case_id,),
+        ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in reports],
+            [
+                (
+                    second["report"]["report_id"],
+                    second["session_id"],
+                    2,
+                )
+            ],
+        )
+        report_ref_ids = {
+            row["report_id"]
+            for row in self.state.repo.conn.execute(
+                "SELECT DISTINCT report_id FROM response_agent_report_refs"
+            ).fetchall()
+        }
+        self.assertEqual(report_ref_ids, {second["report"]["report_id"]})
+
+        superseded = self.state.repo.get_response_agent_session(first["session_id"])
+        self.assertIsNone(superseded["report_id"])
+        self.assertIsNone(superseded["report"])
+        self.assertEqual(
+            [item["step_id"] for item in superseded["steps"]],
+            first_step_ids,
+        )
+        self.assertEqual(
+            [item["call_id"] for item in superseded["tool_calls"]],
+            first_call_ids,
+        )
+        self.assertEqual(
+            self.state.response_agent.latest(case_id)["session_id"],
+            second["session_id"],
+        )
+
+    def test_unfinished_rerun_preserves_previous_report(self):
+        case_id = self._case("response-agent-preserve-report")
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        first_started = self.state.response_agent.create(
+            case_id, artifact=artifact, goal="usable report", actor="analyst"
+        )
+        first = self._wait(
+            self.state.response_agent,
+            first_started["session_id"],
+            {"completed", "review", "blocked", "failed", "budget_exhausted"},
+        )
+        self.assertEqual(first["status"], "completed")
+        first_report_id = first["report"]["report_id"]
+
+        self.state.response_agent.stop()
+        rerun = self.state.response_agent.create(
+            case_id, artifact=artifact, goal="unfinished rerun", actor="analyst"
+        )
+        self.assertEqual(rerun["status"], "queued")
+        cancelled = self.state.response_agent.cancel(
+            rerun["session_id"], actor="analyst"
+        )
+        self.assertEqual(cancelled["status"], "cancelled")
+
+        retained = self.state.repo.get_response_agent_session(first["session_id"])
+        self.assertEqual(retained["report_id"], first_report_id)
+        self.assertEqual(retained["report"]["report_id"], first_report_id)
+        report_ids = [
+            row["report_id"]
+            for row in self.state.repo.conn.execute(
+                "SELECT report_id FROM response_agent_reports WHERE case_id = ?",
+                (case_id,),
+            ).fetchall()
+        ]
+        self.assertEqual(report_ids, [first_report_id])
+
     def test_commands_and_terminal_case_lifecycle_are_governed(self):
         self.state.response_agent.stop()
         case_id = self._case("response-agent-commands")
@@ -833,7 +945,10 @@ class ResponseAgentTest(unittest.TestCase):
             "decision_contract_error:model_response_contract",
         )
         self.assertEqual(paused["usage"]["model_calls"], 3)
-        self.assertEqual(paused["usage"]["tool_calls"], 0)
+        self.assertEqual(
+            paused["usage"]["tool_calls"],
+            len(MANDATORY_TOOLS),
+        )
         rejections = [
             step
             for step in paused["steps"]
@@ -890,7 +1005,10 @@ class ResponseAgentTest(unittest.TestCase):
         )
         self.assertEqual(paused["status"], "paused")
         self.assertEqual(paused["last_error"], "model_error:RuntimeError")
-        self.assertEqual(paused["usage"]["tool_calls"], 0)
+        self.assertEqual(
+            paused["usage"]["tool_calls"],
+            len(MANDATORY_TOOLS),
+        )
         self.assertGreater(paused["usage"]["active_seconds"], 0.0)
 
     def test_unexpected_tool_failure_records_active_duration(self):
@@ -949,9 +1067,14 @@ class ResponseAgentTest(unittest.TestCase):
             started["session_id"]
         )
         self.assertEqual(stored["tool_calls"][0]["arguments"], {})
-        self.assertEqual(
-            stored["usage"]["model_calls"], len(CONTROLLER_TOOLS) + 2
-        )
+        self.assertEqual(stored["usage"]["model_calls"], 3)
+        baseline_steps = [
+            step
+            for step in stored["steps"]
+            if (step.get("detail") or {}).get("controller_requirement")
+            == "baseline_evidence"
+        ]
+        self.assertEqual(len(baseline_steps), len(MANDATORY_TOOLS))
         self.assertNotIn("override controller scope", stored["last_error"])
 
     def test_controller_defers_early_finish_until_evidence_floor_is_complete(self):
@@ -990,6 +1113,28 @@ class ResponseAgentTest(unittest.TestCase):
         )
         self.assertTrue(
             session["report"]["validation"]["checks"]["raw_evidence_complete"]
+        )
+        self.assertEqual(session["usage"]["model_calls"], 3)
+        stored = self.state.repo.get_response_agent_session(
+            started["session_id"]
+        )
+        calls_by_tool = {
+            call["tool_name"]: call for call in stored["tool_calls"]
+        }
+        self.assertEqual(
+            calls_by_tool["search_related_alerts"]["arguments"],
+            {
+                "products": [],
+                "window_minutes": (
+                    self.state.response_agent.config.correlation_window_minutes
+                ),
+                "limit": 20,
+                "offset": 0,
+            },
+        )
+        self.assertEqual(
+            calls_by_tool["read_raw_alert_chunk"]["arguments"]["max_bytes"],
+            self.state.response_agent.config.raw_chunk_max_bytes,
         )
 
     def test_report_gate_independently_blocks_incomplete_evidence_floor(self):
@@ -1278,7 +1423,15 @@ class ResponseAgentTest(unittest.TestCase):
             for step in session["steps"]
             if (step.get("detail") or {}).get("completion_guard")
         ]
-        self.assertEqual(len(guard_steps), len(CONTROLLER_TOOLS) - 1)
+        self.assertEqual(len(guard_steps), 1)
+        baseline_steps = [
+            step
+            for step in session["steps"]
+            if (step.get("detail") or {}).get("controller_requirement")
+            == "baseline_evidence"
+        ]
+        self.assertEqual(len(baseline_steps), len(MANDATORY_TOOLS))
+        self.assertEqual(session["usage"]["model_calls"], 3)
         self.assertTrue(
             session["report"]["validation"]["checks"][
                 "mandatory_tools_completed"
@@ -1313,7 +1466,10 @@ class ResponseAgentTest(unittest.TestCase):
             session["last_error"], "decision_contract_error:scope_override"
         )
         self.assertEqual(session["usage"]["model_calls"], 3)
-        self.assertEqual(session["usage"]["tool_calls"], 0)
+        self.assertEqual(
+            session["usage"]["tool_calls"],
+            len(MANDATORY_TOOLS),
+        )
         self.assertGreater(session["usage"]["active_seconds"], 0.0)
         rejected = [
             step
@@ -1346,8 +1502,20 @@ class ResponseAgentTest(unittest.TestCase):
             session["last_error"],
             "decision_contract_error:forbidden_tool_argument",
         )
-        self.assertEqual(session["usage"]["tool_calls"], 0)
-        self.assertFalse(session["tool_calls"])
+        self.assertEqual(
+            session["usage"]["tool_calls"],
+            len(MANDATORY_TOOLS),
+        )
+        self.assertEqual(len(session["tool_calls"]), len(MANDATORY_TOOLS))
+        self.assertTrue(
+            all(call["status"] == "completed" for call in session["tool_calls"])
+        )
+        self.assertTrue(
+            all(
+                "filters" not in (call.get("arguments") or {})
+                for call in session["tool_calls"]
+            )
+        )
         self.assertGreater(session["usage"]["active_seconds"], 0.0)
 
     def test_out_of_scope_raw_read_is_recoverable_and_audited(self):
@@ -1373,9 +1541,14 @@ class ResponseAgentTest(unittest.TestCase):
         stored = self.state.repo.get_response_agent_session(
             started["session_id"]
         )
-        self.assertEqual(stored["tool_calls"][0]["status"], "failed")
+        rejected_calls = [
+            call
+            for call in stored["tool_calls"]
+            if call["status"] == "failed"
+        ]
+        self.assertEqual(len(rejected_calls), 1)
         self.assertIn(
-            "raw_alert_outside_scope", stored["tool_calls"][0]["error"]
+            "raw_alert_outside_scope", rejected_calls[0]["error"]
         )
         self.assertTrue(
             any(step["phase"] == "tool_rejected" for step in stored["steps"])
@@ -1406,7 +1579,10 @@ class ResponseAgentTest(unittest.TestCase):
             "tool_contract_error:raw_alert_outside_scope",
         )
         self.assertEqual(session["usage"]["model_calls"], 3)
-        self.assertEqual(session["usage"]["tool_calls"], 3)
+        self.assertEqual(
+            session["usage"]["tool_calls"],
+            len(MANDATORY_TOOLS) + 3,
+        )
         self.assertGreater(session["usage"]["active_seconds"], 0.0)
         self.assertEqual(
             len(
@@ -1812,6 +1988,8 @@ class ResponseAgentTest(unittest.TestCase):
             ]
         )
         self.assertEqual(plan[0]["mode"], "approve_required")
+        for field in ("rationale", "success_criteria", "rollback"):
+            self.assertTrue(plan[0][field], field)
 
         collection_plan = self.state.response_agent._normalize_response_plan(
             [
@@ -1827,6 +2005,125 @@ class ResponseAgentTest(unittest.TestCase):
             "Collect raw logs from Tomcat and source logs from WAF",
         )
         self.assertEqual(collection_plan[0]["mode"], "observe")
+        for field in ("rationale", "success_criteria", "rollback"):
+            self.assertTrue(collection_plan[0][field], field)
+
+    def test_report_quality_guard_filters_gaps_and_compromise_overclaims(self):
+        case_id = self._case("response-agent-report-consistency")
+        source = self.state.repo.get_case_response_source(case_id)
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        session = {
+            "session_id": "response_agent_report_consistency",
+            "case_id": case_id,
+            "goal": "Keep report claims within the governed evidence ceiling",
+            "source_snapshot_hash": artifact["source_snapshot_hash"],
+            "artifact_id": artifact["artifact_id"],
+            "model_metadata": {"report_language": "zh"},
+            "tool_calls": [],
+        }
+        base = self.state.response_agent._base_report(
+            session,
+            source,
+            artifact,
+        )
+        base["cross_source_correlation"]["strength"] = "single_source"
+        base["risk_assessment"]["attack_status"] = "suspicious"
+        candidate = {
+            "executive_summary": "该事件高度疑似初始突破。",
+            "conclusion": {
+                "classification": "malicious",
+                "confidence": 0.95,
+                "statement": "攻击者已完成初始突破。",
+            },
+            "risk_assessment": {
+                "attack_status": "likely_compromise",
+                "rationale": "单一来源显示高风险活动。",
+            },
+            "findings": [
+                {
+                    "claim_id": "false-positive-gap",
+                    "claim_state": "confirmed",
+                    "statement": "误报与白名单：当前没有足够证据。",
+                    "evidence_refs": [],
+                }
+            ],
+            "final_assessment": "高度疑似初始突破并已进入主机。",
+        }
+
+        normalized = self.state.response_agent._normalize_report(
+            candidate,
+            base,
+            session,
+        )
+
+        self.assertEqual(
+            normalized["risk_assessment"]["attack_status"],
+            "suspicious",
+        )
+        self.assertTrue(
+            normalized["scope"]["narrative_consistency_enforced"]
+        )
+        self.assertNotIn("高度疑似初始突破", normalized["executive_summary"])
+        self.assertNotIn(
+            "已完成初始突破",
+            normalized["conclusion"]["statement"],
+        )
+        self.assertFalse(
+            any(
+                "当前没有足够证据" in item.get("statement", "")
+                for item in normalized["findings"]
+            )
+        )
+
+    def test_report_gate_requires_operational_response_plan_details(self):
+        self.state.response_agent.stop()
+        case_id = self._case("response-agent-response-plan-gate")
+        source = self.state.repo.get_case_response_source(case_id)
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        started = self.state.response_agent.create(
+            case_id,
+            artifact=artifact,
+            goal="Validate operational response plan fields",
+            actor="analyst",
+        )
+        session = self.state.repo.get_response_agent_session(
+            started["session_id"]
+        )
+        report = self.state.response_agent._base_report(
+            session,
+            source,
+            artifact,
+        )
+        self.assertTrue(report["response_plan"])
+        report["response_plan"][0]["rationale"] = ""
+        report["response_plan"][0]["evidence_refs"] = []
+
+        validation, _refs = self.state.response_agent._validate_report(
+            report,
+            session,
+            source,
+            artifact,
+        )
+
+        self.assertTrue(
+            any(
+                error.startswith("response_plan_detail_missing:")
+                for error in validation["errors"]
+            )
+        )
+        self.assertTrue(
+            any(
+                error.startswith("response_plan_evidence_missing:")
+                for error in validation["errors"]
+            )
+        )
+        self.assertFalse(
+            validation["checks"]["response_plan_operational"]
+        )
 
     def test_llm_synthesis_uses_react_dossier_and_preserves_controller_timestamps(self):
         llm = _NarrativeAgentLLM()
@@ -2139,7 +2436,7 @@ class ResponseAgentTest(unittest.TestCase):
             if (step.get("detail") or {}).get("tool_name")
             == "read_raw_alert_chunk"
         ]
-        self.assertGreaterEqual(len(raw_decisions), 3)
+        self.assertGreaterEqual(len(raw_decisions), 2)
         self.assertEqual(
             {
                 step["detail"]["arguments"].get("json_pointer")

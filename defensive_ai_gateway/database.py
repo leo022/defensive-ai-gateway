@@ -8775,6 +8775,11 @@ class Repository:
                         str(ref.get("source_hash") or "")[:128],
                     ),
                 )
+            self._retain_latest_response_agent_report(
+                case_id=str(report["case_id"]),
+                session_id=str(report["session_id"]),
+                report_id=str(report["report_id"]),
+            )
             if _commit:
                 self.conn.commit()
             row = self.conn.execute(
@@ -8795,6 +8800,37 @@ class Repository:
             if not row:  # pragma: no cover
                 raise RuntimeError("Response Agent report was not persisted")
             return self._response_agent_report_row(row, saved_refs)
+
+    def _retain_latest_response_agent_report(
+        self,
+        *,
+        case_id: str,
+        session_id: str,
+        report_id: str,
+    ) -> int:
+        """Keep one materialized Response Agent report per Case.
+
+        Session steps, tool calls and audit events remain available for governance,
+        while report content and claim references from superseded runs are removed.
+        Callers invoke this inside the same transaction that commits the new report,
+        so a failed rerun cannot delete the previous usable report.
+        """
+        self.conn.execute(
+            """
+            UPDATE response_agent_sessions
+            SET report_id = NULL
+            WHERE case_id = ? AND session_id <> ? AND report_id IS NOT NULL
+            """,
+            (case_id, session_id),
+        )
+        deleted = self.conn.execute(
+            """
+            DELETE FROM response_agent_reports
+            WHERE case_id = ? AND report_id <> ?
+            """,
+            (case_id, report_id),
+        )
+        return int(deleted.rowcount)
 
     def get_response_agent_session(
         self, session_id: str, *, after_sequence: int = 0

@@ -13,9 +13,9 @@ from .llm import LLMResponseContractError
 from .models import new_id, now_ms
 
 
-REPORT_SCHEMA_VERSION = "response-investigation-report-v5"
-AGENT_VERSION = "response-investigation-agent-v7"
-TOOL_VERSION = "6"
+REPORT_SCHEMA_VERSION = "response-investigation-report-v6"
+AGENT_VERSION = "response-investigation-agent-v8"
+TOOL_VERSION = "7"
 FORENSIC_INVENTORY_MAX_ALERTS = 200
 ACTIVE_STATUSES = {
     "queued",
@@ -156,7 +156,38 @@ REPORT_SCHEMA = {
         "forensic_workstreams": {"type": "array", "items": {"type": "object"}},
         "evidence_gaps": {"type": "array", "items": {"type": "string"}},
         "prior_analysis_context": {"type": "object"},
-        "response_plan": {"type": "array", "items": {"type": "object"}},
+        "response_plan": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "step_id": {"type": "string"},
+                    "stage": {"type": "string"},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["observe", "approve_required"],
+                    },
+                    "action": {"type": "string"},
+                    "rationale": {"type": "string"},
+                    "success_criteria": {"type": "string"},
+                    "rollback": {"type": "string"},
+                    "evidence_refs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": [
+                    "step_id",
+                    "stage",
+                    "mode",
+                    "action",
+                    "rationale",
+                    "success_criteria",
+                    "rollback",
+                    "evidence_refs",
+                ],
+            },
+        },
         "final_assessment": {"type": "string"},
     },
     "required": [
@@ -1277,12 +1308,28 @@ class ResponseInvestigationAgent:
                 return
 
             calls = list(current.get("tool_calls") or [])
+            controller_decision = self._baseline_controller_decision(
+                calls,
+                report_language,
+            )
+            decision_source = "controller" if controller_decision else "model"
             try:
-                decision = self._next_decision(current, source, calls)
+                if controller_decision:
+                    decision = self._validate_decision(
+                        controller_decision,
+                        session=current,
+                    )
+                    decision["controller_requirement"] = "baseline_evidence"
+                else:
+                    decision = self._next_decision(current, source, calls)
             except _SessionPaused:
                 self._persist_active_seconds(session_id, usage, run_started)
                 return
             except _DecisionRejected as exc:
+                if decision_source == "controller":
+                    raise RuntimeError(
+                        f"invalid controller decision: {exc.code}"
+                    ) from exc
                 usage["turns"] = int(usage.get("turns") or 0) + 1
                 if not self._current_llm().is_deterministic:
                     usage["model_calls"] = int(usage.get("model_calls") or 0) + 1
@@ -1349,9 +1396,10 @@ class ResponseInvestigationAgent:
             if not latest_after_decision or latest_after_decision["status"] != "running":
                 return
             decision_rejections = 0
-            usage["turns"] = int(usage.get("turns") or 0) + 1
-            if not self._current_llm().is_deterministic:
-                usage["model_calls"] = int(usage.get("model_calls") or 0) + 1
+            if decision_source == "model":
+                usage["turns"] = int(usage.get("turns") or 0) + 1
+                if not self._current_llm().is_deterministic:
+                    usage["model_calls"] = int(usage.get("model_calls") or 0) + 1
             action = decision["action"]
 
             if action == "request_human_input":
@@ -1446,16 +1494,35 @@ class ResponseInvestigationAgent:
                         usage=usage,
                     )
                 return
+            controller_requirement = str(
+                decision.get("controller_requirement") or ""
+            )
             step = self._append_step(
                 session_id,
                 "tool_decision",
                 _pick(
                     report_language,
-                    f"调用只读工具：{tool_name}",
-                    f"Run read-only tool: {tool_name}",
+                    (
+                        f"控制器补齐基线证据：{tool_name}"
+                        if controller_requirement == "baseline_evidence"
+                        else f"调用只读工具：{tool_name}"
+                    ),
+                    (
+                        f"Controller collects baseline evidence: {tool_name}"
+                        if controller_requirement == "baseline_evidence"
+                        else f"Run read-only tool: {tool_name}"
+                    ),
                 ),
                 decision["rationale"],
-                {"tool_name": tool_name, "arguments": arguments},
+                {
+                    "tool_name": tool_name,
+                    "arguments": arguments,
+                    "decision_source": decision_source,
+                    "controller_requirement": controller_requirement,
+                    "completion_guard": (
+                        controller_requirement == "completion_guard"
+                    ),
+                },
                 [],
             )
             idempotency_key = _canonical_hash(
@@ -1498,7 +1565,7 @@ class ResponseInvestigationAgent:
                     },
                     call["evidence_refs"],
                 )
-                if duplicate_count >= 2:
+                if duplicate_count >= 1:
                     required = self._completion_guard_decision(
                         calls, report_language
                     )
@@ -1522,6 +1589,10 @@ class ResponseInvestigationAgent:
                         )
                         return
                     duplicate_count = 0
+                    required = self._validate_decision(
+                        required,
+                        session=current,
+                    )
                     tool_name = required["tool_name"]
                     arguments = required.get("arguments") or {}
                     step = self._append_step(
@@ -1537,6 +1608,8 @@ class ResponseInvestigationAgent:
                             "tool_name": tool_name,
                             "arguments": arguments,
                             "completion_guard": True,
+                            "decision_source": "controller",
+                            "controller_requirement": "completion_guard",
                         },
                         [],
                     )
@@ -1750,7 +1823,9 @@ class ResponseInvestigationAgent:
         if llm.is_deterministic:
             required = self._completion_guard_decision(calls, report_language)
             if required:
-                return required
+                decision = self._validate_decision(required, session=session)
+                decision["controller_requirement"] = "completion_guard"
+                return decision
             return {
                 "action": "finish",
                 "tool_name": "",
@@ -1765,11 +1840,13 @@ class ResponseInvestigationAgent:
             }
 
         observation_context = self._model_observations(calls)
+        controller_state = self._controller_progress(calls, report_language)
         context = self.policy.sanitize_json_value(
             {
                 "active_raw_observation": observation_context.get(
                     "active_raw_observation"
                 ),
+                "controller_state": controller_state,
                 "goal": session["goal"],
                 "case": source["case"],
                 "plan": session["plan"],
@@ -1810,7 +1887,11 @@ class ResponseInvestigationAgent:
             "is complete. complete=true proves only that the selected stored, redacted "
             "serialization was read contiguously to its end; it does not prove source "
             "or transport integrity. Use syslog_message_integrity for that separate "
-            "claim. A captured null, empty or incomplete HTTP field is a source-capture "
+            "claim. Never repeat a tool_name plus normalized arguments listed in "
+            "controller_state.completed_calls; its immutable result is already available. "
+            "Use controller_state.next_required_action to preserve the evidence floor, "
+            "unless a different read-only pivot adds genuinely new Case evidence. "
+            "A captured null, empty or incomplete HTTP field is a source-capture "
             "state, not a tool truncation. An explicitly empty request established by "
             "the HTTP method or Content-Length is not missing evidence. When "
             "active_raw_observation is "
@@ -1853,8 +1934,104 @@ class ResponseInvestigationAgent:
         if decision["action"] == "finish":
             required = self._completion_guard_decision(calls, report_language)
             if required:
-                return required
+                decision = self._validate_decision(required, session=session)
+                decision["controller_requirement"] = "completion_guard"
         return decision
+
+    @staticmethod
+    def _baseline_controller_decision(
+        calls: list[dict[str, Any]],
+        language: str = "zh",
+    ) -> dict[str, Any] | None:
+        completed = {
+            str(call.get("tool_name") or "")
+            for call in calls
+            if call.get("status") == "completed"
+        }
+        for tool_name in MANDATORY_TOOLS:
+            if tool_name in completed:
+                continue
+            return {
+                "action": "tool_call",
+                "tool_name": tool_name,
+                "arguments": {},
+                "rationale": _pick(
+                    language,
+                    "控制器直接采集受治理的必查基线证据；该步骤不需要模型重复决定。",
+                    "The controller directly collects the governed baseline evidence; no repeated model decision is required.",
+                ),
+                "question": "",
+                "plan_updates": [],
+                "controller_requirement": "baseline_evidence",
+            }
+        return None
+
+    @classmethod
+    def _controller_progress(
+        cls,
+        calls: list[dict[str, Any]],
+        language: str = "zh",
+    ) -> dict[str, Any]:
+        completed_calls = [
+            call for call in calls if call.get("status") == "completed"
+        ]
+        raw_calls_by_stream: dict[
+            tuple[str, str], list[dict[str, Any]]
+        ] = {}
+        for call in completed_calls:
+            if call.get("tool_name") != "read_raw_alert_chunk":
+                continue
+            arguments = call.get("arguments")
+            if not isinstance(arguments, dict):
+                continue
+            stream = (
+                str(arguments.get("alert_id") or ""),
+                str(arguments.get("json_pointer") or ""),
+            )
+            raw_calls_by_stream.setdefault(stream, []).append(call)
+        raw_streams = []
+        for stream in sorted(raw_calls_by_stream):
+            progress = _raw_stream_progress(raw_calls_by_stream[stream])
+            raw_streams.append(
+                {
+                    "alert_id": stream[0],
+                    "json_pointer": stream[1],
+                    "complete": progress.get("complete") is True,
+                    "invalid": bool(progress.get("invalid")),
+                    "next_offset": _integer(progress.get("next_offset"), 0),
+                    "total_bytes": _integer(progress.get("total_bytes"), 0),
+                }
+            )
+        required = cls._completion_guard_decision(calls, language)
+        return {
+            "completed_tools": list(
+                dict.fromkeys(
+                    str(call.get("tool_name") or "")
+                    for call in completed_calls
+                    if call.get("tool_name")
+                )
+            ),
+            "completed_calls": [
+                {
+                    "tool_name": str(call.get("tool_name") or ""),
+                    "arguments": (
+                        call.get("arguments")
+                        if isinstance(call.get("arguments"), dict)
+                        else {}
+                    ),
+                }
+                for call in completed_calls[-40:]
+            ],
+            "raw_streams": raw_streams,
+            "next_required_action": (
+                {
+                    "tool_name": required.get("tool_name"),
+                    "arguments": required.get("arguments") or {},
+                }
+                if required
+                else None
+            ),
+        }
 
     @staticmethod
     def _completion_guard_decision(
@@ -5164,7 +5341,7 @@ class ResponseInvestigationAgent:
                 statement = _text(fact, 2_000)
                 evidence_refs = [str(item) for item in default_refs][:32]
                 state = "inferred"
-            if statement:
+            if statement and not self._is_gap_only_statement(statement):
                 findings.append(
                     {
                         "claim_id": f"finding-{index}",
@@ -5173,19 +5350,6 @@ class ResponseInvestigationAgent:
                         "evidence_refs": evidence_refs,
                     }
                 )
-        if not findings:
-            findings.append(
-                {
-                    "claim_id": "finding-1",
-                    "claim_state": "unverified",
-                    "statement": _pick(
-                        report_language,
-                        "当前快照没有足够的已确认事实形成确定性攻击结论。",
-                        "The current snapshot does not contain enough confirmed facts for a deterministic attack conclusion.",
-                    ),
-                    "evidence_refs": default_refs[:32],
-                }
-            )
         playbook = []
         for index, item in enumerate(
             (pack.get("playbook") or {}).get("steps") or [], start=1
@@ -5203,9 +5367,7 @@ class ResponseInvestigationAgent:
                     "step_id": str(item.get("step_id") or f"response-{index}"),
                     "stage": str(item.get("stage") or "verify"),
                     "mode": mode,
-                    "action": self.policy.safe_action_text(
-                        action
-                    ),
+                    "action": action,
                     "rationale": _text(item.get("rationale"), 1_000),
                     "success_criteria": _text(
                         item.get("success_criteria"), 1_000
@@ -5216,6 +5378,10 @@ class ResponseInvestigationAgent:
                     ][:32],
                 }
             )
+        playbook = self._normalize_response_plan(
+            playbook,
+            language=report_language,
+        )
         calls = [
             call
             for call in session.get("tool_calls") or []
@@ -5508,7 +5674,12 @@ class ResponseInvestigationAgent:
                 base["scope_assessment"],
             )
             response_plan = self._normalize_response_plan(
-                candidate.get("response_plan")
+                candidate.get("response_plan"),
+                language=_language(
+                    (session.get("model_metadata") or {}).get(
+                        "report_language"
+                    )
+                ),
             )
             if response_plan:
                 normalized["response_plan"] = response_plan
@@ -5541,6 +5712,13 @@ class ResponseInvestigationAgent:
             normalized["scope"]["model_synthesis_disposition"] = (
                 "deterministic_fallback"
             )
+        self._enforce_narrative_consistency(
+            normalized,
+            base,
+            _language(
+                (session.get("model_metadata") or {}).get("report_language")
+            ),
+        )
         return normalized
 
     @staticmethod
@@ -5589,6 +5767,131 @@ class ResponseInvestigationAgent:
             ):
                 return True
         return False
+
+    @staticmethod
+    def _unsupported_compromise_narrative(
+        value: Any,
+        *,
+        allow_likely: bool,
+    ) -> bool:
+        text = _text(value, 8_000).casefold()
+        confirmed_patterns = (
+            "confirmed compromise",
+            "confirmed host compromise",
+            "host is compromised",
+            "确认失陷",
+            "已确认入侵",
+            "已被攻陷",
+            "主机已失陷",
+        )
+        likely_patterns = (
+            "likely compromise",
+            "initial access was achieved",
+            "successful exploitation",
+            "successful intrusion",
+            "高度疑似初始突破",
+            "已完成初始突破",
+            "成功入侵",
+            "成功利用并进入",
+        )
+        patterns = confirmed_patterns if allow_likely else (
+            *confirmed_patterns,
+            *likely_patterns,
+        )
+        negative_markers = (
+            "does not support",
+            "not confirmed",
+            "not establish",
+            "unconfirmed",
+            "no evidence",
+            "insufficient evidence",
+            "不支持",
+            "未确认",
+            "尚未",
+            "无法",
+            "不能",
+            "证据不足",
+        )
+        for pattern in patterns:
+            start = text.find(pattern)
+            while start >= 0:
+                window = text[
+                    max(0, start - 40) : start + len(pattern) + 40
+                ]
+                if not any(marker in window for marker in negative_markers):
+                    return True
+                start = text.find(pattern, start + len(pattern))
+        return False
+
+    def _enforce_narrative_consistency(
+        self,
+        report: dict[str, Any],
+        base: dict[str, Any],
+        language: str,
+    ) -> None:
+        risk = report.get("risk_assessment") or {}
+        attack_status = str(risk.get("attack_status") or "")
+        if attack_status == "confirmed_compromise":
+            return
+        allow_likely = attack_status == "likely_compromise"
+        narrative_fields = (
+            report.get("executive_summary"),
+            (report.get("conclusion") or {}).get("statement"),
+            report.get("final_assessment"),
+        )
+        if not any(
+            self._unsupported_compromise_narrative(
+                value,
+                allow_likely=allow_likely,
+            )
+            for value in narrative_fields
+        ):
+            return
+        status_text = {
+            "malicious_activity": _pick(
+                language,
+                "当前证据支持存在恶意活动，但不支持确认已成功利用、完成初始突破或主机失陷。",
+                "Current evidence supports malicious activity, but not confirmed successful exploitation, achieved initial access, or host compromise.",
+            ),
+            "attempted_attack": _pick(
+                language,
+                "当前证据支持存在攻击尝试，但攻击结果、初始突破和主机影响均未被确认。",
+                "Current evidence supports an attack attempt, while its outcome, initial access, and host impact remain unconfirmed.",
+            ),
+            "suspicious": _pick(
+                language,
+                "当前证据支持将活动判定为可疑，但不足以确认成功利用、初始突破或主机失陷。",
+                "Current evidence supports a suspicious classification, but not confirmed exploitation, initial access, or host compromise.",
+            ),
+            "benign": _pick(
+                language,
+                "当前受治理证据不支持成功利用、初始突破或主机失陷。",
+                "The governed evidence does not support successful exploitation, initial access, or host compromise.",
+            ),
+            "insufficient_evidence": _pick(
+                language,
+                "当前证据不足以确认攻击结果、初始突破或主机失陷。",
+                "Current evidence is insufficient to confirm the attack outcome, initial access, or host compromise.",
+            ),
+        }.get(
+            attack_status,
+            _pick(
+                language,
+                "当前证据不支持确认初始突破或主机失陷。",
+                "Current evidence does not support confirmed initial access or host compromise.",
+            ),
+        )
+        correlation = base.get("cross_source_correlation") or {}
+        correlation_text = _pick(
+            language,
+            f"跨来源印证强度为 {correlation.get('strength') or 'unknown'}。",
+            f"Cross-source corroboration strength is {correlation.get('strength') or 'unknown'}.",
+        )
+        guarded = f"{status_text} {correlation_text}".strip()
+        report["executive_summary"] = guarded
+        report.setdefault("conclusion", {})["statement"] = guarded
+        report["final_assessment"] = guarded
+        report.setdefault("scope", {})["narrative_consistency_enforced"] = True
 
     @staticmethod
     def _report_trusted_digest_paths(
@@ -5866,7 +6169,26 @@ class ResponseInvestigationAgent:
         return result
 
     @staticmethod
-    def _normalize_claims(value: Any, *, prefix: str) -> list[dict[str, Any]]:
+    def _is_gap_only_statement(value: Any) -> bool:
+        text = " ".join(_text(value, 2_500).casefold().split())
+        gap_markers = (
+            "当前没有足够证据",
+            "目前没有足够证据",
+            "当前证据不足",
+            "目前证据不足",
+            "insufficient evidence",
+            "not enough evidence",
+            "no sufficient evidence",
+        )
+        return any(marker in text for marker in gap_markers)
+
+    @classmethod
+    def _normalize_claims(
+        cls,
+        value: Any,
+        *,
+        prefix: str,
+    ) -> list[dict[str, Any]]:
         if not isinstance(value, list):
             return []
         claims = []
@@ -5877,7 +6199,7 @@ class ResponseInvestigationAgent:
                 item.get("statement") or item.get("finding") or item.get("text"),
                 2_500,
             )
-            if not statement:
+            if not statement or cls._is_gap_only_statement(statement):
                 continue
             claim_state = str(item.get("claim_state") or "unverified")
             if claim_state not in {"confirmed", "inferred", "unverified"}:
@@ -5946,7 +6268,12 @@ class ResponseInvestigationAgent:
             target["evidence_refs"] = list(target.get("evidence_refs") or [])[:64]
         return result
 
-    def _normalize_response_plan(self, value: Any) -> list[dict[str, Any]]:
+    def _normalize_response_plan(
+        self,
+        value: Any,
+        *,
+        language: str = "zh",
+    ) -> list[dict[str, Any]]:
         if not isinstance(value, list):
             return []
         result = []
@@ -5965,6 +6292,51 @@ class ResponseInvestigationAgent:
                     if self.policy.requires_approval(action)
                     else "observe"
                 )
+            rationale = _model_narrative_text(
+                item.get("rationale"), 1_000
+            ) or _pick(
+                language,
+                (
+                    "在审批边界内降低已识别风险，并保留可审计的执行记录。"
+                    if mode == "approve_required"
+                    else "补齐当前证据缺口或验证调查假设，且不直接改变生产状态。"
+                ),
+                (
+                    "Reduce the identified risk within the approval boundary and retain an auditable execution record."
+                    if mode == "approve_required"
+                    else "Close the current evidence gap or validate the investigation hypothesis without directly changing production state."
+                ),
+            )
+            success_criteria = _model_narrative_text(
+                item.get("success_criteria"), 1_000
+            ) or _pick(
+                language,
+                (
+                    "审批、执行结果和影响范围均已回写当前 Case，且关键服务与监控验证正常。"
+                    if mode == "approve_required"
+                    else "已获得可验证结果并绑定当前 Case 的证据引用；未发生未经批准的生产变更。"
+                ),
+                (
+                    "Approval, execution outcome, and affected scope are recorded in the Case, with critical services and monitoring verified healthy."
+                    if mode == "approve_required"
+                    else "A verifiable result is bound to the current Case and no unapproved production change occurred."
+                ),
+            )
+            rollback = _model_narrative_text(
+                item.get("rollback"), 1_000
+            ) or _pick(
+                language,
+                (
+                    "按审批变更单恢复执行前配置，并验证服务、流量与监控恢复正常。"
+                    if mode == "approve_required"
+                    else "该步骤默认不改生产状态；若采集影响业务，停止采集并恢复执行前监控配置。"
+                ),
+                (
+                    "Restore the pre-change configuration under the approved change record, then verify service, traffic, and monitoring recovery."
+                    if mode == "approve_required"
+                    else "This step does not change production state by default; if collection affects service, stop it and restore the prior monitoring configuration."
+                ),
+            )
             result.append(
                 {
                     "step_id": _text(
@@ -5973,15 +6345,9 @@ class ResponseInvestigationAgent:
                     "stage": _text(item.get("stage") or "verify", 200),
                     "mode": mode,
                     "action": self.policy.safe_action_text(action),
-                    "rationale": _model_narrative_text(
-                        item.get("rationale"), 1_000
-                    ),
-                    "success_criteria": _model_narrative_text(
-                        item.get("success_criteria"), 1_000
-                    ),
-                    "rollback": _model_narrative_text(
-                        item.get("rollback"), 1_000
-                    ),
+                    "rationale": rationale,
+                    "success_criteria": success_criteria,
+                    "rollback": rollback,
                     "evidence_refs": [
                         str(ref)
                         for ref in item.get("evidence_refs") or []
@@ -6214,8 +6580,20 @@ class ResponseInvestigationAgent:
         if not isinstance(report.get("scope_assessment"), dict):
             errors.append("scope_assessment_missing")
 
-        cited: list[tuple[str, str]] = []
+        actionable_findings = []
         for claim in report.get("findings") or []:
+            if not isinstance(claim, dict):
+                continue
+            if self._is_gap_only_statement(claim.get("statement")):
+                warnings.append(
+                    f"evidence_gap_removed_from_findings:{claim.get('claim_id') or 'finding'}"
+                )
+                continue
+            actionable_findings.append(claim)
+        report["findings"] = actionable_findings
+
+        cited: list[tuple[str, str]] = []
+        for claim in actionable_findings:
             claim_id = str(claim.get("claim_id") or "")
             refs = [
                 str(item)
@@ -6328,6 +6706,22 @@ class ResponseInvestigationAgent:
                 if str(ref) in ref_manifest
             ]
             item["evidence_refs"] = valid_refs
+            missing_detail = [
+                key
+                for key in (
+                    "action",
+                    "rationale",
+                    "success_criteria",
+                    "rollback",
+                )
+                if not _text(item.get(key))
+            ]
+            if missing_detail:
+                errors.append(
+                    f"response_plan_detail_missing:{claim_id}:{','.join(missing_detail)}"
+                )
+            if not valid_refs:
+                errors.append(f"response_plan_evidence_missing:{claim_id}")
             cited.extend((claim_id, ref) for ref in valid_refs)
 
         boundary = report.get("execution_boundary") or {}
@@ -6384,7 +6778,7 @@ class ResponseInvestigationAgent:
         return (
             {
                 "status": status,
-                "validator": "deterministic-response-report-gate-v5",
+                "validator": "deterministic-response-report-gate-v6",
                 "errors": errors,
                 "warnings": warnings,
                 "checks": {
@@ -6424,6 +6818,10 @@ class ResponseInvestigationAgent:
                     ),
                     "cross_source_correlation_complete": (
                         "cross_source_correlation_missing" not in errors
+                    ),
+                    "response_plan_operational": not any(
+                        item.startswith("response_plan_")
+                        for item in errors
                     ),
                     "direct_execution_blocked": "direct_execution_not_blocked"
                     not in errors,

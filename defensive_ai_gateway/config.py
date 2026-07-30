@@ -194,7 +194,7 @@ class ResponseAgentConfig:
     correlation_window_minutes: int = 1_440
     correlation_scan_limit: int = 2_000
     correlation_scan_max_bytes: int = 64_000_000
-    raw_chunk_max_bytes: int = 4_096
+    raw_chunk_max_bytes: int = 6_144
 
 
 @dataclass
@@ -588,10 +588,10 @@ def load_config(path: str | None = None) -> GatewayConfig:
                     int(
                         os.getenv(
                             "DEFENSIVE_AI_RESPONSE_AGENT_RAW_CHUNK_MAX_BYTES",
-                            response_agent.get("raw_chunk_max_bytes", 4_096),
+                            response_agent.get("raw_chunk_max_bytes", 6_144),
                         )
                     ),
-                    4_096,
+                    6_144,
                 ),
             ),
         ),
