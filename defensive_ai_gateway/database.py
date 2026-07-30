@@ -8298,11 +8298,13 @@ class Repository:
         report_id: str | None = None,
         last_error: str | None = None,
         completed: bool = False,
+        refresh_claimed_at: bool = False,
         _commit: bool = True,
     ) -> dict[str, Any] | None:
         with self._lock:
+            timestamp = now_ms()
             assignments = ["updated_at_ms = ?"]
-            values: list[Any] = [now_ms()]
+            values: list[Any] = [timestamp]
             if status is not None:
                 assignments.append("status = ?")
                 values.append(status)
@@ -8323,9 +8325,12 @@ class Repository:
             if last_error is not None:
                 assignments.append("last_error = ?")
                 values.append(str(last_error)[:2000])
+            if refresh_claimed_at:
+                assignments.append("claimed_at_ms = ?")
+                values.append(timestamp)
             if completed:
                 assignments.append("completed_at_ms = ?")
-                values.append(now_ms())
+                values.append(timestamp)
             where = "WHERE session_id = ?"
             values.append(session_id)
             if expected_statuses:
@@ -8359,6 +8364,27 @@ class Repository:
         with self._lock:
             placeholders = ",".join("?" for _ in from_statuses)
             timestamp = now_ms()
+            existing = self.conn.execute(
+                """
+                SELECT status, claimed_at_ms, usage_json
+                FROM response_agent_sessions WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            if not existing or str(existing["status"]) not in from_statuses:
+                return None
+            usage = json.loads(existing["usage_json"] or "{}")
+            claimed_at_ms = int(existing["claimed_at_ms"] or 0)
+            if (
+                claimed_at_ms > 0
+                and str(existing["status"])
+                in {"running", "synthesizing", "validating"}
+            ):
+                usage["active_seconds"] = round(
+                    max(0.0, float(usage.get("active_seconds") or 0))
+                    + max(0, timestamp - claimed_at_ms) / 1_000,
+                    3,
+                )
             completed_at = (
                 timestamp
                 if to_status in {
@@ -8375,7 +8401,8 @@ class Repository:
                 f"""
                 UPDATE response_agent_sessions
                 SET status = ?, updated_at_ms = ?, claimed_at_ms = NULL,
-                    completed_at_ms = COALESCE(?, completed_at_ms), last_error = ?
+                    completed_at_ms = COALESCE(?, completed_at_ms), last_error = ?,
+                    usage_json = ?
                 WHERE session_id = ? AND status IN ({placeholders})
                 """,
                 (
@@ -8383,6 +8410,7 @@ class Repository:
                     timestamp,
                     completed_at,
                     str(last_error)[:2000],
+                    json.dumps(usage, ensure_ascii=False, sort_keys=True),
                     session_id,
                     *from_statuses,
                 ),
@@ -8398,9 +8426,38 @@ class Repository:
             return self._response_agent_session_row(row) if row else None
 
     def append_response_agent_step(
-        self, step: dict[str, Any], *, _commit: bool = True
-    ) -> dict[str, Any]:
+        self,
+        step: dict[str, Any],
+        *,
+        expected_statuses: tuple[str, ...] | None = None,
+        usage: dict[str, Any] | None = None,
+        _commit: bool = True,
+    ) -> dict[str, Any] | None:
         with self._lock:
+            if expected_statuses:
+                placeholders = ",".join("?" for _ in expected_statuses)
+                row = self.conn.execute(
+                    f"""
+                    SELECT status FROM response_agent_sessions
+                    WHERE session_id = ? AND status IN ({placeholders})
+                    """,
+                    (step["session_id"], *expected_statuses),
+                ).fetchone()
+                if not row:
+                    return None
+                if usage is not None:
+                    self.conn.execute(
+                        """
+                        UPDATE response_agent_sessions
+                        SET usage_json = ?, updated_at_ms = ?
+                        WHERE session_id = ?
+                        """,
+                        (
+                            json.dumps(usage, ensure_ascii=False, sort_keys=True),
+                            now_ms(),
+                            step["session_id"],
+                        ),
+                    )
             sequence_row = self.conn.execute(
                 """
                 SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence

@@ -65,6 +65,35 @@ class _BrokenAgentLLM:
         raise RuntimeError("model unavailable")
 
 
+class _TransientContractAgentLLM:
+    is_deterministic = False
+    runtime_metadata = {
+        "provider": "test",
+        "model": "transient-contract-agent-model",
+        "endpoint_host": "",
+    }
+
+    def __init__(self, *, planner_failures: int = 0, report_failures: int = 0):
+        self.planner_failures = planner_failures
+        self.report_failures = report_failures
+        self.planner_contract_errors = 0
+        self.report_contract_errors = 0
+
+    def generate_structured(self, prompt, context, schema=None):  # noqa: ANN001
+        if prompt.startswith("Write a complete"):
+            if self.report_contract_errors < self.report_failures:
+                self.report_contract_errors += 1
+                raise LLMResponseContractError("synthetic malformed report response")
+            return {}
+        if self.planner_contract_errors < self.planner_failures:
+            self.planner_contract_errors += 1
+            raise LLMResponseContractError("synthetic malformed planning response")
+        return {
+            "action": "finish",
+            "rationale": "Advance the controller evidence floor and synthesize.",
+        }
+
+
 class _BlockingAgentLLM:
     is_deterministic = False
     runtime_metadata = {
@@ -73,25 +102,36 @@ class _BlockingAgentLLM:
         "endpoint_host": "",
     }
 
-    def __init__(self, block_phase: str):
+    def __init__(self, block_phase: str, *, contract_error: bool = False):
         self.block_phase = block_phase
+        self.contract_error = contract_error
         self.entered = threading.Event()
         self.release = threading.Event()
         self.returned = threading.Event()
         self.report_called = threading.Event()
+        self.report_invocations = 0
 
     def generate_structured(self, prompt, context, schema=None):  # noqa: ANN001
         if prompt.startswith("Write a complete"):
             self.report_called.set()
+            self.report_invocations += 1
             if self.block_phase == "report":
                 self.entered.set()
                 self.release.wait(timeout=3)
                 self.returned.set()
+                if self.contract_error:
+                    raise LLMResponseContractError(
+                        "synthetic malformed report secret-contract-marker"
+                    )
             return {}
         if self.block_phase == "planner":
             self.entered.set()
             self.release.wait(timeout=3)
             self.returned.set()
+            if self.contract_error:
+                raise LLMResponseContractError(
+                    "synthetic malformed planner secret-contract-marker"
+                )
         return {
             "action": "finish",
             "rationale": "Current governed evidence is sufficient for synthesis.",
@@ -722,6 +762,119 @@ class ResponseAgentTest(unittest.TestCase):
         cancelled = self.state.response_agent.get(session["session_id"])
         self.assertEqual(cancelled["status"], "cancelled")
         self.assertIn("terminal status", cancelled["last_error"])
+
+    def test_transient_structured_contract_errors_retry_without_manual_resume(self):
+        llm = _TransientContractAgentLLM(
+            planner_failures=2,
+            report_failures=2,
+        )
+        self.state.response_agent.set_llm(llm)
+        case_id = self._case("response-agent-contract-retry")
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        started = self.state.response_agent.create(
+            case_id,
+            artifact=artifact,
+            goal="retry malformed structured responses",
+            actor="analyst",
+        )
+
+        final = self._wait(
+            self.state.response_agent,
+            started["session_id"],
+            {"completed", "review", "blocked", "failed", "paused"},
+        )
+
+        self.assertIn(final["status"], {"completed", "review"})
+        self.assertEqual(final["last_error"], "")
+        self.assertEqual(llm.planner_contract_errors, 2)
+        self.assertEqual(llm.report_contract_errors, 2)
+        planner_rejections = [
+            step
+            for step in final["steps"]
+            if step["phase"] == "decision_rejected"
+            and (step.get("detail") or {}).get("code")
+            == "model_response_contract"
+        ]
+        report_rejections = [
+            step
+            for step in final["steps"]
+            if step["phase"] == "synthesis_rejected"
+        ]
+        self.assertEqual(len(planner_rejections), 2)
+        self.assertEqual(len(report_rejections), 2)
+        self.assertTrue(all((step.get("detail") or {}).get("retry") for step in planner_rejections))
+        self.assertTrue(all((step.get("detail") or {}).get("retry") for step in report_rejections))
+
+    def test_persistent_planner_contract_error_pauses_after_bounded_retries(self):
+        llm = _TransientContractAgentLLM(planner_failures=3)
+        self.state.response_agent.set_llm(llm)
+        case_id = self._case("response-agent-contract-pause")
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        started = self.state.response_agent.create(
+            case_id,
+            artifact=artifact,
+            goal="bound malformed structured responses",
+            actor="analyst",
+        )
+
+        paused = self._wait(
+            self.state.response_agent,
+            started["session_id"],
+            {"paused", "failed"},
+        )
+
+        self.assertEqual(paused["status"], "paused")
+        self.assertEqual(
+            paused["last_error"],
+            "decision_contract_error:model_response_contract",
+        )
+        self.assertEqual(paused["usage"]["model_calls"], 3)
+        self.assertEqual(paused["usage"]["tool_calls"], 0)
+        rejections = [
+            step
+            for step in paused["steps"]
+            if step["phase"] == "decision_rejected"
+        ]
+        self.assertEqual(len(rejections), 3)
+        self.assertFalse((rejections[-1].get("detail") or {}).get("retry"))
+
+    def test_persistent_report_contract_error_pauses_after_bounded_retries(self):
+        llm = _TransientContractAgentLLM(report_failures=3)
+        self.state.response_agent.set_llm(llm)
+        case_id = self._case("response-agent-report-contract-pause")
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        started = self.state.response_agent.create(
+            case_id,
+            artifact=artifact,
+            goal="bound malformed report responses",
+            actor="analyst",
+        )
+
+        paused = self._wait(
+            self.state.response_agent,
+            started["session_id"],
+            {"paused", "failed"},
+        )
+
+        self.assertEqual(paused["status"], "paused")
+        self.assertEqual(
+            paused["last_error"],
+            "report_contract_error:model_response_contract",
+        )
+        rejections = [
+            step
+            for step in paused["steps"]
+            if step["phase"] == "synthesis_rejected"
+        ]
+        self.assertEqual(len(rejections), 3)
+        self.assertFalse((rejections[-1].get("detail") or {}).get("retry"))
+        self.assertGreater(paused["usage"]["active_seconds"], 0.0)
 
     def test_model_failure_pauses_without_heuristic_fallback(self):
         self.state.response_agent.set_llm(_BrokenAgentLLM())
@@ -3168,6 +3321,114 @@ class ResponseAgentTest(unittest.TestCase):
         self.assertEqual(final["status"], "cancelled")
         self.assertIsNone(final["report"])
         self.assertFalse(llm.report_called.is_set())
+
+    def _assert_late_contract_error_boundary(
+        self,
+        block_phase: str,
+        command: str,
+    ) -> None:
+        llm = _BlockingAgentLLM(block_phase, contract_error=True)
+        self.state.response_agent.set_llm(llm)
+        case_id = self._case(
+            f"response-agent-{block_phase}-{command}-boundary"
+        )
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        started = self.state.response_agent.create(
+            case_id,
+            artifact=artifact,
+            goal="freeze the operator boundary",
+            actor="analyst",
+        )
+        self.assertTrue(llm.entered.wait(timeout=3))
+        time.sleep(0.05)
+
+        getattr(self.state.response_agent, command)(
+            started["session_id"],
+            actor="analyst",
+        )
+        frozen = self.state.response_agent.get(started["session_id"])
+        frozen_active = frozen["usage"]["active_seconds"]
+        frozen_step_count = len(frozen["steps"])
+        self.assertGreater(frozen_active, 0.0)
+
+        time.sleep(0.15)
+        llm.release.set()
+        self.assertTrue(llm.returned.wait(timeout=2))
+        time.sleep(0.1)
+
+        final = self.state.response_agent.get(started["session_id"])
+        self.assertEqual(
+            final["status"],
+            "paused" if command == "pause" else "cancelled",
+        )
+        self.assertAlmostEqual(
+            final["usage"]["active_seconds"],
+            frozen_active,
+            delta=0.01,
+        )
+        self.assertEqual(len(final["steps"]), frozen_step_count)
+        self.assertIsNone(final["report"])
+        self.assertNotIn(
+            "secret-contract-marker",
+            json.dumps(final, ensure_ascii=False),
+        )
+
+    def test_late_planner_contract_error_respects_pause_boundary(self):
+        self._assert_late_contract_error_boundary("planner", "pause")
+
+    def test_late_planner_contract_error_respects_cancel_boundary(self):
+        self._assert_late_contract_error_boundary("planner", "cancel")
+
+    def test_late_report_contract_error_respects_pause_boundary(self):
+        self._assert_late_contract_error_boundary("report", "pause")
+
+    def test_late_report_contract_error_respects_cancel_boundary(self):
+        self._assert_late_contract_error_boundary("report", "cancel")
+
+    def test_report_contract_retry_stops_at_wall_budget(self):
+        llm = _BlockingAgentLLM("report", contract_error=True)
+        self.state.response_agent.set_llm(llm)
+        case_id = self._case("response-agent-report-contract-wall-budget")
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        started = self.state.response_agent.create(
+            case_id,
+            artifact=artifact,
+            goal="enforce the report wall budget",
+            actor="analyst",
+        )
+        self.assertTrue(llm.entered.wait(timeout=3))
+        original_budget = self.state.response_agent.config.max_wall_seconds
+        self.state.response_agent.config.max_wall_seconds = 0
+        try:
+            llm.release.set()
+            self.assertTrue(llm.returned.wait(timeout=2))
+            exhausted = self._wait(
+                self.state.response_agent,
+                started["session_id"],
+                {"budget_exhausted", "failed", "paused"},
+            )
+        finally:
+            self.state.response_agent.config.max_wall_seconds = original_budget
+
+        self.assertEqual(exhausted["status"], "budget_exhausted")
+        self.assertEqual(exhausted["last_error"], "investigation_budget_exhausted")
+        self.assertEqual(llm.report_invocations, 1)
+        self.assertIsNone(exhausted["report"])
+        rejections = [
+            step
+            for step in exhausted["steps"]
+            if step["phase"] == "synthesis_rejected"
+        ]
+        self.assertEqual(len(rejections), 1)
+        self.assertGreater(exhausted["usage"]["active_seconds"], 0.0)
+        self.assertNotIn(
+            "secret-contract-marker",
+            json.dumps(exhausted, ensure_ascii=False),
+        )
 
     def test_report_synthesis_calls_model_and_falls_back_when_candidate_is_empty(self):
         llm = _BlockingAgentLLM("none")

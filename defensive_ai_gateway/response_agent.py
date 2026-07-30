@@ -9,6 +9,7 @@ from typing import Any
 
 from .case_response import build_case_timeline, source_snapshot_hash
 from .config import ResponseAgentConfig
+from .llm import LLMResponseContractError
 from .models import new_id, now_ms
 
 
@@ -1286,18 +1287,35 @@ class ResponseInvestigationAgent:
                 if not self._current_llm().is_deterministic:
                     usage["model_calls"] = int(usage.get("model_calls") or 0) + 1
                 decision_rejections += 1
-                self._append_step(
+                model_contract_error = exc.code == "model_response_contract"
+                rejection_step = self._append_step(
                     session_id,
                     "decision_rejected",
                     _pick(
                         report_language,
-                        "模型工具决策已被控制器拒绝",
-                        "Model tool decision rejected by the controller",
+                        (
+                            "模型结构化规划响应不符合契约"
+                            if model_contract_error
+                            else "模型工具决策已被控制器拒绝"
+                        ),
+                        (
+                            "Model structured planning response did not satisfy the contract"
+                            if model_contract_error
+                            else "Model tool decision rejected by the controller"
+                        ),
                     ),
                     _pick(
                         report_language,
-                        "控制器没有执行不符合工具契约或调查范围的参数。",
-                        "The controller did not execute arguments outside the tool contract or investigation scope.",
+                        (
+                            "控制器未执行任何工具，并将在有界次数内重新请求 JSON 响应。"
+                            if model_contract_error
+                            else "控制器没有执行不符合工具契约或调查范围的参数。"
+                        ),
+                        (
+                            "The controller executed no tool and will request a JSON response again within the bounded retry limit."
+                            if model_contract_error
+                            else "The controller did not execute arguments outside the tool contract or investigation scope."
+                        ),
                     ),
                     {
                         "code": exc.code,
@@ -1305,7 +1323,11 @@ class ResponseInvestigationAgent:
                         "retry": decision_rejections < 3,
                     },
                     [],
+                    expected_statuses=("running",),
+                    usage=usage,
                 )
+                if not rejection_step:
+                    return
                 if decision_rejections >= 3:
                     self._persist_active_seconds(session_id, usage, run_started)
                     paused = self.repo.transition_response_agent_session(
@@ -1322,8 +1344,10 @@ class ResponseInvestigationAgent:
                             rejection_code=exc.code,
                         )
                     return
-                self.repo.update_response_agent_session(session_id, usage=usage)
                 continue
+            latest_after_decision = self.repo.get_response_agent_session(session_id)
+            if not latest_after_decision or latest_after_decision["status"] != "running":
+                return
             decision_rejections = 0
             usage["turns"] = int(usage.get("turns") or 0) + 1
             if not self._current_llm().is_deterministic:
@@ -1641,13 +1665,23 @@ class ResponseInvestigationAgent:
 
     def _persist_active_seconds(
         self, session_id: str, usage: dict[str, Any], started: float
-    ) -> None:
-        usage["active_seconds"] = round(
+    ) -> dict[str, Any] | None:
+        next_usage = dict(usage)
+        next_usage["active_seconds"] = round(
             float(usage.get("active_seconds") or 0)
             + max(0.0, time.monotonic() - started),
             3,
         )
-        self.repo.update_response_agent_session(session_id, usage=usage)
+        updated = self.repo.update_response_agent_session(
+            session_id,
+            expected_statuses=("running", "synthesizing", "validating"),
+            usage=next_usage,
+            refresh_claimed_at=True,
+        )
+        if updated:
+            usage.clear()
+            usage.update(next_usage)
+        return updated
 
     def _persist_active_seconds_floor(
         self,
@@ -1666,7 +1700,42 @@ class ResponseInvestigationAgent:
             baseline_active_seconds + max(0.0, time.monotonic() - started),
         )
         usage["active_seconds"] = round(max(observed, elapsed_floor), 3)
-        self.repo.update_response_agent_session(session_id, usage=usage)
+        self.repo.update_response_agent_session(
+            session_id,
+            expected_statuses=("running", "synthesizing", "validating"),
+            usage=usage,
+            refresh_claimed_at=True,
+        )
+
+    @staticmethod
+    def _active_elapsed(usage: dict[str, Any], started: float) -> float:
+        return max(0.0, float(usage.get("active_seconds") or 0)) + max(
+            0.0,
+            time.monotonic() - started,
+        )
+
+    def _exhaust_synthesis_wall_budget(
+        self,
+        session_id: str,
+        usage: dict[str, Any],
+        started: float,
+    ) -> None:
+        if not self._persist_active_seconds(session_id, usage, started):
+            return
+        exhausted = self.repo.transition_response_agent_session(
+            session_id,
+            ("synthesizing",),
+            "budget_exhausted",
+            last_error="investigation_budget_exhausted",
+        )
+        if exhausted:
+            self._audit(
+                exhausted,
+                "response-agent",
+                "response_agent_budget_exhausted",
+                usage=usage,
+                phase="report_synthesis",
+            )
 
     def _next_decision(
         self,
@@ -1760,6 +1829,11 @@ class ResponseInvestigationAgent:
         )
         try:
             raw = llm.generate_structured(prompt, context, TURN_SCHEMA)
+        except LLMResponseContractError as exc:
+            raise _DecisionRejected(
+                "model_response_contract",
+                "model response did not contain one valid structured JSON object",
+            ) from exc
         except Exception as exc:
             paused = self.repo.transition_response_agent_session(
                 session["session_id"],
@@ -3984,32 +4058,119 @@ class ResponseInvestigationAgent:
                 f"{json.dumps(REPORT_SCHEMA, ensure_ascii=False)}\n"
                 f"CONTEXT={self.policy.truncate_prompt_payload(context)}"
             )
-            try:
-                candidate = llm.generate_structured(
-                    prompt,
-                    context,
-                    REPORT_SCHEMA,
-                )
-            except Exception as exc:
-                self._persist_active_seconds(
-                    session_id,
-                    usage,
-                    synthesis_started,
-                )
-                paused = self.repo.transition_response_agent_session(
-                    session_id,
-                    ("synthesizing",),
-                    "paused",
-                    last_error=f"model_error:{type(exc).__name__}",
-                )
-                if paused:
-                    self._audit(
-                        paused,
-                        "response-agent",
-                        "response_agent_model_paused",
-                        error_type=type(exc).__name__,
+            for attempt in range(1, 4):
+                if (
+                    self._active_elapsed(usage, synthesis_started)
+                    >= self.config.max_wall_seconds
+                ):
+                    self._exhaust_synthesis_wall_budget(
+                        session_id,
+                        usage,
+                        synthesis_started,
                     )
-                return
+                    return
+                if attempt > 1:
+                    usage["model_calls"] = int(usage.get("model_calls") or 0) + 1
+                    updated = self.repo.update_response_agent_session(
+                        session_id,
+                        expected_statuses=("synthesizing",),
+                        usage=usage,
+                    )
+                    if not updated:
+                        return
+                structured_prompt = prompt
+                if attempt > 1:
+                    structured_prompt += (
+                        "\nRETRY_FEEDBACK=The previous response was not one valid JSON "
+                        "object. Return only the requested JSON object without markdown."
+                    )
+                try:
+                    candidate = llm.generate_structured(
+                        structured_prompt,
+                        context,
+                        REPORT_SCHEMA,
+                    )
+                    latest = self.repo.get_response_agent_session(session_id)
+                    if not latest or latest["status"] != "synthesizing":
+                        return
+                    if (
+                        self._active_elapsed(usage, synthesis_started)
+                        >= self.config.max_wall_seconds
+                    ):
+                        self._exhaust_synthesis_wall_budget(
+                            session_id,
+                            usage,
+                            synthesis_started,
+                        )
+                        return
+                    break
+                except LLMResponseContractError:
+                    retry = attempt < 3
+                    rejection_step = self._append_step(
+                        session_id,
+                        "synthesis_rejected",
+                        _pick(
+                            report_language,
+                            "模型结构化报告响应不符合契约",
+                            "Model structured report response did not satisfy the contract",
+                        ),
+                        _pick(
+                            report_language,
+                            "控制器未保存无效报告，并将在有界次数内重新请求 JSON 响应。",
+                            "The controller did not store the invalid report and will request a JSON response again within the bounded retry limit.",
+                        ),
+                        {
+                            "code": "model_response_contract",
+                            "retry": retry,
+                            "attempt": attempt,
+                        },
+                        [],
+                        expected_statuses=("synthesizing",),
+                    )
+                    if not rejection_step:
+                        return
+                    if retry:
+                        continue
+                    self._persist_active_seconds(
+                        session_id,
+                        usage,
+                        synthesis_started,
+                    )
+                    paused = self.repo.transition_response_agent_session(
+                        session_id,
+                        ("synthesizing",),
+                        "paused",
+                        last_error="report_contract_error:model_response_contract",
+                    )
+                    if paused:
+                        self._audit(
+                            paused,
+                            "response-agent",
+                            "response_agent_model_paused",
+                            error_type="LLMResponseContractError",
+                            rejection_code="model_response_contract",
+                        )
+                    return
+                except Exception as exc:
+                    self._persist_active_seconds(
+                        session_id,
+                        usage,
+                        synthesis_started,
+                    )
+                    paused = self.repo.transition_response_agent_session(
+                        session_id,
+                        ("synthesizing",),
+                        "paused",
+                        last_error=f"model_error:{type(exc).__name__}",
+                    )
+                    if paused:
+                        self._audit(
+                            paused,
+                            "response-agent",
+                            "response_agent_model_paused",
+                            error_type=type(exc).__name__,
+                        )
+                    return
         validating = self.repo.update_response_agent_session(
             session_id,
             expected_statuses=("synthesizing",),
@@ -6283,7 +6444,10 @@ class ResponseInvestigationAgent:
         rationale: str,
         detail: dict[str, Any],
         refs: list[dict[str, Any]],
-    ) -> dict[str, Any]:
+        *,
+        expected_statuses: tuple[str, ...] | None = None,
+        usage: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         return self.repo.append_response_agent_step(
             {
                 "step_id": new_id("response_agent_step"),
@@ -6294,7 +6458,9 @@ class ResponseInvestigationAgent:
                 "rationale": _text(rationale, 4_000),
                 "detail": self.policy.sanitize_json_value(detail, 32_000),
                 "evidence_refs": refs[:128],
-            }
+            },
+            expected_statuses=expected_statuses,
+            usage=usage,
         )
 
     @staticmethod
