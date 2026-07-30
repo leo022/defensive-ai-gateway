@@ -168,6 +168,18 @@ const COPY = {
     agentReadOnly: "Agent 可执行受治理的数据库只读调查与原始日志溯源，不会直接执行生产处置。",
     agentGate: "报告门禁",
     agentConclusion: "完整结论",
+    agentRiskAssessment: "风险研判",
+    agentRiskLevel: "风险等级",
+    agentAttackStatus: "攻击状态",
+    agentLikelihood: "发生可能性",
+    agentImpactLevel: "影响等级",
+    agentAggravatingFactors: "风险加剧因素",
+    agentMitigatingFactors: "风险缓解因素",
+    agentAttackChain: "攻击活动时间线",
+    agentRelatedActivity: "同源/同目标关联活动",
+    agentRelationship: "关联依据",
+    agentSource: "来源",
+    agentTarget: "目标",
     agentFindings: "关键发现",
     agentHypotheses: "调查假设验证",
     agentHypothesisSupport: "支持证据",
@@ -181,6 +193,8 @@ const COPY = {
     agentUnresolvedDomains: "未解决取证域",
     agentImpact: "影响分析",
     agentForensics: "深度取证流程",
+    agentTechnicalAppendix: "技术取证附录",
+    agentTechnicalAppendixOpen: "展开查看取证覆盖与关联明细",
     agentForensicSources: "现有证据源",
     agentCollectionSteps: "补充采集步骤",
     agentForensicAssessment: "调查判断",
@@ -332,6 +346,18 @@ const COPY = {
     agentReadOnly: "The Agent can run governed read-only database and raw-log investigations. It never executes a production response directly.",
     agentGate: "Report gate",
     agentConclusion: "Conclusion",
+    agentRiskAssessment: "Risk assessment",
+    agentRiskLevel: "Risk level",
+    agentAttackStatus: "Attack status",
+    agentLikelihood: "Likelihood",
+    agentImpactLevel: "Impact level",
+    agentAggravatingFactors: "Aggravating factors",
+    agentMitigatingFactors: "Mitigating factors",
+    agentAttackChain: "Attack activity timeline",
+    agentRelatedActivity: "Same-source / same-target activity",
+    agentRelationship: "Relationship",
+    agentSource: "Source",
+    agentTarget: "Target",
     agentFindings: "Key findings",
     agentHypotheses: "Investigation hypothesis testing",
     agentHypothesisSupport: "Supporting evidence",
@@ -345,6 +371,8 @@ const COPY = {
     agentUnresolvedDomains: "Unresolved forensic domains",
     agentImpact: "Impact",
     agentForensics: "Deep forensic workstreams",
+    agentTechnicalAppendix: "Technical forensic appendix",
+    agentTechnicalAppendixOpen: "Expand forensic coverage and correlation details",
     agentForensicSources: "Available evidence sources",
     agentCollectionSteps: "Additional collection steps",
     agentForensicAssessment: "Investigation assessment",
@@ -406,6 +434,21 @@ const ENUM_LABELS = {
       multi_source: "多源交叉印证",
       single_source: "单一来源",
       no_correlation: "未取得关联结果",
+    },
+    attackStatus: {
+      confirmed_compromise: "已确认失陷",
+      likely_compromise: "很可能已失陷",
+      malicious_activity: "已确认恶意活动",
+      attempted_attack: "攻击尝试",
+      suspicious: "可疑活动",
+      benign: "良性活动",
+      insufficient_evidence: "证据不足",
+    },
+    likelihood: {
+      high: "高",
+      medium: "中",
+      low: "低",
+      unknown: "未知",
     },
     forensicConclusion: {
       corroborated: "已交叉印证",
@@ -527,6 +570,21 @@ const ENUM_LABELS = {
       multi_source: "Cross-source corroboration",
       single_source: "Single source",
       no_correlation: "No correlation result",
+    },
+    attackStatus: {
+      confirmed_compromise: "Confirmed compromise",
+      likely_compromise: "Likely compromise",
+      malicious_activity: "Confirmed malicious activity",
+      attempted_attack: "Attempted attack",
+      suspicious: "Suspicious activity",
+      benign: "Benign activity",
+      insufficient_evidence: "Insufficient evidence",
+    },
+    likelihood: {
+      high: "High",
+      medium: "Medium",
+      low: "Low",
+      unknown: "Unknown",
     },
     forensicConclusion: {
       corroborated: "Corroborated",
@@ -1530,6 +1588,7 @@ function renderAgentReport() {
   band.hidden = false;
   const content = report.content;
   const conclusion = content.conclusion || {};
+  const risk = content.risk_assessment || {};
   const correlation = content.cross_source_correlation || {};
   const scope = content.scope_assessment || {};
   const validation = report.validation || {};
@@ -1539,21 +1598,59 @@ function renderAgentReport() {
         <h5 class="response-agent-report-document-title">${escapeHtml(content.title || tr("agentReport"))}</h5>
         <p>${escapeHtml(content.executive_summary || "-")}</p>
       `)}
-      ${agentReportSection(2, tr("agentConclusion"), `
+      ${agentReportSection(2, tr("agentRiskAssessment"), `
         <p><strong>${escapeHtml(enumLabel("state", conclusion.classification))} · ${escapeHtml(fmtConfidence(conclusion.confidence))}</strong></p>
         <p>${escapeHtml(conclusion.statement || "-")}</p>
+        ${risk.risk_level ? `<div class="response-agent-risk-grid">
+          <small><strong>${escapeHtml(tr("agentRiskLevel"))}</strong>${escapeHtml(enumLabel("state", risk.risk_level))}</small>
+          <small><strong>${escapeHtml(tr("agentAttackStatus"))}</strong>${escapeHtml(enumLabel("attackStatus", risk.attack_status))}</small>
+          <small><strong>${escapeHtml(tr("agentLikelihood"))}</strong>${escapeHtml(enumLabel("likelihood", risk.likelihood))}</small>
+          <small><strong>${escapeHtml(tr("agentImpactLevel"))}</strong>${escapeHtml(enumLabel("state", risk.impact))}</small>
+        </div>` : ""}
+        ${risk.rationale ? `<p>${escapeHtml(risk.rationale)}</p>` : ""}
+        ${agentDetailList(tr("agentAggravatingFactors"), risk.aggravating_factors)}
+        ${agentDetailList(tr("agentMitigatingFactors"), risk.mitigating_factors)}
+        ${compactAgentRefs(risk.evidence_refs)}
       `, "response-agent-report-conclusion")}
-      ${agentReportSection(3, tr("agentFindings"), reportItems(
-        content.findings,
+      ${agentReportSection(3, tr("agentAttackChain"), reportItems(
+        content.attack_chain,
         (item) => `
+            <strong>${escapeHtml(item.timestamp || item.stage || "-")}</strong>
+            ${item.timestamp && item.stage ? `<small>${escapeHtml(item.stage)}</small>` : ""}
             <p>${escapeHtml(item.statement || "-")}</p>
-            <small>${escapeHtml(enumLabel("claimState", item.claim_state))}</small>
+            ${item.assessment ? `<small>${escapeHtml(item.assessment)}</small>` : ""}
             ${compactAgentRefs(item.evidence_refs)}
         `,
         tr("agentEmptyFindings"),
         3,
       ))}
-      ${agentReportSection(4, tr("agentHypotheses"), reportItems(
+      ${agentReportSection(4, tr("agentFindings"), reportItems(
+        content.findings,
+        (item) => `
+            ${item.title ? `<strong>${escapeHtml(item.title)}</strong>` : ""}
+            <p>${escapeHtml(item.statement || "-")}</p>
+            <small>${escapeHtml(enumLabel("claimState", item.claim_state))}${item.severity ? ` · ${escapeHtml(enumLabel("state", item.severity))}` : ""}</small>
+            ${item.significance ? `<small>${escapeHtml(item.significance)}</small>` : ""}
+            ${compactAgentRefs(item.evidence_refs)}
+        `,
+        tr("agentEmptyFindings"),
+        4,
+      ))}
+      ${agentReportSection(5, tr("agentRelatedActivity"), reportItems(
+        content.related_activity,
+        (item) => `
+            <strong>${escapeHtml(item.timestamp || item.alert_id || "-")}</strong>
+            <small>${escapeHtml([item.product, item.severity, item.alert_id].filter(Boolean).join(" · "))}</small>
+            <p>${escapeHtml(item.activity || "-")}</p>
+            ${(item.source || item.target) ? `<small>${escapeHtml(tr("agentSource"))}: ${escapeHtml(item.source || "-")} · ${escapeHtml(tr("agentTarget"))}: ${escapeHtml(item.target || "-")}</small>` : ""}
+            ${item.relationship ? `<small><strong>${escapeHtml(tr("agentRelationship"))}</strong> ${escapeHtml(item.relationship)}</small>` : ""}
+            ${item.assessment ? `<small>${escapeHtml(item.assessment)}</small>` : ""}
+            ${compactAgentRefs(item.evidence_refs)}
+        `,
+        tr("agentEmptyFindings"),
+        5,
+      ))}
+      ${agentReportSection(6, tr("agentHypotheses"), reportItems(
         content.hypothesis_assessment,
         (item) => `
             <strong>${escapeHtml(item.title || item.hypothesis_id || "-")}</strong>
@@ -1568,18 +1665,12 @@ function renderAgentReport() {
               : ""}
         `,
         tr("agentEmptyFindings"),
-        4,
+        6,
       ))}
-      ${agentReportSection(5, tr("agentCorrelation"), `
-        <p><strong>${escapeHtml(enumLabel("correlationStrength", correlation.strength))}</strong></p>
-        <p>${escapeHtml(correlation.summary || "-")}</p>
-        ${agentDetailList(
-          tr("agentCorrelationPivots"),
-          (correlation.correlation_pivots || []).map((item) => `${item.field || "-"}: ${item.value || "-"}`),
-        )}
-      `)}
-      ${agentReportSection(6, tr("agentScope"), `
+      ${agentReportSection(7, tr("agentScope"), `
         <p>${escapeHtml(scope.blast_radius_assessment || "-")}</p>
+        <p><strong>${escapeHtml(tr("agentImpact"))}</strong></p>
+        <p>${escapeHtml(content.impact || "-")}</p>
         ${agentDetailList(
           tr("agentObservedEntities"),
           (scope.observed_entities || []).map((item) => `${item.type || "-"}: ${item.value || "-"}`),
@@ -1588,36 +1679,7 @@ function renderAgentReport() {
         ${agentDetailList(tr("agentUnresolvedDomains"), scope.unresolved_domains)}
         ${compactAgentRefs(scope.evidence_refs)}
       `)}
-      ${agentReportSection(7, tr("agentImpact"), `
-        <p>${escapeHtml(content.impact || "-")}</p>
-      `)}
-      ${agentReportSection(8, tr("agentForensics"), reportItems(
-        content.forensic_workstreams,
-        (item) => {
-          const result = item.investigation_result || {};
-          return `
-              <strong>${escapeHtml(item.title || item.workstream_id || "-")}</strong>
-              <small>${escapeHtml(enumLabel("state", item.status))} · ${escapeHtml(item.coverage_summary || "-")}</small>
-              <small>${escapeHtml(enumLabel("forensicConclusion", result.conclusion_state))}</small>
-              ${compactAgentSources(item.evidence_sources)}
-              ${result.assessment ? `<div class="response-agent-investigation-detail"><strong>${escapeHtml(tr("agentForensicAssessment"))}</strong><small>${escapeHtml(result.assessment)}</small></div>` : ""}
-              ${agentDetailList(tr("agentForensicObservations"), result.observations)}
-              ${agentDetailList(tr("agentAlternativeExplanations"), result.alternative_explanations)}
-              ${agentDetailList(tr("agentNextPivots"), result.next_pivots)}
-              ${agentDetailList(tr("agentCollectionSteps"), item.collection_steps)}
-              ${compactAgentRefs(item.evidence_refs)}
-          `;
-        },
-        tr("agentEmptyForensics"),
-        8,
-      ))}
-      ${agentReportSection(9, tr("agentGaps"), reportItems(
-        content.evidence_gaps,
-        (item) => `<p>${escapeHtml(item)}</p>`,
-        tr("agentEmptyGaps"),
-        9,
-      ))}
-      ${agentReportSection(10, tr("agentResponsePlan"), reportItems(
+      ${agentReportSection(8, tr("agentResponsePlan"), reportItems(
         content.response_plan,
         (item) => `
             <strong>${escapeHtml(item.action || "-")}</strong>
@@ -1626,13 +1688,53 @@ function renderAgentReport() {
             ${compactAgentRefs(item.evidence_refs)}
         `,
         tr("agentEmptyPlan"),
-        10,
+        8,
       ))}
+      ${agentReportSection(9, tr("agentGaps"), reportItems(
+        content.evidence_gaps,
+        (item) => `<p>${escapeHtml(item)}</p>`,
+        tr("agentEmptyGaps"),
+        9,
+      ))}
+      ${agentReportSection(10, tr("agentTechnicalAppendix"), `
+        <details class="response-agent-technical-appendix">
+          <summary>${escapeHtml(tr("agentTechnicalAppendixOpen"))}</summary>
+          <div class="response-agent-technical-appendix-content">
+            <div class="response-agent-technical-block">
+              <strong>${escapeHtml(tr("agentCorrelation"))}</strong>
+              <p>${escapeHtml(correlation.summary || "-")}</p>
+              <small>${escapeHtml(enumLabel("correlationStrength", correlation.strength))}</small>
+              ${agentDetailList(
+                tr("agentCorrelationPivots"),
+                (correlation.correlation_pivots || []).map((item) => `${item.field || "-"}: ${item.value || "-"}`),
+              )}
+            </div>
+            ${reportItems(
+              content.forensic_workstreams,
+              (item) => {
+                const result = item.investigation_result || {};
+                return `
+                    <strong>${escapeHtml(item.title || item.workstream_id || "-")}</strong>
+                    <small>${escapeHtml(enumLabel("state", item.status))} · ${escapeHtml(item.coverage_summary || "-")}</small>
+                    <small>${escapeHtml(enumLabel("forensicConclusion", result.conclusion_state))}</small>
+                    ${compactAgentSources(item.evidence_sources)}
+                    ${result.assessment ? `<div class="response-agent-investigation-detail"><strong>${escapeHtml(tr("agentForensicAssessment"))}</strong><small>${escapeHtml(result.assessment)}</small></div>` : ""}
+                    ${agentDetailList(tr("agentForensicObservations"), result.observations)}
+                    ${agentDetailList(tr("agentAlternativeExplanations"), result.alternative_explanations)}
+                    ${agentDetailList(tr("agentNextPivots"), result.next_pivots)}
+                    ${agentDetailList(tr("agentCollectionSteps"), item.collection_steps)}
+                    ${compactAgentRefs(item.evidence_refs)}
+                `;
+              },
+              tr("agentEmptyForensics"),
+              10,
+            )}
+          </div>
+        </details>
+      `)}
       ${agentReportSection(11, tr("agentFinalAssessment"), `
         <p>${escapeHtml(content.final_assessment || "-")}</p>
-      `)}
-      ${agentReportSection(12, tr("agentGate"), `
-        <p><span class="case-response-state ${stateTone(report.validation_status)}">${escapeHtml(enumLabel("state", report.validation_status))}</span></p>
+        <p><strong>${escapeHtml(tr("agentGate"))}</strong> <span class="case-response-state ${stateTone(report.validation_status)}">${escapeHtml(enumLabel("state", report.validation_status))}</span></p>
         ${(validation.warnings || []).length ? `<small>${escapeHtml(validation.warnings.join(" · "))}</small>` : ""}
       `)}
     </article>
@@ -1710,8 +1812,15 @@ function formatAgentElapsed(seconds) {
 
 function mergeAgentSession(next, replaceSteps = false) {
   const previousSessionId = agentSession?.session_id || "";
+  const previousStatus = agentSession?.status || "";
   if (previousSessionId !== next.session_id) {
-    agentTraceExpanded = true;
+    agentTraceExpanded = !AGENT_TERMINAL_STATUSES.has(next.status);
+    agentTraceMiddleExpanded = false;
+  } else if (
+    !AGENT_TERMINAL_STATUSES.has(previousStatus)
+    && AGENT_TERMINAL_STATUSES.has(next.status)
+  ) {
+    agentTraceExpanded = false;
     agentTraceMiddleExpanded = false;
   }
   const incoming = Array.isArray(next.steps) ? next.steps : [];

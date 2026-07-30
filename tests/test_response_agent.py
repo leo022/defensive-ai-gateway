@@ -143,6 +143,79 @@ class _EarlyFinishAgentLLM:
         }
 
 
+class _NarrativeAgentLLM:
+    is_deterministic = False
+    runtime_metadata = {
+        "provider": "test",
+        "model": "narrative-agent-model",
+        "endpoint_host": "",
+    }
+
+    def __init__(self):
+        self.report_context = None
+
+    def generate_structured(self, prompt, context, schema=None):  # noqa: ANN001
+        if not prompt.startswith("Write a complete"):
+            return {
+                "action": "finish",
+                "rationale": "Advance the controller evidence floor, then synthesize.",
+            }
+        self.report_context = context
+        related = context.get("controller_related_activity") or []
+        refs = list((related[0] if related else {}).get("evidence_refs") or [])
+        return {
+            "title": "Attack-focused investigation",
+            "executive_summary": "The correlated activity supports a malicious exploitation campaign.",
+            "conclusion": {
+                "classification": "malicious",
+                "confidence": 0.88,
+                "statement": "The application runtime observed repeated high-risk operations from one source.",
+                "basis": ["Repeated runtime observations form a coherent attack sequence."],
+            },
+            "findings": [
+                {
+                    "claim_id": "campaign",
+                    "title": "Repeated exploitation activity",
+                    "severity": "high",
+                    "claim_state": "inferred",
+                    "statement": "Multiple related events share the same source and target.",
+                    "significance": "The pattern is inconsistent with an isolated probe.",
+                    "evidence_refs": refs,
+                }
+            ],
+            "attack_chain": [
+                {
+                    "timestamp": "model-must-not-change-time",
+                    "stage": "execution_attempt",
+                    "statement": "The related runtime event is part of the observed sequence.",
+                    "assessment": "The event is temporally and technically related.",
+                    "claim_state": "inferred",
+                    "evidence_refs": refs,
+                }
+            ],
+            "related_activity": [
+                {
+                    "alert_id": (related[0] if related else {}).get("alert_id", ""),
+                    "activity": "Runtime exploitation activity tied to the anchor Case.",
+                    "assessment": "The source and target relationship is materially relevant.",
+                    "evidence_refs": refs,
+                }
+            ],
+            "risk_assessment": {
+                "risk_level": "high",
+                "attack_status": "malicious_activity",
+                "likelihood": "high",
+                "impact": "high",
+                "rationale": "Repeated high-risk runtime events materially increase incident likelihood.",
+                "aggravating_factors": ["Repeated activity from the same source."],
+                "mitigating_factors": ["Host compromise is not established."],
+                "evidence_refs": refs,
+            },
+            "impact": "Sensitive application and host data may have been exposed.",
+            "final_assessment": "Treat the activity as malicious while preserving the distinction between runtime observation and confirmed host compromise.",
+        }
+
+
 class _DuplicateToolAgentLLM:
     is_deterministic = False
     runtime_metadata = {
@@ -724,7 +797,7 @@ class ResponseAgentTest(unittest.TestCase):
         )
         self.assertEqual(stored["tool_calls"][0]["arguments"], {})
         self.assertEqual(
-            stored["usage"]["model_calls"], len(CONTROLLER_TOOLS) + 1
+            stored["usage"]["model_calls"], len(CONTROLLER_TOOLS) + 2
         )
         self.assertNotIn("override controller scope", stored["last_error"])
 
@@ -1272,6 +1345,375 @@ class ResponseAgentTest(unittest.TestCase):
             hashlib.sha256(reconstructed.encode("utf-8")).hexdigest(),
         )
         self.assertEqual(source_hash, item["source_hash"])
+
+    def test_rasp_manifest_projects_runtime_attack_facts_without_http_secrets(self):
+        raw_log = json.loads(
+            Path("samples_syslog/rasp/rasp_alert.json").read_text(encoding="utf-8")
+        )
+        payload = {
+            "original_log": raw_log,
+            "sink": "javax.naming.InitialContext.lookup",
+            "request_body": "must-not-enter-manifest",
+            "request_headers": {"authorization": "must-not-enter-manifest"},
+            "rasp_items_context": {
+                "items": [
+                    {"sink": "javax.naming.InitialContext.lookup"},
+                    {"sink": "javax.naming.InitialContext.lookup"},
+                ]
+            },
+        }
+
+        facts = self.state.repo._response_agent_investigation_facts(payload)
+
+        self.assertEqual(facts["source_ip"], "10.0.10.132")
+        self.assertEqual(facts["rule"], "cloudrasp_jndi_108")
+        self.assertEqual(facts["action"], "log")
+        self.assertEqual(
+            facts["dangerous_sink"], "javax.naming.InitialContext.lookup"
+        )
+        self.assertEqual(
+            facts["detections"][0]["hook_evidence"]["url"],
+            "ldap://127.0.0.1:1389/obj",
+        )
+        serialized = json.dumps(facts, ensure_ascii=False)
+        self.assertNotIn("must-not-enter-manifest", serialized)
+        self.assertNotIn("dataSourceName", serialized)
+
+    def test_rasp_domains_do_not_imply_endpoint_network_or_persistence_coverage(self):
+        raw_log = json.loads(
+            Path("samples_syslog/rasp/rasp_alert.json").read_text(encoding="utf-8")
+        )
+        payload = {"original_log": raw_log}
+        catalog = self.state.repo._response_agent_json_catalog(
+            payload, max_entries=120, include_sizes=True
+        )
+
+        domains = self.state.repo._response_agent_forensic_domains("rasp", catalog)
+
+        self.assertIn("web_request", domains)
+        self.assertIn("server_runtime", domains)
+        self.assertNotIn("endpoint_process", domains)
+        self.assertNotIn("network_perimeter", domains)
+        self.assertNotIn("persistence", domains)
+        self.assertNotIn("file_integrity", domains)
+
+        file_payload = {
+            "original_log": {
+                "event": raw_log["event"],
+                "items": [{"hook_data": {"path": "/etc/passwd"}}],
+            }
+        }
+        file_catalog = self.state.repo._response_agent_json_catalog(
+            file_payload, max_entries=120, include_sizes=True
+        )
+        self.assertIn(
+            "file_integrity",
+            self.state.repo._response_agent_forensic_domains(
+                "rasp",
+                file_catalog,
+                self.state.repo._response_agent_investigation_facts(file_payload),
+            ),
+        )
+
+    def test_compacted_query_page_preserves_pagination_and_every_attack_fact(self):
+        items = []
+        for index in range(20):
+            items.append(
+                {
+                    "alert_id": f"alert-{index:02d}",
+                    "event_id": f"event-{index:02d}",
+                    "product": "rasp",
+                    "event_type": "runtime_attack",
+                    "severity": "high",
+                    "timestamp": f"2026-07-27T18:{index:02d}:00+08:00",
+                    "relation": "case_indicator_correlation",
+                    "source_hash": "a" * 64,
+                    "syslog_message_present": True,
+                    "syslog_message_pointer": "/_syslog_envelope/raw_message",
+                    "forensic_domains": ["web_request", "server_runtime"],
+                    "investigation_facts": {
+                        "source_ip": "43.154.138.159",
+                        "host": "VM-0-7-centos",
+                        "rule": f"cloudrasp_rule_{index:02d}",
+                        "method": "POST",
+                        "url": f"http://106.53.107.29:8080/path/{index}",
+                        "action": "log",
+                        "dangerous_sink": "ognl.SimpleNode.evaluateGetValueBody",
+                    },
+                    "capture_diagnostics": [
+                        {
+                            "field": f"http_field_{entry}",
+                            "state": "captured_incomplete",
+                            "provenance": "syslog_raw_message",
+                            "reason": "x" * 600,
+                            "observed_value": "y" * 300,
+                        }
+                        for entry in range(8)
+                    ],
+                    "field_catalog": [
+                        {
+                            "json_pointer": f"/oversized/{entry}",
+                            "value_type": "string",
+                            "bytes": 500,
+                        }
+                        for entry in range(120)
+                    ],
+                }
+            )
+        page = {
+            "items": items,
+            "total": 47,
+            "limit": 20,
+            "offset": 20,
+            "next_offset": 40,
+            "query_mode": "case_indicator_correlation",
+            "scan_truncated": False,
+        }
+
+        compact = self.state.response_agent._compact_query_tool_result(
+            "search_related_alerts", page
+        )
+
+        self.assertLessEqual(
+            len(json.dumps(compact, ensure_ascii=False, sort_keys=True).encode("utf-8")),
+            self.state.response_agent.config.tool_result_max_bytes,
+        )
+        self.assertEqual(compact["total"], 47)
+        self.assertEqual(compact["next_offset"], 40)
+        self.assertEqual(compact["page_item_count"], 20)
+        self.assertEqual(len(compact["items"]), 20)
+        self.assertEqual(
+            [item["alert_id"] for item in compact["items"]],
+            [f"alert-{index:02d}" for index in range(20)],
+        )
+        self.assertEqual(
+            [item["investigation_facts"]["rule"] for item in compact["items"]],
+            [f"cloudrasp_rule_{index:02d}" for index in range(20)],
+        )
+
+        coverage = self.state.response_agent._compact_query_tool_result(
+            "query_forensic_coverage",
+            {
+                "scope": {"mode": "controller_scoped_read_only"},
+                "inventory": {"candidate_count": 20, "products": ["rasp"]},
+                "activity_inventory": [
+                    {
+                        "alert_id": item["alert_id"],
+                        "event_id": item["event_id"],
+                        "product": item["product"],
+                        "event_type": item["event_type"],
+                        "severity": item["severity"],
+                        "timestamp": item["timestamp"],
+                        "relation": item["relation"],
+                        "investigation_facts": item["investigation_facts"],
+                        "evidence_ref": f"raw-alert:{item['alert_id']}",
+                    }
+                    for item in items
+                ],
+                "required_reads": [],
+                "workstreams": [
+                    {
+                        "workstream_id": f"workstream-{index}",
+                        "title": f"Workstream {index}",
+                        "domain": "server_runtime",
+                        "status": "partial",
+                        "coverage_summary": "Single-source evidence.",
+                        "collection_steps": ["Collect independent telemetry."],
+                        "analysis_metrics": {
+                            "source_count": 1,
+                            "products": ["rasp"],
+                        },
+                    }
+                    for index in range(8)
+                ],
+                "source_limits": [],
+            },
+        )
+        self.assertLessEqual(
+            len(json.dumps(coverage, ensure_ascii=False, sort_keys=True).encode("utf-8")),
+            self.state.response_agent.config.tool_result_max_bytes,
+        )
+        self.assertEqual(len(coverage["activity_inventory"]), 20)
+        for index, item in enumerate(coverage["activity_inventory"]):
+            facts = item["investigation_facts"]
+            self.assertEqual(facts["source_ip"], "43.154.138.159")
+            self.assertEqual(facts["host"], "VM-0-7-centos")
+            self.assertEqual(facts["rule"], f"cloudrasp_rule_{index:02d}")
+            self.assertEqual(facts["url"], f"http://106.53.107.29:8080/path/{index}")
+
+    def test_synthesis_context_preserves_controller_limits_related_facts_and_notes(self):
+        related = [
+            {
+                "alert_id": f"alert-{index:02d}",
+                "timestamp": f"2026-07-27T18:{index:02d}:00+08:00",
+                "product": "rasp",
+                "severity": "high",
+                "activity": f"Runtime attack event {index}",
+                "evidence_refs": [f"raw-alert:alert-{index:02d}"],
+            }
+            for index in range(30)
+        ]
+        session = {
+            "goal": "Analyze the full attack chain",
+            "tool_calls": [
+                {
+                    "status": "completed",
+                    "tool_name": "read_raw_alert_chunk",
+                    "result_hash": str(index) * 64,
+                    "evidence_refs": [
+                        {"ref_id": f"raw-alert:alert-{index:02d}"}
+                    ],
+                }
+                for index in range(20)
+            ],
+            "steps": [
+                {
+                    "phase": "tool_decision",
+                    "sequence": index,
+                    "rationale": f"Raw review note {index} with decisive evidence.",
+                    "detail": {"tool_name": "read_raw_alert_chunk"},
+                }
+                for index in range(20)
+            ],
+        }
+        base = {
+            "related_activity": related,
+            "attack_chain": [
+                {"statement": item["activity"], "evidence_refs": item["evidence_refs"]}
+                for item in related
+            ],
+            "risk_assessment": {
+                "risk_level": "high",
+                "attack_status": "malicious_activity",
+                "rationale": "Repeated related runtime activity.",
+            },
+            "scope_assessment": {
+                "blast_radius_assessment": "One observed application host."
+            },
+            "evidence_gaps": [
+                "HTTP response outcome remains unresolved.",
+                "Independent endpoint telemetry is not available.",
+            ],
+            "forensic_workstreams": [],
+        }
+        source = {"case": {"case_id": "case-large"}, "events": []}
+        artifact = {"content": {"case_summary": {}, "playbook": {"steps": []}}}
+
+        context = self.state.response_agent._report_synthesis_context(
+            session, source, artifact, base
+        )
+
+        self.assertEqual(
+            context["context_contract_version"],
+            "response-agent-synthesis-context-v2",
+        )
+        self.assertTrue(context["controller_related_activity"])
+        self.assertTrue(context["controller_attack_chain_seed"])
+        self.assertTrue(context["controller_risk_seed"])
+        self.assertTrue(context["controller_scope"])
+        self.assertEqual(len(context["controller_evidence_limitations"]), 2)
+        self.assertTrue(context["raw_review_notes"])
+
+    def test_model_attack_chain_and_response_actions_remain_controller_governed(self):
+        base_chain = [
+            {
+                "sequence": 1,
+                "timestamp": "2026-07-27T18:12:35+08:00",
+                "stage": "observed_activity",
+                "statement": "Controller event",
+                "assessment": "Direct Case evidence",
+                "claim_state": "confirmed",
+                "evidence_refs": ["raw-alert:known"],
+            }
+        ]
+        normalized_chain = self.state.response_agent._normalize_attack_chain(
+            [
+                {
+                    "timestamp": "forged-time",
+                    "stage": "execution_attempt",
+                    "statement": "Model interpretation anchored to known evidence.",
+                    "evidence_refs": ["raw-alert:known"],
+                },
+                {
+                    "timestamp": "forged-event",
+                    "statement": "Invented related event.",
+                    "evidence_refs": ["raw-alert:unknown"],
+                },
+            ],
+            base_chain,
+        )
+        self.assertEqual(len(normalized_chain), 1)
+        self.assertEqual(
+            normalized_chain[0]["timestamp"], "2026-07-27T18:12:35+08:00"
+        )
+        self.assertEqual(
+            normalized_chain[0]["statement"],
+            "Controller event",
+        )
+        plan = self.state.response_agent._normalize_response_plan(
+            [
+                {
+                    "action": "立即隔离目标主机并封禁来源 IP",
+                    "mode": "observe",
+                }
+            ]
+        )
+        self.assertEqual(plan[0]["mode"], "approve_required")
+
+        collection_plan = self.state.response_agent._normalize_response_plan(
+            [
+                {
+                    "action": "Collect raw logs from Tomcat and source logs from WAF",
+                    "mode": "observe",
+                }
+            ]
+        )
+        self.assertEqual(len(collection_plan), 1)
+        self.assertEqual(
+            collection_plan[0]["action"],
+            "Collect raw logs from Tomcat and source logs from WAF",
+        )
+        self.assertEqual(collection_plan[0]["mode"], "observe")
+
+    def test_llm_synthesis_uses_react_dossier_and_preserves_controller_timestamps(self):
+        llm = _NarrativeAgentLLM()
+        self.state.response_agent.set_llm(llm)
+        case_id = self._case("response-agent-narrative-synthesis")
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        started = self.state.response_agent.create(
+            case_id,
+            artifact=artifact,
+            goal="Produce an attack-focused deep investigation",
+            actor="analyst",
+        )
+
+        session = self._wait(
+            self.state.response_agent,
+            started["session_id"],
+            {"completed", "review", "blocked", "failed", "paused"},
+        )
+
+        self.assertIn(
+            session["status"],
+            {"completed", "review"},
+            (session.get("report") or {}).get("validation")
+            or session.get("last_error"),
+        )
+        self.assertIsNotNone(llm.report_context)
+        self.assertTrue(llm.report_context["controller_related_activity"])
+        report = session["report"]
+        self.assertTrue(report["model_metadata"]["model_synthesis_applied"])
+        self.assertEqual(
+            report["model_metadata"]["report_compiler"],
+            "llm_synthesis_with_controller_evidence",
+        )
+        self.assertEqual(report["content"]["title"], "Attack-focused investigation")
+        self.assertNotEqual(
+            report["content"]["attack_chain"][0]["timestamp"],
+            "model-must-not-change-time",
+        )
 
     def test_forensic_coverage_reads_syslog_and_correlated_host_evidence(self):
         alert = _waf_alert("response-agent-forensic-syslog")
@@ -2053,7 +2495,7 @@ class ResponseAgentTest(unittest.TestCase):
             "not_observed",
         )
 
-    def test_model_cannot_override_any_controller_report_fact(self):
+    def test_model_narrative_cannot_override_controller_evidence_boundaries(self):
         base = {
             "schema_version": "test",
             "title": "Controller report",
@@ -2173,16 +2615,16 @@ class ResponseAgentTest(unittest.TestCase):
         self.assertEqual(normalized["final_assessment"], "Assessment")
         self.assertEqual(
             normalized["scope"]["model_synthesis_disposition"],
-            "advisory_not_applied_to_controller_report",
+            "narrative_applied_controller_facts_locked",
         )
         self.assertEqual(
             normalized["scope"]["session_id"],
             "response_agent_gap_authority",
         )
-        self.assertEqual(normalized["title"], "Controller report")
+        self.assertEqual(normalized["title"], "Model title claiming compromise")
         self.assertEqual(
             normalized["conclusion"]["classification"],
-            "insufficient_evidence",
+            "malicious",
         )
         self.assertEqual(normalized["impact"], "Unknown")
         self.assertEqual(normalized["response_plan"], [])
@@ -2367,6 +2809,94 @@ class ResponseAgentTest(unittest.TestCase):
             self.state.repo.get_response_agent_raw_alert(
                 case_id,
                 weak_rule_match.alert_id,
+                window_ms=60 * 60 * 1_000,
+            )
+        )
+
+    def test_related_search_rejects_body_pivots_and_preserves_ip_direction(self):
+        case_id = self._case("response-agent-correlation-pollution-anchor")
+        source = self.state.repo.get_case_response_source(case_id)
+        timestamp = source["events"][0]["timestamp"]
+        shared_source_ip = "43.154.138.159"
+
+        body_pollution = RawAlert(
+            source="untrusted-web-sensor",
+            product="edr",
+            event_type="generic_event",
+            severity="low",
+            timestamp=timestamp,
+            payload={
+                "request": {"body": {"source_ip": shared_source_ip}},
+                "original_log": {
+                    "request_message": {
+                        "body": json.dumps({"source_ip": shared_source_ip})
+                    }
+                },
+            },
+            alert_id="response-agent-body-pivot-pollution",
+        )
+        reversed_direction = RawAlert(
+            source="unrelated-network-sensor",
+            product="edr",
+            event_type="network_connection",
+            severity="low",
+            timestamp=timestamp,
+            payload={"dst_ip": shared_source_ip},
+            alert_id="response-agent-reversed-network-direction",
+        )
+        trusted_same_direction = RawAlert(
+            source="trusted-network-sensor",
+            product="edr",
+            event_type="network_connection",
+            severity="medium",
+            timestamp=timestamp,
+            payload={"source": {"ip": shared_source_ip}},
+            alert_id="response-agent-trusted-same-direction",
+        )
+        self.state.repo.insert_raw_alert(body_pollution)
+        self.state.repo.insert_raw_alert(reversed_direction)
+        self.state.repo.insert_raw_alert(trusted_same_direction)
+
+        related = self.state.repo.query_response_agent_related_alerts(
+            case_id,
+            products=["edr"],
+            window_ms=60 * 60 * 1_000,
+            scan_limit=100,
+            scan_max_bytes=2_000_000,
+            limit=20,
+        )
+
+        ids = {item["alert_id"] for item in related["items"]}
+        self.assertNotIn(body_pollution.alert_id, ids)
+        self.assertNotIn(reversed_direction.alert_id, ids)
+        self.assertIn(trusted_same_direction.alert_id, ids)
+        trusted_result = next(
+            item
+            for item in related["items"]
+            if item["alert_id"] == trusted_same_direction.alert_id
+        )
+        self.assertIn(
+            {"field": "src_ip", "value": shared_source_ip},
+            trusted_result["matched_entities"],
+        )
+        self.assertIsNone(
+            self.state.repo.get_response_agent_raw_alert(
+                case_id,
+                body_pollution.alert_id,
+                window_ms=60 * 60 * 1_000,
+            )
+        )
+        trusted_raw = self.state.repo.get_response_agent_raw_alert(
+            case_id,
+            trusted_same_direction.alert_id,
+            window_ms=60 * 60 * 1_000,
+        )
+        self.assertIsNotNone(trusted_raw)
+        self.assertEqual(trusted_raw["relation"], "case_indicator_correlation")
+        self.assertIsNone(
+            self.state.repo.get_response_agent_raw_alert(
+                case_id,
+                reversed_direction.alert_id,
                 window_ms=60 * 60 * 1_000,
             )
         )
@@ -2639,8 +3169,8 @@ class ResponseAgentTest(unittest.TestCase):
         self.assertIsNone(final["report"])
         self.assertFalse(llm.report_called.is_set())
 
-    def test_controller_report_compilation_does_not_call_model_again(self):
-        llm = _BlockingAgentLLM("report")
+    def test_report_synthesis_calls_model_and_falls_back_when_candidate_is_empty(self):
+        llm = _BlockingAgentLLM("none")
         self.state.response_agent.set_llm(llm)
         case_id = self._case("response-agent-cancel-report")
         artifact = self.state.case_response.generate(
@@ -2649,7 +3179,7 @@ class ResponseAgentTest(unittest.TestCase):
         started = self.state.response_agent.create(
             case_id,
             artifact=artifact,
-            goal="compile controller report without a second model call",
+            goal="synthesize a model report with deterministic fallback",
             actor="analyst",
         )
         final = self._wait(
@@ -2660,13 +3190,13 @@ class ResponseAgentTest(unittest.TestCase):
 
         self.assertEqual(final["status"], "completed")
         self.assertIsNotNone(final["report"])
-        self.assertFalse(llm.report_called.is_set())
+        self.assertTrue(llm.report_called.is_set())
         self.assertFalse(
             final["report"]["model_metadata"]["model_synthesis_applied"]
         )
         self.assertEqual(
             final["report"]["model_metadata"]["report_compiler"],
-            "deterministic_controller",
+            "deterministic_fallback",
         )
 
     def test_schema_and_static_workbench_contract(self):
@@ -2723,6 +3253,11 @@ class ResponseAgentTest(unittest.TestCase):
         self.assertIn("AGENT_POLL_INTERVAL_MS", script)
         self.assertIn("setResponseAgentExpanded(false)", script)
         self.assertIn("AGENT_TERMINAL_STATUSES", script)
+        self.assertIn(
+            "agentTraceExpanded = !AGENT_TERMINAL_STATUSES.has(next.status)",
+            script,
+        )
+        self.assertIn("AGENT_TERMINAL_STATUSES.has(previousStatus)", script)
         self.assertIn("agentTraceMiddleExpanded = false", script)
         self.assertIn("agentSteps.slice(1, -1)", script)
         self.assertIn('renderAgentTraceStep(first, firstRole, firstLabel)', script)
@@ -2746,7 +3281,12 @@ class ResponseAgentTest(unittest.TestCase):
         self.assertIn("content.hypothesis_assessment", script)
         self.assertIn("content.cross_source_correlation", script)
         self.assertIn("content.scope_assessment", script)
+        self.assertIn("content.related_activity", script)
+        self.assertIn("content.risk_assessment", script)
+        self.assertIn("content.attack_chain", script)
         self.assertIn('agentForensics: "深度取证流程"', script)
+        self.assertIn('agentRiskAssessment: "风险研判"', script)
+        self.assertIn('agentTechnicalAppendix: "技术取证附录"', script)
         self.assertIn('body: JSON.stringify({ goal, language: language() })', script)
         self.assertIn('items.slice(1)', script)
         self.assertIn(
@@ -2756,10 +3296,13 @@ class ResponseAgentTest(unittest.TestCase):
         self.assertNotIn("function compactAgentRefs(values, limit = 4)", script)
         self.assertIn(".response-agent-evidence-more", css)
         self.assertIn("function agentReportSection(number, title, body", script)
-        self.assertIn('agentReportSection(12, tr("agentGate")', script)
+        self.assertIn('agentReportSection(11, tr("agentFinalAssessment")', script)
+        self.assertIn('class="response-agent-technical-appendix"', script)
         self.assertIn("response-agent-report-item-number", script)
         self.assertIn(".response-agent-report-section-number", css)
         self.assertIn(".response-agent-report-sublist", css)
+        self.assertIn(".response-agent-risk-grid", css)
+        self.assertIn(".response-agent-technical-appendix", css)
         self.assertIn(".response-agent-trace-row-latest", css)
         self.assertIn(".response-agent-trace-middle", css)
         self.assertIn("function formatAgentElapsed(seconds)", script)

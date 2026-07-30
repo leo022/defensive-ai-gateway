@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import re
 import sqlite3
@@ -89,7 +90,8 @@ _RESPONSE_AGENT_CORRELATION_FIELDS = (
 _RESPONSE_AGENT_CORRELATION_WEIGHTS = {
     "trace_id": 8,
     "request_id": 8,
-    "network_entity": 5,
+    "src_ip": 5,
+    "dst_ip": 5,
     "host": 5,
     "user": 4,
     "app": 3,
@@ -117,6 +119,64 @@ _RESPONSE_AGENT_SYSLOG_ENVELOPE_PATHS = (
     ("/syslog_route", ("syslog_route",)),
     ("/syslog_envelope", ("syslog_envelope",)),
 )
+
+# Raw payloads are attacker-controlled evidence. Correlation pivots may only
+# come from explicit telemetry metadata paths; request bodies, parameters,
+# headers and arbitrary nested business objects are deliberately absent.
+_RESPONSE_AGENT_RAW_CORRELATION_PATHS = {
+    ("source", "ip"): "src_ip",
+    ("source", "address"): "src_ip",
+    ("client", "ip"): "src_ip",
+    ("client", "address"): "src_ip",
+    ("destination", "ip"): "dst_ip",
+    ("destination", "address"): "dst_ip",
+    ("server", "ip"): "dst_ip",
+    ("server", "address"): "dst_ip",
+    ("destination", "domain"): "host",
+    ("destination", "hostname"): "host",
+    ("host", "name"): "host",
+    ("host", "hostname"): "host",
+    ("agent", "host"): "host",
+    ("agent", "hostname"): "host",
+    ("agent", "name"): "host",
+    ("server", "hostname"): "host",
+    ("runtime", "host"): "host",
+    ("user", "name"): "user",
+    ("user", "id"): "user",
+    ("process", "name"): "process",
+    ("process", "executable"): "process",
+    ("service", "name"): "app",
+    ("rule", "id"): "rule",
+    ("rule", "name"): "rule",
+    ("url", "original"): "url",
+    ("url", "full"): "url",
+    ("url", "path"): "url",
+    ("request", "id"): "request_id",
+    ("request", "url"): "url",
+    ("request", "uri"): "url",
+    ("http", "client_ip"): "src_ip",
+    ("http", "request", "id"): "request_id",
+    ("http", "request", "url"): "url",
+    ("trace", "id"): "trace_id",
+    ("event", "request_id"): "request_id",
+    ("event", "trace_id"): "trace_id",
+    ("event", "rasp_trace_id"): "trace_id",
+    ("event", "attack_source"): "src_ip",
+    ("event", "server_hostname"): "host",
+    ("event", "server_domain"): "host",
+    ("event", "app_name"): "app",
+    ("event", "application_name"): "app",
+    ("event", "request_message", "url"): "url",
+    ("event", "request_message", "request_id"): "request_id",
+}
+for _alias, _field in _RESPONSE_AGENT_CORRELATION_ALIASES.items():
+    _RESPONSE_AGENT_RAW_CORRELATION_PATHS[(_alias,)] = _field
+    _RESPONSE_AGENT_RAW_CORRELATION_PATHS[("mapped_entities", _alias)] = _field
+_RESPONSE_AGENT_RAW_CORRELATION_PREFIXES = {
+    path[:index]
+    for path in _RESPONSE_AGENT_RAW_CORRELATION_PATHS
+    for index in range(1, len(path))
+}
 
 
 SCHEMA = """
@@ -3682,56 +3742,46 @@ class Repository:
         *,
         max_nodes: int = 10_000,
         _decode_syslog_envelopes: bool = True,
+        _raw_payload: bool = False,
     ) -> dict[str, set[str]]:
-        """Extract only allowlisted correlation values from normalized or raw JSON."""
+        """Extract correlation values without traversing attacker-controlled bodies."""
         result = {field: set() for field in _RESPONSE_AGENT_CORRELATION_FIELDS}
-        stack: list[tuple[Any, str, tuple[str, ...]]] = [(value, "", ())]
+        if _raw_payload:
+            allowed_paths = _RESPONSE_AGENT_RAW_CORRELATION_PATHS
+            allowed_prefixes = _RESPONSE_AGENT_RAW_CORRELATION_PREFIXES
+        else:
+            allowed_paths = {
+                (alias,): field
+                for alias, field in _RESPONSE_AGENT_CORRELATION_ALIASES.items()
+            }
+            allowed_prefixes: set[tuple[str, ...]] = set()
+        stack: list[tuple[Any, tuple[str, ...]]] = [(value, ())]
         visited = 0
         while stack and visited < max(1, int(max_nodes)):
-            item, inherited_field, path = stack.pop()
+            item, path = stack.pop()
             visited += 1
-            if isinstance(item, dict):
-                for key, nested in reversed(list(item.items())):
-                    canonical = cls._response_agent_canonical_field(key)
-                    nested_path = (*path, canonical)[-4:]
-                    candidates = [
-                        canonical,
-                        "_".join(nested_path[-2:]),
-                        "_".join(nested_path[-3:]),
-                    ]
-                    mapped = next(
-                        (
-                            _RESPONSE_AGENT_CORRELATION_ALIASES[candidate]
-                            for candidate in candidates
-                            if candidate in _RESPONSE_AGENT_CORRELATION_ALIASES
-                        ),
-                        "",
-                    )
-                    # A field merely named raw_message is untrusted application
-                    # data. Only the exact server-owned envelope paths below may
-                    # introduce decoded Syslog values into a correlation pivot.
-                    if canonical == "raw_message":
-                        continue
-                    stack.append(
-                        (nested, mapped or inherited_field, nested_path)
-                    )
+            if not isinstance(item, dict):
                 continue
-            if isinstance(item, list):
-                stack.extend(
-                    (nested, inherited_field, path)
-                    for nested in reversed(item[:2_000])
-                )
-                continue
-            if not inherited_field or item in (None, ""):
-                continue
-            rendered = cls._entity_value(item)
-            if (
-                rendered
-                and rendered != "[redacted]"
-                and 2 <= len(rendered) <= 256
-                and len(result[inherited_field]) < 128
-            ):
-                result[inherited_field].add(rendered)
+            for key, nested in reversed(list(item.items())[:2_000]):
+                canonical = cls._response_agent_canonical_field(key)
+                nested_path = (*path, canonical)
+                field = allowed_paths.get(nested_path)
+                if field and not isinstance(nested, (dict, list)):
+                    rendered = cls._entity_value(nested)
+                    if field in {"src_ip", "dst_ip"} and rendered:
+                        try:
+                            rendered = str(ipaddress.ip_address(rendered))
+                        except ValueError:
+                            rendered = ""
+                    if (
+                        rendered
+                        and rendered != "[redacted]"
+                        and 2 <= len(rendered) <= 256
+                        and len(result[field]) < 128
+                    ):
+                        result[field].add(rendered)
+                if nested_path in allowed_prefixes and isinstance(nested, dict):
+                    stack.append((nested, nested_path))
         if _decode_syslog_envelopes and isinstance(value, dict):
             records = cls._response_agent_syslog_records(value)
             decoded_budget = max(1, int(max_nodes) // max(1, len(records)))
@@ -3747,6 +3797,7 @@ class Repository:
                         decoded,
                         max_nodes=decoded_budget,
                         _decode_syslog_envelopes=False,
+                        _raw_payload=True,
                     ),
                 )
         return result
@@ -3882,7 +3933,8 @@ class Repository:
                 self._merge_response_agent_values(
                     values,
                     self._response_agent_collect_values(
-                        json.loads(row["payload_json"])
+                        json.loads(row["payload_json"]),
+                        _raw_payload=True,
                     ),
                 )
         fallback = int(
@@ -3923,22 +3975,17 @@ class Repository:
         if row.get("payload_json"):
             cls._merge_response_agent_values(
                 candidate_values,
-                cls._response_agent_collect_values(json.loads(row["payload_json"])),
+                cls._response_agent_collect_values(
+                    json.loads(row["payload_json"]),
+                    _raw_payload=True,
+                ),
             )
 
         matched: list[dict[str, str]] = []
         anchor_values = scope["values"]
-        anchor_network = (
-            set(anchor_values.get("src_ip") or set())
-            | set(anchor_values.get("dst_ip") or set())
-        )
-        candidate_network = (
-            set(candidate_values.get("src_ip") or set())
-            | set(candidate_values.get("dst_ip") or set())
-        )
-        for value in sorted(anchor_network & candidate_network)[:8]:
-            matched.append({"field": "network_entity", "value": value})
         for field in (
+            "src_ip",
+            "dst_ip",
             "trace_id",
             "request_id",
             "host",
@@ -5072,9 +5119,181 @@ class Repository:
         return descriptor, effective, mapping_gaps
 
     @staticmethod
+    def _response_agent_investigation_facts(payload: Any) -> dict[str, Any]:
+        """Project bounded attack facts without exposing request bodies or headers."""
+        if not isinstance(payload, dict):
+            return {}
+
+        original_log = payload.get("original_log")
+        original_event = (
+            original_log.get("event")
+            if isinstance(original_log, dict)
+            and isinstance(original_log.get("event"), dict)
+            else {}
+        )
+        request = (
+            original_event.get("request_message")
+            if isinstance(original_event.get("request_message"), dict)
+            else {}
+        )
+        original_items = (
+            original_log.get("items")
+            if isinstance(original_log, dict)
+            and isinstance(original_log.get("items"), list)
+            else []
+        )
+        projected_context = payload.get("rasp_items_context")
+        projected_items = (
+            projected_context.get("items")
+            if isinstance(projected_context, dict)
+            and isinstance(projected_context.get("items"), list)
+            else []
+        )
+
+        def bounded(value: Any, limit: int = 512) -> Any:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return value
+            if isinstance(value, str):
+                return value[:limit]
+            return None
+
+        allowed_hook_fields = {
+            "absolute_path": "path",
+            "absolutepath": "path",
+            "class": "class",
+            "class_name": "class",
+            "classname": "class",
+            "file": "file",
+            "file_name": "file",
+            "filename": "file",
+            "hit_evidence": "attack_evidence",
+            "hitevidence": "attack_evidence",
+            "lib": "library",
+            "library": "library",
+            "method": "method",
+            "name": "name",
+            "path": "path",
+            "process": "process",
+            "process_name": "process",
+            "processname": "process",
+            "suffix": "suffix",
+            "url": "url",
+        }
+
+        def project_hook(value: Any) -> dict[str, Any]:
+            if not isinstance(value, dict):
+                return {}
+            projected: dict[str, Any] = {}
+            for key, candidate in value.items():
+                canonical = str(key or "").strip().casefold().replace("-", "_")
+                output_key = allowed_hook_fields.get(canonical)
+                rendered = bounded(candidate)
+                if output_key and rendered is not None and output_key not in projected:
+                    projected[output_key] = rendered
+            return projected
+
+        detections: list[dict[str, Any]] = []
+        for index, raw_item in enumerate(original_items[:8]):
+            if not isinstance(raw_item, dict):
+                continue
+            projected_item = (
+                projected_items[index]
+                if index < len(projected_items)
+                and isinstance(projected_items[index], dict)
+                else {}
+            )
+            detection: dict[str, Any] = {}
+            candidates = {
+                "sequence": (raw_item.get("sequence"), index + 1),
+                "trigger_time": (raw_item.get("trigger_time"),),
+                "rule": (raw_item.get("rule_id"), projected_item.get("rule_id")),
+                "rule_name": (
+                    raw_item.get("rule_name"),
+                    projected_item.get("rule_name"),
+                ),
+                "attack_type": (raw_item.get("attack_type"),),
+                "attack_level": (raw_item.get("attack_level"),),
+                "action": (
+                    raw_item.get("intercept_state"),
+                    raw_item.get("action"),
+                    projected_item.get("action"),
+                ),
+                "dangerous_sink": (
+                    projected_item.get("sink"),
+                    raw_item.get("sink"),
+                ),
+            }
+            for name, values in candidates.items():
+                for candidate in values:
+                    rendered = bounded(candidate)
+                    if rendered not in {None, ""}:
+                        detection[name] = rendered
+                        break
+            hook_evidence = project_hook(raw_item.get("hook_data"))
+            if hook_evidence:
+                detection["hook_evidence"] = hook_evidence
+            if detection:
+                detections.append(detection)
+
+        facts: dict[str, Any] = {}
+        primary_detection = detections[0] if detections else {}
+        sources = {
+            "event_time": (payload.get("event_time"), original_event.get("attack_time")),
+            "source_ip": (
+                payload.get("src_ip"),
+                original_event.get("attack_source"),
+                original_event.get("attacker_ip"),
+            ),
+            "host": (payload.get("host"), original_event.get("server_hostname")),
+            "application": (payload.get("app"), original_event.get("app_name")),
+            "request_id": (payload.get("request_id"), original_event.get("request_id")),
+            "method": (payload.get("method"), request.get("method")),
+            "url": (payload.get("url"), request.get("url")),
+            "rule": (
+                payload.get("rule"),
+                primary_detection.get("rule"),
+                original_event.get("attack_rule_code"),
+            ),
+            "rule_name": (primary_detection.get("rule_name"),),
+            "action": (
+                payload.get("action"),
+                primary_detection.get("action"),
+                original_event.get("intercept_state"),
+            ),
+            "attack_type": (primary_detection.get("attack_type"),),
+            "attack_level": (primary_detection.get("attack_level"),),
+            "dangerous_sink": (
+                payload.get("sink"),
+                primary_detection.get("dangerous_sink"),
+            ),
+            "web_root": (original_event.get("web_path"),),
+        }
+        for name, candidates in sources.items():
+            for candidate in candidates:
+                value = bounded(candidate)
+                if value not in {None, ""}:
+                    facts[name] = value
+                    break
+
+        hook_evidence = (
+            primary_detection.get("hook_evidence")
+            if isinstance(primary_detection.get("hook_evidence"), dict)
+            else project_hook(payload.get("hook_data"))
+        )
+        if hook_evidence:
+            facts["hook_evidence"] = hook_evidence
+        if detections:
+            facts["detections"] = detections
+
+        return facts
+
+    @staticmethod
     def _response_agent_forensic_domains(
         product: str,
         catalog: list[dict[str, Any]],
+        investigation_facts: dict[str, Any] | None = None,
     ) -> list[str]:
         product_name = str(product or "").casefold()
         pointers = " ".join(
@@ -5082,24 +5301,57 @@ class Repository:
             for item in catalog
         )
         domains: set[str] = set()
+        facts = investigation_facts or {}
+        fact_hooks = []
+        if isinstance(facts.get("hook_evidence"), dict):
+            fact_hooks.append(facts["hook_evidence"])
+        fact_hooks.extend(
+            item.get("hook_evidence")
+            for item in facts.get("detections") or []
+            if isinstance(item, dict) and isinstance(item.get("hook_evidence"), dict)
+        )
         if product_name in {"waf", "rasp"} or any(
             token in pointers
             for token in ("request_message", "request_body", "/http", "/url")
         ):
             domains.add("web_request")
-        if product_name in {"rasp", "edr", "hips"} or any(
+        if product_name == "rasp" or any(
             token in pointers
-            for token in ("/host", "/server", "/runtime", "/process")
+            for token in ("/host", "/server", "/runtime", "/stacktrace", "/sink")
         ):
-            domains.update({"server_runtime", "endpoint_process"})
-        if product_name in {"rasp", "edr", "hips"} or any(
+            domains.add("server_runtime")
+        if product_name in {"edr", "hips", "sysmon", "auditd"} or any(
             token in pointers
-            for token in ("/file", "/path", "/hash", "/webroot")
+            for token in ("/process", "/parent", "/command_line", "/module")
+        ):
+            domains.add("endpoint_process")
+        if any(
+            any(key in hook for key in ("process", "class", "method"))
+            for hook in fact_hooks
+        ) and product_name in {"edr", "hips", "sysmon", "auditd"}:
+            domains.add("endpoint_process")
+        if product_name in {"edr", "hips", "fim"} or any(
+            token in pointers
+            for token in (
+                "/hook_data/path",
+                "/hook_data/absolute_path",
+                "/file_path",
+                "/file_name",
+                "/filename",
+                "/file/",
+                "/hash",
+                "/webroot",
+            )
+        ):
+            domains.add("file_integrity")
+        if any(
+            any(key in hook for key in ("path", "file"))
+            for hook in fact_hooks
         ):
             domains.add("file_integrity")
         if product_name in {"waf", "ndr", "siem", "firewall", "ids", "ips"} or any(
             token in pointers
-            for token in ("/src_ip", "/dst_ip", "/network", "/connection")
+            for token in ("/dst_ip", "/network", "/connection", "/flow")
         ):
             domains.add("network_perimeter")
         if product_name in {"siem", "iam", "idp"} or any(
@@ -5107,7 +5359,7 @@ class Repository:
             for token in ("/user", "/account", "/login", "/authentication")
         ):
             domains.add("identity_authentication")
-        if product_name in {"edr", "hips", "rasp"} or any(
+        if any(
             token in pointers
             for token in ("/service", "/cron", "/scheduled", "/autorun", "/startup")
         ):
@@ -5142,6 +5394,7 @@ class Repository:
             capture_diagnostics,
             capture_mapping_gaps,
         ) = cls._response_agent_capture_layers(payload)
+        investigation_facts = cls._response_agent_investigation_facts(payload)
         return {
             "alert_id": str(row.get("alert_id") or ""),
             "event_id": str(row.get("event_id") or ""),
@@ -5180,9 +5433,11 @@ class Repository:
             **syslog_descriptor,
             "capture_diagnostics": capture_diagnostics,
             "capture_mapping_gaps": capture_mapping_gaps,
+            "investigation_facts": investigation_facts,
             "forensic_domains": cls._response_agent_forensic_domains(
                 str(row.get("product") or ""),
                 catalog,
+                investigation_facts,
             ),
             "field_catalog": catalog if include_catalog else [],
         }

@@ -278,6 +278,6 @@ docs/
 - 高影响动作只生成 `approve_required` 建议。
 - 只有 Validator `passed` 的建议可以进入审批队列；仅明确的来源 IP 临时封禁可在策略开启、审批达标和连接器健康时进入受控执行，其他高影响建议仍保持只读。
 - 自动化处置默认关闭，支持影子、手工和自动模式；连接器凭据只从环境变量读取，规则必须经设备核验并在 TTL 到期、Case 关闭或误报确认后回滚。完整契约见 `docs/AUTOMATED_RESPONSE.md`。
-- Response Agent 第一阶段 v4 使用 Case 锁定的只读工具，除冻结证据快照外，还可分段读取脱敏后的完整原始日志，并基于 Case 派生实体关联 WAF、EDR、HIPS 等本地遥测；控制器会验证原始流从 offset 0 连续覆盖、分块与整流哈希，并以 HTTP 方法、查询串、长度和请求字段联合区分明确空载荷与真实采集缺口，最终输出带引用且通过确定性门禁的深度报告。完整架构与迭代路线见 `docs/RESPONSE_AGENT.md`。
+- Response Agent 第一阶段 v7 使用 Case 锁定的只读工具规划 ReAct 调查，分段读取脱敏后的完整原始 Syslog，并按 Case 实体关联 WAF、EDR、HIPS、RASP、NDR 等已入库遥测；最终由 LLM 综合攻击行为、时间线、同源/同目标活动、风险与处置优先级，控制器锁定证据身份、精确缺口、权限和审批边界。完整架构、已知边界与迭代路线见 `docs/RESPONSE_AGENT.md`。
 - 生产模板要求两个不同的服务端认证主体投票；本地 Demo 保持单签。
 - Demo 样本真值只在回环请求带 `X-Defensive-AI-Demo-Sample: 1` 时生效，普通告警不能用请求体自证结论。

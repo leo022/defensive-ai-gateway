@@ -5180,6 +5180,28 @@ button.memory-audit-row:hover {
   padding-left: 12px;
 }
 
+.response-agent-risk-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.response-agent-risk-grid small {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 8px;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.response-agent-risk-grid strong {
+  color: var(--muted);
+  font-size: 9px;
+}
+
 .response-agent-report-list {
   display: grid;
   gap: 12px;
@@ -5239,6 +5261,33 @@ button.memory-audit-row:hover {
   font-size: 11px;
   line-height: 1.55;
   list-style-type: lower-alpha;
+}
+
+.response-agent-technical-appendix {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--surface-subtle);
+}
+
+.response-agent-technical-appendix > summary {
+  cursor: pointer;
+  padding: 10px 12px;
+  color: var(--ink-strong);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.response-agent-technical-appendix-content {
+  display: grid;
+  gap: 14px;
+  border-top: 1px solid var(--line);
+  padding: 12px;
+}
+
+.response-agent-technical-block {
+  display: grid;
+  gap: 6px;
 }
 
 .response-agent-controls {
@@ -5823,5 +5872,9 @@ body.response-agent-open {
 
   .response-agent-report-section-content {
     padding-left: 0;
+  }
+
+  .response-agent-risk-grid {
+    grid-template-columns: 1fr;
   }
 }
