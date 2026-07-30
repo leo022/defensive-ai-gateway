@@ -224,17 +224,66 @@ class Orchestrator:
                 event.timestamp,
                 window_ms=self.CASE_CORRELATION_WINDOW_MS,
             )
-        # alert_received is deliberately persisted before model work, when the
-        # Case is not known yet. Record the explicit relationship as soon as
-        # correlation resolves it so audit retention never relies on trace_id
-        # accidentally being equal to case_id.
-        self.repo.link_audit_trace_to_case(trace_id, case_id)
         agent = build_agent(event.product, self.llm, self.policy)
+        alert_at_ms = self.repo.timestamp_ms(event.timestamp)
+        provisional_analysis = target_case_id is None
+        if provisional_analysis:
+            # Make the alert visible to operators before memory matching or a
+            # remote model call. Case creation, alert linkage and audit binding
+            # commit together so the workbench never exposes a dangling Case.
+            with self.repo.transaction():
+                created = self.repo.ensure_provisional_case(
+                    case_id=case_id,
+                    correlation_key=correlation_key,
+                    product=event.product,
+                    severity=event.severity,
+                    event_type=event.event_type,
+                    alert_at_ms=alert_at_ms,
+                    _commit=False,
+                )
+                self.repo.link_case_alert(
+                    case_id,
+                    alert.alert_id,
+                    event.event_id,
+                    _commit=False,
+                    alert_at_ms=alert_at_ms,
+                )
+                self.repo.link_audit_trace_to_case(
+                    trace_id,
+                    case_id,
+                    _commit=False,
+                )
+                self.repo.insert_audit(
+                    new_id("audit"),
+                    trace_id,
+                    agent.name,
+                    "analysis_started",
+                    {
+                        "case_id": case_id,
+                        "event_id": event.event_id,
+                        "correlation_key": correlation_key,
+                        "resolution": case_resolution,
+                        "provisional_case_created": created,
+                    },
+                    _commit=False,
+                )
+        else:
+            # Replay targets an existing Case and must not replace its current
+            # status with a provisional state.
+            self.repo.link_audit_trace_to_case(trace_id, case_id)
         asset_id = self.memory.asset_id_for(event)
         # Keep governance status current even when operators do not manually run
         # a sweep. Expired memories are therefore never presented as live context.
         self.memory.expire_due()
-        memory_context = self.memory.load_context(event.product, case_id=case_id, asset_id=asset_id)
+        memory_context = self.memory.load_context(
+            event.product,
+            case_id=case_id,
+            asset_id=asset_id,
+            # The current event is already present in ``event.evidence``. Do not
+            # duplicate it in the model prompt merely because it was linked
+            # early for operator visibility.
+            exclude_evidence_event_id=event.event_id if provisional_analysis else None,
+        )
         if replay_metadata:
             # A replaced conclusion must not feed itself back into its corrected
             # run through low-trust case memory or pending candidates.
@@ -278,9 +327,13 @@ class Orchestrator:
             if isinstance(exc, AlertNonRetryableError):
                 # Credentials, endpoint configuration and response-contract
                 # errors need operator intervention and must not fill deferred.
-                self.repo.insert_audit(
-                    new_id("audit"), trace_id, agent.name, "analysis_failed",
-                    {
+                self._record_provisional_analysis_state(
+                    case_id=case_id,
+                    event=event,
+                    trace_id=trace_id,
+                    actor=agent.name,
+                    status="analysis_failed",
+                    detail={
                         "provider": model_runtime.get("provider", "unknown"),
                         "endpoint_host": model_runtime.get("endpoint_host", ""),
                         "error_type": type(exc).__name__,
@@ -295,9 +348,13 @@ class Orchestrator:
                 # The raw alert and normalized event are already durable above;
                 # returning this typed error lets the inbox retry it after the
                 # circuit-breaker window instead of treating it as completed.
-                self.repo.insert_audit(
-                    new_id("audit"), trace_id, agent.name, "analysis_deferred",
-                    {
+                self._record_provisional_analysis_state(
+                    case_id=case_id,
+                    event=event,
+                    trace_id=trace_id,
+                    actor=agent.name,
+                    status="analysis_deferred",
+                    detail={
                         "provider": model_runtime.get("provider", "unknown"),
                         "endpoint_host": model_runtime.get("endpoint_host", ""),
                         "error_type": type(exc).__name__,
@@ -323,10 +380,17 @@ class Orchestrator:
             except Exception as exc2:
                 # Heuristic itself failed: record and re-raise. The ingest
                 # transaction above is already committed, so the raw alert is
-                # preserved for replay even though no case was produced.
-                self.repo.insert_audit(
-                    new_id("audit"), trace_id, agent.name, "analysis_failed",
-                    {"error": str(exc2), "fallback": "local_heuristic_failed"},
+                # preserved for replay and the provisional Case remains visible.
+                self._record_provisional_analysis_state(
+                    case_id=case_id,
+                    event=event,
+                    trace_id=trace_id,
+                    actor=agent.name,
+                    status="analysis_failed",
+                    detail={
+                        "error": str(exc2),
+                        "fallback": "local_heuristic_failed",
+                    },
                 )
                 raise
         result = self.memory_matcher.reconcile(result, memory_evaluation)
@@ -376,10 +440,9 @@ class Orchestrator:
         # record_case_summary opens a nested transaction (no-op commit) and its
         # inner writes use _commit=False, deferring to this outer commit.
         with self.repo.transaction():
-            # Case row must exist before case_alert_links (FK case_id → cases) and
-            # before agent_runs (FK case_id → cases). Linking after analysis is
-            # safe: analysis and memory loading do not depend on the link row.
-            alert_at_ms = self.repo.timestamp_ms(event.timestamp)
+            # Normal intake already created and linked a provisional Case.
+            # Replays still rely on this upsert/link pair for their new event
+            # version, and both operations remain idempotent.
             self.repo.upsert_case(
                 result,
                 event.product,
@@ -491,6 +554,37 @@ class Orchestrator:
                     _commit=False,
                 )
         return result
+
+    def _record_provisional_analysis_state(
+        self,
+        *,
+        case_id: str,
+        event: NormalizedEvent,
+        trace_id: str,
+        actor: str,
+        status: str,
+        detail: dict,
+    ) -> None:
+        """Persist model interruption state and its audit record atomically."""
+        with self.repo.transaction():
+            self.repo.update_provisional_case_status(
+                case_id,
+                status,
+                event.event_type,
+                _commit=False,
+            )
+            self.repo.insert_audit(
+                new_id("audit"),
+                trace_id,
+                actor,
+                status,
+                {
+                    "case_id": case_id,
+                    "event_id": event.event_id,
+                    **detail,
+                },
+                _commit=False,
+            )
 
     def _persist_memory_matches(
         self,

@@ -599,6 +599,29 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(state.repo.get_case(case_id)["status"], "closed")
             self.assertEqual(state.repo.stats()["cases"], 0)
 
+    def test_case_disposition_rejects_incomplete_analysis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            config.database.path = str(Path(tmp) / "gateway.db")
+            state = GatewayState(config)
+            case_id = "case_waf_pending_analysis"
+            state.repo.ensure_provisional_case(
+                case_id=case_id,
+                correlation_key=case_id,
+                product="waf",
+                severity="high",
+                event_type="pending_test",
+                alert_at_ms=1,
+            )
+
+            with self.assertRaisesRegex(ValueError, "analysis is not complete"):
+                state.update_case_disposition(
+                    case_id,
+                    {"status": "closed", "actor": "analyst-lee"},
+                )
+
+            self.assertEqual(state.repo.get_case_status(case_id), "analyzing")
+
     def test_random_sample_generation_is_repeatable_and_varied(self):
         first = generate_alerts(3, product="waf", scenario="random", seed=42)
         second = generate_alerts(3, product="waf", scenario="random", seed=42)

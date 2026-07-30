@@ -87,6 +87,9 @@ _RESPONSE_AGENT_CORRELATION_FIELDS = (
     "rule",
     "url",
 )
+PROVISIONAL_CASE_STATUSES = frozenset(
+    {"analyzing", "analysis_deferred", "analysis_failed"}
+)
 _RESPONSE_AGENT_CORRELATION_WEIGHTS = {
     "trace_id": 8,
     "request_id": 8,
@@ -1635,12 +1638,22 @@ class Repository:
                     ELSE cases.correlation_key
                   END,
                   product = excluded.product,
+                  status = CASE
+                    WHEN cases.status IN ('analyzing', 'analysis_deferred', 'analysis_failed')
+                      THEN excluded.status
+                    ELSE cases.status
+                  END,
                   severity = excluded.severity,
                   classification = excluded.classification,
                   confidence = excluded.confidence,
                   summary = excluded.summary,
                   updated_at_ms = excluded.updated_at_ms,
-                  last_alert_at_ms = MAX(cases.last_alert_at_ms, excluded.last_alert_at_ms)
+                  last_alert_at_ms = MAX(cases.last_alert_at_ms, excluded.last_alert_at_ms),
+                  closed_at_ms = CASE
+                    WHEN cases.status IN ('analyzing', 'analysis_deferred', 'analysis_failed')
+                      THEN NULL
+                    ELSE cases.closed_at_ms
+                  END
                 """,
                 (
                     result.case_id,
@@ -1658,6 +1671,96 @@ class Repository:
             )
             if _commit:
                 self.conn.commit()
+
+    def ensure_provisional_case(
+        self,
+        *,
+        case_id: str,
+        correlation_key: str,
+        product: str,
+        severity: str,
+        event_type: str,
+        alert_at_ms: int,
+        _commit: bool = True,
+    ) -> bool:
+        """Make a normalized alert visible before remote analysis completes.
+
+        Retries may move only machine-owned provisional states back to
+        ``analyzing``. Existing analyst-controlled or completed Case state is
+        never overwritten.
+        """
+        with self._lock:
+            created_at = now_ms()
+            summary = f"告警已接收，AI 研判进行中 · {event_type}"
+            cur = self.conn.execute(
+                """
+                INSERT OR IGNORE INTO cases
+                (case_id, correlation_key, product, status, severity, classification,
+                 confidence, summary, created_at_ms, updated_at_ms, last_alert_at_ms, closed_at_ms)
+                VALUES (?, ?, ?, 'analyzing', ?, 'pending_analysis', 0, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    case_id,
+                    correlation_key,
+                    product,
+                    severity,
+                    summary,
+                    created_at,
+                    created_at,
+                    alert_at_ms,
+                ),
+            )
+            created = cur.rowcount > 0
+            if not created:
+                self.conn.execute(
+                    """
+                    UPDATE cases
+                    SET status = 'analyzing',
+                        severity = ?,
+                        classification = 'pending_analysis',
+                        confidence = 0,
+                        summary = ?,
+                        updated_at_ms = ?,
+                        last_alert_at_ms = MAX(last_alert_at_ms, ?),
+                        closed_at_ms = NULL
+                    WHERE case_id = ?
+                      AND status IN ('analyzing', 'analysis_deferred', 'analysis_failed')
+                    """,
+                    (severity, summary, created_at, alert_at_ms, case_id),
+                )
+            if _commit:
+                self.conn.commit()
+            return created
+
+    def update_provisional_case_status(
+        self,
+        case_id: str,
+        status: str,
+        event_type: str,
+        _commit: bool = True,
+    ) -> bool:
+        """Transition only a still-provisional Case to another machine state."""
+        if status not in PROVISIONAL_CASE_STATUSES:
+            raise ValueError(f"unsupported provisional Case status: {status}")
+        summaries = {
+            "analyzing": f"告警已接收，AI 研判进行中 · {event_type}",
+            "analysis_deferred": f"远程模型暂不可用，告警等待自动重试 · {event_type}",
+            "analysis_failed": f"AI 研判失败，告警证据已保留 · {event_type}",
+        }
+        with self._lock:
+            cur = self.conn.execute(
+                """
+                UPDATE cases
+                SET status = ?, classification = 'pending_analysis', confidence = 0,
+                    summary = ?, updated_at_ms = ?, closed_at_ms = NULL
+                WHERE case_id = ?
+                  AND status IN ('analyzing', 'analysis_deferred', 'analysis_failed')
+                """,
+                (status, summaries[status], now_ms(), case_id),
+            )
+            if _commit:
+                self.conn.commit()
+            return cur.rowcount > 0
 
     def insert_agent_run(
         self, run_id: str, result: AgentResult, product: str, prompt_version: str, event_id: str, _commit: bool = True
@@ -6699,18 +6802,24 @@ class Repository:
             ).fetchone()
             return int(row["count"])
 
-    def load_evidence_refs(self, case_id: str) -> list[dict[str, Any]]:
+    def load_evidence_refs(
+        self,
+        case_id: str,
+        exclude_event_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Immutable evidence store: read-only, already-desensitized refs from normalized events."""
         with self._lock:
+            excluded = str(exclude_event_id or "")
             rows = self.conn.execute(
                 """
                 SELECT ne.event_id, ne.product, ne.evidence_json, ne.sensitivity_tags_json
                 FROM case_alert_links l
                 JOIN normalized_events ne ON ne.event_id = l.event_id
                 WHERE l.case_id = ?
+                  AND (? = '' OR ne.event_id != ?)
                 ORDER BY l.created_at_ms ASC
                 """,
-                (case_id,),
+                (case_id, excluded, excluded),
             ).fetchall()
             refs: list[dict[str, Any]] = []
             for row in rows:
@@ -7214,6 +7323,14 @@ class Repository:
             result["memory_matches"] = self.list_memory_matches(case_id=case_id, limit=200)
             result["linked_alerts"] = self._linked_alerts_locked(case_id)
             return result
+
+    def get_case_status(self, case_id: str) -> str | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT status FROM cases WHERE case_id = ?",
+                (case_id,),
+            ).fetchone()
+            return str(row["status"]) if row else None
 
     def get_case_triage(self, case_id: str) -> dict[str, Any] | None:
         """Load the bounded Case workbench graph without deserializing raw evidence."""

@@ -151,6 +151,7 @@ class MemoryManager:
         case_id: str | None = None,
         asset_id: str | None = None,
         limit: int = 5,
+        exclude_evidence_event_id: str | None = None,
     ) -> dict[str, Any]:
         """Load structured multi-layer memory for an analysis run."""
         context: dict[str, Any] = {
@@ -164,7 +165,10 @@ class MemoryManager:
             context["case_short_term"] = self.repo.query_memory(
                 layer=LAYER_CASE_SHORT_TERM, namespace=self.case_namespace(case_id), limit=limit
             )
-            context["evidence_refs"] = self.load_evidence(case_id)
+            context["evidence_refs"] = self.load_evidence(
+                case_id,
+                exclude_event_id=exclude_evidence_event_id,
+            )
         context["product_long_term"] = self._load_product_long_term(product, limit)
         if asset_id:
             context["asset_profile"] = self.repo.query_memory(
@@ -200,9 +204,16 @@ class MemoryManager:
         """Load a broad, governed candidate pool for the independent matcher."""
         return self.repo.query_matchable_product_memory(product, now_ms(), limit=limit)
 
-    def load_evidence(self, case_id: str) -> list[dict[str, Any]]:
+    def load_evidence(
+        self,
+        case_id: str,
+        exclude_event_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Read-only immutable evidence store: desensitized refs only, never writable by agents."""
-        return self.repo.load_evidence_refs(case_id)
+        return self.repo.load_evidence_refs(
+            case_id,
+            exclude_event_id=exclude_event_id,
+        )
 
     # ---- recording ----------------------------------------------------
 

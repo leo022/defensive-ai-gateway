@@ -461,10 +461,20 @@ const STRINGS = {
     clusterMemoryWriteHint: "一次确认将批量处置该组告警，并只写入代表性长期记忆；不同规则、路径或行为不会被合并。",
     caseDisposition: "Case 处置",
     caseStatusOpen: "待处置",
+    caseStatusAnalyzing: "研判中",
+    caseStatusAnalysisDeferred: "等待模型",
+    caseStatusAnalysisFailed: "研判失败",
     caseStatusUnderReview: "人工复核",
     caseStatusConfirmedAttack: "确认攻击",
     caseStatusFalsePositive: "业务误报",
     caseStatusClosed: "已关闭",
+    classificationPendingAnalysis: "待研判",
+    caseAnalyzingSummary: "告警已接收，AI 正在研判",
+    caseAnalysisDeferredSummary: "远程模型暂不可用，告警等待自动重试",
+    caseAnalysisFailedSummary: "AI 研判失败，告警证据已保留",
+    caseAnalyzingHint: "AI 正在分析，完成后将自动更新研判结论。",
+    caseAnalysisDeferredHint: "远程模型暂不可用，系统将在模型恢复后自动重试。",
+    caseAnalysisFailedHint: "模型配置或响应异常；告警与证据已完整保留。",
     markAttack: "确认攻击",
     escalateReview: "升级复核",
     closeCase: "关闭",
@@ -1051,10 +1061,20 @@ const STRINGS = {
     clusterMemoryWriteHint: "One confirmation disposes the group and writes one representative memory. Different rules, routes, or behaviors remain separate.",
     caseDisposition: "Case disposition",
     caseStatusOpen: "Open",
+    caseStatusAnalyzing: "Analyzing",
+    caseStatusAnalysisDeferred: "Waiting for model",
+    caseStatusAnalysisFailed: "Analysis failed",
     caseStatusUnderReview: "Under review",
     caseStatusConfirmedAttack: "Confirmed attack",
     caseStatusFalsePositive: "Business false positive",
     caseStatusClosed: "Closed",
+    classificationPendingAnalysis: "Pending analysis",
+    caseAnalyzingSummary: "Alert received; AI analysis is in progress",
+    caseAnalysisDeferredSummary: "Remote model unavailable; automatic retry pending",
+    caseAnalysisFailedSummary: "AI analysis failed; alert evidence was retained",
+    caseAnalyzingHint: "AI analysis is in progress. The judgment will update automatically.",
+    caseAnalysisDeferredHint: "The remote model is unavailable. Analysis will retry after recovery.",
+    caseAnalysisFailedHint: "The model configuration or response failed; alert evidence was retained.",
     markAttack: "Confirm attack",
     escalateReview: "Escalate",
     closeCase: "Close",
@@ -2381,7 +2401,12 @@ function renderDashboard(health, caseSummary, llmConfig, syslogPayload) {
     .map(([product, count]) => [product.toUpperCase(), count]);
   const classificationRows = distributionRows(caseSummary?.classifications);
   renderDistribution("#product-distribution", productRows, totalCases);
-  renderDistribution("#classification-distribution", classificationRows, totalCases, (value) => value.replaceAll("_", " "));
+  renderDistribution(
+    "#classification-distribution",
+    classificationRows,
+    totalCases,
+    (value) => classificationLabel(value).replaceAll("_", " "),
+  );
   renderHealth(buildHealthItems(health, llmConfig, syslogPayload));
   renderIntakeHealth(syslogPayload);
   const lastRefresh = document.querySelector("#last-refresh");
@@ -2466,12 +2491,35 @@ function actionStageLabel(stage) {
 function caseStatusLabel(status) {
   const key = {
     open: "caseStatusOpen",
+    analyzing: "caseStatusAnalyzing",
+    analysis_deferred: "caseStatusAnalysisDeferred",
+    analysis_failed: "caseStatusAnalysisFailed",
     under_review: "caseStatusUnderReview",
     confirmed_attack: "caseStatusConfirmedAttack",
     false_positive: "caseStatusFalsePositive",
     closed: "caseStatusClosed",
   }[status || "open"];
   return key ? tr(key) : text(status || "open");
+}
+
+function isProvisionalCaseStatus(status) {
+  return ["analyzing", "analysis_deferred", "analysis_failed"].includes(text(status).toLowerCase());
+}
+
+function caseAnalysisStateText(status, compact = false) {
+  const value = text(status).toLowerCase();
+  const key = {
+    analyzing: compact ? "caseAnalyzingSummary" : "caseAnalyzingHint",
+    analysis_deferred: compact ? "caseAnalysisDeferredSummary" : "caseAnalysisDeferredHint",
+    analysis_failed: compact ? "caseAnalysisFailedSummary" : "caseAnalysisFailedHint",
+  }[value];
+  return key ? tr(key) : "";
+}
+
+function classificationLabel(classification) {
+  return text(classification).toLowerCase() === "pending_analysis"
+    ? tr("classificationPendingAnalysis")
+    : text(classification);
 }
 
 function caseStatusClass(status) {
@@ -2498,6 +2546,17 @@ function caseDispositionControls(detail) {
   const status = detail.status || "open";
   const actions = dispositionActions(status);
   const allowed = hasAnyRole("analyst");
+  if (isProvisionalCaseStatus(status)) {
+    return `
+      <div class="case-disposition">
+        <div class="case-disposition-head">
+          <span>${escapeHtml(tr("caseDisposition"))}</span>
+          <strong class="case-status ${escapeHtml(caseStatusClass(status))}">${escapeHtml(caseStatusLabel(status))}</strong>
+        </div>
+        <p class="case-disposition-status">${escapeHtml(caseAnalysisStateText(status))}</p>
+      </div>
+    `;
+  }
   return `
     <div class="case-disposition">
       <div class="case-disposition-head">
@@ -2945,7 +3004,7 @@ function renderDetail(detail) {
         <div class="case-context-grid">
           <div>
             <span>${escapeHtml(tr("classification"))}</span>
-            <strong>${escapeHtml(detail.classification)}</strong>
+            <strong>${escapeHtml(classificationLabel(detail.classification))}</strong>
           </div>
           <div>
             <span>${escapeHtml(tr("triageAlertVolume"))}</span>
@@ -2965,7 +3024,11 @@ function renderDetail(detail) {
         <div class="section-title">
           <h3>${escapeHtml(tr("aiAnalysis"))}</h3>
         </div>
-        ${explanationBlock(latestRun.explanation)}
+        ${
+          isProvisionalCaseStatus(detail.status)
+            ? `<p class="analysis-state-message">${escapeHtml(caseAnalysisStateText(detail.status))}</p>`
+            : explanationBlock(latestRun.explanation)
+        }
       </section>
 
       ${linkedAlertsBlock(linked, detail.alert_clusters || [])}
@@ -3116,6 +3179,9 @@ const RASP_RISK_LABELS = [
 ];
 
 function caseFocusSummary(item = {}) {
+  if (isProvisionalCaseStatus(item.status)) {
+    return caseAnalysisStateText(item.status, true);
+  }
   const summary = text(item.summary).trim();
   if (!summary) return text(item.case_id);
   if (text(item.product).toLowerCase() === "rasp" && /关键实体：|核心依据：|业务影响：/.test(summary)) {

@@ -292,6 +292,38 @@ class RemoteLLMDeferralTest(unittest.TestCase):
                 "LLM gateway endpoint requires a WebSocket/Realtime protocol"
             )
 
+    class _BlockingRemoteLLM(LLMClient):
+        def __init__(self):
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.context: dict | None = None
+
+        @property
+        def runtime_metadata(self) -> dict:
+            return {
+                "provider": "gateway",
+                "model": "remote-test",
+                "endpoint_host": "llm-gateway.example",
+            }
+
+        def analyze(self, prompt: str, context: dict) -> dict:
+            self.context = context
+            self.started.set()
+            if not self.release.wait(2):
+                raise RuntimeError("test did not release blocking model")
+            return {
+                "classification": "suspicious",
+                "confidence": 0.84,
+                "verdict": "【需人工复核】- 阻塞模型完成研判",
+                "reason": "研判结论：【需人工复核】- 阻塞模型完成研判\n分析报告：证据待复核。",
+                "analysis_dimensions": [
+                    {"title": "证据", "status": "review", "evidence": "告警证据已保留"}
+                ],
+                "recommended_next_steps": [],
+                "missing_evidence": [],
+                "business_impact": "待人工复核",
+            }
+
     @staticmethod
     def _wait_until(predicate, timeout: float = 2.0) -> bool:
         deadline = time.monotonic() + timeout
@@ -300,6 +332,114 @@ class RemoteLLMDeferralTest(unittest.TestCase):
                 return True
             time.sleep(0.02)
         return bool(predicate())
+
+    def test_normalized_alert_is_visible_while_remote_analysis_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            repo = Repository(str(Path(tmp) / "gateway.db"))
+            policy = PolicyEngine(config.policy)
+            llm = self._BlockingRemoteLLM()
+            orchestrator = Orchestrator(
+                repo,
+                EventNormalizer(policy),
+                MemoryManager(repo, policy),
+                llm,
+                policy,
+            )
+            outcome: dict = {}
+            alert = _alert("remote-in-progress-001")
+
+            def run_analysis() -> None:
+                try:
+                    outcome["result"] = orchestrator.handle_alert(alert)
+                except Exception as exc:  # pragma: no cover - asserted below
+                    outcome["error"] = exc
+
+            started_at = time.monotonic()
+            worker = threading.Thread(target=run_analysis)
+            worker.start()
+            try:
+                self.assertTrue(llm.started.wait(1))
+                provisional = repo.conn.execute(
+                    """
+                    SELECT c.*, l.alert_id, l.event_id
+                    FROM cases c
+                    JOIN case_alert_links l ON l.case_id = c.case_id
+                    WHERE l.alert_id = ?
+                    """,
+                    (alert.alert_id,),
+                ).fetchone()
+                self.assertIsNotNone(provisional)
+                self.assertLess(time.monotonic() - started_at, 1)
+                self.assertEqual(provisional["status"], "analyzing")
+                self.assertEqual(provisional["classification"], "pending_analysis")
+                self.assertEqual(provisional["confidence"], 0)
+                self.assertEqual(
+                    repo.conn.execute(
+                        "SELECT COUNT(*) FROM audit_log WHERE action = 'analysis_started'"
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertEqual(llm.context["memory"]["evidence_refs"], [])
+            finally:
+                llm.release.set()
+                worker.join(2)
+
+            self.assertFalse(worker.is_alive())
+            self.assertNotIn("error", outcome)
+            result = outcome["result"]
+            completed = repo.get_case(result.case_id)
+            self.assertEqual(completed["status"], "open")
+            self.assertEqual(completed["classification"], "suspicious")
+            self.assertEqual(len(completed["linked_alerts"]), 1)
+            self.assertEqual(len(completed["agent_runs"]), 1)
+
+    def test_new_alert_does_not_overwrite_existing_case_disposition_while_analyzing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            repo = Repository(str(Path(tmp) / "gateway.db"))
+            policy = PolicyEngine(config.policy)
+            orchestrator = Orchestrator(
+                repo,
+                EventNormalizer(policy),
+                MemoryManager(repo, policy),
+                self._RecoveredRemoteLLM(),
+                policy,
+            )
+            first = orchestrator.handle_alert(_alert("remote-correlated-001"))
+            repo.update_case_status(first.case_id, "under_review")
+
+            llm = self._BlockingRemoteLLM()
+            orchestrator.llm = llm
+            outcome: dict = {}
+
+            def run_analysis() -> None:
+                try:
+                    outcome["result"] = orchestrator.handle_alert(
+                        _alert("remote-correlated-002")
+                    )
+                except Exception as exc:  # pragma: no cover - asserted below
+                    outcome["error"] = exc
+
+            worker = threading.Thread(target=run_analysis)
+            worker.start()
+            try:
+                self.assertTrue(llm.started.wait(1))
+                in_progress = repo.get_case(first.case_id)
+                self.assertEqual(in_progress["status"], "under_review")
+                self.assertEqual(in_progress["classification"], "suspicious")
+                self.assertEqual(len(in_progress["linked_alerts"]), 2)
+                self.assertEqual(len(in_progress["agent_runs"]), 1)
+            finally:
+                llm.release.set()
+                worker.join(2)
+
+            self.assertFalse(worker.is_alive())
+            self.assertNotIn("error", outcome)
+            completed = repo.get_case(first.case_id)
+            self.assertEqual(completed["status"], "under_review")
+            self.assertEqual(len(completed["linked_alerts"]), 2)
+            self.assertEqual(len(completed["agent_runs"]), 2)
 
     def test_remote_model_failure_is_durable_and_does_not_use_local_heuristic(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -336,6 +476,17 @@ class RemoteLLMDeferralTest(unittest.TestCase):
             self.assertEqual(run_count, 0)
             self.assertIsNotNone(audit)
             self.assertIn('"provider": "gateway"', audit["detail_json"])
+            provisional = repo.conn.execute(
+                """
+                SELECT c.* FROM cases c
+                JOIN case_alert_links l ON l.case_id = c.case_id
+                WHERE l.alert_id = ?
+                """,
+                ("remote-deferred-001",),
+            ).fetchone()
+            self.assertIsNotNone(provisional)
+            self.assertEqual(provisional["status"], "analysis_deferred")
+            self.assertEqual(provisional["classification"], "pending_analysis")
 
     def test_websocket_endpoint_error_is_terminal_and_not_durably_retried(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -363,6 +514,16 @@ class RemoteLLMDeferralTest(unittest.TestCase):
             self.assertEqual(deferred, 0)
             self.assertIsNotNone(failed)
             self.assertIn('"fallback": "not_used"', failed["detail_json"])
+            provisional = repo.conn.execute(
+                """
+                SELECT c.status, c.classification FROM cases c
+                JOIN case_alert_links l ON l.case_id = c.case_id
+                WHERE l.alert_id = ?
+                """,
+                ("websocket-config-001",),
+            ).fetchone()
+            self.assertEqual(provisional["status"], "analysis_failed")
+            self.assertEqual(provisional["classification"], "pending_analysis")
 
     def test_async_terminal_remote_error_enters_durable_dlq_once(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -427,6 +588,16 @@ class RemoteLLMDeferralTest(unittest.TestCase):
                 deferred = state.repo.get_inbox_alert(alert.alert_id)
                 self.assertIsNotNone(deferred)
                 self.assertEqual(deferred["attempts"], 0)
+                provisional = state.repo.conn.execute(
+                    """
+                    SELECT c.case_id, c.status FROM cases c
+                    JOIN case_alert_links l ON l.case_id = c.case_id
+                    WHERE l.alert_id = ?
+                    """,
+                    (alert.alert_id,),
+                ).fetchone()
+                self.assertEqual(provisional["status"], "analysis_deferred")
+                provisional_case_id = provisional["case_id"]
                 self.assertEqual(state.processing_stats()["llm_deferred"]["deferred"], 1)
                 self.assertEqual(
                     state.repo.release_llm_deferred_alerts(limit=10, force=False)["released"],
@@ -456,6 +627,9 @@ class RemoteLLMDeferralTest(unittest.TestCase):
                     ).fetchone()["count"],
                     1,
                 )
+                completed = state.repo.get_case(provisional_case_id)
+                self.assertEqual(completed["status"], "open")
+                self.assertEqual(len(completed["linked_alerts"]), 1)
                 self.assertEqual(
                     state.release_llm_deferred_alerts(limit=10, actor="test-analyst")["released"],
                     0,

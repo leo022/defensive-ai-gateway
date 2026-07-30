@@ -1051,6 +1051,24 @@ main {
   color: var(--warning);
 }
 
+.case-status.analyzing {
+  border-color: var(--brand-line);
+  background: var(--brand-bg);
+  color: var(--brand-strong);
+}
+
+.case-status.analysis-deferred {
+  border-color: var(--warning-line);
+  background: var(--warning-bg);
+  color: var(--warning);
+}
+
+.case-status.analysis-failed {
+  border-color: var(--risk-line);
+  background: var(--risk-bg);
+  color: var(--risk);
+}
+
 .case-status.confirmed-attack {
   border-color: var(--risk-line);
   background: var(--risk-bg);
@@ -1473,6 +1491,16 @@ h4 {
   min-height: 18px;
   color: var(--muted);
   font-size: 12px;
+}
+
+.analysis-state-message {
+  margin: 0;
+  border-left: 3px solid var(--brand-line);
+  background: var(--surface-2);
+  color: var(--muted);
+  padding: 12px;
+  font-size: 13px;
+  line-height: 1.55;
 }
 
 .validation-gate,

@@ -124,6 +124,18 @@ class DeferredLlmReplayRenderingTest(unittest.TestCase):
         self.assertEqual(JS.count("deferredAlertsReleased:"), 2)
         self.assertEqual(JS.count("deferredAlertsNeedRemoteModel:"), 2)
 
+    def test_provisional_case_states_are_explicit_and_not_disposable(self):
+        self.assertEqual(JS.count("caseStatusAnalyzing:"), 2)
+        self.assertEqual(JS.count("caseStatusAnalysisDeferred:"), 2)
+        self.assertEqual(JS.count("caseStatusAnalysisFailed:"), 2)
+        self.assertIn("function isProvisionalCaseStatus", JS)
+        self.assertIn("function caseAnalysisStateText", JS)
+        self.assertIn("if (isProvisionalCaseStatus(status))", JS)
+        self.assertIn("classificationPendingAnalysis", JS)
+        self.assertIn(".case-status.analyzing", CSS)
+        self.assertIn(".case-status.analysis-deferred", CSS)
+        self.assertIn(".case-status.analysis-failed", CSS)
+
 
 class GatewayModelDefaultRenderingTest(unittest.TestCase):
     def test_gateway_form_defaults_use_the_supported_http_responses_api(self):

@@ -21,7 +21,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from .config import GatewayConfig, LLMConfig, load_config
 from .case_response import CaseResponseService
-from .database import AlertIdentityConflict, Repository
+from .database import AlertIdentityConflict, PROVISIONAL_CASE_STATUSES, Repository
 from .json_safety import loads_bounded_json
 from .log_adapter import (
     AUTO_PROFILE,
@@ -2775,9 +2775,12 @@ class GatewayState:
         reason = str(body.get("reason") or "").strip()
         with self.lock:
             with self.repo.transaction():
-                updated = self.repo.update_case_status(case_id, status, _commit=False)
-                if not updated:
+                current_status = self.repo.get_case_status(case_id)
+                if current_status is None:
                     return None
+                if current_status in PROVISIONAL_CASE_STATUSES:
+                    raise ValueError("case analysis is not complete")
+                updated = self.repo.update_case_status(case_id, status, _commit=False)
                 self.repo.insert_audit(
                     new_id("audit"),
                     case_id,
