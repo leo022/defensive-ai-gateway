@@ -4277,6 +4277,7 @@ async function sweepMemory() {
 function setView(name) {
   const target = document.querySelector(`#${name}-view`);
   if (!target) return;
+  document.body.dataset.activeView = name;
   const navigationView = name === "triage"
     ? "dashboard"
     : name === "memory-associations"

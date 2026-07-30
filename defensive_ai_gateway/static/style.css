@@ -945,8 +945,15 @@ main {
 
 .triage-page-content {
   width: min(1120px, 100%);
+  min-width: 0;
   margin-right: auto;
   margin-left: auto;
+}
+
+.triage-page-header > div,
+.case-detail-heading > div,
+.section-title > * {
+  min-width: 0;
 }
 
 .case-item {
@@ -5430,7 +5437,6 @@ body.response-agent-open {
 
   .header-actions,
   .dashboard-controls,
-  .primary-nav,
   .sidebar-footer,
   .form-actions,
   .memory-browser-panel .panel-heading,
@@ -5480,6 +5486,54 @@ body.response-agent-open {
 
   .nav-subbutton {
     width: 100%;
+  }
+
+  .primary-nav {
+    display: flex;
+    width: 100%;
+    min-width: 0;
+    align-items: center;
+    gap: 6px;
+    overflow-x: auto;
+    padding-top: 10px;
+    padding-bottom: 4px;
+    scroll-snap-type: x proximity;
+    scrollbar-width: thin;
+  }
+
+  .primary-nav > .nav-button,
+  .primary-nav > .nav-group {
+    flex: 0 0 auto;
+  }
+
+  .nav-group {
+    display: flex;
+    width: auto;
+    align-items: center;
+    gap: 3px;
+  }
+
+  .nav-group:not(.active) .nav-submenu {
+    display: none;
+  }
+
+  .nav-group.active .nav-submenu {
+    display: flex;
+    grid-template-columns: none;
+    gap: 3px;
+    margin: 0;
+    padding: 0;
+    border-left: 0;
+  }
+
+  .primary-nav .nav-button,
+  .primary-nav .nav-subbutton {
+    width: auto;
+    min-height: 40px;
+    flex: 0 0 auto;
+    padding-inline: 11px;
+    scroll-snap-align: start;
+    white-space: nowrap;
   }
 
   .syslog-deployment-targets {
@@ -5666,11 +5720,17 @@ body.response-agent-open {
   }
 
   .case-detail-heading {
+    align-items: stretch;
+    flex-direction: column;
     gap: 10px;
   }
 
   .case-context-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .case-context-grid > div:last-child {
+    grid-column: 1 / -1;
   }
 
   .triage-page-header,
@@ -5682,6 +5742,126 @@ body.response-agent-open {
   .triage-back,
   .case-details-back {
     width: 100%;
+  }
+
+  body[data-active-view="triage"] .workspace-header {
+    min-height: 0;
+    padding-top: 10px;
+    padding-bottom: 10px;
+  }
+
+  body[data-active-view="triage"] .workspace-header > div:first-child {
+    display: none;
+  }
+
+  body[data-active-view="triage"] .header-actions {
+    width: 100%;
+  }
+
+  .triage-page-header {
+    gap: 10px;
+    margin-bottom: 10px;
+    padding: 12px;
+  }
+
+  .triage-page-header h2 {
+    font-size: 18px;
+  }
+
+  .triage-page-header p {
+    font-size: 12px;
+  }
+
+  .triage-back {
+    width: fit-content;
+    min-height: 40px;
+    align-self: flex-start;
+  }
+
+  .case-detail-overview,
+  .detail-card {
+    padding: 12px;
+  }
+
+  .case-detail-heading h3 {
+    display: block;
+    overflow: visible;
+    font-size: 15px;
+    overflow-wrap: anywhere;
+    -webkit-line-clamp: unset;
+  }
+
+  .case-detail-confidence {
+    display: inline-flex;
+    width: fit-content;
+    min-width: 0;
+    align-items: baseline;
+    align-self: flex-start;
+    gap: 7px;
+    text-align: left;
+  }
+
+  .case-disposition-actions,
+  .approval-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
+  }
+
+  .case-disposition-actions > :last-child:nth-child(odd),
+  .approval-actions > :last-child:nth-child(odd) {
+    grid-column: 1 / -1;
+  }
+
+  .case-disposition-button,
+  .approval-decision,
+  .review-button,
+  .validation-review-continue {
+    width: 100%;
+    min-height: 44px;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .approval-current-head {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .approval-history summary {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    align-items: start;
+    gap: 4px;
+  }
+
+  .prompt-injection-clues-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .prompt-injection-clue dl > div {
+    grid-template-columns: 1fr;
+    gap: 3px;
+  }
+
+  .validation-gate .plain-list li {
+    overflow-wrap: anywhere;
+  }
+
+  .linked-alerts-card > .section-title,
+  .linked-alert-item > .section-title {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .linked-alert-item > .section-title .case-status {
+    align-self: flex-start;
+  }
+
+  .dimension-list li {
+    grid-template-columns: minmax(70px, auto) minmax(0, 1fr);
   }
 
   .detail-link-card {

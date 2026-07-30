@@ -296,6 +296,34 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertEqual(JS.count("footer:"), 2)
         self.assertIn('data-i18n="footer"', HTML)
 
+    def test_triage_mobile_layout_compacts_navigation_and_prevents_control_overflow(self):
+        set_view = JS.split("function setView(name)", 1)[1].split(
+            "function updateTriageBackLabel", 1
+        )[0]
+        self.assertIn("document.body.dataset.activeView = name", set_view)
+
+        mobile = CSS.split("@media (max-width: 720px)", 1)[1].split(
+            "@media (max-width: 900px)", 1
+        )[0]
+        for rule in (
+            ".nav-group:not(.active) .nav-submenu",
+            "overflow-x: auto;",
+            "min-width: 0;",
+            'body[data-active-view="triage"] .workspace-header > div:first-child',
+            ".case-detail-heading h3",
+            "overflow-wrap: anywhere;",
+            ".case-disposition-actions,",
+            ".approval-actions",
+            "grid-template-columns: repeat(2, minmax(0, 1fr));",
+            "min-height: 44px;",
+            ".prompt-injection-clue dl > div",
+            ".validation-gate .plain-list li",
+            ".linked-alert-item > .section-title",
+        ):
+            with self.subTest(rule=rule):
+                self.assertIn(rule, mobile)
+        self.assertIn("width: fit-content;", mobile)
+
     def test_response_workbench_keeps_secrets_out_of_forms_and_separates_roles(self):
         self.assertIn('id="automation-view"', HTML)
         self.assertIn('id="automation-pagination"', HTML)
