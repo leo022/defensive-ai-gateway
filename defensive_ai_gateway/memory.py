@@ -442,6 +442,16 @@ class MemoryManager:
         if not product:
             raise ValueError("alert product is missing")
         features = self.extract_false_positive_features(linked_alert)
+        identity_fields = [
+            field_name
+            for field_name in ("event_type", "rule_id")
+            if features.get(field_name)
+        ]
+        behavior_boundaries = [
+            field_name
+            for field_name in ("method", "uri", "process_name", "sink", "user_agent")
+            if features.get(field_name)
+        ]
         content = json.dumps(
             {
                 "classification": "benign",
@@ -458,10 +468,11 @@ class MemoryManager:
                 "similarity_features": features["similarity_features"],
                 "alert_cluster": cluster or None,
                 "match_policy": {
-                    "must_match_any": ["product", "event_type", "rule_id"],
+                    "must_match_all": identity_fields,
+                    "behavior_boundaries": behavior_boundaries,
                     "high_similarity_threshold": 0.78,
                     "effect_mode": "downgrade_to_benign",
-                    "effect": "降低同类型告警置信度；高度相似时优先判定为误报并保留人工复核边界",
+                    "effect": "仅在身份字段一致且方法、URI、进程、危险调用或客户端边界无冲突时，才以高度相似记忆辅助误报判断",
                 },
             },
             ensure_ascii=False,
@@ -558,6 +569,7 @@ class MemoryManager:
             "parameter_keys": self._parameter_keys(features.get("matched_parameters")),
             "process_name": str(features.get("process_name") or "").lower(),
             "parent_process": str(features.get("parent_process") or "").lower(),
+            "sink": str(features.get("sink") or "").lower(),
             "signature_status": str(features.get("signature_status") or "").lower(),
             "sni": str(features.get("sni") or "").lower(),
             "protocol": str(features.get("protocol") or "").lower(),
@@ -647,6 +659,19 @@ class MemoryManager:
         normalized = linked_alert.get("normalized_event") or {}
         payload = raw.get("payload") or {}
         entities = normalized.get("entities") or {}
+        normalized_evidence = normalized.get("evidence") or []
+
+        def first_evidence_value(evidence_type: str) -> Any:
+            for item in normalized_evidence:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("type") or "").strip().lower() != evidence_type:
+                    continue
+                value = item.get("value")
+                if value not in (None, "", [], {}):
+                    return value
+            return None
+
         product = str(raw.get("product") or normalized.get("product") or "").lower()
         event_type = str(raw.get("event_type") or normalized.get("event_type") or "")
         feature_map = {
@@ -665,6 +690,7 @@ class MemoryManager:
             "matched_parameters": payload.get("matched_parameters"),
             "process_name": payload.get("process_name"),
             "parent_process": payload.get("parent_process"),
+            "sink": payload.get("sink") or first_evidence_value("sink"),
             "signature_status": payload.get("signature_status"),
             "sni": payload.get("sni"),
             "protocol": payload.get("protocol"),
@@ -674,7 +700,10 @@ class MemoryManager:
         }
         stable_text = json.dumps(feature_map, ensure_ascii=False, sort_keys=True)
         similarity_features = sorted(self._extract_similarity_features(stable_text))
-        for key in ["rule_id", "event_type", "app", "host", "uri", "route", "user_agent", "process_name", "parent_process", "sni", "protocol"]:
+        for key in [
+            "rule_id", "event_type", "app", "host", "uri", "route", "method",
+            "user_agent", "process_name", "parent_process", "sink", "sni", "protocol",
+        ]:
             value = feature_map.get(key)
             if isinstance(value, str) and value:
                 similarity_features.append(value.lower())

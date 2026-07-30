@@ -76,6 +76,72 @@ def _memory(
     }
 
 
+def _rasp_read_file_memory() -> dict:
+    content = {
+        "classification": "benign",
+        "false_positive_candidate": True,
+        "human_confirmed": True,
+        "confirmation_type": "business_false_positive",
+        "product": "rasp",
+        "event_type": "高危读取行为判断",
+        "features": {
+            "product": "rasp",
+            "event_type": "高危读取行为判断",
+            "rule_id": "cloudrasp_read_file_103",
+            "app": "ai_agent",
+            "host": "VM-0-7-centos",
+            "method": "GET",
+            "uri": "http://106.53.107.29:8080/bastestground/file/file_input_stream/getParam",
+            "src_ip": "43.154.138.159",
+        },
+        "match_policy": {
+            "must_match_any": ["product", "event_type", "rule_id"],
+            "high_similarity_threshold": 0.78,
+            "effect_mode": "downgrade_to_benign",
+        },
+    }
+    return {
+        "memory_id": "mem-approved-rasp-read-file",
+        "layer": "product_long_term",
+        "namespace": "product/rasp",
+        "retrieval_key": "cloudrasp_read_file_103",
+        "content": json.dumps(content, ensure_ascii=False, sort_keys=True),
+        "source_case_id": "case_rasp_source",
+        "scope": "rasp:business_false_positive:高危读取行为判断",
+        "trust_level": "medium",
+        "status": "active",
+        "sensitivity_ok": True,
+        "approved_by": "analyst",
+        "expires_at_ms": now_ms() + 30 * 24 * 3600 * 1000,
+    }
+
+
+def _rasp_read_file_event(*, method: str, uri: str, host: str) -> NormalizedEvent:
+    return NormalizedEvent(
+        event_id=f"event-{method.lower()}-{uri.rsplit('/', 1)[-1]}",
+        source="syslog",
+        product="rasp",
+        event_type="高危读取行为判断",
+        severity="critical",
+        timestamp="2026-07-30T07:38:38Z",
+        entities={
+            "rule": "cloudrasp_read_file_103",
+            "app": "ai_agent",
+            "host": host,
+            "method": method,
+            "url": uri,
+            "src_ip": "43.154.138.159",
+            "action": "log",
+        },
+        evidence=[
+            {"type": "sink", "value": "java.io.FileInputStream.<init>", "ref": "ref-sink"},
+            {"type": "stack_trace", "value": ["java.io.FileInputStream.<init>"], "ref": "ref-stack"},
+        ],
+        sensitivity_tags=[],
+        raw_ref=f"alert-{method.lower()}-{uri.rsplit('/', 1)[-1]}",
+    )
+
+
 class _CapturingLLM(LLMClient):
     def __init__(self, classification: str = "suspicious"):
         self.classification = classification
@@ -109,6 +175,82 @@ class MemoryMatcherUnitTest(unittest.TestCase):
         self.assertEqual(best.retrieval_score, 1.0)
         self.assertGreaterEqual(best.overall_score, matcher.config.apply_threshold)
         self.assertIn("uri:/payments/{id}/search", best.matched_features)
+        self.assertEqual(best.match_level, "exact")
+        self.assertTrue(best.title_eligible)
+
+    def test_rasp_method_and_uri_boundaries_control_title_eligibility(self):
+        matcher = MemoryMatcher()
+        memory = _rasp_read_file_memory()
+        source_uri = "http://106.53.107.29:8080/bastestground/file/file_input_stream/getParam"
+        scenarios = (
+            (
+                "same_method_and_uri",
+                _rasp_read_file_event(method="GET", uri=source_uri, host="106.53.107.29:8080"),
+                "high",
+                True,
+                ["host"],
+            ),
+            (
+                "post_parameter_route",
+                _rasp_read_file_event(
+                    method="POST",
+                    uri="http://106.53.107.29:8080/bastestground/file/file_input_stream/postParam",
+                    host="106.53.107.29:8080",
+                ),
+                "related",
+                False,
+                ["host", "method", "uri"],
+            ),
+            (
+                "different_jstl_call_path",
+                _rasp_read_file_event(
+                    method="GET",
+                    uri="http://106.53.107.29:8080/bastestground/jstl-import/index.jsp",
+                    host="VM-0-7-centos",
+                ),
+                "related",
+                False,
+                ["uri"],
+            ),
+        )
+        for name, event, expected_level, title_eligible, conflicts in scenarios:
+            with self.subTest(name=name):
+                evaluation = matcher.match(event, [memory])
+                self.assertIsNotNone(evaluation.best)
+                self.assertEqual(evaluation.best.match_level, expected_level)
+                self.assertEqual(evaluation.best.title_eligible, title_eligible)
+                self.assertEqual(
+                    set(evaluation.best.comparison["conflicting_fields"]),
+                    set(conflicts),
+                )
+
+                result = AgentResult(
+                    case_id=f"case-{name}",
+                    agent="rasp-agent",
+                    classification="suspicious",
+                    confidence=0.85,
+                    severity="critical",
+                    summary=f"summary-{name}",
+                    evidence=[],
+                    missing_evidence=[],
+                    recommended_actions=[],
+                    dashboard_cards=[],
+                    explanation={"verdict": "【需人工复核】- test", "dimensions": []},
+                )
+                reconciled = matcher.reconcile(result, evaluation)
+                self.assertEqual(
+                    reconciled.summary.startswith("【长期记忆命中】"),
+                    title_eligible,
+                )
+                history = reconciled.explanation["dimensions"][-1]["evidence"]
+                expected_label = {
+                    "high": "高度相似",
+                    "related": "部分相似（不构成命中）",
+                }[expected_level]
+                self.assertIn(f"匹配程度：{expected_label}", history)
+                if not title_eligible:
+                    self.assertEqual(evaluation.final_effect, "related_only")
+                    self.assertIn("不构成命中", reconciled.explanation["verdict"])
 
     def test_hard_filters_reject_untrusted_expired_and_cross_product_memory(self):
         matcher = MemoryMatcher()
@@ -272,6 +414,11 @@ class MemoryMatcherIntegrationTest(unittest.TestCase):
             self.assertEqual(result.classification, "benign")
             self.assertIn("长期记忆命中", result.summary)
             self.assertEqual(result.explanation["memory_association"]["final_effect"], "downgraded_to_benign")
+            self.assertIn(
+                result.explanation["memory_association"]["matches"][0]["match_level"],
+                {"exact", "high"},
+            )
+            self.assertTrue(result.explanation["memory_association"]["matches"][0]["title_eligible"])
             self.assertEqual(len(llm.context["memory"]["product_long_term"]), 1)
             self.assertEqual(llm.context["memory"]["memory_association"]["best_memory_id"], "mem-approved-waf")
 

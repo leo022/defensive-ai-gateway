@@ -12,7 +12,7 @@ from .config import MemoryMatchingConfig
 from .models import AgentResult, NormalizedEvent, RecommendedAction, now_ms
 
 
-MATCHER_VERSION = "hybrid-memory-v3"
+MATCHER_VERSION = "hybrid-memory-v4"
 
 _FALSE_POSITIVE_MARKERS = {
     "false_positive", "false positive", "benign", "maintenance",
@@ -40,10 +40,15 @@ _FIELD_ALIASES = {
     "url": "uri",
     "path": "uri",
     "route": "uri",
+    "method": "method",
+    "http_method": "method",
+    "request_method": "method",
     "process": "process",
     "process_name": "process",
     "parent_process": "process",
     "image": "process",
+    "sink": "sink",
+    "dangerous_call": "sink",
     "user_agent": "user_agent",
     "user-agent": "user_agent",
     "client": "user_agent",
@@ -63,13 +68,41 @@ _FEATURE_WEIGHTS = {
     "app": 0.12,
     "host": 0.08,
     "uri": 0.14,
+    "method": 0.08,
     "process": 0.08,
+    "sink": 0.10,
     "user_agent": 0.06,
     "src_ip": 0.025,
     "dst_ip": 0.025,
     "protocol": 0.02,
     "user": 0.02,
     "tokens": 0.03,
+}
+
+_IDENTITY_FIELDS = ("rule_id", "event_type")
+_BEHAVIOR_BOUNDARY_FIELDS = ("uri", "method", "process", "sink", "user_agent")
+_CONTEXT_FIELDS = ("app", "host", "dst_ip", "protocol", "user")
+_MATCH_LEVEL_PRIORITY = {"exact": 0, "high": 1, "related": 2, "weak": 3}
+_MATCH_LEVEL_LABELS = {
+    "exact": "完全一致",
+    "high": "高度相似",
+    "related": "部分相似（不构成命中）",
+    "weak": "相似度不足",
+}
+_FIELD_LABELS = {
+    "rule_id": "规则",
+    "event_type": "事件类型",
+    "app": "应用",
+    "host": "资产/目标",
+    "uri": "URI",
+    "method": "HTTP 方法",
+    "process": "进程",
+    "sink": "危险调用",
+    "user_agent": "客户端",
+    "src_ip": "来源 IP",
+    "dst_ip": "目标 IP",
+    "protocol": "协议",
+    "user": "账号",
 }
 
 # Only evidence that describes the current request, payload, or process may veto
@@ -134,6 +167,9 @@ class MemoryMatchCandidate:
     overall_score: float
     matched_features: list[str]
     score_breakdown: dict[str, float]
+    match_level: str = "weak"
+    title_eligible: bool = False
+    comparison: dict[str, Any] = field(default_factory=dict)
     apply_threshold: float = 1.0
     policy_effect: str = "downgrade_to_benign"
     rank: int = 0
@@ -149,6 +185,9 @@ class MemoryMatchCandidate:
             "overall_score": self.overall_score,
             "matched_features": list(self.matched_features),
             "score_breakdown": dict(self.score_breakdown),
+            "match_level": self.match_level,
+            "title_eligible": self.title_eligible,
+            "comparison": dict(self.comparison),
             "decision": self.decision,
             "apply_threshold": self.apply_threshold,
             "policy_effect": self.policy_effect,
@@ -271,10 +310,16 @@ class MemoryMatcher:
             candidate = self._score_candidate(event, event_text, event_features, memory)
             if candidate is not None:
                 candidates.append(candidate)
-        candidates.sort(key=lambda item: (-item.overall_score, item.memory_id))
+        candidates.sort(
+            key=lambda item: (
+                _MATCH_LEVEL_PRIORITY.get(item.match_level, 9),
+                -item.overall_score,
+                item.memory_id,
+            )
+        )
         for rank, candidate in enumerate(candidates, start=1):
             candidate.rank = rank
-            if candidate.overall_score >= candidate.apply_threshold and candidate.policy_effect != "review_only":
+            if candidate.title_eligible and candidate.policy_effect != "review_only":
                 candidate.decision = "apply"
             elif candidate.overall_score >= self.config.review_threshold:
                 candidate.decision = "review"
@@ -295,11 +340,12 @@ class MemoryMatcher:
 
         original = result.classification
         score = best.overall_score
-        if evaluation.attack_signal_veto:
+        if not best.title_eligible:
+            effect = "related_only"
+        elif evaluation.attack_signal_veto:
             effect = "attack_signal_veto"
         elif (
-            score >= best.apply_threshold
-            and best.policy_effect != "review_only"
+            best.policy_effect != "review_only"
             and original in {"malicious", "suspicious", "benign"}
         ):
             effect = "classification_reinforced" if original == "benign" else "downgraded_to_benign"
@@ -315,28 +361,37 @@ class MemoryMatcher:
         association["final_classification"] = result.classification
 
         matched = ", ".join(best.matched_features[:6]) or "语义向量"
+        comparison = best.comparison
+        level_label = _MATCH_LEVEL_LABELS.get(best.match_level, best.match_level)
+        matched_dimensions = self._dimension_labels(comparison.get("matched_fields")) or "无稳定维度"
+        conflicting_dimensions = self._dimension_labels(comparison.get("conflicting_fields")) or "无"
+        missing_dimensions = self._dimension_labels(comparison.get("missing_fields")) or "无"
+        association_verb = "命中" if best.title_eligible else "关联候选"
         evidence = (
-            f"命中长期记忆 {best.memory_id}；综合分 {score:.2f}；"
+            f"{association_verb}长期记忆 {best.memory_id}；匹配程度：{level_label}；综合分 {score:.2f}；"
             f"结构化 {best.structured_score:.2f}；语义 {best.semantic_score:.2f}；"
-            f"匹配特征：{matched}。"
+            f"检索键 {best.retrieval_score:.2f}；一致维度：{matched_dimensions}；"
+            f"冲突维度：{conflicting_dimensions}；缺失维度：{missing_dimensions}；匹配特征：{matched}。"
         )
         dimensions = list(result.explanation.get("dimensions") or [])
         dimensions.append({"title": "历史误报", "status": "benign" if result.classification == "benign" else "review", "evidence": evidence})
         result.explanation["dimensions"] = dimensions
         verdict = str(result.explanation.get("verdict") or "")
-        if effect == "downgraded_to_benign":
+        if effect == "related_only":
+            result.explanation["verdict"] = f"{verdict}；长期记忆仅部分相似，不构成命中且不作为误报依据"
+        elif effect == "downgraded_to_benign":
             result.explanation["verdict"] = "【误报】- 与人工批准的长期记忆高度相似，保留偏离基线复核"
-            result.summary = f"【长期记忆命中】{result.summary}"
         elif effect == "classification_reinforced":
             result.explanation["verdict"] = f"{verdict}；人工批准的长期记忆进一步支持当前误报结论"
-            result.summary = f"【长期记忆命中】{result.summary}"
         elif effect == "attack_signal_veto":
             result.explanation["verdict"] = f"{verdict}；相似误报记忆不覆盖当前攻击证据"
-            result.summary = f"【长期记忆命中】{result.summary}"
         else:
-            result.explanation["verdict"] = f"{verdict}；命中相似长期记忆，建议人工复核"
+            result.explanation["verdict"] = f"{verdict}；长期记忆达到{level_label}，建议人工复核"
+        if best.title_eligible and not result.summary.startswith("【长期记忆命中】"):
             result.summary = f"【长期记忆命中】{result.summary}"
-        result.dashboard_cards.append({"title": "记忆关联", "body": f"{best.memory_id} / {score:.2f} / {effect}"})
+        result.dashboard_cards.append(
+            {"title": "记忆关联", "body": f"{best.memory_id} / {level_label} / {score:.2f} / {effect}"}
+        )
         if not any("长期记忆" in action.action for action in result.recommended_actions):
             result.recommended_actions.append(
                 RecommendedAction(
@@ -359,19 +414,26 @@ class MemoryMatcher:
         memory_content = self._content(memory)
         memory_text = json.dumps(memory, ensure_ascii=False, sort_keys=True).lower()
         memory_features = self._fingerprint(memory_content)
+        retrieval_key = self._normalize(memory.get("retrieval_key", ""), "rule_id")
+        # Legacy governed memories may keep their exact rule/event identity only
+        # in retrieval_key. Treat it as structured identity solely when it exactly
+        # matches the corresponding current-event field.
+        if not memory_features["rule_id"] and retrieval_key in event_features.get("rule_id", set()):
+            memory_features["rule_id"].add(retrieval_key)
+        elif not memory_features["event_type"] and retrieval_key in event_features.get("event_type", set()):
+            memory_features["event_type"].add(retrieval_key)
         match_policy = memory_content.get("match_policy", {}) if isinstance(memory_content, dict) else {}
         if not isinstance(match_policy, dict):
             match_policy = {}
         if not self._match_policy_allows(event, event_features, memory_features, match_policy):
             return None
-        retrieval_key = self._normalize(memory.get("retrieval_key", ""), "rule_id")
         retrieval_score = 1.0 if retrieval_key and retrieval_key in event_text else 0.0
 
         identity_matches = set()
         for field_name in ("rule_id", "event_type"):
             identity_matches.update(event_features.get(field_name, set()) & memory_features.get(field_name, set()))
         stable_matches = set()
-        for field_name in ("app", "host", "uri", "process", "user_agent", "tokens"):
+        for field_name in ("app", "host", "uri", "method", "process", "sink", "user_agent", "tokens"):
             stable_matches.update(event_features.get(field_name, set()) & memory_features.get(field_name, set()))
         if not identity_matches and not retrieval_score and len(stable_matches) < 2:
             return None
@@ -421,6 +483,14 @@ class MemoryMatcher:
         policy_effect = str(match_policy.get("effect_mode") or "downgrade_to_benign").strip().lower()
         if policy_effect not in {"downgrade_to_benign", "review_only"}:
             policy_effect = "review_only"
+        match_level, title_eligible, comparison = self._match_level(
+            event_features,
+            memory_features,
+            breakdown,
+            structured_score,
+            overall,
+            apply_threshold,
+        )
         return MemoryMatchCandidate(
             memory_id=str(memory.get("memory_id") or ""),
             memory=memory,
@@ -430,9 +500,103 @@ class MemoryMatcher:
             overall_score=overall,
             matched_features=sorted(set(matched_features))[:16],
             score_breakdown=breakdown,
+            match_level=match_level,
+            title_eligible=title_eligible,
+            comparison=comparison,
             apply_threshold=apply_threshold,
             policy_effect=policy_effect,
         )
+
+    def _match_level(
+        self,
+        event_features: dict[str, set[str]],
+        memory_features: dict[str, set[str]],
+        breakdown: dict[str, float],
+        structured_score: float,
+        overall_score: float,
+        apply_threshold: float,
+    ) -> tuple[str, bool, dict[str, Any]]:
+        matched_fields: list[str] = []
+        conflicting_fields: list[str] = []
+        missing_fields: list[str] = []
+        considered_fields: list[str] = []
+        for field_name in _FEATURE_WEIGHTS:
+            if field_name == "tokens" or not memory_features.get(field_name):
+                continue
+            considered_fields.append(field_name)
+            event_values = event_features.get(field_name, set())
+            if not event_values:
+                missing_fields.append(field_name)
+            elif event_values & memory_features[field_name]:
+                matched_fields.append(field_name)
+            else:
+                conflicting_fields.append(field_name)
+
+        identity_defined = [field for field in _IDENTITY_FIELDS if memory_features.get(field)]
+        identity_matched = [field for field in identity_defined if field in matched_fields]
+        identity_gate = bool(identity_matched) and all(field in matched_fields for field in identity_defined)
+        behavior_defined = [
+            field for field in _BEHAVIOR_BOUNDARY_FIELDS if memory_features.get(field)
+        ]
+        behavior_matched = [field for field in behavior_defined if field in matched_fields]
+        boundary_conflicts = [
+            field
+            for field in (*_IDENTITY_FIELDS, *_BEHAVIOR_BOUNDARY_FIELDS)
+            if field in conflicting_fields
+        ]
+        context_matched = [field for field in _CONTEXT_FIELDS if field in matched_fields]
+        stable_behavior_gate = bool(behavior_matched) or len(context_matched) >= 2
+        all_defined_match = bool(considered_fields) and all(
+            field in matched_fields and breakdown.get(field, 0.0) == 1.0
+            for field in considered_fields
+        )
+        exact = (
+            identity_gate
+            and stable_behavior_gate
+            and len(considered_fields) >= 3
+            and all_defined_match
+        )
+        high = (
+            identity_gate
+            and stable_behavior_gate
+            and not boundary_conflicts
+            and structured_score >= 0.72
+            and overall_score >= apply_threshold
+        )
+        if exact:
+            level = "exact"
+        elif high:
+            level = "high"
+        elif overall_score >= self.config.review_threshold:
+            level = "related"
+        else:
+            level = "weak"
+
+        gate_reasons: list[str] = []
+        if not identity_gate:
+            gate_reasons.append("identity_not_fully_matched")
+        if not stable_behavior_gate:
+            gate_reasons.append("stable_behavior_not_matched")
+        if boundary_conflicts:
+            gate_reasons.append("boundary_conflict")
+        if structured_score < 0.72:
+            gate_reasons.append("structured_similarity_below_0.72")
+        if overall_score < apply_threshold:
+            gate_reasons.append("overall_similarity_below_apply_threshold")
+        return level, level in {"exact", "high"}, {
+            "matched_fields": matched_fields,
+            "conflicting_fields": conflicting_fields,
+            "missing_fields": missing_fields,
+            "identity_fields": identity_defined,
+            "behavior_fields": behavior_defined,
+            "gate_reasons": gate_reasons,
+        }
+
+    @staticmethod
+    def _dimension_labels(fields: Any) -> str:
+        if not isinstance(fields, list):
+            return ""
+        return "、".join(_FIELD_LABELS.get(str(field), str(field)) for field in fields)
 
     def _eligible(
         self,

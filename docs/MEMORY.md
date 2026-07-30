@@ -32,12 +32,13 @@
 不同 ID 的同类事件若落在默认一小时相关窗口内，会归并到同一 Case；应通过该 Case 的关联原始告警数量确认多条事实均被保留。
 
 1. 从同产品 `product/{product}` 中召回最多 `candidate_limit` 条候选；只允许 `active`、`medium/high` 信任、人工批准、未过期、通过敏感性检查且表达受治理误报语义的产品长期记忆。
-2. 对规则 ID、事件类型、应用、资产、URI 模板、进程、客户端、网络和账号计算加权结构化包含度。
+2. 对规则 ID、事件类型、应用、资产、HTTP 方法、URI 模板、进程、危险调用、客户端、网络和账号计算加权结构化包含度。
 3. 使用离线稳定哈希向量计算文本余弦相似度；该接口可替换为企业 Embedding 服务，默认实现不需要网络或第三方依赖。
 4. 检查 `retrieval_key` 精确命中，并对规则/事件类型冲突施加负向惩罚。
-5. 按配置权重合成总分，只把达到 `review_threshold` 的 Top-K 记忆注入模型上下文。
-6. 模型返回后执行确定性合并：高分可支持 `suspicious → benign`；当前告警中可核验的攻击证据拥有否决权，模型仅自报 `malicious` 不能替代证据门禁。
-7. 所有被评分候选写入 `memory_matches`，保留分项分数、排名、命中特征、决策和最终影响。
+5. 按配置权重合成总分，并用身份/行为边界门禁将候选分为 `exact`（完全一致）、`high`（高度相似）、`related`（部分相似）或 `weak`。规则/事件身份必须一致；方法、URI、进程、危险调用或客户端若出现明确冲突，不得进入 `exact/high`。字段缺失会明确展示，但不会被当成字段冲突。
+6. 只把达到 `review_threshold` 的 Top-K 记忆注入模型上下文。每条候选同时携带 `match_level`、`title_eligible` 以及一致、冲突、缺失维度；`related` 只能用于差异复核，不得称为“命中”或作为误报依据。
+7. 模型返回后执行确定性合并：只有 `title_eligible=true` 的 `exact/high` 才能支持 `suspicious → benign` 并在 Case 标题添加 `【长期记忆命中】`；当前告警中可核验的攻击证据仍拥有否决权，模型仅自报 `malicious` 不能替代证据门禁。
+8. 所有被评分候选写入 `memory_matches`，保留分项分数、排名、命中特征、决策和最终影响；Case 分维度结论持久化本次匹配等级及一致/冲突/缺失依据。
 
 记忆治理详情只返回关联告警总数，不携带关联清单。运营人员点击“查看清单”进入独立
 次级页面后，页面通过 `/api/memory/matches` 按 `memory_id + limit + offset` 服务端分页；
@@ -50,7 +51,7 @@
 overall = 0.68 * structured + 0.22 * semantic_vector + 0.10 * retrieval_key
 ```
 
-默认 `review_threshold=0.58`、`apply_threshold=0.78`。配置位于 `memory_matching`，在切换 LLM 后端时保持一致。
+默认 `review_threshold=0.58`、`apply_threshold=0.78`。达到 `apply_threshold` 只是高度相似的必要条件，不能绕过身份与行为边界门禁。配置位于 `memory_matching`，在切换 LLM 后端时保持一致。
 
 ## 3. 晋升五门禁（Promotion Rule）
 

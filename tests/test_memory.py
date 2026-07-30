@@ -59,6 +59,7 @@ def _business_false_positive_alert(
             "app": "settlement-api",
             "host": "settlement-api-01",
             "src_ip": src_ip,
+            "method": "POST",
             "uri": "/partner/settlement/upload",
             "headers": {"user-agent": "bank-partner-batch-client/2.4"},
             "matched_parameters": matched_parameters
@@ -701,6 +702,10 @@ class MemoryGovernanceAPITest(unittest.TestCase):
             self.assertTrue(content["human_confirmed"])
             self.assertEqual(content["confirmation_type"], "business_false_positive")
             self.assertIn("rule_id", content["features"])
+            self.assertEqual(content["features"]["method"], "POST")
+            self.assertEqual(content["match_policy"]["must_match_all"], ["event_type", "rule_id"])
+            self.assertIn("method", content["match_policy"]["behavior_boundaries"])
+            self.assertIn("uri", content["match_policy"]["behavior_boundaries"])
             self.assertGreaterEqual(len(content["features"]["similarity_features"]), 1)
             linked = state.repo.get_case(result.case_id)["linked_alerts"][0]
             self.assertEqual(
