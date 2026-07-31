@@ -1553,8 +1553,22 @@ function reportItems(items, renderItem, emptyText, sectionNumber) {
   `).join("")}</ol>`;
 }
 
+function normalizeAgentDetailItems(values) {
+  const source = Array.isArray(values) ? values : (values ? [values] : []);
+  const items = source
+    .map((item) => String(item ?? "").trim())
+    .filter(Boolean);
+  if (items.length >= 4) {
+    const characterItems = items.filter((item) => Array.from(item).length <= 1);
+    if (characterItems.length >= items.length * 0.75) {
+      return [items.join("")];
+    }
+  }
+  return items;
+}
+
 function agentDetailList(label, values) {
-  const items = (values || []).filter(Boolean);
+  const items = normalizeAgentDetailItems(values);
   if (!items.length) return "";
   return `<div class="response-agent-investigation-detail">
     <strong>${escapeHtml(label)}</strong>

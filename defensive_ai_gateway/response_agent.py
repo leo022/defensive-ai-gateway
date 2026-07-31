@@ -14,7 +14,7 @@ from .models import new_id, now_ms
 
 
 REPORT_SCHEMA_VERSION = "response-investigation-report-v7"
-AGENT_VERSION = "response-investigation-agent-v9"
+AGENT_VERSION = "response-investigation-agent-v10"
 TOOL_VERSION = "7"
 FORENSIC_INVENTORY_MAX_ALERTS = 200
 ACTIVE_STATUSES = {
@@ -4229,6 +4229,8 @@ class ResponseInvestigationAgent:
                 "values. Every source or target identifier named in a proposed response "
                 "must cite evidence for that specific identifier. Do not use placeholders "
                 "such as none, N/A or 无 for rationale, success criteria or rollback. "
+                "Risk aggravating_factors and mitigating_factors must be JSON arrays of "
+                "complete sentences, never a string or an array of individual characters. "
                 "Proposed production actions must use observe or approve_required. "
                 "Do not discuss snapshots, hashes, tool allowlists or controller mechanics "
                 "in the executive summary or final assessment. Do not expose chain-of-thought. "
@@ -5993,13 +5995,25 @@ class ResponseInvestigationAgent:
         if rationale:
             result["rationale"] = rationale
         for key in ("aggravating_factors", "mitigating_factors"):
+            raw_factors = value.get(key)
+            if isinstance(raw_factors, str):
+                factor_items = [raw_factors]
+            elif isinstance(raw_factors, list):
+                factor_items = raw_factors
+            else:
+                factor_items = []
             rendered = [
                 _model_narrative_text(item, 1_500)
-                for item in value.get(key) or []
+                for item in factor_items
                 if _model_narrative_text(item, 1_500)
-            ][:16]
+            ]
+            if len(rendered) >= 4 and sum(
+                len(item) <= 1 for item in rendered
+            ) >= len(rendered) * 0.75:
+                combined = _model_narrative_text("".join(rendered), 1_500)
+                rendered = [combined] if combined else []
             if rendered:
-                result[key] = rendered
+                result[key] = rendered[:16]
         result["evidence_refs"] = list(
             dict.fromkeys(
                 [

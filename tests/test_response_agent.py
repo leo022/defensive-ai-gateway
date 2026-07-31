@@ -2125,6 +2125,30 @@ class ResponseAgentTest(unittest.TestCase):
             validation["checks"]["response_plan_operational"]
         )
 
+    def test_risk_factor_normalization_preserves_complete_sentences(self):
+        normalized = self.state.response_agent._normalize_risk_assessment(
+            {
+                "aggravating_factors": "在短时间内发现了多条针对同一应用的攻击活动。",
+                "mitigating_factors": list(
+                    "RASP已部署并在应用运行时捕获了危险调用。"
+                ),
+            },
+            {
+                "aggravating_factors": [],
+                "mitigating_factors": [],
+                "evidence_refs": [],
+            },
+        )
+
+        self.assertEqual(
+            normalized["aggravating_factors"],
+            ["在短时间内发现了多条针对同一应用的攻击活动。"],
+        )
+        self.assertEqual(
+            normalized["mitigating_factors"],
+            ["RASP已部署并在应用运行时捕获了危险调用。"],
+        )
+
     def test_response_plan_backfills_placeholders_and_cites_each_entity(self):
         plan = self.state.response_agent._normalize_response_plan(
             [
@@ -3973,6 +3997,9 @@ class ResponseAgentTest(unittest.TestCase):
         self.assertIn(".response-agent-report-section-number", css)
         self.assertIn(".response-agent-report-sublist", css)
         self.assertIn(".response-agent-risk-grid", css)
+        self.assertIn("function normalizeAgentDetailItems(values)", script)
+        self.assertIn('return [items.join("")];', script)
+        self.assertIn(".response-agent-report-sublist > li", css)
         self.assertIn(".response-agent-technical-appendix", css)
         self.assertIn(".response-agent-trace-row-latest", css)
         self.assertIn(".response-agent-trace-middle", css)
