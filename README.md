@@ -1,20 +1,54 @@
 # Defensive AI Gateway
 
-[English](README_EN.md) | 中文
+简体中文 | [English](README_EN.md)
 
-银行业防御 AI 代理网关 MVP。该工程用于先在外网开发与验证，再以离线包形式迁移到企业内网部署。
+Defensive AI Gateway 是面向安全运营中心（SOC）的告警研判与响应网关。系统统一接入
+HIPS、RASP、NDR、WAF 和 SIEM 告警，提供格式归一化、持久化排队、AI 辅助研判、
+确定性验证、人工审批、受控响应与全程审计能力。
 
-## 技术路线
+本仓库提供可运行的参考实现，适用于方案验证、集成测试和受控环境部署。生产使用前，
+应结合组织要求完成身份与密钥管理、网络隔离、容量规划、灾备恢复及安全合规评审。
 
-- Python 标准库优先：第一版不依赖 pip/npm，降低内网迁移和供应链审查成本。
-- SQLite 事实库：PoC 阶段开箱即用，生产可替换为 PostgreSQL。
-- HTTP API + 静态 Dashboard：接收 HIPS/RASP/NDR/WAF/SIEM 告警，实时查看 Case。
-- 持久告警队列：HTTP 入口在返回 `202` 前写入 SQLite inbox；后台 worker 有限重试，终态失败进入可查询 DLQ。远程 LLM 不可达的告警进入独立 `deferred` 状态，只由定时恢复或分析师手工释放，进程重启可恢复。
-- Agent/Skill/Harness 分层：产品专属提示词、记忆命名空间、策略检查和离线回放分开演进。
-- LLM 可插拔：开发配置默认使用 deterministic 本地规则分析器 `local-rule-analyst`；需要真实模型验证时，可在 Dashboard 切换到本地 Ollama 或内网 LLM Gateway。
-- 随机样例 + 记忆降噪：样例脚本可随机生成 attack / false_positive 告警；已批准产品长期记忆可辅助同系统重复告警的误报分辨。
+## 核心能力
 
-## 快速启动
+| 能力 | 说明 |
+| --- | --- |
+| 多源告警接入 | 通过 HTTP API 或 Syslog Collector 接入 HIPS、RASP、NDR、WAF、SIEM 数据 |
+| 稳定数据契约 | 使用 Mapping Profile 将厂商原始日志转换为 `RawAlert` 和 `NormalizedEvent` |
+| 可靠异步处理 | 告警在返回 `202` 前写入 SQLite 持久队列，支持有限重试、延迟恢复和可查询 DLQ |
+| 分层智能分析 | 按安全产品路由 Agent、Skill 和记忆命名空间，可使用本地规则分析器、Ollama 或兼容的企业 LLM Gateway |
+| 验证与治理 | Validator 检查证据可追溯性、提示注入、敏感输出和动作权限 |
+| 人机协同处置 | 通过 Case 工作台完成调查、复核、审批、受控执行、核验和回滚 |
+| 离线评测与交付 | 提供可复现样例、随机场景、Harness 回放、离线打包以及 Docker/k3s 部署参考 |
+
+## 处理流程
+
+```text
+HIPS / RASP / NDR / WAF / SIEM
+                |
+        HTTP API / Syslog Collector
+                |
+          Mapping Profile
+                |
+     RawAlert -> Durable Inbox
+                |
+      Product Agent / LLM Analysis
+                |
+             Validator
+                |
+       Case / Memory / Audit Log
+                |
+      Review -> Approval -> Response
+```
+
+## 运行要求
+
+- Python 3.11（推荐）
+- SQLite（由 Python 标准库提供）
+- 无必需的 pip 或 npm 运行时依赖
+- 可选：Docker、k3s、Ollama 或兼容的企业 LLM Gateway
+
+## 快速开始
 
 ```bash
 python3 -m defensive_ai_gateway --config config/dev.yaml
@@ -22,32 +56,43 @@ python3 -m defensive_ai_gateway --config config/dev.yaml
 
 服务默认监听 `127.0.0.1:8080`：
 
-- Dashboard: `http://127.0.0.1:8080/`
-- 健康检查: `GET /api/health`
-- 提交告警: `POST /api/alerts`
-- 查看 Case: `GET /api/cases`
-- 查询接入队列/DLQ: `GET /api/alerts/inbox?status=deferred&limit=100&offset=0` 或 `GET /api/alerts/inbox?status=dead_letter&limit=100&offset=0`
+| 用途 | 地址或接口 |
+| --- | --- |
+| Dashboard | `http://127.0.0.1:8080/` |
+| 存活检查 | `GET /api/live` |
+| 就绪检查 | `GET /api/ready` |
+| 运行状态 | `GET /api/health` |
+| 提交告警 | `POST /api/alerts` |
+| 查询 Case | `GET /api/cases` |
+| 查询延迟队列 | `GET /api/alerts/inbox?status=deferred&limit=100&offset=0` |
+| 查询死信队列 | `GET /api/alerts/inbox?status=dead_letter&limit=100&offset=0` |
 
-Dashboard 的“模型服务 -> 内网 Gateway”可接入 kkcoder 的 OpenAI 兼容 API：
+开发配置默认使用确定性的本地规则分析器 `local-rule-analyst`，无需外部模型服务即可运行。
+
+## 模型服务配置
+
+Dashboard 的“模型服务 → 内网 Gateway”支持兼容 OpenAI HTTP 协议的企业模型服务。
+也可以通过环境变量完成等价配置：
 
 ```bash
 export DEFENSIVE_AI_LLM_PROVIDER=gateway
-export DEFENSIVE_AI_LLM_ENDPOINT="https://kkcoder.com/v1/responses"
-export DEFENSIVE_AI_LLM_API_KEY="<secret>"
-export DEFENSIVE_AI_LLM_MODEL="gpt-5.5"
-export DEFENSIVE_AI_LLM_ALLOWED_HOSTS="kkcoder.com"
+export DEFENSIVE_AI_LLM_ENDPOINT="https://llm-gateway.example.com/v1/responses"
+export DEFENSIVE_AI_LLM_API_KEY="<api-key>"
+export DEFENSIVE_AI_LLM_MODEL="<model-id>"
+export DEFENSIVE_AI_LLM_ALLOWED_HOSTS="llm-gateway.example.com"
 ```
 
 Gateway 支持 `/v1/responses`、`/v1/chat/completions`、Anthropic Messages 和现有企业
 JSON 协议。Anthropic Messages 仅用于实际兼容该协议的服务：设置
 `ANTHROPIC_BASE_URL` 与 `ANTHROPIC_AUTH_TOKEN` 后，会规范化为 `/v1/messages`。
-访问凭据只用于配置的同源端点；不要把 token 写入 YAML、README 或其他仓库文件。
+访问凭据仅用于已配置的同源端点。密钥应通过环境变量或专用密钥管理系统注入，不得写入
+YAML、README、日志或其他仓库文件。
 
 Gateway 只调用 HTTP 请求-响应 API，不支持 `wss://`、`/v1/realtime`、`/ws` 等
 WebSocket 入口。出现 HTTP 426 `WebSocket upgrade required` 时，应改用服务商提供的
 `/v1/responses` 或 `/v1/chat/completions` HTTP 地址，而不是重试同一地址。
 
-## 提交样例告警
+## 样例告警与验证
 
 ```bash
 python3 scripts/send_sample.py --file samples/waf_alert.json
@@ -55,19 +100,23 @@ python3 scripts/send_sample.py --file samples/siem_case.json
 python3 scripts/send_demo_alerts.py
 ```
 
-`alert_id` 是告警实例的幂等键。样例发送工具默认在传输前生成当前执行时间和唯一实例 ID；原生日志内嵌的事件 ID 与时间也会同步刷新。只有明确验证历史重放或幂等行为时，才使用 `--preserve-fixture-identity` 保留固定样本身份：
+`alert_id` 是告警实例的幂等键。样例发送工具默认在传输前生成当前时间和唯一实例 ID，
+原始日志内嵌的事件 ID 与时间也会同步刷新。仅在验证历史重放或幂等行为时，使用
+`--preserve-fixture-identity` 保留固定样本身份：
 
 ```bash
 python3 scripts/send_sample.py --file samples/waf_alert.json --preserve-fixture-identity
 ```
 
-若同一 `alert_id` 携带不同的时间戳、字段或证据，接口会返回 `409 alert_id_conflict`，要求上游为新的告警实例分配唯一 ID，避免静默丢弃或篡改既有审计证据。
-不同 ID 的同类告警在默认一小时相关窗口内会聚合为同一个 Case；这表示关联，不表示覆盖。应在该 Case 的“关联原始告警”中看到递增的告警数量和每条原始记录。
+若同一 `alert_id` 携带不同的时间戳、字段或证据，接口会返回
+`409 alert_id_conflict`。上游必须为新的告警实例分配唯一 ID，避免静默丢弃或篡改
+既有审计证据。不同 ID 的同类告警在默认一小时相关窗口内可聚合为同一个 Case；
+这表示事件关联，不表示数据覆盖。
 
-`send_demo_alerts.py` 默认提交 16 条覆盖五类产品的 Demo 告警，其中额外包含一条
+`send_demo_alerts.py` 默认提交 16 条覆盖五类产品的演示告警，其中包含一条
 WAF XSS 提示注入样本，预期触发 Validator `review` 且不生成审批项；脚本会等待所有目标告警
 进入 `completed` 或 `dead_letter` 后再退出；只需提交、不等待时使用
-`--wait-seconds 0`。`clean_alerts_and_memory.py` 会同步清理 durable inbox，并在仍有
+`--wait-seconds 0`。`clean_alerts_and_memory.py` 会同步清理持久化队列，并在仍有
 `pending/retry/deferred/processing` 任务时拒绝执行，避免处理中的事实记录被删除。
 
 生产环境的持久队列同时受 `processing.queue_max_size`（未完成条数）、
@@ -116,7 +165,10 @@ python3 scripts/send_sample.py --random --count 3 --product ndr --feature sql_in
 python3 scripts/send_sample.py --list-features
 ```
 
-`--file` 与 `--random` 是两种互斥的发送模式。`--feature` 只控制攻击特征，`--scenario` 控制真实攻击、人工复核或误报；未指定 `--feature` 时随机选择产品特征。`--preserve-generated-identity` 继续作为旧版参数别名，但新命令应使用 `--preserve-fixture-identity`。离线 Harness 也支持相同能力：
+`--file` 与 `--random` 是两种互斥的发送模式。`--feature` 控制攻击特征，
+`--scenario` 控制真实攻击、人工复核或误报；未指定 `--feature` 时随机选择产品特征。
+`--preserve-generated-identity` 作为兼容参数保留，新命令应使用
+`--preserve-fixture-identity`。离线 Harness 也支持相同能力：
 
 ```bash
 python3 scripts/run_harness.py --samples samples --random-count 10 --random-product ndr --random-feature brute_force
@@ -124,9 +176,19 @@ python3 scripts/run_harness.py --samples samples --random-count 10 --random-prod
 
 ## 真实日志格式适配
 
-Dashboard 的“适配”页面可配置 Mapping Profile，把内网真实告警日志映射为内部稳定 `RawAlert`，并通过 dry-run 预览 `RawAlert` 与 `NormalizedEvent`。正式接入时可通过 `POST /api/alerts?profile=<profile_id>` 或请求体中的 `profile_id` 提交真实日志；映射失败的日志不会进入 LLM 分析。
+Dashboard 的“适配”页面可配置 Mapping Profile，将厂商告警日志映射为稳定的
+`RawAlert`，并通过 dry-run 预览 `RawAlert` 与 `NormalizedEvent`。正式接入时可通过
+`POST /api/alerts?profile=<profile_id>` 或请求体中的 `profile_id` 提交原始日志；
+映射失败的数据不会进入 LLM 分析。
 
-不带 `profile` 直接提交厂商原生日志时，网关会按内容指纹识别来源（例如 cloudrasp 的 `data_type=attack_event` 识别为 `rasp`）；WAF、HIPS、NDR、RASP 和 SIEM 默认均注册 `auto-<product>-json` 自动 Profile，识别后会自动做深度字段映射。既无显式 `product` 字段、又无法识别且不含标准告警字段的日志会被拒绝（400）。为兼容既有标准 `RawAlert` 调用，带有 `event_type`、`severity`、`alert_id`、`source` 或 `timestamp` 但缺少 `product` 的请求仍会按 SIEM 处理；生产接入应始终提供明确的 `product` 或 Mapping Profile。
+不带 `profile` 直接提交厂商原始日志时，网关会按内容指纹识别来源。例如，
+`data_type=attack_event` 可识别为 `rasp`。WAF、HIPS、NDR、RASP 和 SIEM 默认注册
+`auto-<product>-json` Profile，识别后执行深度字段映射。既无显式 `product` 字段、
+又无法识别且不含标准告警字段的数据会被拒绝并返回 `400`。
+
+为兼容既有标准 `RawAlert` 调用，包含 `event_type`、`severity`、`alert_id`、`source`
+或 `timestamp` 但缺少 `product` 的请求仍按 SIEM 处理。生产接入应始终提供明确的
+`product` 或 Mapping Profile。
 
 Harness 也支持用 profile 回放脱敏真实日志：
 
@@ -146,7 +208,8 @@ python3 scripts/run_harness.py --samples samples --config config/dev.yaml --use-
 bash scripts/package_offline.sh ../outputs
 ```
 
-`--use-config-llm` 会按 `config/dev.yaml` 使用默认的 `local-rule-analyst`。如需回放真实模型效果，可先在配置或 Dashboard 中切换到本地 Ollama / 内网 LLM Gateway。
+`--use-config-llm` 会按 `config/dev.yaml` 使用默认的 `local-rule-analyst`。如需回放真实
+模型效果，可先在配置或 Dashboard 中切换到 Ollama 或企业 LLM Gateway。
 
 离线包解压后可以先运行安装检查脚本，生成生产配置和数据目录：
 
@@ -167,15 +230,18 @@ sudo --preserve-env=DEFENSIVE_AI_API_TOKEN,DEFENSIVE_AI_INGEST_TOKEN,DEFENSIVE_A
   bash install.sh --systemd --enable --start
 ```
 
-生产安装拒绝空、已知占位或重复角色 Token，默认双签且关闭 loopback 免认证。
+生产安装拒绝空、已知占位或重复角色 Token，默认双签且关闭回环免认证。
 systemd 服务只监听 `127.0.0.1:8080`，应由同机 TLS/mTLS 反向代理提供远程入口，
 避免 Bearer Token 经过节点明文 HTTP。
 `bash install.sh --demo-mode` 仅生成回环、单签配置，不影响 `config/dev.yaml` 的现有
-Demo 启动方式。
+演示启动方式。
 
-## k3s 与 Syslog 接入
+## 容器化部署与 Syslog 接入
 
-镜像内置离线运行配置：本地规则分析器、`0.0.0.0:8080`、SQLite `/data/gateway.db`。Docker 可直接运行，无需挂载配置文件：
+### Docker 演示环境
+
+镜像内置离线运行配置：本地规则分析器、`0.0.0.0:8080` 和 SQLite
+`/data/gateway.db`。Docker 可直接运行，无需挂载配置文件：
 
 ```bash
 docker build -t defensive-ai-gateway:latest -f deploy/docker/Dockerfile .
@@ -185,9 +251,10 @@ docker run --rm -p 127.0.0.1:8080:8080 \
   -v defensive-ai-data:/data defensive-ai-gateway:latest
 ```
 
-然后访问 `http://127.0.0.1:8080`。上面的两个环境变量只适用于隔离 Demo；
-生产不要扩展这条 `docker run`，应使用下方 production Compose，把 loopback bypass、
-Demo 标志和单签全部切换为生产值。
+然后访问 `http://127.0.0.1:8080`。上述两个环境变量仅适用于隔离的演示环境。
+生产部署应使用下方 Compose 参考，将回环免认证、演示标志和单签配置切换为生产值。
+
+### Docker 生产参考
 
 Docker 生产参考使用 `deploy/docker/compose.production.yaml`：应用仅绑定宿主回环，
 必须由同机 TLS/mTLS 反向代理对外提供服务；预检脚本会验证不可变镜像 digest、
@@ -201,6 +268,8 @@ bash deploy/docker/validate-production-env.sh
 docker compose -f deploy/docker/compose.production.yaml up -d
 ```
 
+### k3s 与 Syslog
+
 生产接入推荐在 k3s 中用独立 collector 接收 syslog，再转发到网关 HTTP 入口：
 
 ```text
@@ -210,7 +279,8 @@ Security Product -> Syslog 15140-15144 (RASP 15143 uses TCP; UDP is migration-on
 参考清单：
 
 - `deploy/k3s/gateway.yaml`：默认对远程请求鉴权失败关闭的 Gateway Deployment、Service 和 PVC。
-- `deploy/k3s/syslog-collector-vector.yaml`：Vector syslog collector 参考清单，使用独立 ingest Token 接收 syslog，并按五产品内置 Mapping Profile 转发。
+- `deploy/k3s/syslog-collector-vector.yaml`：Vector Syslog Collector 参考清单，使用独立
+  ingest Token 接收 Syslog，并按五产品内置 Mapping Profile 转发。
 - `docs/SYSLOG_INGESTION.md`：安全设备配置、Mapping Profile 接入和运维注意事项。
 
 如果目标服务器不安装 Python，可用 k3s 部署物料：
@@ -222,25 +292,58 @@ bash scripts/package_k3s_deploy.sh --include-vector
 ```
 
 脚本会基于当前源码重建镜像，并在成功后替换
-`dist/defensive-ai-gateway-k3s-deploy.tar.gz` 及其校验文件。部署包只包含内网运行
-所需的镜像、校验文件、k3s 清单和导入脚本，不包含源码与构建工具。目标服务器
-解压后通过权限为 `600` 的 `.env` 设置五个独立角色 Token、TLS Secret、生产域名、来源 CIDR 和模型参数。生产默认只创建 ClusterIP + TLS Ingress，拒绝 `latest`、脏工作区、空/弱凭据、全网段来源和缺失 TLS；升级前自动备份 SQLite，失败恢复旧镜像与数据库。仅隔离、临时展示可显式使用 `bash install.sh --demo-mode` 增加明文 hostPort。详细说明见 `deploy/k3s/README.md`。
+`dist/defensive-ai-gateway-k3s-deploy.tar.gz` 及其校验文件。部署包只包含目标环境运行
+所需的镜像、校验文件、k3s 清单和导入脚本，不包含源码与构建工具。
 
-本地可以模拟五类设备分别通过不同 TCP 端口发送 syslog，并验证路由不会把安全系统识别错：
+目标服务器通过权限为 `600` 的 `.env` 设置五个独立角色 Token、TLS Secret、生产域名、
+来源 CIDR 和模型参数。生产默认只创建 ClusterIP 和 TLS Ingress，并拒绝 `latest`、
+脏工作区、空或弱凭据、全网段来源及缺失 TLS；升级前自动备份 SQLite，失败时恢复旧镜像
+与数据库。仅在隔离的临时演示环境中，才可显式使用 `bash install.sh --demo-mode` 增加明文
+hostPort。详细说明见 [`deploy/k3s/README.md`](deploy/k3s/README.md)。
+
+### 接入验证
+
+可模拟五类设备分别通过不同 TCP 端口发送 Syslog，验证采集、映射与产品路由：
 
 ```bash
 python3 -m defensive_ai_gateway --config config/dev.yaml
 python3 scripts/simulate_syslog_ports.py --config config/dev.yaml
 ```
 
-Syslog 模拟器默认刷新五类原生日志的事件 ID/时间，并使用管理员 API Token 生成 HMAC 测试标记。Gateway 只在可信采集路由确认来源为本机且签名正确时将其标记为运行验证样本；此类 Case 不写长期记忆，也不生成生产审批。外置 Vector 已在运行时使用 `--running-collector`，并通过环境变量提供管理员 Token：
+Syslog 模拟器默认刷新五类原始日志的事件 ID 和时间，并使用管理员 API Token 生成
+HMAC 测试标记。Gateway 仅在可信采集路由确认来源为本机且签名正确时，将其标记为
+运行验证样本；此类 Case 不写长期记忆，也不生成生产审批。使用已运行的外置 Vector 时，
+添加 `--running-collector`，并通过环境变量提供管理员 Token：
 
 ```bash
 DEFENSIVE_AI_API_TOKEN='<admin-token>' \
 python3 scripts/simulate_syslog_ports.py --config config/container.yaml --running-collector
 ```
 
-只有明确需要产生生产记忆与审批的测试才使用 `--production-event`；历史身份重放另加 `--preserve-fixture-identity`。
+仅在明确需要产生生产记忆与审批的测试中使用 `--production-event`；历史身份重放另加
+`--preserve-fixture-identity`。
+
+## 测试与质量检查
+
+```bash
+python3 -m unittest discover -s tests -p 'test_*.py'
+python3 -m compileall -q defensive_ai_gateway scripts tests
+```
+
+涉及前端静态资源时，还应对变更的 JavaScript 文件执行 `node --check`。涉及部署配置时，
+应同时运行对应预检脚本，并在目标环境验证 Gateway、反向代理、Collector、监听端口及
+真实端到端样本；就绪检查通过不代表完整链路验证完成。
+
+## 文档索引
+
+- [总体架构](docs/ARCHITECTURE.md)
+- [风险控制](docs/RISK_CONTROLS.md)
+- [离线迁移](docs/OFFLINE_MIGRATION.md)
+- [回放评测](docs/HARNESS.md)
+- [Response Agent](docs/RESPONSE_AGENT.md)
+- [自动化响应](docs/AUTOMATED_RESPONSE.md)
+- [记忆管理与治理](docs/MEMORY.md)
+- [Syslog 接入](docs/SYSLOG_INGESTION.md)
 
 ## 工程结构
 
@@ -264,32 +367,39 @@ defensive_ai_gateway/
   agents/             HIPS/RASP/NDR/WAF/SIEM 专属 Agent
   static/             Dashboard 前端
 config/
-  dev.yaml            外网开发配置
-  container.yaml      Docker/k3s 离线、远程鉴权失败关闭默认值
-  prod.example.yaml   内网生产配置模板
+  dev.yaml            开发与功能验证配置
+  container.yaml      Docker/k3s 容器运行配置
+  prod.example.yaml   生产配置模板
 deploy/
   docker/             容器部署参考
   k3s/                k3s 部署与 syslog collector 清单
   systemd/            Linux systemd 部署参考
 docs/
-  TECHNICAL_PLAN.md   技术方案与迁移路径
-  OFFLINE_MIGRATION.md 离线迁移步骤
-  HARNESS.md          回放评测说明
-  PHASE2_DEFENSE_AGENT.md 第二阶段 Agent、验证与审批设计
-  RESPONSE_AGENT.md   Response Agent 总体方案、第一阶段实现与后续路线
-  AUTOMATED_RESPONSE.md 审批后自动化处置的控制、协议与运维说明
+  ARCHITECTURE.md     总体架构
+  RISK_CONTROLS.md    风险控制与信任边界
+  RESPONSE_AGENT.md   Response Agent 设计
+  AUTOMATED_RESPONSE.md 自动化处置控制与运维
   MEMORY.md           多层记忆管理与治理
-  SYSLOG_INGESTION.md syslog collector 接入说明
+  SYSLOG_INGESTION.md Syslog Collector 接入说明
+samples/              标准告警样例
+scripts/              发送、回放、打包和运维脚本
+tests/                单元与回归测试
 ```
 
 ## 安全默认值
 
-- 默认只读分析，不执行封禁、隔离、策略变更。
-- prompt 前字段脱敏，原始证据仅保留在数据库。
-- 每次 Agent Run、LLM 调用、策略拦截和输出都写审计记录。
-- 高影响动作只生成 `approve_required` 建议。
-- 只有 Validator `passed` 的建议可以进入审批队列；仅明确的来源 IP 临时封禁可在策略开启、审批达标和连接器健康时进入受控执行，其他高影响建议仍保持只读。
-- 自动化处置默认关闭，支持影子、手工和自动模式；连接器凭据只从环境变量读取，规则必须经设备核验并在 TTL 到期、Case 关闭或误报确认后回滚。完整契约见 `docs/AUTOMATED_RESPONSE.md`。
-- Response Agent 第一阶段 v7 使用 Case 锁定的只读工具规划 ReAct 调查，分段读取脱敏后的完整原始 Syslog，并按 Case 实体关联 WAF、EDR、HIPS、RASP、NDR 等已入库遥测；最终由 LLM 综合攻击行为、时间线、同源/同目标活动、风险与处置优先级，控制器锁定证据身份、精确缺口、权限和审批边界。完整架构、已知边界与迭代路线见 `docs/RESPONSE_AGENT.md`。
-- 生产模板要求两个不同的服务端认证主体投票；本地 Demo 保持单签。
-- Demo 样本真值只在回环请求带 `X-Defensive-AI-Demo-Sample: 1` 时生效，普通告警不能用请求体自证结论。
+- 默认执行只读分析，不直接实施封禁、隔离或策略变更。
+- 进入提示词前对字段脱敏，原始证据保留在事实库中。
+- Agent Run、LLM 调用、策略拦截、审批和响应结果均写入审计记录。
+- 高影响动作默认只生成 `approve_required` 建议。
+- 仅 Validator 状态为 `passed` 的建议可以进入审批队列。只有明确的来源 IP 临时封禁，
+  才能在策略开启、审批达标且连接器健康时进入受控执行；其他高影响动作保持只读。
+- 自动化处置默认关闭，支持影子、手工和自动模式。连接器凭据仅从环境变量读取，
+  规则必须经过设备核验，并在 TTL 到期、Case 关闭或误报确认后回滚。完整契约见
+  [自动化响应文档](docs/AUTOMATED_RESPONSE.md)。
+- Response Agent 使用 Case 锁定的只读工具执行 ReAct 调查，关联已入库遥测，并由控制器
+  约束证据身份、调查缺口、权限和审批边界。完整设计见
+  [Response Agent 文档](docs/RESPONSE_AGENT.md)。
+- 生产模板要求两个不同的服务端认证主体投票；隔离演示配置保持单签。
+- 演示样本真值仅在回环请求携带 `X-Defensive-AI-Demo-Sample: 1` 时生效，普通告警不能
+  通过请求体自证结论。
