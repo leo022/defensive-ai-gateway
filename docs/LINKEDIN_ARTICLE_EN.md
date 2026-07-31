@@ -1,7 +1,5 @@
 # Building a Defensive AI Gateway for Regulated SOC Environments
 
-![Defensive AI Gateway architecture overview](linkedin-assets/architecture-overview.svg)
-
 AI is becoming a practical part of security operations, but the harder question is not whether a model can summarize an alert. The harder question is whether an organization can use AI in a way that is governed, traceable, deployable in restricted environments, and safe for production operations.
 
 That was the design goal behind this Defensive AI Gateway MVP: a lightweight, offline-friendly gateway that receives alerts from security products, normalizes them into a common evidence model, routes them to product-specific agents, applies policy controls, and produces analyst-ready case summaries and next-step recommendations.
@@ -45,8 +43,6 @@ This design keeps the MVP easy to inspect, easy to package, and easier to migrat
 
 ## Alert Processing Flow
 
-![Defensive AI Gateway alert processing flow](linkedin-assets/alert-processing-flow.svg)
-
 The processing flow is deliberately explicit:
 
 1. **Receive a raw alert** from a security product or SIEM case feed.
@@ -82,8 +78,6 @@ This separation makes prompts easier to reason about and makes it possible to ve
 One of the most interesting parts of the project is the memory model. Security memory can help with continuity, but unmanaged memory is also a risk. It can preserve false assumptions, leak sensitive material, or become a source of prompt poisoning.
 
 The gateway therefore separates memory into layers:
-
-![Governed memory model for defensive AI agents](linkedin-assets/memory-governance.svg)
 
 The layers are:
 
@@ -160,4 +154,3 @@ For me, the most promising direction is not "AI replaces the SOC analyst." It is
 **AI helps the SOC analyst move faster while the architecture keeps the organization safer.**
 
 #CyberSecurity #AI #SOC #SecurityOperations #LLM #DefensiveAI #ThreatDetection #Governance #BankingSecurity #IncidentResponse
-

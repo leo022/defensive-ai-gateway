@@ -14,3 +14,4 @@ dist/k3s-images/*.tar
 dist/k3s-images/*.tar.sha256
 dist/k3s-images/*.tar.ref
 .DS_Store
+linkedin-assets/
