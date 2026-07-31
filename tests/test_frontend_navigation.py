@@ -425,10 +425,16 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertIn('else params.set("terminal_only", "1");', JS)
         self.assertIn("case-filter-from", HTML)
         self.assertIn("history-case-filter-from", HTML)
-        self.assertIn("function setPendingCaseSearchCurrentMonth(now = new Date())", JS)
-        self.assertIn("new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0)", JS)
-        self.assertIn("new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 0, 0)", JS)
-        self.assertEqual(JS.count("setPendingCaseSearchCurrentMonth();"), 2)
+        self.assertIn("const PENDING_CASE_DEFAULT_WINDOW_MS = 14 * 24 * 60 * 60 * 1000", JS)
+        self.assertIn("function setPendingCaseSearchRecentTwoWeeks(now = new Date())", JS)
+        self.assertIn("const rangeEnd = new Date(now.getTime())", JS)
+        self.assertIn("rangeEnd.setSeconds(0, 0)", JS)
+        self.assertIn(
+            "const rangeStart = new Date(rangeEnd.getTime() - PENDING_CASE_DEFAULT_WINDOW_MS)",
+            JS,
+        )
+        self.assertEqual(JS.count("setPendingCaseSearchRecentTwoWeeks();"), 2)
+        self.assertNotIn("setPendingCaseSearchCurrentMonth", JS)
         self.assertIn("async function loadMemoryInventory", JS)
         self.assertIn("async function loadMemoryAudit", JS)
         self.assertIn("Promise.allSettled", JS)
@@ -496,7 +502,11 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertIn('<script src="/theme-init.js"></script>', HTML)
         self.assertNotIn("localStorage.getItem(key)", HTML)
         self.assertIn('localStorage.getItem(key)', THEME_JS)
+        self.assertIn('const theme = stored === "dark" ? "dark" : "light"', THEME_JS)
         self.assertIn('document.documentElement.dataset.theme = theme', THEME_JS)
+        self.assertIn('const initial = stored === "dark" ? "dark" : "light"', JS)
+        self.assertNotIn("prefers-color-scheme", THEME_JS)
+        self.assertNotIn("prefers-color-scheme", JS)
 
     def test_alert_triage_drills_from_queue_to_vertical_disposition_page(self):
         self.assertIn("cases-list", self.elements)

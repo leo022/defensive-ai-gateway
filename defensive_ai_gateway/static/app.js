@@ -10,6 +10,7 @@ const COLLAPSIBLE_TEXT_LINE_LIMIT = 8;
 const DASHBOARD_REFRESH_MS = 10_000;
 const OLLAMA_MODEL_REFRESH_MS = 15000;
 const REQUEST_TIMEOUT_MS = 30_000;
+const PENDING_CASE_DEFAULT_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
 const PAGE_SIZE_OPTIONS = [10, 20, 50, 100];
 const LOG_PRODUCT_OPTIONS = [
   { product: "waf", label: "WAF" },
@@ -1471,15 +1472,16 @@ function formatDatetimeLocal(date) {
   ].join("-") + `T${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
-function setPendingCaseSearchCurrentMonth(now = new Date()) {
+function setPendingCaseSearchRecentTwoWeeks(now = new Date()) {
   const form = document.querySelector('form[data-case-search-section="pending"]');
   if (!form) return;
-  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
-  const monthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 0, 0);
+  const rangeEnd = new Date(now.getTime());
+  rangeEnd.setSeconds(0, 0);
+  const rangeStart = new Date(rangeEnd.getTime() - PENDING_CASE_DEFAULT_WINDOW_MS);
   const fromInput = form.elements.namedItem("from");
   const toInput = form.elements.namedItem("to");
-  if (fromInput) fromInput.value = formatDatetimeLocal(monthStart);
-  if (toInput) toInput.value = formatDatetimeLocal(monthEnd);
+  if (fromInput) fromInput.value = formatDatetimeLocal(rangeStart);
+  if (toInput) toInput.value = formatDatetimeLocal(rangeEnd);
 }
 
 function datetimeLocalMs(value) {
@@ -2148,7 +2150,7 @@ function loadThemePreference() {
   } catch (err) {
     stored = "";
   }
-  const initial = stored || document.documentElement.dataset.theme || "light";
+  const initial = stored === "dark" ? "dark" : "light";
   applyTheme(initial);
 }
 
@@ -5050,19 +5052,6 @@ loadLanguagePreference();
 loadThemePreference();
 loadRefreshPreference();
 
-if (window.matchMedia) {
-  const media = window.matchMedia("(prefers-color-scheme: dark)");
-  media.addEventListener("change", (event) => {
-    try {
-      if (!localStorage.getItem(THEME_KEY)) {
-        applyTheme(event.matches ? "dark" : "light");
-      }
-    } catch (err) {
-      applyTheme(event.matches ? "dark" : "light");
-    }
-  });
-}
-
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
     clearDashboardRefreshTimer();
@@ -5109,7 +5098,7 @@ document.querySelectorAll(".case-search-form").forEach((form) => {
   });
   form.querySelector("button[type=button]")?.addEventListener("click", () => {
     form.reset();
-    if (section === "pending") setPendingCaseSearchCurrentMonth();
+    if (section === "pending") setPendingCaseSearchRecentTwoWeeks();
     casePagination[section].page = 1;
     activeDashboardSection = section;
     setView("dashboard");
@@ -5361,7 +5350,7 @@ document.querySelector("#auth-form").addEventListener("submit", async (event) =>
 });
 
 renderLogProductOptions();
-setPendingCaseSearchCurrentMonth();
+setPendingCaseSearchRecentTwoWeeks();
 loadApplicationData().catch((err) =>
   showToast(err.message || String(err), "error"),
 );
