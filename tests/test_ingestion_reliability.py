@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,10 +16,14 @@ from defensive_ai_gateway.config import GatewayConfig
 from defensive_ai_gateway.database import AlertIdentityConflict, Repository
 from defensive_ai_gateway.json_safety import MAX_JSON_NESTING, MAX_JSON_NODES
 from defensive_ai_gateway.llm import LLMClient, LLMEndpointConfigurationError, LocalHeuristicLLM
-from defensive_ai_gateway.log_adapter import LogAdapter
+from defensive_ai_gateway.log_adapter import LogAdapter, builtin_product_profile
 from defensive_ai_gateway.memory import MemoryManager
 from defensive_ai_gateway.models import RawAlert
 from defensive_ai_gateway.normalizer import EventNormalizer
+from defensive_ai_gateway.operational_test import (
+    OPERATIONAL_TEST_MARKER_FIELD,
+    verify_operational_test_marker,
+)
 from defensive_ai_gateway.orchestrator import Orchestrator
 from defensive_ai_gateway.policy import PolicyEngine
 from defensive_ai_gateway.processing import (
@@ -36,7 +41,11 @@ from defensive_ai_gateway.syslog_receiver import (
     _SyslogListener,
 )
 from defensive_ai_gateway.syslog_router import SyslogPortRouter
-from scripts.simulate_syslog_ports import _embedded_expected_alert, _send_to_embedded_listeners
+from scripts.simulate_syslog_ports import (
+    _embedded_expected_alert,
+    _prepare_syslog_samples,
+    _send_to_embedded_listeners,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1081,6 +1090,40 @@ class SyslogFrameDecoderTest(unittest.TestCase):
 
 
 class SyslogDemoScriptTest(unittest.TestCase):
+    def test_samples_are_current_unique_and_signed_as_operational_tests(self):
+        delivered_at = datetime(2026, 7, 31, 15, 20, tzinfo=timezone(timedelta(hours=8)))
+        samples = _prepare_syslog_samples(
+            {"waf": 15140, "ndr": 15142},
+            signing_secret="admin-secret",
+            delivered_at=delivered_at,
+            batch_id="syslog-regression",
+        )
+
+        self.assertEqual(len(samples), 2)
+        for index, (product, _port, data) in enumerate(samples):
+            native_log = json.loads(data)
+            marker = native_log.pop(OPERATIONAL_TEST_MARKER_FIELD)
+            mapped = LogAdapter().adapt(builtin_product_profile(product), native_log)
+            alert = mapped["raw_alert"]
+            self.assertIsNotNone(alert)
+            self.assertRegex(
+                alert.alert_id,
+                rf"^{product}-demo-20260731152000-syslogregression-{index + 1:03d}$",
+            )
+            self.assertEqual(
+                datetime.fromisoformat(alert.timestamp),
+                delivered_at + timedelta(milliseconds=index),
+            )
+            self.assertTrue(
+                verify_operational_test_marker(
+                    marker,
+                    alert_id=alert.alert_id,
+                    product=alert.product,
+                    timestamp=alert.timestamp,
+                    secret="admin-secret",
+                )
+            )
+
     def test_embedded_mode_reuses_running_listeners_and_waits_for_durable_completion(self):
         ports = {"waf": 15140, "hips": 15141, "ndr": 15142, "rasp": 15143, "siem": 15144}
         profiles = {product: f"auto-{product}-json" for product in ports}

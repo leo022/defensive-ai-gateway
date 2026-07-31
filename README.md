@@ -55,10 +55,10 @@ python3 scripts/send_sample.py --file samples/siem_case.json
 python3 scripts/send_demo_alerts.py
 ```
 
-`alert_id` 是告警实例的幂等键。以上 `--file` 命令会原样重放固定样本；再次发送同一文件是重试，不会创建第二条原始告警或重新执行长期记忆匹配。要模拟同类型的新告警，请保留规则语义、生成新的实例 ID 和时间戳：
+`alert_id` 是告警实例的幂等键。样例发送工具默认在传输前生成当前执行时间和唯一实例 ID；原生日志内嵌的事件 ID 与时间也会同步刷新。只有明确验证历史重放或幂等行为时，才使用 `--preserve-fixture-identity` 保留固定样本身份：
 
 ```bash
-python3 scripts/send_sample.py --file samples/waf_alert.json --mutate
+python3 scripts/send_sample.py --file samples/waf_alert.json --preserve-fixture-identity
 ```
 
 若同一 `alert_id` 携带不同的时间戳、字段或证据，接口会返回 `409 alert_id_conflict`，要求上游为新的告警实例分配唯一 ID，避免静默丢弃或篡改既有审计证据。
@@ -95,11 +95,14 @@ python3 scripts/send_demo_alerts.py --batch validation-review
 也可以随机生成不同特征的攻击或误报告警：
 
 ```bash
-# --file 永远按原 JSON 发送固定样本；重复提交是幂等重放
+# --file 默认保留规则和证据语义，但生成当前时间与唯一实例 ID
 python3 scripts/send_sample.py --file samples/ndr_alert.json
 
-# --mutate 保留同类规则语义，但生成新的告警实例 ID、时间戳和可变字段
+# --mutate 额外随机化 IP、会话和速率等可变字段
 python3 scripts/send_sample.py --file samples/ndr_alert.json --mutate --count 2
+
+# 仅在验证历史/幂等重放时保留固定 ID 与时间
+python3 scripts/send_sample.py --file samples/ndr_alert.json --preserve-fixture-identity
 
 # --random 随机选择产品、场景和该产品支持的攻击特征
 python3 scripts/send_sample.py --random --count 5 --product waf --scenario random
@@ -113,7 +116,7 @@ python3 scripts/send_sample.py --random --count 3 --product ndr --feature sql_in
 python3 scripts/send_sample.py --list-features
 ```
 
-`--file` 与 `--random` 是两种互斥的发送模式。`--feature` 只控制攻击特征，`--scenario` 控制真实攻击、人工复核或误报；未指定 `--feature` 时随机选择产品特征。离线 Harness 也支持相同能力：
+`--file` 与 `--random` 是两种互斥的发送模式。`--feature` 只控制攻击特征，`--scenario` 控制真实攻击、人工复核或误报；未指定 `--feature` 时随机选择产品特征。`--preserve-generated-identity` 继续作为旧版参数别名，但新命令应使用 `--preserve-fixture-identity`。离线 Harness 也支持相同能力：
 
 ```bash
 python3 scripts/run_harness.py --samples samples --random-count 10 --random-product ndr --random-feature brute_force
@@ -229,6 +232,15 @@ bash scripts/package_k3s_deploy.sh --include-vector
 python3 -m defensive_ai_gateway --config config/dev.yaml
 python3 scripts/simulate_syslog_ports.py --config config/dev.yaml
 ```
+
+Syslog 模拟器默认刷新五类原生日志的事件 ID/时间，并使用管理员 API Token 生成 HMAC 测试标记。Gateway 只在可信采集路由确认来源为本机且签名正确时将其标记为运行验证样本；此类 Case 不写长期记忆，也不生成生产审批。外置 Vector 已在运行时使用 `--running-collector`，并通过环境变量提供管理员 Token：
+
+```bash
+DEFENSIVE_AI_API_TOKEN='<admin-token>' \
+python3 scripts/simulate_syslog_ports.py --config config/container.yaml --running-collector
+```
+
+只有明确需要产生生产记忆与审批的测试才使用 `--production-event`；历史身份重放另加 `--preserve-fixture-identity`。
 
 ## 工程结构
 

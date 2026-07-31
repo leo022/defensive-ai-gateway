@@ -75,9 +75,11 @@ FEATURES_BY_SCENARIO = {
 }
 HK_TZ = timezone(timedelta(hours=8))
 _DELIVERY_TIMESTAMP_KEYS = {
+    "@timestamp",
     "attack_time",
     "created_at",
     "event_time",
+    "time",
     "timestamp",
     "trigger_time",
 }
@@ -201,35 +203,42 @@ def prepare_alerts_for_delivery(
         payload = copy.deepcopy(source)
         occurrence_time = base_delivery + timedelta(milliseconds=index - 1)
         original_time = _parse_sample_timestamp(payload.get("timestamp"))
+        original_alert_id = str(payload.get("alert_id") or "")
+        product = re.sub(r"[^a-z0-9]", "", str(payload.get("product") or "alert").lower())
+        refreshed_alert_id = (
+            f"{product or 'alert'}-demo-{occurrence_time.strftime('%Y%m%d%H%M%S')}"
+            f"-{rendered_batch}-{index:03d}"
+        )
         visited: set[int] = set()
 
-        def refresh_timestamps(node: Any) -> None:
+        def refresh_occurrence_fields(node: Any) -> None:
             if isinstance(node, dict):
                 if id(node) in visited:
                     return
                 visited.add(id(node))
                 for key, value in list(node.items()):
-                    if key in _DELIVERY_TIMESTAMP_KEYS and isinstance(value, str):
+                    if original_alert_id and isinstance(value, str) and value == original_alert_id:
+                        node[key] = refreshed_alert_id
+                    elif key in _DELIVERY_TIMESTAMP_KEYS and isinstance(value, str):
                         parsed = _parse_sample_timestamp(value)
                         if parsed is not None:
                             delta = parsed - original_time if original_time is not None else timedelta()
                             node[key] = (occurrence_time + delta).isoformat()
                     elif isinstance(value, (dict, list)):
-                        refresh_timestamps(value)
+                        refresh_occurrence_fields(value)
             elif isinstance(node, list):
                 if id(node) in visited:
                     return
                 visited.add(id(node))
-                for item in node:
-                    refresh_timestamps(item)
+                for item_index, item in enumerate(node):
+                    if original_alert_id and isinstance(item, str) and item == original_alert_id:
+                        node[item_index] = refreshed_alert_id
+                    elif isinstance(item, (dict, list)):
+                        refresh_occurrence_fields(item)
 
-        refresh_timestamps(payload)
+        refresh_occurrence_fields(payload)
         payload["timestamp"] = occurrence_time.isoformat()
-        product = re.sub(r"[^a-z0-9]", "", str(payload.get("product") or "alert").lower())
-        payload["alert_id"] = (
-            f"{product or 'alert'}-demo-{occurrence_time.strftime('%Y%m%d%H%M%S')}"
-            f"-{rendered_batch}-{index:03d}"
-        )
+        payload["alert_id"] = refreshed_alert_id
         prepared.append(payload)
     return prepared
 

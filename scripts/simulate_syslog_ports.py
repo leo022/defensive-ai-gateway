@@ -11,6 +11,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
@@ -20,6 +21,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from defensive_ai_gateway.config import load_config
 from defensive_ai_gateway.log_adapter import LogAdapter, builtin_product_profile
+from defensive_ai_gateway.operational_test import (
+    OPERATIONAL_TEST_MARKER_FIELD,
+    build_operational_test_marker,
+)
+from defensive_ai_gateway.sample_alerts import prepare_alerts_for_delivery
 from defensive_ai_gateway.syslog_router import SyslogPortRouter
 
 
@@ -58,6 +64,67 @@ def _embedded_expected_alert(router: SyslogPortRouter, product: str, port: int, 
     if alert is None:
         raise ValueError(f"{product} sample mapping failed: {adapted.get('errors', [])}")
     return alert.alert_id, routed.profile_id
+
+
+def _prepare_syslog_samples(
+    product_ports: dict[str, int],
+    *,
+    signing_secret: str = "",
+    operational_test: bool = True,
+    preserve_fixture_identity: bool = False,
+    delivered_at: datetime | None = None,
+    batch_id: str | None = None,
+) -> list[tuple[str, int, bytes]]:
+    """Build current, unique native device messages for one simulator run."""
+    adapter = LogAdapter()
+    wrappers: list[dict] = []
+    products: list[tuple[str, int]] = []
+    for product, port in sorted(product_ports.items(), key=lambda item: item[1]):
+        sample_path = PROJECT_ROOT / "samples_syslog" / product / f"{product}_alert.json"
+        native_log = json.loads(sample_path.read_text(encoding="utf-8"))
+        mapped = adapter.adapt(builtin_product_profile(product), native_log)
+        alert = mapped.get("raw_alert")
+        if alert is None:
+            raise ValueError(f"{product} sample mapping failed: {mapped.get('errors', [])}")
+        wrappers.append(
+            {
+                "product": product,
+                "alert_id": alert.alert_id,
+                "timestamp": alert.timestamp,
+                "payload": native_log,
+            }
+        )
+        products.append((product, int(port)))
+
+    if not preserve_fixture_identity:
+        wrappers = prepare_alerts_for_delivery(
+            wrappers,
+            delivered_at=delivered_at,
+            batch_id=batch_id,
+        )
+
+    samples: list[tuple[str, int, bytes]] = []
+    for (product, port), wrapper in zip(products, wrappers, strict=True):
+        native_log = wrapper["payload"]
+        mapped = adapter.adapt(builtin_product_profile(product), native_log)
+        alert = mapped.get("raw_alert")
+        if alert is None:
+            raise ValueError(f"refreshed {product} sample mapping failed: {mapped.get('errors', [])}")
+        if operational_test:
+            native_log[OPERATIONAL_TEST_MARKER_FIELD] = build_operational_test_marker(
+                alert.alert_id,
+                alert.product,
+                alert.timestamp,
+                signing_secret,
+            )
+        samples.append(
+            (
+                product,
+                port,
+                json.dumps(native_log, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+            )
+        )
+    return samples
 
 
 def _send_to_embedded_listeners(
@@ -157,6 +224,15 @@ class TcpCollectorSimulator:
                         chunks.append(chunk)
                 data = b"".join(chunks)
                 routed = self.router.route(port, data, hostname=addr[0], appname=product)
+                route = dict(routed.envelope)
+                route["collector"] = "vector"
+                route["source_ip"] = addr[0]
+                routed.payload["syslog_route"] = route
+                if isinstance(routed.payload.get("log"), dict):
+                    routed.payload["log"]["_syslog_envelope"] = route
+                alert_payload = routed.payload.get("payload")
+                if isinstance(alert_payload, dict):
+                    alert_payload["syslog_route"] = route
                 response = _post_json(self.gateway_url, routed.payload, self.token)
                 record = {
                     "port": port,
@@ -191,7 +267,31 @@ def main() -> None:
     parser.add_argument("--health-url", default="http://127.0.0.1:8080/api/health")
     parser.add_argument("--bind-host", default="127.0.0.1")
     parser.add_argument("--timeout", type=float, default=10)
-    parser.add_argument("--token", default=os.getenv("DEFENSIVE_AI_API_TOKEN", ""))
+    parser.add_argument(
+        "--token",
+        default=os.getenv("DEFENSIVE_AI_API_TOKEN", ""),
+        help="Admin API token used to sign operational tests and query Gateway state",
+    )
+    parser.add_argument(
+        "--ingest-token",
+        default=os.getenv("DEFENSIVE_AI_INGEST_TOKEN", ""),
+        help="Collector ingest token used only by the built-in HTTP collector simulator",
+    )
+    parser.add_argument(
+        "--running-collector",
+        action="store_true",
+        help="Send to already-running Syslog listeners even when the Gateway uses an external collector",
+    )
+    parser.add_argument(
+        "--production-event",
+        action="store_true",
+        help="Submit normal production events instead of memory-isolated operational tests",
+    )
+    parser.add_argument(
+        "--preserve-fixture-identity",
+        action="store_true",
+        help="Preserve fixed fixture IDs/timestamps for an explicit historical replay",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -200,12 +300,14 @@ def main() -> None:
         raise SystemExit(f"gateway health check failed: {health}")
 
     router = SyslogPortRouter(config.syslog.product_ports, config.syslog.gateway_profiles)
-    samples: list[tuple[str, int, bytes]] = []
-    for product, port in sorted(config.syslog.product_ports.items(), key=lambda item: item[1]):
-        sample_path = PROJECT_ROOT / "samples_syslog" / product / f"{product}_alert.json"
-        samples.append((product, int(port), sample_path.read_bytes()))
+    samples = _prepare_syslog_samples(
+        config.syslog.product_ports,
+        signing_secret=args.token,
+        operational_test=not args.production_event,
+        preserve_fixture_identity=args.preserve_fixture_identity,
+    )
 
-    if config.syslog.embedded_listeners_enabled:
+    if config.syslog.embedded_listeners_enabled or args.running_collector:
         results = _send_to_embedded_listeners(
             router,
             samples,
@@ -215,7 +317,12 @@ def main() -> None:
             args.timeout,
         )
     else:
-        collector = TcpCollectorSimulator(args.bind_host, router, args.gateway_url, args.token)
+        collector = TcpCollectorSimulator(
+            args.bind_host,
+            router,
+            args.gateway_url,
+            args.ingest_token,
+        )
         collector.start()
         try:
             for product, port, data in samples:

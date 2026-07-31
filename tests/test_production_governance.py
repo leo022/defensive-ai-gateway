@@ -12,7 +12,12 @@ from pathlib import Path
 from defensive_ai_gateway.app import GatewayState, build_server
 from defensive_ai_gateway.config import AuthPrincipalConfig, GatewayConfig
 from defensive_ai_gateway.database import Repository, SCHEMA_VERSION
+from defensive_ai_gateway.log_adapter import LogAdapter, builtin_product_profile
 from defensive_ai_gateway.models import AgentResult, NormalizedEvent, RawAlert
+from defensive_ai_gateway.operational_test import (
+    OPERATIONAL_TEST_MARKER_FIELD,
+    build_operational_test_marker,
+)
 
 
 def _sample_alert(alert_id: str, timestamp: str = "2026-07-14T01:00:00Z") -> RawAlert:
@@ -886,6 +891,109 @@ class HTTPProductionBoundaryTest(unittest.TestCase):
             )[0],
             403,
         )
+
+    def test_signed_loopback_syslog_isolated_and_spoofed_markers_rejected(self):
+        def vector_payload(alert_id: str, source_ip: str, *, valid_signature: bool = True) -> dict:
+            native = json.loads(
+                Path("samples_syslog/waf/waf_alert.json").read_text(encoding="utf-8")
+            )
+            native["alert"]["id"] = alert_id
+            native["event"]["time"] = "2026-07-31T16:00:00+08:00"
+            mapped = LogAdapter().adapt(builtin_product_profile("waf"), native)
+            alert = mapped["raw_alert"]
+            marker = build_operational_test_marker(
+                alert.alert_id,
+                alert.product,
+                alert.timestamp,
+                "admin-token",
+            )
+            if not valid_signature:
+                marker["signature"] = "0" * 64
+            native[OPERATIONAL_TEST_MARKER_FIELD] = marker
+            route = {
+                "collector": "vector",
+                "destination_port": 15140,
+                "product": "waf",
+                "hostname": "syslog-source",
+                "source_ip": source_ip,
+                "protocol": "tcp",
+                "route_reason": "port_profile",
+            }
+            return {
+                "log": native,
+                "profile_id": "auto-waf-json",
+                "syslog_route": route,
+            }
+
+        status, operational = self._request(
+            "/api/alerts",
+            token="ingest-token",
+            payload=vector_payload("signed-syslog-operational", "127.0.0.1"),
+        )
+        self.assertEqual(status, 202)
+        self.assertTrue(operational["case_id"].startswith("case_test_"))
+        self.assertEqual(
+            operational["explanation"]["memory_write_status"],
+            "suppressed_for_operational_test",
+        )
+        persisted = self.server.state.repo.get_inbox_alert("signed-syslog-operational")
+        self.assertTrue(persisted["raw_alert"]["trusted_sample"])
+        self.assertTrue(persisted["raw_alert"]["operational_test"])
+        self.assertNotIn(
+            OPERATIONAL_TEST_MARKER_FIELD,
+            json.dumps(persisted["raw_alert"]["payload"]),
+        )
+        self.assertEqual(
+            self.server.state.repo.conn.execute(
+                "SELECT COUNT(*) FROM memory_entries WHERE source_case_id = ?",
+                (operational["case_id"],),
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.server.state.repo.list_approvals(
+                case_id=operational["case_id"], limit=10
+            ),
+            [],
+        )
+
+        invalid_status, _ = self._request(
+            "/api/alerts",
+            token="ingest-token",
+            payload=vector_payload(
+                "invalid-syslog-operational",
+                "127.0.0.1",
+                valid_signature=False,
+            ),
+        )
+        self.assertEqual(invalid_status, 400)
+        self.assertIsNone(
+            self.server.state.repo.get_inbox_alert("invalid-syslog-operational")
+        )
+
+        remote_status, _ = self._request(
+            "/api/alerts",
+            token="ingest-token",
+            payload=vector_payload("remote-syslog-operational", "10.20.30.40"),
+        )
+        self.assertEqual(remote_status, 400)
+        self.assertIsNone(
+            self.server.state.repo.get_inbox_alert("remote-syslog-operational")
+        )
+
+        unsigned = vector_payload("unsigned-production-syslog", "10.20.30.40")
+        unsigned["log"].pop(OPERATIONAL_TEST_MARKER_FIELD)
+        production_status, production = self._request(
+            "/api/alerts",
+            token="ingest-token",
+            payload=unsigned,
+        )
+        self.assertEqual(production_status, 202)
+        self.assertFalse(production["case_id"].startswith("case_test_"))
+        production_record = self.server.state.repo.get_inbox_alert(
+            "unsigned-production-syslog"
+        )
+        self.assertFalse(production_record["raw_alert"]["operational_test"])
 
     def test_quorum_uses_distinct_server_issued_principals(self):
         sample = json.loads(Path("samples/waf_alert.json").read_text(encoding="utf-8"))

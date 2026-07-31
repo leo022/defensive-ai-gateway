@@ -204,7 +204,9 @@ def main() -> None:
     )
     parser.add_argument("--print-only", action="store_true", help="Print payloads without sending")
     parser.add_argument(
+        "--preserve-fixture-identity",
         "--preserve-generated-identity",
+        dest="preserve_fixture_identity",
         action="store_true",
         help="Send fixed fixture IDs/timestamps for an explicit historical replay",
     )
@@ -220,19 +222,19 @@ def main() -> None:
     for product, scenario, label, seed in selected:
         payloads.append((label, build_demo_payload(product, scenario, label, seed)))
 
+    if not args.preserve_fixture_identity:
+        refreshed = prepare_alerts_for_delivery([payload for _, payload in payloads])
+        payloads = [
+            (label, refreshed[index])
+            for index, (label, _payload) in enumerate(payloads)
+        ]
+
     summary = coverage_summary(payloads)
     print(json.dumps({"batch": args.batch, "coverage": summary}, ensure_ascii=False, indent=2))
 
     if args.print_only:
         print(json.dumps({"generated": len(payloads), "alerts": [p for _, p in payloads]}, ensure_ascii=False, indent=2))
         return
-
-    if not args.preserve_generated_identity:
-        refreshed = prepare_alerts_for_delivery([payload for _, payload in payloads])
-        payloads = [
-            (label, refreshed[index])
-            for index, (label, _payload) in enumerate(payloads)
-        ]
 
     rows = []
     for label, payload in payloads:

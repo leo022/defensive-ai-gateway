@@ -12,6 +12,7 @@ from typing import Any
 SERVER_OWNED_ALERT_PAYLOAD_FIELDS = frozenset(
     {
         "_syslog_envelope",
+        "_defensive_ai_operational_test",
         "adapter",
         "adapter_evidence",
         "collector_mapping_fallback",

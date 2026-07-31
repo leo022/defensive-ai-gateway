@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -643,6 +645,11 @@ class PipelineTest(unittest.TestCase):
 
     def test_live_sample_delivery_refreshes_fixture_identity_and_embedded_times(self):
         fixture = generate_alert(product="rasp", scenario="attack", seed=5001)
+        fixture["payload"]["nested_identity"] = {
+            "event_id": fixture["alert_id"],
+            "time": fixture["timestamp"],
+            "related_ids": [fixture["alert_id"]],
+        }
         original = json.loads(json.dumps(fixture))
         delivered_at = datetime(2026, 7, 31, 14, 5, 6, tzinfo=timezone(timedelta(hours=8)))
 
@@ -671,6 +678,53 @@ class PipelineTest(unittest.TestCase):
             datetime.fromisoformat(prepared[1]["timestamp"]) - delivered_at,
             timedelta(milliseconds=1),
         )
+        self.assertEqual(
+            prepared[0]["payload"]["nested_identity"]["event_id"],
+            prepared[0]["alert_id"],
+        )
+        self.assertEqual(
+            prepared[0]["payload"]["nested_identity"]["related_ids"],
+            [prepared[0]["alert_id"]],
+        )
+        self.assertEqual(
+            prepared[0]["payload"]["nested_identity"]["time"],
+            prepared[0]["timestamp"],
+        )
+
+    def test_static_sample_cli_defaults_to_a_current_unique_occurrence(self):
+        fixture = json.loads(Path("samples/waf_alert.json").read_text(encoding="utf-8"))
+        before = datetime.now(timezone.utc) - timedelta(seconds=2)
+        result = subprocess.run(
+            [
+                sys.executable,
+                "scripts/send_sample.py",
+                "--file",
+                "samples/waf_alert.json",
+                "--print-only",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        rendered = json.loads(result.stdout)["alerts"][0]
+
+        self.assertNotEqual(rendered["alert_id"], fixture["alert_id"])
+        self.assertGreaterEqual(datetime.fromisoformat(rendered["timestamp"]), before)
+
+        preserved = subprocess.run(
+            [
+                sys.executable,
+                "scripts/send_sample.py",
+                "--file",
+                "samples/waf_alert.json",
+                "--print-only",
+                "--preserve-fixture-identity",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(json.loads(preserved.stdout)["alerts"][0], fixture)
 
     def test_random_rasp_generation_covers_real_attack_event_shapes(self):
         alerts = [generate_alert(product="rasp", scenario="attack", seed=seed) for seed in range(1, 12)]

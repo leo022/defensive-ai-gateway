@@ -93,7 +93,18 @@ python3 -m defensive_ai_gateway --config config/dev.yaml
 python3 scripts/simulate_syslog_ports.py --config config/dev.yaml
 ```
 
-脚本会检查 `GET /api/health`，把 `samples_syslog/<product>/<product>_alert.json` 作为不同设备发来的 syslog 报文发送到 `15140`-`15144`，并确认每条都按目标端口路由到正确 product。`config/dev.yaml` 的内嵌监听模式会直接复用已经启动的五个监听器并轮询持久 inbox，直到每条记录变为 `completed`；外置 collector 模式仍验证 HTTP 入口返回 `202`、`status=queued` 和 `durable=true`。
+脚本会检查 `GET /api/health`，刷新 `samples_syslog/<product>/<product>_alert.json` 的原生事件 ID 和时间后，作为不同设备发来的 syslog 报文发送到 `15140`-`15144`，并确认每条都按目标端口路由到正确 product。默认报文带有使用管理员 API Token 签发的 HMAC 运行测试标记；Gateway 仅在可信路由确认来源为本机且签名正确时启用测试隔离，禁止长期记忆写入和生产审批。`config/dev.yaml` 的内嵌监听模式会直接复用已经启动的五个监听器并轮询持久 inbox，直到每条记录变为 `completed`。
+
+生产或其他外置 Vector 场景应复用正在运行的监听器：
+
+```bash
+DEFENSIVE_AI_API_TOKEN='<admin-token>' \
+python3 scripts/simulate_syslog_ports.py \
+  --config config/container.yaml \
+  --running-collector
+```
+
+内置 HTTP collector 模拟模式另需 `DEFENSIVE_AI_INGEST_TOKEN`。只有明确需要创建正常生产记忆和审批时才加 `--production-event`；需要固定历史 ID/时间验证幂等行为时再加 `--preserve-fixture-identity`。
 
 内嵌 TCP 接收器兼容 RFC6587 八位计数、单行换行分帧，以及本仓库 Demo 使用的完整多行 JSON 文档；每帧和每连接仍受配置的字节上限保护。
 

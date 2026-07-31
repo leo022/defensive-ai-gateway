@@ -69,6 +69,12 @@ from .models import (
 from .network_safety import EndpointPin, pinned_endpoint_handlers, resolve_http_endpoint_pin
 from .normalizer import EventNormalizer
 from .orchestrator import Orchestrator
+from .operational_test import (
+    extract_operational_test_marker,
+    strip_operational_test_markers,
+    trusted_syslog_test_source,
+    verify_operational_test_marker,
+)
 from .policy import PolicyEngine
 from .processing import (
     AlertNonRetryableError,
@@ -2229,12 +2235,58 @@ class GatewayState:
             routed_payload = routed.payload.get("payload")
             if isinstance(routed_payload, dict):
                 original_log = routed_payload.get("original_log")
-        return self.alert_from_payload(
+        alert = self.alert_from_payload(
             routed.payload,
             routed.profile_id,
             trusted_syslog_route=routed.envelope,
             trusted_original_log=original_log if isinstance(original_log, dict) else None,
         )
+        self.apply_syslog_operational_test(alert, routed.payload, routed.envelope)
+        return alert
+
+    def apply_syslog_operational_test(
+        self,
+        alert: RawAlert,
+        inbound_payload: dict,
+        trusted_route: dict | None,
+    ) -> bool:
+        """Verify and apply a signed, loopback-only Syslog test marker."""
+        marker = extract_operational_test_marker(inbound_payload)
+        strip_operational_test_markers(alert.payload)
+        if marker is None:
+            return False
+        if not trusted_syslog_test_source(trusted_route):
+            raise ValueError(
+                "operational test marker requires a trusted loopback Syslog route"
+            )
+
+        auth = self.config.auth
+        configured_tokens = (
+            auth.api_token,
+            auth.ingest_token,
+            auth.operator_token,
+            auth.approver_token,
+            auth.responder_token,
+            *(principal.token for principal in auth.principals),
+        )
+        secret = str(auth.api_token or "")
+        if not secret and not (
+            auth.allow_loopback_no_token and not any(configured_tokens)
+        ):
+            raise ValueError(
+                "operational Syslog tests require the configured admin API token"
+            )
+        if not verify_operational_test_marker(
+            marker,
+            alert_id=alert.alert_id,
+            product=alert.product,
+            timestamp=alert.timestamp,
+            secret=secret,
+        ):
+            raise ValueError("invalid operational test marker signature")
+        alert.trusted_sample = True
+        alert.operational_test = True
+        return True
 
     def alert_from_payload(
         self,
@@ -4574,6 +4626,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     trusted_syslog_route=trusted_route,
                     trusted_original_log=trusted_original,
                 )
+            self.state.apply_syslog_operational_test(alert, payload, trusted_route)
             if self._is_trusted_demo_sample_request():
                 alert.trusted_sample = True
                 alert.operational_test = True

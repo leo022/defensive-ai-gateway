@@ -161,9 +161,11 @@ def main():
     parser.add_argument("--seed", type=int, help="Seed for repeatable randomized/mutated samples")
     parser.add_argument("--print-only", action="store_true", help="Print payloads without sending them")
     parser.add_argument(
+        "--preserve-fixture-identity",
         "--preserve-generated-identity",
+        dest="preserve_fixture_identity",
         action="store_true",
-        help="Send the fixed generated alert_id/timestamp for an explicit historical replay",
+        help="Preserve fixed fixture alert_id/timestamps for an explicit historical replay",
     )
     parser.add_argument("--url", default="http://127.0.0.1:8080/api/alerts")
     parser.add_argument("--timeout", type=int, default=180)
@@ -185,9 +187,6 @@ def main():
         parser.error("--feature can only be used with --random")
     if args.feature and not args.product:
         parser.error("--product is required when --feature is specified")
-    if args.preserve_generated_identity and not args.random:
-        parser.error("--preserve-generated-identity can only be used with --random")
-
     if args.random:
         payloads = generate_alerts(
             args.count,
@@ -207,12 +206,12 @@ def main():
             parser.error("--file is required unless --random or --mutate is set")
         payloads = [json.loads(Path(args.file).read_text(encoding="utf-8"))]
 
+    if not args.preserve_fixture_identity:
+        payloads = prepare_alerts_for_delivery(payloads)
+
     if args.print_only:
         print(json.dumps({"generated": len(payloads), "alerts": payloads}, ensure_ascii=False, indent=2))
         return
-
-    if args.random and not args.preserve_generated_identity:
-        payloads = prepare_alerts_for_delivery(payloads)
 
     responses = []
     headers = {
@@ -231,7 +230,7 @@ def main():
                 if isinstance(response, dict) and response.get("duplicate"):
                     item["notice"] = (
                         "The gateway reused the existing alert because alert_id is the idempotency key. "
-                        "Use --mutate for a new sample occurrence."
+                        "Omit --preserve-fixture-identity for a new sample occurrence."
                     )
                 responses.append(item)
         except urllib.error.HTTPError as exc:
@@ -252,7 +251,7 @@ def main():
     if duplicate_count:
         summary["notice"] = (
             f"{duplicate_count} submission(s) reused an existing alert_id. "
-            "Use --mutate to create a distinct same-type sample alert."
+            "Omit --preserve-fixture-identity to create a distinct sample occurrence."
         )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
