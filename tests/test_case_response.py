@@ -111,6 +111,40 @@ class CaseResponseServiceTest(unittest.TestCase):
         self.assertTrue(second["created"])
         self.assertEqual(second["artifact"]["version"], 2)
 
+    def test_pack_and_timeline_normalize_legacy_nested_verdict_title(self):
+        case_id = self._case("case-response-nested-verdict")
+        detail = "疑似TLS数据外传，存在大流量出站但缺少资产和业务确认"
+        malformed = f"【需人工复核】- 研判结论：【需人工复核】- {detail}"
+        expected = f"【需人工复核】- {detail}"
+        row = self.state.repo.conn.execute(
+            "SELECT run_id, result_json FROM agent_runs "
+            "WHERE case_id = ? ORDER BY created_at_ms DESC LIMIT 1",
+            (case_id,),
+        ).fetchone()
+        result = json.loads(row["result_json"])
+        result["summary"] = malformed
+        result.setdefault("explanation", {})["verdict"] = malformed
+        self.state.repo.conn.execute(
+            "UPDATE agent_runs SET result_json = ? WHERE run_id = ?",
+            (json.dumps(result, ensure_ascii=False), row["run_id"]),
+        )
+        self.state.repo.conn.execute(
+            "UPDATE cases SET summary = ? WHERE case_id = ?",
+            (malformed, case_id),
+        )
+        self.state.repo.conn.commit()
+
+        pack = self.state.case_response.generate(
+            case_id,
+            actor="soc-analyst",
+        )["artifact"]["content"]
+        self.assertEqual(pack["case_summary"]["headline"], expected)
+        self.assertEqual(pack["case_summary"]["current_assessment"], expected)
+
+        timeline = self.state.case_response.timeline(case_id, limit=100, offset=0)
+        analysis = next(item for item in timeline["items"] if item["kind"] == "analysis")
+        self.assertEqual(analysis["title"], expected)
+
     def test_timeline_uses_sql_pagination_and_dual_clock_fallback(self):
         case_id = self._case("case-response-timeline")
         event_id = self.state.repo.get_case_response_source(case_id)["events"][0][

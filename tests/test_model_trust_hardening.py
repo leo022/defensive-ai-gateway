@@ -231,6 +231,45 @@ def _alert(*, trusted: bool) -> RawAlert:
     )
 
 
+class VerdictTitleNormalizationTest(unittest.TestCase):
+    def setUp(self):
+        self.agent = build_agent("ndr", _Model({}), _policy())
+
+    def test_nested_verdict_heading_and_tag_are_collapsed(self):
+        detail = "疑似TLS数据外传，存在大流量出站但缺少资产和业务确认"
+        expected = f"【需人工复核】- {detail}"
+
+        self.assertEqual(
+            self.agent._format_verdict(
+                f"研判结论：【需人工复核】- {detail}",
+                "suspicious",
+            ),
+            expected,
+        )
+        self.assertEqual(
+            self.agent._compact_case_title(
+                f"【需人工复核】- 研判结论：【需人工复核】- {detail}",
+                "Rare outbound TLS beacon or exfiltration pattern",
+            ),
+            expected,
+        )
+
+    def test_markdown_wrapped_verdict_is_plain_and_idempotent(self):
+        expected = "【需人工复核】- 疑似TLS数据外传"
+
+        self.assertEqual(
+            self.agent._format_verdict(
+                "**研判结论：** **【需人工复核】- 疑似TLS数据外传**",
+                "suspicious",
+            ),
+            expected,
+        )
+        self.assertEqual(
+            self.agent._format_verdict(expected, "suspicious"),
+            expected,
+        )
+
+
 class SampleTrustBoundaryTest(unittest.TestCase):
     def test_untrusted_alert_cannot_inject_verdict_or_whitelist(self):
         normalizer = EventNormalizer(_policy())

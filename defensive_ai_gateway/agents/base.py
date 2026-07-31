@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 from ..action_plan import normalize_action_plan
+from ..case_titles import compact_case_title, normalize_case_verdict
 
 from ..llm import LLMClient
 from ..models import AgentResult, NormalizedEvent, RecommendedAction, new_id
@@ -149,13 +150,7 @@ class SecurityAgent(ABC):
         return self._compact_case_title(verdict, event.event_type)
 
     def _compact_case_title(self, verdict: Any, event_type: str) -> str:
-        value = re.sub(r"^研判结论[：:]\s*", "", str(verdict or "").strip())
-        value = re.split(r"[。\n]", value, maxsplit=1)[0].strip()
-        if not value:
-            value = f"【需人工复核】- {event_type or '安全告警'}关键证据不足"
-        if len(value) > 72:
-            value = value[:71].rstrip("，,；;：:、 ") + "…"
-        return value
+        return compact_case_title(verdict, event_type)
 
     def _correct_rasp_evidence_claims(
         self,
@@ -899,9 +894,6 @@ class SecurityAgent(ABC):
             "suspicious": "【需人工复核】- 归一化证据不足以完全确认",
         }.get(classification, "【需人工复核】- 证据不足")
 
-    # 原始三类结论格式：【真实攻击/误报/需人工复核】- 原因
-    _VERDICT_TAGS = ("【真实攻击】", "【误报】", "【需人工复核】")
-
     # 分维度 status 原始取值（与 prompt 中 analysis_dimensions.status 枚举一致，
     # 对应 Dashboard 的 风险/正常/复核/信息 四类颜色）。
     _DIMENSION_STATUSES = ("risk", "benign", "normal", "blocked", "review", "info")
@@ -931,24 +923,7 @@ class SecurityAgent(ABC):
         不改 prompt 的前提下，按 classification 修正类别标签、保留模型的
         原因描述，使研判结论回到统一的三类格式。
         """
-        verdict = (verdict or "").strip()
-        for tag in self._VERDICT_TAGS:
-            if verdict.startswith(tag):
-                return verdict
-        if "真实攻击" in verdict or "真实事件" in verdict or classification == "malicious":
-            tag = "【真实攻击】"
-        elif "误报" in verdict or classification == "benign":
-            tag = "【误报】"
-        else:
-            tag = "【需人工复核】"
-        detail = verdict
-        if detail:
-            detail = re.sub(r"^【(?:真实攻击|真实事件|误报|需人工复核)】[\s\-:：、，,]*", "", detail).strip()
-            detail = re.sub(r"^(真实攻击|误报|需人工复核|恶意|良性)[\s\-:：、，,]*", "", detail).strip()
-            detail = detail.strip("【】[]-—：:、，, ")
-        if not detail:
-            detail = self._verdict_from_classification(classification).split("】- ", 1)[-1].strip()
-        return f"{tag}- {detail}"
+        return normalize_case_verdict(verdict, classification)
 
     def _fallback_confidence(self, classification: str, dimensions: list[dict[str, str]], severity: str) -> float:
         confidence = 0.65 + min(0.18, len(dimensions) * 0.03)

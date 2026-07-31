@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .action_plan import ACTION_STAGE_ORDER, action_stage
+from .case_titles import compact_case_title, normalize_case_verdict
 from .models import NormalizedEvent, new_id, now_ms
 from .response_automation import ACTION_BLOCK_IP, compile_response_action
 
@@ -247,7 +248,7 @@ def _timeline_page_item(row: dict[str, Any]) -> dict[str, Any]:
         if context:
             title = f"{title} | {context}"
     elif kind == "analysis":
-        title = str(detail.get("summary") or title)
+        title = compact_case_title(detail.get("summary") or title)
         state = str(detail.get("classification") or state)
     elif kind == "approval_request":
         action_type = detail.get("action_type") or detail.get("action")
@@ -329,7 +330,10 @@ def build_case_timeline(source: dict[str, Any]) -> list[dict[str, Any]]:
                 "recorded_at_ms": recorded_at_ms,
                 "time_basis": "system",
                 "title": _bounded_text(
-                    result.get("summary") or "AI analysis completed", 500
+                    compact_case_title(
+                        result.get("summary") or "AI analysis completed"
+                    ),
+                    500,
                 ),
                 "state": str(result.get("classification") or ""),
                 "product": str(run.get("product") or ""),
@@ -802,16 +806,28 @@ class CaseResponseService:
             for item in source.get("approvals") or []
             if item.get("status") == "pending"
         ]
+        headline = compact_case_title(
+            case.get("summary") or latest_result.get("summary") or case["case_id"]
+        )
+        assessment_source = (
+            explanation.get("verdict") or latest_result.get("summary")
+        )
+        current_assessment = (
+            normalize_case_verdict(
+                assessment_source,
+                str(case.get("classification") or ""),
+            )
+            if assessment_source
+            else str(case.get("classification") or "")
+        )
         case_summary = {
             "headline": _bounded_text(
-                case.get("summary") or latest_result.get("summary") or case["case_id"],
+                headline,
                 500,
             ),
             "headline_evidence_refs": latest_refs,
             "current_assessment": _bounded_text(
-                explanation.get("verdict")
-                or latest_result.get("summary")
-                or case.get("classification"),
+                current_assessment,
                 1_500,
             ),
             "classification": case.get("classification"),
