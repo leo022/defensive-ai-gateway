@@ -30,6 +30,27 @@ def fact(label: str, value: Any, limit: int = SHORT_LIMIT) -> str:
     return f"{label}={short_text(value, limit)}"
 
 
+def _encoded_projection_fact(value: Any, label: str) -> str:
+    if not isinstance(value, dict):
+        return ""
+    selected = value.get("selected_evidence")
+    if not isinstance(selected, dict):
+        return ""
+    status = str(selected.get("selection_status") or "").strip()
+    content_status = str(selected.get("content_inspection_status") or "").strip()
+    relevance = str(selected.get("security_relevance") or "").strip()
+    if status.startswith("selected_by_runtime_correlation"):
+        content_label = {
+            "opaque_encoded": "编码后内容不透明",
+            "decoded_no_indicator_match": "已解码但未命中静态攻击特征",
+            "decoded_known_binary_format": "已识别编码后的二进制格式",
+        }.get(content_status, "内容未被静态规则识别")
+        return f"{label}载荷已关联 RASP 运行时证据（{content_label}，原文未进入模型）"
+    if relevance == "content_indicator_matched" and content_status == "decoded_indicator_match":
+        return f"{label}载荷安全解码后命中攻击特征"
+    return ""
+
+
 def request_parameters_fact(value: Any, label: str = "请求参数") -> str:
     """Render RASP parameter state without exposing the original request payload."""
     if value in ("", None):
@@ -51,7 +72,8 @@ def request_parameters_fact(value: Any, label: str = "请求参数") -> str:
                 detail += f"，数量 {count}"
             elif isinstance(value.get("length"), int):
                 detail += f"，长度 {value['length']}"
-            return f"{label}=已提供（{detail}）"
+            projection = _encoded_projection_fact(value, label)
+            return f"{label}=已提供（{detail}）" + (f"；{projection}" if projection else "")
         return f"{label}=已提供（对象，字段数 {len(value)}）"
     if isinstance(value, list):
         return f"{label}=已提供（数组，数量 {len(value)}）"
@@ -80,6 +102,9 @@ def request_context_fact(value: Any, label: str = "请求上下文") -> str:
         item_state = str(item.get("state") or "").strip().lower()
         if item_state == "present":
             details.append(f"{label_text}已提供")
+            projection = _encoded_projection_fact(item, label_text)
+            if projection:
+                details.append(projection)
         elif item_state == "empty":
             details.append(f"{label_text}为空")
     if value.get("raw_evidence_retained"):

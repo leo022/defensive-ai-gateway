@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import copy
+import gzip
 import json
 import tempfile
 import unittest
@@ -140,6 +142,180 @@ class RaspEvidenceRetentionTest(unittest.TestCase):
         self.assertEqual(
             by_type["hook_data"]["selected_evidence"]["selection_status"],
             "no_rule_match",
+        )
+
+    def test_opaque_base64_payload_is_selected_as_value_free_runtime_metadata(self):
+        raw_log = copy.deepcopy(self._cloudrasp_log())
+        opaque_bytes = bytes(range(256)) + bytes(range(112))
+        encoded_payload = base64.b64encode(opaque_bytes).decode("ascii")
+        boundary = "----RuntimeCorrelationBoundary"
+        raw_log["event"]["request_message"].update(
+            {
+                "method": "POST",
+                "url": "http://example.test/deserialization/xml/xml_decoder/postBody",
+                "parameter": json.dumps({"payload": [encoded_payload]}),
+                "body": {
+                    "rasp_raw_type": "formdata",
+                    "rasp_raw_data": (
+                        f"--{boundary}\r\n"
+                        'Content-Disposition: form-data; name="payload"\r\n\r\n'
+                        f"{encoded_payload}\r\n"
+                        f"--{boundary}--\r\n"
+                    ),
+                },
+            }
+        )
+        raw_log["items"] = [
+            {
+                "rule_id": "cloudrasp_cmd_106",
+                "rule_name": "命令执行行为记录判断",
+                "attack_level": 3,
+                "intercept_state": "log",
+                "hook_data": {"command": "open -a Calculator"},
+                "stacktrace": [
+                    "java.lang.ProcessBuilder.start(ProcessBuilder.java)",
+                    "java.beans.XMLDecoder.readObject(XMLDecoder.java:250)",
+                ],
+            }
+        ]
+
+        policy = PolicyEngine(GatewayConfig().policy)
+        event = EventNormalizer(policy).normalize(
+            LogAdapter(EventNormalizer(policy)).adapt(
+                builtin_product_profile("rasp"), raw_log
+            )["raw_alert"]
+        )
+        by_type = {item["type"]: item.get("value") for item in event.evidence}
+        parameter_selected = by_type["request_context"]["parameter"]["selected_evidence"]
+        body_selected = by_type["request_context"]["body"]["selected_evidence"]
+        request_selected = by_type["request_parameters"]["selected_evidence"]
+
+        for selected in (parameter_selected, body_selected, request_selected):
+            self.assertEqual(
+                selected["selection_status"],
+                "selected_by_runtime_correlation",
+            )
+            self.assertEqual(selected["content_inspection_status"], "opaque_encoded")
+            self.assertEqual(selected["security_relevance"], "runtime_correlated")
+            self.assertEqual(selected["entry_count"], 1)
+            entry = selected["entries"][0]
+            self.assertEqual(entry["evidence_type"], "encoded_payload_metadata")
+            self.assertFalse(entry["value_included"])
+            self.assertNotIn("value", entry)
+            self.assertEqual(entry["encoding"], "base64")
+            self.assertEqual(entry["encoded_chars"], 492)
+            self.assertEqual(entry["base64_decoded_bytes"], 368)
+            self.assertEqual(entry["content_format"], "opaque_binary")
+            self.assertEqual(entry["correlated_rule_ids"], ["cloudrasp_cmd_106"])
+            self.assertEqual(
+                entry["correlated_sinks"],
+                ["java.lang.ProcessBuilder.start"],
+            )
+            self.assertEqual(entry["correlated_hook_fields"], ["command"])
+            self.assertEqual(len(entry["evidence_sha256"]), 64)
+            self.assertEqual(len(entry["decoded_sha256"]), 64)
+
+        model_context = policy.sanitize_context(
+            {
+                "product": "rasp",
+                "severity": event.severity,
+                "event_type": event.event_type,
+                "entities": event.entities,
+                "evidence": event.evidence,
+                "memory": {},
+            }
+        )
+        model_text = json.dumps(model_context, ensure_ascii=False)
+        self.assertNotIn(encoded_payload, model_text)
+        self.assertIn("selected_by_runtime_correlation", model_text)
+
+        result = RaspAgent(LocalHeuristicLLM(), policy).analyze(
+            "case-opaque-runtime-correlation", event, []
+        )
+        dimensions = {
+            item["title"]: item["evidence"]
+            for item in result.explanation["dimensions"]
+        }
+        self.assertIn("运行时证据", dimensions["参数特征"])
+        self.assertNotIn("RASP 规则未命中", dimensions["参数特征"])
+
+    def test_bounded_base64_and_gzip_decode_selects_decoded_attack_indicator(self):
+        raw_log = copy.deepcopy(self._cloudrasp_log())
+        decoded_payload = "<script>alert(1)</script>"
+        encoded_payload = base64.b64encode(
+            gzip.compress(decoded_payload.encode("utf-8"), mtime=0)
+        ).decode("ascii")
+        raw_log["event"]["request_message"]["parameter"] = json.dumps(
+            {"payload": [encoded_payload]}
+        )
+        raw_log["event"]["request_message"]["body"] = None
+        raw_log["items"] = [
+            {
+                "rule_id": "informational_rule",
+                "rule_name": "ordinary observation",
+                "attack_level": 3,
+                "intercept_state": "log",
+                "hook_data": {"other": "ordinary"},
+                "stacktrace": ["com.example.Controller.handle(Controller.java:10)"],
+            }
+        ]
+
+        policy = PolicyEngine(GatewayConfig().policy)
+        event = EventNormalizer(policy).normalize(
+            LogAdapter(EventNormalizer(policy)).adapt(
+                builtin_product_profile("rasp"), raw_log
+            )["raw_alert"]
+        )
+        by_type = {item["type"]: item.get("value") for item in event.evidence}
+        selected = by_type["request_context"]["parameter"]["selected_evidence"]
+        entry = selected["entries"][0]
+
+        self.assertEqual(selected["selection_status"], "selected")
+        self.assertEqual(selected["content_inspection_status"], "decoded_indicator_match")
+        self.assertEqual(selected["security_relevance"], "content_indicator_matched")
+        self.assertEqual(entry["value"], decoded_payload)
+        self.assertEqual(entry["encoding"], "base64")
+        self.assertEqual(entry["compression_status"], "gzip_decompressed")
+        self.assertEqual(entry["content_format"], "xml_text")
+        self.assertIn("xss_reference", entry["indicator_categories"])
+        self.assertNotIn(encoded_payload, json.dumps(entry, ensure_ascii=False))
+
+    def test_benign_base64_without_runtime_correlation_remains_unselected(self):
+        raw_log = copy.deepcopy(self._cloudrasp_log())
+        encoded_payload = base64.b64encode(
+            b"quarterly settlement report"
+        ).decode("ascii")
+        raw_log["event"]["request_message"]["parameter"] = json.dumps(
+            {"payload": [encoded_payload]}
+        )
+        raw_log["event"]["request_message"]["body"] = None
+        raw_log["items"] = [
+            {
+                "rule_id": "informational_rule",
+                "rule_name": "ordinary observation",
+                "attack_level": 3,
+                "intercept_state": "log",
+                "hook_data": {"other": "ordinary"},
+                "stacktrace": ["com.example.Controller.handle(Controller.java:10)"],
+            }
+        ]
+
+        policy = PolicyEngine(GatewayConfig().policy)
+        event = EventNormalizer(policy).normalize(
+            LogAdapter(EventNormalizer(policy)).adapt(
+                builtin_product_profile("rasp"), raw_log
+            )["raw_alert"]
+        )
+        by_type = {item["type"]: item.get("value") for item in event.evidence}
+        selected = by_type["request_context"]["parameter"]["selected_evidence"]
+
+        self.assertEqual(selected["selection_status"], "no_rule_match")
+        self.assertEqual(selected["content_inspection_status"], "decoded_no_indicator_match")
+        self.assertEqual(selected["security_relevance"], "unknown")
+        self.assertEqual(selected["entries"], [])
+        self.assertNotIn(
+            "quarterly settlement report",
+            json.dumps(event.evidence, ensure_ascii=False),
         )
 
     def test_ognl_java_file_constructor_and_listing_chain_are_projected(self):

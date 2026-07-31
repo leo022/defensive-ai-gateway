@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
+import math
 import re
+import zlib
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from typing import Any
@@ -53,6 +58,10 @@ _RASP_EVIDENCE_MAX_DEPTH = 6
 _RASP_EVIDENCE_MAX_NODES = 128
 _RASP_EVIDENCE_MAX_ENTRIES = 8
 _RASP_EVIDENCE_MAX_VALUE_BYTES = 384
+_RASP_BASE64_MAX_ENCODED_BYTES = 16_384
+_RASP_BASE64_MAX_DECODED_BYTES = 12_288
+_RASP_DECOMPRESSED_MAX_BYTES = 32_768
+_RASP_RUNTIME_MAX_CORRELATIONS = 4
 _TRUSTED_TRANSPORT_MARKER = "_gateway_transport_trusted"
 _RASP_SEMANTIC_FIELD_NAMES = {
     "class",
@@ -881,6 +890,11 @@ class LogAdapter:
             self._resolve_mapping(profile.mappings.get("product"), log),
             profile.product_map,
         ).lower()
+        rasp_runtime_context = (
+            self._build_rasp_runtime_context(log)
+            if profile_product == "rasp"
+            else None
+        )
         rasp_model_mappings = demo_rasp_profile().mappings if profile_product == "rasp" else {}
         for target, source in profile.mappings.items():
             if profile_product == "rasp" and (
@@ -894,7 +908,11 @@ class LogAdapter:
                 )
                 if source is None:
                     continue
-            value = self._resolve_mapping(source, log)
+            value = self._resolve_mapping(
+                source,
+                log,
+                rasp_runtime_context=rasp_runtime_context,
+            )
             if value in ("", None):
                 continue
             if target.startswith("entities."):
@@ -978,6 +996,7 @@ class LogAdapter:
             profile,
             log,
             product=str(mapped.get("product") or ""),
+            rasp_runtime_context=rasp_runtime_context,
         )
         if adapter_evidence:
             payload["adapter_evidence"] = adapter_evidence
@@ -1212,10 +1231,20 @@ class LogAdapter:
         decoded, _ = self.unwrap_syslog_envelope(log)
         return self._product_signal(decoded, self._flatten_paths(decoded), None)
 
-    def _resolve_mapping(self, mapping: Any, log: dict[str, Any]) -> Any:
+    def _resolve_mapping(
+        self,
+        mapping: Any,
+        log: dict[str, Any],
+        *,
+        rasp_runtime_context: dict[str, Any] | None = None,
+    ) -> Any:
         if isinstance(mapping, list):
             for item in mapping:
-                value = self._resolve_mapping(item, log)
+                value = self._resolve_mapping(
+                    item,
+                    log,
+                    rasp_runtime_context=rasp_runtime_context,
+                )
                 if value not in ("", None):
                     return value
             return None
@@ -1224,7 +1253,11 @@ class LogAdapter:
                 return mapping["literal"]
             if "path" in mapping:
                 value = self._path_get(log, str(mapping["path"]))
-                return self._apply_transform(value, str(mapping.get("transform") or ""))
+                return self._apply_transform(
+                    value,
+                    str(mapping.get("transform") or ""),
+                    rasp_runtime_context=rasp_runtime_context,
+                )
             return None
         if isinstance(mapping, str):
             if mapping.startswith("$.") or mapping == "$":
@@ -1385,13 +1418,25 @@ class LogAdapter:
         text = "" if value is None else str(value).strip()
         return mapping.get(text, mapping.get(text.lower(), text))
 
-    def _apply_transform(self, value: Any, transform: str) -> Any:
+    def _apply_transform(
+        self,
+        value: Any,
+        transform: str,
+        *,
+        rasp_runtime_context: dict[str, Any] | None = None,
+    ) -> Any:
         if transform == "rasp_sink_from_stacktrace":
             return self._derive_rasp_sink(value)
         if transform == "rasp_request_parameter_summary":
-            return self._summarize_rasp_request_parameters(value)
+            return self._summarize_rasp_request_parameters(
+                value,
+                runtime_context=rasp_runtime_context,
+            )
         if transform == "rasp_request_context":
-            return self._summarize_rasp_request_context(value)
+            return self._summarize_rasp_request_context(
+                value,
+                runtime_context=rasp_runtime_context,
+            )
         if transform == "rasp_hook_data_summary":
             return self._summarize_rasp_hook_data(value)
         if transform == "rasp_items_context":
@@ -1400,7 +1445,106 @@ class LogAdapter:
             return self._summarize_rasp_evidence_integrity(value)
         return value
 
-    def _summarize_rasp_request_parameters(self, value: Any) -> dict[str, Any] | None:
+    def _build_rasp_runtime_context(
+        self,
+        log: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Build a value-free correlation summary from vendor-owned RASP items.
+
+        Request payload projection must not infer relevance from an endpoint name
+        alone.  A correlation is retained only when a vendor rule is accompanied
+        by a security-relevant runtime sink and either a controlled hook field or
+        an explicit stack indicator.  Hook values and stack frames never enter
+        this context.
+        """
+        if not isinstance(log, dict):
+            return None
+        items = log.get("items")
+        if not isinstance(items, list):
+            return None
+
+        correlations: list[dict[str, Any]] = []
+        for index, item in enumerate(items[:_RASP_CONTEXT_MAX_ITEMS]):
+            if not isinstance(item, dict):
+                continue
+            rule_id = self._safe_rasp_label(item.get("rule_id"), limit=128)
+            rule_name = self._safe_rasp_label(item.get("rule_name"), limit=160)
+            if not (rule_id or rule_name):
+                continue
+            hook_data = item.get("hook_data")
+            hook_fields = []
+            if isinstance(hook_data, dict):
+                hook_fields = sorted(
+                    {
+                        self._canonical_rasp_field_name(key)
+                        for key, value in hook_data.items()
+                        if value not in (None, "", [], {})
+                        and self._canonical_rasp_field_name(key)
+                        in _RASP_HOOK_ATTACK_FIELD_NAMES
+                    }
+                )[:8]
+            stacktrace = item.get("stacktrace") or item.get("stack_trace")
+            stack_indicators = sorted(
+                set(self._rasp_indicator_categories(stacktrace))
+                & _RASP_EXPLICIT_ATTACK_INDICATORS
+            )[:8]
+            sink = self._derive_rasp_sink(stacktrace)
+            if not self._rasp_sink_is_security_relevant(sink):
+                continue
+            if not (hook_fields or stack_indicators):
+                continue
+            correlations.append(
+                {
+                    "item_index": index,
+                    "rule_id": rule_id,
+                    "rule_name": rule_name,
+                    "sink": self._safe_rasp_label(sink, limit=200),
+                    "hook_fields": hook_fields,
+                    "stack_indicator_categories": stack_indicators,
+                }
+            )
+            if len(correlations) >= _RASP_RUNTIME_MAX_CORRELATIONS:
+                break
+
+        if not correlations:
+            return None
+        return {
+            "security_relevance": "runtime_correlated",
+            "correlations": correlations,
+            "truncated": len(items) > _RASP_CONTEXT_MAX_ITEMS,
+        }
+
+    @staticmethod
+    def _rasp_sink_is_security_relevant(sink: str) -> bool:
+        normalized = str(sink or "").casefold()
+        return any(
+            marker in normalized
+            for marker in (
+                ".connect",
+                ".delete",
+                ".deserialize",
+                ".eval",
+                ".exec",
+                ".execute",
+                ".executequery",
+                ".list",
+                ".load",
+                ".loadclass",
+                ".lookup",
+                ".openconnection",
+                ".query",
+                ".readobject",
+                ".renameto",
+                ".start",
+            )
+        )
+
+    def _summarize_rasp_request_parameters(
+        self,
+        value: Any,
+        *,
+        runtime_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         """Retain bounded attack semantics while filtering unrelated request data."""
         if value is None:
             return None
@@ -1419,6 +1563,7 @@ class LogAdapter:
                         value,
                         source="request_parameters",
                         direct_fields=_RASP_REQUEST_ATTACK_FIELD_NAMES,
+                        runtime_context=runtime_context,
                     ),
                 }
 
@@ -1430,6 +1575,7 @@ class LogAdapter:
                 value,
                 source="request_parameters",
                 direct_fields=_RASP_REQUEST_ATTACK_FIELD_NAMES,
+                runtime_context=runtime_context,
             )
             return summary
         if isinstance(value, list):
@@ -1440,6 +1586,7 @@ class LogAdapter:
                 value,
                 source="request_parameters",
                 direct_fields=_RASP_REQUEST_ATTACK_FIELD_NAMES,
+                runtime_context=runtime_context,
             )
             return summary
         summary = {"state": "present", "format": type(value).__name__}
@@ -1447,10 +1594,16 @@ class LogAdapter:
             value,
             source="request_parameters",
             direct_fields=_RASP_REQUEST_ATTACK_FIELD_NAMES,
+            runtime_context=runtime_context,
         )
         return summary
 
-    def _summarize_rasp_request_context(self, value: Any) -> dict[str, Any] | None:
+    def _summarize_rasp_request_context(
+        self,
+        value: Any,
+        *,
+        runtime_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         """Project HTTP context into a model-safe, evidence-preserving summary.
 
         The original request remains under ``payload.original_log`` for audited
@@ -1467,12 +1620,14 @@ class LogAdapter:
                 value.get("parameter"),
                 source="request_parameter",
                 direct_fields=_RASP_REQUEST_ATTACK_FIELD_NAMES,
+                runtime_context=runtime_context,
             )
         if body.get("state") == "present":
             body["selected_evidence"] = self._project_rasp_attack_evidence(
                 value.get("body"),
                 source="request_body",
                 direct_fields=_RASP_REQUEST_ATTACK_FIELD_NAMES,
+                runtime_context=runtime_context,
             )
         headers = value.get("header") or value.get("headers")
         header_names = []
@@ -1662,19 +1817,32 @@ class LogAdapter:
         *,
         source: str,
         direct_fields: set[str],
+        runtime_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Return a bounded, redacted projection of rule-relevant RASP values.
 
         Telemetry is always untrusted. Only allowlisted security fields or values
-        matching deterministic attack indicators are reflected. Sensitive paths
-        are dropped before hashing or projection, while selected values are
-        policy-redacted and byte-bounded before they can enter model evidence.
+        matching deterministic attack indicators are reflected as values.  An
+        encoded request payload may additionally be reflected as value-free
+        metadata when the same vendor event contains a correlated RASP rule,
+        controlled hook field and security-relevant runtime sink. Sensitive
+        paths are dropped before hashing or projection, while selected values
+        are policy-redacted and byte-bounded before they can enter model evidence.
         """
         entries: list[dict[str, Any]] = []
         nodes_scanned = 0
         projection_truncated = False
+        encoded_candidate_seen = False
         unrecognized_security_fields: set[str] = set()
+        inspection_states: set[str] = set()
+        relevance_states: set[str] = set()
         decoded = self._decode_rasp_evidence_value(value, allow_form=True)
+        runtime_correlations = (
+            runtime_context.get("correlations", [])
+            if source.startswith("request_") and isinstance(runtime_context, dict)
+            else []
+        )
+        runtime_correlated = bool(runtime_correlations)
 
         configured_sensitive = {
             self._canonical_rasp_field_name(field)
@@ -1714,8 +1882,48 @@ class LogAdapter:
                 return f"{parent}.{field_name}"
             return f"{parent}.[filtered_field]"
 
-        def walk(node: Any, path: str, depth: int, direct: bool = False) -> None:
-            nonlocal nodes_scanned, projection_truncated
+        def correlation_metadata() -> dict[str, Any]:
+            correlations = [
+                item for item in runtime_correlations if isinstance(item, dict)
+            ][:_RASP_RUNTIME_MAX_CORRELATIONS]
+            return {
+                "correlated_item_indexes": [
+                    int(item["item_index"])
+                    for item in correlations
+                    if isinstance(item.get("item_index"), int)
+                ],
+                "correlated_rule_ids": sorted(
+                    {
+                        str(item.get("rule_id") or "")
+                        for item in correlations
+                        if item.get("rule_id")
+                    }
+                ),
+                "correlated_sinks": sorted(
+                    {
+                        str(item.get("sink") or "")
+                        for item in correlations
+                        if item.get("sink")
+                    }
+                ),
+                "correlated_hook_fields": sorted(
+                    {
+                        str(field)
+                        for item in correlations
+                        for field in item.get("hook_fields", [])
+                        if field
+                    }
+                ),
+            }
+
+        def walk(
+            node: Any,
+            path: str,
+            depth: int,
+            direct: bool = False,
+            encoded_payload_candidate: bool = False,
+        ) -> None:
+            nonlocal nodes_scanned, projection_truncated, encoded_candidate_seen
             if len(entries) >= _RASP_EVIDENCE_MAX_ENTRIES:
                 projection_truncated = True
                 return
@@ -1737,19 +1945,38 @@ class LogAdapter:
                     if sensitive_field(name):
                         continue
                     field_direct = name in direct_fields
+                    field_is_payload_candidate = (
+                        not field_direct
+                        and any(
+                            marker in name
+                            for marker in ("payload", "raw_data")
+                        )
+                    )
                     if not field_direct and name not in _RASP_EVIDENCE_WRAPPER_FIELD_NAMES and any(
                         marker in name
                         for marker in ("lib", "library", "payload", "path", "raw_data")
                     ):
                         unrecognized_security_fields.add(name)
-                    walk(item, safe_path(path, name), depth + 1, field_direct)
+                    walk(
+                        item,
+                        safe_path(path, name),
+                        depth + 1,
+                        field_direct,
+                        encoded_payload_candidate or field_is_payload_candidate,
+                    )
                     if len(entries) >= _RASP_EVIDENCE_MAX_ENTRIES:
                         projection_truncated = True
                         break
                 return
             if isinstance(node, list):
                 for index, item in enumerate(node):
-                    walk(item, f"{path}[{index}]", depth + 1, direct)
+                    walk(
+                        item,
+                        f"{path}[{index}]",
+                        depth + 1,
+                        direct,
+                        encoded_payload_candidate,
+                    )
                     if len(entries) >= _RASP_EVIDENCE_MAX_ENTRIES:
                         projection_truncated = True
                         break
@@ -1762,21 +1989,95 @@ class LogAdapter:
                 )
                 nested = self._decode_rasp_evidence_value(node, allow_form=allow_nested_form)
                 if isinstance(nested, (dict, list)):
-                    walk(nested, f"{path}.decoded", depth + 1)
+                    walk(
+                        nested,
+                        f"{path}.decoded",
+                        depth + 1,
+                        encoded_payload_candidate=encoded_payload_candidate,
+                    )
                     return
 
             raw_text = node if isinstance(node, str) else self._rasp_serialized(node)
+            encoded_profile = (
+                self._inspect_rasp_encoded_value(raw_text)
+                if not direct and encoded_payload_candidate
+                else None
+            )
+            if isinstance(encoded_profile, dict):
+                encoded_candidate_seen = True
+                inspection_states.add(
+                    str(
+                        encoded_profile.get("content_inspection_status")
+                        or "encoded_no_indicator_match"
+                    )
+                )
+            inspection_text = (
+                encoded_profile.get("_inspection_text")
+                if isinstance(encoded_profile, dict)
+                else None
+            )
             indicators = self._rasp_indicator_categories(raw_text)
+            if isinstance(inspection_text, str):
+                indicators = sorted(
+                    set(indicators)
+                    | set(self._rasp_indicator_categories(inspection_text))
+                )
             explicit_indicators = sorted(set(indicators) & _RASP_EXPLICIT_ATTACK_INDICATORS)
-            require_explicit_indicator = source.startswith("request_")
-            if require_explicit_indicator and not direct and not explicit_indicators:
+            if (
+                not direct
+                and not explicit_indicators
+                and not (
+                    runtime_correlated
+                    and encoded_payload_candidate
+                    and isinstance(encoded_profile, dict)
+                )
+            ):
                 return
-            if not require_explicit_indicator and not direct and not explicit_indicators:
+
+            if not direct and not explicit_indicators:
+                evidence_bytes = raw_text.encode("utf-8", errors="replace")
+                public_profile = {
+                    key: item
+                    for key, item in encoded_profile.items()
+                    if not str(key).startswith("_")
+                }
+                content_status = str(
+                    public_profile.get("content_inspection_status")
+                    or "encoded_no_indicator_match"
+                )
+                entries.append(
+                    {
+                        "source": source,
+                        "path": path,
+                        "evidence_type": "encoded_payload_metadata",
+                        "value_included": False,
+                        "evidence_bytes": len(evidence_bytes),
+                        "evidence_sha256": hashlib.sha256(evidence_bytes).hexdigest(),
+                        "content_inspection_status": content_status,
+                        "security_relevance": "runtime_correlated",
+                        "selection_reason": "opaque_payload_correlated_with_rasp_runtime",
+                        "indicator_categories": [],
+                        "trust": "untrusted_external_telemetry",
+                        **public_profile,
+                        **correlation_metadata(),
+                    }
+                )
+                inspection_states.add(content_status)
+                relevance_states.add("runtime_correlated")
                 return
-            projected_text = raw_text
+
+            projected_text = (
+                inspection_text
+                if explicit_indicators and isinstance(inspection_text, str)
+                else raw_text
+            )
             context_trimmed = False
             if not direct:
                 projected_text, context_trimmed = self._rasp_attack_indicator_excerpt(raw_text)
+                if isinstance(inspection_text, str):
+                    projected_text, context_trimmed = self._rasp_attack_indicator_excerpt(
+                        inspection_text
+                    )
             redacted_value = self.policy.redact({"selected_value": projected_text}).get("selected_value", "")
             redacted_text = str(redacted_value)
             evidence_bytes = redacted_text.encode("utf-8", errors="replace")
@@ -1784,30 +2085,86 @@ class LogAdapter:
                 redacted_text,
                 _RASP_EVIDENCE_MAX_VALUE_BYTES,
             )
-            entries.append(
-                {
-                    "source": source,
-                    "path": path,
-                    "value": safe_value,
-                    "evidence_bytes": len(evidence_bytes),
-                    "evidence_sha256": hashlib.sha256(evidence_bytes).hexdigest(),
-                    "value_truncated": value_truncated or context_trimmed,
-                    "context_trimmed_to_indicator": context_trimmed,
-                    "sensitive_content_redacted": redacted_text != projected_text,
-                    "indicator_categories": explicit_indicators,
-                    "trust": "untrusted_external_telemetry",
-                }
+            entry = {
+                "source": source,
+                "path": path,
+                "value": safe_value,
+                "evidence_bytes": len(evidence_bytes),
+                "evidence_sha256": hashlib.sha256(evidence_bytes).hexdigest(),
+                "value_truncated": value_truncated or context_trimmed,
+                "context_trimmed_to_indicator": context_trimmed,
+                "sensitive_content_redacted": redacted_text != projected_text,
+                "indicator_categories": explicit_indicators,
+                "trust": "untrusted_external_telemetry",
+            }
+            entry_inspection_status = (
+                "decoded_indicator_match"
+                if isinstance(inspection_text, str) and explicit_indicators
+                else "indicator_matched"
+                if explicit_indicators
+                else "allowlisted_field"
             )
+            entry_relevance = (
+                "content_indicator_matched"
+                if explicit_indicators
+                else "rule_relevant_field"
+            )
+            if isinstance(encoded_profile, dict):
+                entry.update(
+                    {
+                        key: item
+                        for key, item in encoded_profile.items()
+                        if not str(key).startswith("_")
+                        and key != "content_inspection_status"
+                    }
+                )
+            entries.append(entry)
+            inspection_states.add(entry_inspection_status)
+            relevance_states.add(entry_relevance)
 
         walk(decoded, "$", 0)
-        if entries:
+        metadata_only = bool(entries) and all(
+            entry.get("evidence_type") == "encoded_payload_metadata"
+            for entry in entries
+        )
+        if metadata_only:
+            selection_status = (
+                "selected_by_runtime_correlation_with_truncation"
+                if projection_truncated
+                else "selected_by_runtime_correlation"
+            )
+        elif entries:
             selection_status = (
                 "selected_with_truncation" if projection_truncated else "selected"
             )
         else:
             selection_status = "truncated" if projection_truncated else "no_rule_match"
+        if "decoded_indicator_match" in inspection_states:
+            content_inspection_status = "decoded_indicator_match"
+        elif "indicator_matched" in inspection_states:
+            content_inspection_status = "indicator_matched"
+        elif "allowlisted_field" in inspection_states:
+            content_inspection_status = "allowlisted_field"
+        elif "opaque_encoded" in inspection_states:
+            content_inspection_status = "opaque_encoded"
+        elif inspection_states:
+            content_inspection_status = sorted(inspection_states)[0]
+        else:
+            content_inspection_status = (
+                "truncated_before_match" if projection_truncated else "no_indicator_match"
+            )
+        if "runtime_correlated" in relevance_states and len(relevance_states) > 1:
+            security_relevance = "runtime_correlated_and_content_matched"
+        elif "runtime_correlated" in relevance_states:
+            security_relevance = "runtime_correlated"
+        elif "content_indicator_matched" in relevance_states:
+            security_relevance = "content_indicator_matched"
+        elif "rule_relevant_field" in relevance_states:
+            security_relevance = "rule_relevant_field"
+        else:
+            security_relevance = "unknown"
         result = {
-            "policy": "rule_relevant_fields_and_attack_indicators_only",
+            "policy": "rule_fields_indicators_and_runtime_correlation",
             "trust": "untrusted_external_telemetry",
             "entries": entries,
             "entry_count": len(entries),
@@ -1820,6 +2177,16 @@ class LogAdapter:
                 "max_value_bytes": _RASP_EVIDENCE_MAX_VALUE_BYTES,
             },
         }
+        encoded_entries_present = any(
+            entry.get("evidence_type") == "encoded_payload_metadata"
+            or entry.get("encoding") in {"base64", "base64url"}
+            for entry in entries
+        )
+        if source.startswith("request_") and (
+            encoded_entries_present or encoded_candidate_seen
+        ):
+            result["content_inspection_status"] = content_inspection_status
+            result["security_relevance"] = security_relevance
         if unrecognized_security_fields:
             result["unrecognized_security_fields"] = sorted(
                 unrecognized_security_fields
@@ -1839,6 +2206,10 @@ class LogAdapter:
                 parsed = None
             if isinstance(parsed, (dict, list)):
                 return parsed
+        if allow_form and len(text) <= _RASP_CONTEXT_MAX_TEXT:
+            multipart = self._decode_rasp_multipart_value(text)
+            if multipart:
+                return multipart
         if allow_form and len(text) <= _RASP_CONTEXT_MAX_TEXT and "=" in text:
             try:
                 pairs = parse_qsl(
@@ -1859,6 +2230,198 @@ class LogAdapter:
                         parsed_form[key] = item
                 return parsed_form
         return value
+
+    @staticmethod
+    def _decode_rasp_multipart_value(value: str) -> dict[str, Any] | None:
+        """Parse bounded text-only multipart fields without invoking MIME code.
+
+        RASP vendors often place the already-captured request body under a
+        ``rasp_raw_data`` wrapper.  We only recover field boundaries and never
+        interpret file names, content types or nested MIME structures.
+        """
+        text = str(value or "")
+        if "content-disposition:" not in text.casefold():
+            return None
+        lines = text.splitlines()
+        if not lines:
+            return None
+        delimiter = lines[0].strip()
+        if not delimiter.startswith("--") or not 4 <= len(delimiter) <= 200:
+            return None
+        parsed: dict[str, Any] = {}
+        for raw_part in text.split(delimiter)[1:_RASP_EVIDENCE_MAX_NODES + 1]:
+            part = raw_part.strip("\r\n")
+            if not part or part == "--":
+                continue
+            if part.endswith("--"):
+                part = part[:-2].rstrip("\r\n")
+            if "\r\n\r\n" in part:
+                header_text, body = part.split("\r\n\r\n", 1)
+            elif "\n\n" in part:
+                header_text, body = part.split("\n\n", 1)
+            else:
+                continue
+            name_match = re.search(
+                r"(?im)^content-disposition:[^\r\n]*\bname=(?:\"([^\"]{1,128})\"|([^;\r\n]{1,128}))",
+                header_text,
+            )
+            if not name_match:
+                continue
+            name = (name_match.group(1) or name_match.group(2) or "").strip()
+            if not name:
+                continue
+            body = body.rstrip("\r\n")
+            if name in parsed:
+                current = parsed[name]
+                parsed[name] = [*current, body] if isinstance(current, list) else [current, body]
+            else:
+                parsed[name] = body
+        return parsed or None
+
+    def _inspect_rasp_encoded_value(self, value: str) -> dict[str, Any] | None:
+        """Decode one bounded Base64 layer and safely inspect its format.
+
+        This is transport unwrapping, not decryption.  Opaque decoded bytes are
+        represented only by metadata; decoded text is returned internally for
+        the existing deterministic indicator matcher.
+        """
+        text = str(value or "").strip()
+        compact = re.sub(r"\s+", "", text)
+        encoded_bytes = compact.encode("ascii", errors="ignore")
+        if (
+            len(compact) < 16
+            or len(compact) > _RASP_BASE64_MAX_ENCODED_BYTES
+            or len(compact) % 4 != 0
+            or len(encoded_bytes) != len(compact)
+        ):
+            return None
+        if re.fullmatch(r"[A-Za-z0-9+/]*={0,2}", compact):
+            encoding = "base64"
+            altchars = None
+        elif re.fullmatch(r"[A-Za-z0-9_-]*={0,2}", compact):
+            encoding = "base64url"
+            altchars = b"-_"
+        else:
+            return None
+        try:
+            decoded = base64.b64decode(
+                encoded_bytes,
+                altchars=altchars,
+                validate=True,
+            )
+        except (binascii.Error, ValueError):
+            return None
+        if not decoded or len(decoded) > _RASP_BASE64_MAX_DECODED_BYTES:
+            return None
+
+        inspected = decoded
+        compression_status = "not_compressed"
+        if decoded.startswith(b"\x1f\x8b"):
+            decompressed, compression_status = self._bounded_rasp_gzip_decompress(decoded)
+            if decompressed is not None:
+                inspected = decompressed
+
+        content_format, inspection_text, printable_ratio = self._classify_rasp_decoded_bytes(
+            inspected
+        )
+        entropy = self._rasp_byte_entropy(inspected)
+        if inspection_text is not None:
+            decoded_indicators = sorted(
+                set(self._rasp_indicator_categories(inspection_text))
+                & _RASP_EXPLICIT_ATTACK_INDICATORS
+            )
+            content_status = (
+                "decoded_indicator_match"
+                if decoded_indicators
+                else "decoded_no_indicator_match"
+            )
+        elif content_format == "opaque_binary":
+            content_status = "opaque_encoded"
+        else:
+            content_status = "decoded_known_binary_format"
+
+        return {
+            "encoding": encoding,
+            "encoded_chars": len(compact),
+            "base64_decoded_bytes": len(decoded),
+            "inspected_bytes": len(inspected),
+            "decoded_sha256": hashlib.sha256(decoded).hexdigest(),
+            "decoded_entropy_bits_per_byte": round(entropy, 4),
+            "decoded_printable_ratio": round(printable_ratio, 4),
+            "content_format": content_format,
+            "compression_status": compression_status,
+            "content_inspection_status": content_status,
+            "_inspection_text": inspection_text,
+        }
+
+    @staticmethod
+    def _bounded_rasp_gzip_decompress(
+        value: bytes,
+    ) -> tuple[bytes | None, str]:
+        try:
+            decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            output = decompressor.decompress(
+                value,
+                _RASP_DECOMPRESSED_MAX_BYTES + 1,
+            )
+            if (
+                len(output) > _RASP_DECOMPRESSED_MAX_BYTES
+                or decompressor.unconsumed_tail
+                or not decompressor.eof
+            ):
+                return None, "gzip_limit_exceeded"
+            remaining = _RASP_DECOMPRESSED_MAX_BYTES + 1 - len(output)
+            output += decompressor.flush(remaining)
+            if len(output) > _RASP_DECOMPRESSED_MAX_BYTES:
+                return None, "gzip_limit_exceeded"
+            return output, "gzip_decompressed"
+        except (ValueError, zlib.error):
+            return None, "gzip_invalid"
+
+    @staticmethod
+    def _classify_rasp_decoded_bytes(
+        value: bytes,
+    ) -> tuple[str, str | None, float]:
+        if not value:
+            return "empty", None, 0.0
+        printable_ratio = sum(
+            byte in (9, 10, 13) or 32 <= byte < 127
+            for byte in value
+        ) / len(value)
+        if value.startswith(b"\xac\xed\x00\x05"):
+            return "java_serialization_stream", None, printable_ratio
+        if value.startswith(b"PK\x03\x04"):
+            return "zip_archive", None, printable_ratio
+        if value.startswith(b"\x1f\x8b"):
+            return "gzip_stream", None, printable_ratio
+        try:
+            text = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return "opaque_binary", None, printable_ratio
+        if printable_ratio < 0.85:
+            return "opaque_binary", None, printable_ratio
+        stripped = text.lstrip()
+        if stripped.startswith(("{", "[")):
+            if len(stripped) <= _RASP_CONTEXT_MAX_TEXT:
+                try:
+                    parsed = loads_bounded_json(stripped)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    parsed = None
+                if isinstance(parsed, (dict, list)):
+                    return "json_text", text, printable_ratio
+        if stripped.startswith("<"):
+            return "xml_text", text, printable_ratio
+        return "utf8_text", text, printable_ratio
+
+    @staticmethod
+    def _rasp_byte_entropy(value: bytes) -> float:
+        if not value:
+            return 0.0
+        size = len(value)
+        return -sum(
+            (count / size) * math.log2(count / size)
+            for count in Counter(value).values()
+        )
 
     @staticmethod
     def _truncate_rasp_evidence_text(value: str, max_bytes: int) -> tuple[str, bool]:
@@ -2015,13 +2578,26 @@ class LogAdapter:
         log: dict[str, Any],
         *,
         product: str,
+        rasp_runtime_context: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         evidence = []
         product = str(product or "").strip().lower()
         rasp_compound_transforms = {
             "hook_data": ("rasp_hook_data_summary", self._summarize_rasp_hook_data),
-            "request_context": ("rasp_request_context", self._summarize_rasp_request_context),
-            "request_parameters": ("rasp_request_parameter_summary", self._summarize_rasp_request_parameters),
+            "request_context": (
+                "rasp_request_context",
+                lambda value: self._summarize_rasp_request_context(
+                    value,
+                    runtime_context=rasp_runtime_context,
+                ),
+            ),
+            "request_parameters": (
+                "rasp_request_parameter_summary",
+                lambda value: self._summarize_rasp_request_parameters(
+                    value,
+                    runtime_context=rasp_runtime_context,
+                ),
+            ),
             "rasp_items_context": ("rasp_items_context", self._summarize_rasp_items_context),
             "rasp_evidence_integrity": ("rasp_evidence_integrity", self._summarize_rasp_evidence_integrity),
         }
@@ -2032,7 +2608,11 @@ class LogAdapter:
             evidence_mapping = item.get("path")
             if product == "rasp" and not self._mapping_is_unambiguous_path_only(evidence_mapping):
                 continue
-            value = self._resolve_mapping(evidence_mapping, log)
+            value = self._resolve_mapping(
+                evidence_mapping,
+                log,
+                rasp_runtime_context=rasp_runtime_context,
+            )
             if value in ("", None):
                 continue
             if product == "rasp":
