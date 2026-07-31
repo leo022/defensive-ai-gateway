@@ -891,6 +891,7 @@ class GatewayState:
             payload=dict(payload.get("payload") or {}),
             alert_id=str(payload.get("alert_id") or record.get("alert_id") or ""),
             trusted_sample=bool(payload.get("trusted_sample", False)),
+            operational_test=bool(payload.get("operational_test", False)),
         )
 
     def _dispatch_inbox(self) -> None:
@@ -1546,7 +1547,9 @@ class GatewayState:
         # context. Preserve it under payload.original_log, but replace only the
         # system-owned projection with the current semantic summary. Custom
         # profile fields/mappings remain untouched.
-        is_legacy_builtin = profile.name == expected.name and profile.version in {"v1", "v2", "v3", "v4", "v5", "v6"}
+        is_legacy_builtin = profile.name == expected.name and profile.version in {
+            "v1", "v2", "v3", "v4", "v5", "v6", "v7"
+        }
         if is_legacy_builtin:
             hook_mapping = expected.mappings.get("payload.hook_data")
             if hook_mapping is not None and profile.mappings.get("payload.hook_data") != hook_mapping:
@@ -1566,6 +1569,9 @@ class GatewayState:
                         field.clear()
                         field.update(copy.deepcopy(expected_hook_evidence))
                         upgraded_fields.append("evidence:hook_data")
+            if profile.timestamp_offset != expected.timestamp_offset:
+                profile.timestamp_offset = expected.timestamp_offset
+                upgraded_fields.append("timestamp_offset")
             profile.version = expected.version
             profile.description = expected.description
         if not added_mappings and not added_evidence and not upgraded_fields:
@@ -3526,11 +3532,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
             auth.responder_token,
             *(principal.token for principal in auth.principals),
         )
+        if (
+            not self._trusted_local_demo_request()
+            or self.headers.get("X-Defensive-AI-Demo-Sample", "") != "1"
+        ):
+            return False
+        principal = self._principal()
         return bool(
-            self._trusted_local_demo_request()
-            and auth.allow_loopback_no_token
-            and not any(configured_tokens)
-            and self.headers.get("X-Defensive-AI-Demo-Sample", "") == "1"
+            (principal and principal.get("actor") == "api-admin")
+            or (auth.allow_loopback_no_token and not any(configured_tokens))
         )
 
     def _governance_body(self, body: dict, *, actor_field: str = "actor") -> dict:
@@ -4566,6 +4576,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 )
             if self._is_trusted_demo_sample_request():
                 alert.trusted_sample = True
+                alert.operational_test = True
             result = self.state.submit_alert(alert)
             self._json(202, result)
         except _PayloadTooLarge:

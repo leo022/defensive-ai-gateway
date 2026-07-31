@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import parse_qsl
@@ -45,6 +45,7 @@ RASP_ALERT_ID_PATHS = [
     "$.id",
     "$.trace.id",
 ]
+_TIMESTAMP_OFFSET_RE = re.compile(r"^([+-])(\d{2}):(\d{2})$")
 _RASP_CONTEXT_MAX_ITEMS = 20
 _RASP_CONTEXT_MAX_LEAVES = 64
 _RASP_CONTEXT_MAX_TEXT = 16_384
@@ -271,11 +272,37 @@ def validate_raw_alert(alert: RawAlert) -> RawAlert:
     if len(timestamp) > 64:
         raise ValueError("timestamp is too long")
     try:
-        datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        parsed_timestamp = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
     except ValueError as exc:
         raise ValueError("timestamp must be an ISO-8601 value") from exc
+    if parsed_timestamp.tzinfo is None or parsed_timestamp.utcoffset() is None:
+        raise ValueError("timestamp must include a timezone offset")
     alert.timestamp = timestamp
     return alert
+
+
+def apply_timestamp_offset(timestamp: Any, offset: str) -> tuple[str, bool]:
+    """Attach a profile-owned offset to a timezone-naive ISO-8601 value."""
+    rendered = str(timestamp or "").strip()
+    if not rendered:
+        return rendered, False
+    try:
+        parsed = datetime.fromisoformat(rendered.replace("Z", "+00:00"))
+    except ValueError:
+        return rendered, False
+    if parsed.tzinfo is not None and parsed.utcoffset() is not None:
+        return rendered, False
+    match = _TIMESTAMP_OFFSET_RE.fullmatch(str(offset or "").strip())
+    if not match:
+        return rendered, False
+    hours = int(match.group(2))
+    minutes = int(match.group(3))
+    if hours > 14 or minutes > 59 or (hours == 14 and minutes):
+        raise ValueError("timestamp_offset must be between -14:00 and +14:00")
+    delta = timedelta(hours=hours, minutes=minutes)
+    if match.group(1) == "-":
+        delta = -delta
+    return parsed.replace(tzinfo=timezone(delta)).isoformat(), True
 
 DEFAULT_REQUIRED_FIELD_HINTS = {
     "alert_id": "映射到日志中的唯一告警 ID，例如 $.metadata.id、$.alert.id、$.alert_id 或 $.id。",
@@ -467,6 +494,7 @@ class MappingProfile:
     event_type_map: dict[str, str] = field(default_factory=dict)
     required_fields: list[str] = field(default_factory=lambda: list(DEFAULT_REQUIRED_FIELDS))
     evidence_fields: list[dict[str, Any]] = field(default_factory=list)
+    timestamp_offset: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MappingProfile":
@@ -482,6 +510,7 @@ class MappingProfile:
             event_type_map=dict(data.get("event_type_map") or {}),
             required_fields=list(data.get("required_fields") or DEFAULT_REQUIRED_FIELDS),
             evidence_fields=list(data.get("evidence_fields") or []),
+            timestamp_offset=str(data.get("timestamp_offset") or "").strip(),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -497,6 +526,7 @@ class MappingProfile:
             "event_type_map": self.event_type_map,
             "required_fields": self.required_fields,
             "evidence_fields": self.evidence_fields,
+            "timestamp_offset": self.timestamp_offset,
         }
 
 
@@ -523,7 +553,7 @@ def demo_rasp_profile() -> MappingProfile:
     return MappingProfile(
         profile_id="demo-rasp-json",
         name="Demo RASP JSON 日志",
-        version="v6",
+        version="v7",
         description="示例：把常见 RASP JSON 日志映射为内部 RawAlert，并保留 host、time、stacktrace、hook 和 trace 关键上下文。",
         mappings={
             "alert_id": list(RASP_ALERT_ID_PATHS),
@@ -563,6 +593,7 @@ def demo_rasp_profile() -> MappingProfile:
             "payload.exception": ["$.exception.message", "$.exception", "$.attack.exception"],
         },
         product_map={"runtime_app_protection": "rasp", "runtime_application_self_protection": "rasp", "rasp": "rasp"},
+        timestamp_offset="+08:00",
         evidence_fields=[
             {
                 "type": "request_context",
@@ -627,7 +658,7 @@ def builtin_product_profile(product: str) -> MappingProfile:
         profile = demo_rasp_profile()
         profile.profile_id = profile_id
         profile.name = name
-        profile.version = "v7"
+        profile.version = "v8"
         profile.description = description
         profile.mappings["product"] = [
             "$.product",
@@ -885,6 +916,18 @@ class LogAdapter:
         mapped["product"] = self._map_value(mapped.get("product"), profile.product_map).lower()
         mapped["severity"] = self._map_value(mapped.get("severity"), profile.severity_map).lower()
         mapped["event_type"] = self._map_value(mapped.get("event_type"), profile.event_type_map)
+        if mapped.get("timestamp") not in (None, ""):
+            try:
+                mapped["timestamp"], offset_applied = apply_timestamp_offset(
+                    mapped["timestamp"], profile.timestamp_offset
+                )
+            except ValueError as exc:
+                errors.append(f"invalid_timestamp_offset:{exc}")
+            else:
+                if offset_applied:
+                    warnings.append(
+                        f"timestamp 缺少时区，已按 profile 配置补充 {profile.timestamp_offset}。"
+                    )
 
         for required_field in profile.required_fields:
             if required_field not in mapped or mapped.get(required_field) in ("", None):

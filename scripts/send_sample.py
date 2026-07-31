@@ -17,7 +17,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from defensive_ai_gateway.sample_alerts import PRODUCTS, SCENARIOS, available_features, generate_alerts
+from defensive_ai_gateway.sample_alerts import (
+    PRODUCTS,
+    SCENARIOS,
+    available_features,
+    generate_alerts,
+    prepare_alerts_for_delivery,
+)
 
 HK_TZ = timezone(timedelta(hours=8))
 # Leaf keys whose values identify a single alert instance rather than a scenario.
@@ -154,6 +160,11 @@ def main():
     )
     parser.add_argument("--seed", type=int, help="Seed for repeatable randomized/mutated samples")
     parser.add_argument("--print-only", action="store_true", help="Print payloads without sending them")
+    parser.add_argument(
+        "--preserve-generated-identity",
+        action="store_true",
+        help="Send the fixed generated alert_id/timestamp for an explicit historical replay",
+    )
     parser.add_argument("--url", default="http://127.0.0.1:8080/api/alerts")
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument(
@@ -174,6 +185,8 @@ def main():
         parser.error("--feature can only be used with --random")
     if args.feature and not args.product:
         parser.error("--product is required when --feature is specified")
+    if args.preserve_generated_identity and not args.random:
+        parser.error("--preserve-generated-identity can only be used with --random")
 
     if args.random:
         payloads = generate_alerts(
@@ -197,6 +210,9 @@ def main():
     if args.print_only:
         print(json.dumps({"generated": len(payloads), "alerts": payloads}, ensure_ascii=False, indent=2))
         return
+
+    if args.random and not args.preserve_generated_identity:
+        payloads = prepare_alerts_for_delivery(payloads)
 
     responses = []
     headers = {

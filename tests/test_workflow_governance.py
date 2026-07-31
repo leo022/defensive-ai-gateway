@@ -476,9 +476,11 @@ class OperationalPersistenceTest(unittest.TestCase):
 
             alert = _alert("alert-inbox")
             alert.trusted_sample = True
+            alert.operational_test = True
             self.assertTrue(repo.enqueue_alert(alert, max_attempts=2))
             self.assertFalse(repo.enqueue_alert(alert, max_attempts=2))
             self.assertTrue(repo.get_inbox_alert("alert-inbox")["raw_alert"]["trusted_sample"])
+            self.assertTrue(repo.get_inbox_alert("alert-inbox")["raw_alert"]["operational_test"])
             self.assertEqual(repo.inbox_stats()["pending"], 1)
             first = repo.claim_inbox_alert()
             self.assertEqual(first["raw_alert"]["alert_id"], "alert-inbox")

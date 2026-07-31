@@ -599,10 +599,32 @@ class MemoryManager:
         return f"ac_{hashlib.sha256(encoded.encode('utf-8')).hexdigest()[:20]}"
 
     def cluster_case_alerts(self, linked_alerts: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        grouped: dict[str, list[dict[str, Any]]] = {}
+        # A re-analysis appends a new normalized event for the same immutable
+        # raw alert. Use only its latest linked version so analysis history is
+        # never presented or governed as additional alert occurrences.
+        latest_by_alert: dict[str, dict[str, Any]] = {}
         for linked in linked_alerts:
             if not linked.get("raw_alert"):
                 continue
+            alert_id = str(linked.get("alert_id") or "")
+            if not alert_id:
+                continue
+            current = latest_by_alert.get(alert_id)
+            candidate_order = (
+                int((linked.get("normalized_event") or {}).get("created_at_ms") or 0),
+                int(linked.get("linked_at_ms") or 0),
+                str(linked.get("event_id") or ""),
+            )
+            current_order = (
+                int((current.get("normalized_event") or {}).get("created_at_ms") or 0),
+                int(current.get("linked_at_ms") or 0),
+                str(current.get("event_id") or ""),
+            ) if current else (-1, -1, "")
+            if current is None or candidate_order > current_order:
+                latest_by_alert[alert_id] = linked
+
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for linked in latest_by_alert.values():
             grouped.setdefault(self.alert_cluster_id(linked), []).append(linked)
 
         clusters: list[dict[str, Any]] = []

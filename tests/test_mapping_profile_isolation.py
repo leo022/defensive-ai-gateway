@@ -4,7 +4,7 @@ import json
 import unittest
 from pathlib import Path
 
-from defensive_ai_gateway.log_adapter import LogAdapter, builtin_product_profile
+from defensive_ai_gateway.log_adapter import LogAdapter, MappingProfile, builtin_product_profile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -88,9 +88,32 @@ class BuiltinProductProfileIsolationTest(unittest.TestCase):
                 self.assertTrue(field_targets.isdisjoint({"payload.stack_trace", "payload.sink", "payload.hook_data", "payload.taint_source"}))
 
     def test_rasp_profile_keeps_runtime_specific_extractors(self):
-        profile_shape = json.dumps(builtin_product_profile("rasp").to_dict(), ensure_ascii=False).lower()
+        profile = builtin_product_profile("rasp")
+        profile_shape = json.dumps(profile.to_dict(), ensure_ascii=False).lower()
         self.assertIn("stacktrace", profile_shape)
         self.assertIn("rasp_sink_from_stacktrace", profile_shape)
+        self.assertEqual(profile.timestamp_offset, "+08:00")
+        self.assertEqual(MappingProfile.from_dict(profile.to_dict()).timestamp_offset, "+08:00")
+
+    def test_rasp_profile_attaches_configured_offset_to_naive_vendor_time(self):
+        result = LogAdapter().adapt(
+            builtin_product_profile("rasp"),
+            {
+                "metadata": {"id": "rasp-naive-time-001"},
+                "device": {"vendor": "bank-rasp", "type": "runtime_app_protection"},
+                "risk": {"level": "high"},
+                "time": "2026-07-24 09:03:21",
+                "rule": {"name": "Runtime command execution"},
+            },
+        )
+
+        self.assertTrue(result["ok"], result["errors"])
+        self.assertEqual(result["raw_alert"].timestamp, "2026-07-24T09:03:21+08:00")
+        self.assertTrue(any("+08:00" in warning for warning in result["warnings"]))
+        self.assertEqual(
+            result["raw_alert"].payload["original_log"]["time"],
+            "2026-07-24 09:03:21",
+        )
 
 
 if __name__ == "__main__":

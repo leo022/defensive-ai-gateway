@@ -2786,6 +2786,7 @@ class Repository:
                 "payload": alert.payload,
                 "alert_id": alert.alert_id,
                 "trusted_sample": bool(alert.trusted_sample),
+                "operational_test": bool(alert.operational_test),
             }
         return dict(alert)
 
@@ -2793,12 +2794,13 @@ class Repository:
     def _alert_identity_json(payload: dict[str, Any]) -> str:
         """Render the immutable source-event identity stored under ``alert_id``.
 
-        ``trusted_sample`` is deliberately excluded: it controls local demo
-        parsing, while the source evidence determines whether a retry is the
-        same alert occurrence. Collector receipt timestamps are also excluded:
-        they describe a delivery attempt, not the immutable security event. A
-        Syslog retry otherwise changes ``received_at`` and is incorrectly
-        rejected as an alert-id collision even when its raw evidence is equal.
+        ``trusted_sample`` and ``operational_test`` are deliberately excluded:
+        they control trusted server-side processing, while the source evidence
+        determines whether a retry is the same alert occurrence. Collector
+        receipt timestamps are also excluded: they describe a delivery attempt,
+        not the immutable security event. A Syslog retry otherwise changes
+        ``received_at`` and is incorrectly rejected as an alert-id collision
+        even when its raw evidence is equal.
         """
         evidence_payload = payload.get("payload", {})
 
@@ -6126,10 +6128,13 @@ class Repository:
             )
             aggregate = self.conn.execute(
                 """
-                SELECT COUNT(*) AS total,
-                       SUM(CASE WHEN d.disposition = 'false_positive' THEN 1 ELSE 0 END) AS false_positives
+                SELECT COUNT(DISTINCT l.alert_id) AS total,
+                       COUNT(DISTINCT CASE
+                         WHEN d.disposition = 'false_positive' THEN l.alert_id
+                       END) AS false_positives
                 FROM case_alert_links l
-                LEFT JOIN alert_dispositions d ON d.alert_id = l.alert_id
+                LEFT JOIN alert_dispositions d
+                  ON d.alert_id = l.alert_id AND d.case_id = l.case_id
                 WHERE l.case_id = ?
                 """,
                 (case_id,),
@@ -6195,8 +6200,10 @@ class Repository:
             )
             aggregate = self.conn.execute(
                 """
-                SELECT COUNT(*) AS total,
-                       SUM(CASE WHEN d.disposition = 'false_positive' THEN 1 ELSE 0 END) AS false_positives
+                SELECT COUNT(DISTINCT l.alert_id) AS total,
+                       COUNT(DISTINCT CASE
+                         WHEN d.disposition = 'false_positive' THEN l.alert_id
+                       END) AS false_positives
                 FROM case_alert_links l
                 LEFT JOIN alert_dispositions d
                   ON d.alert_id = l.alert_id AND d.case_id = l.case_id
@@ -6241,10 +6248,13 @@ class Repository:
                 return None
             aggregate = self.conn.execute(
                 """
-                SELECT COUNT(*) AS total,
-                       SUM(CASE WHEN d.disposition = 'false_positive' THEN 1 ELSE 0 END) AS false_positives
+                SELECT COUNT(DISTINCT l.alert_id) AS total,
+                       COUNT(DISTINCT CASE
+                         WHEN d.disposition = 'false_positive' THEN l.alert_id
+                       END) AS false_positives
                 FROM case_alert_links l
-                LEFT JOIN alert_dispositions d ON d.alert_id = l.alert_id
+                LEFT JOIN alert_dispositions d
+                  ON d.alert_id = l.alert_id AND d.case_id = l.case_id
                 WHERE l.case_id = ?
                 """,
                 (row["case_id"],),
@@ -6956,7 +6966,8 @@ class Repository:
                   c.created_at_ms,
                   c.updated_at_ms,
                   COALESCE((
-                    SELECT COUNT(*) FROM case_alert_links l WHERE l.case_id = c.case_id
+                    SELECT COUNT(DISTINCT l.alert_id)
+                    FROM case_alert_links l WHERE l.case_id = c.case_id
                   ), 0) AS alert_count,
                   (
                     SELECT l.alert_id FROM case_alert_links l
@@ -7085,7 +7096,7 @@ class Repository:
                 total = int(
                     self.conn.execute(
                         """
-                        SELECT COUNT(*) AS count
+                        SELECT COUNT(DISTINCT l.alert_id) AS count
                         FROM case_alert_links l
                         JOIN raw_alerts ra ON ra.alert_id = l.alert_id
                         WHERE l.case_id = ?
@@ -7095,16 +7106,25 @@ class Repository:
                 )
                 rows = self.conn.execute(
                     """
+                    WITH latest_links AS (
+                      SELECT l.*,
+                             ROW_NUMBER() OVER (
+                               PARTITION BY l.alert_id
+                               ORDER BY l.created_at_ms DESC, l.event_id DESC
+                             ) AS link_rank
+                      FROM case_alert_links l
+                      WHERE l.case_id = ?
+                    )
                     SELECT l.alert_id, l.event_id, l.created_at_ms AS linked_at_ms,
                            ra.source, ra.product, ra.event_type, ra.severity,
                            ra.timestamp, ra.payload_json, ra.created_at_ms,
                            ad.disposition, ad.actor, ad.reason,
                            ad.updated_at_ms AS disposition_updated_at_ms
-                    FROM case_alert_links l
+                    FROM latest_links l
                     JOIN raw_alerts ra ON ra.alert_id = l.alert_id
                     LEFT JOIN alert_dispositions ad
                       ON ad.case_id = l.case_id AND ad.alert_id = l.alert_id
-                    WHERE l.case_id = ?
+                    WHERE l.link_rank = 1
                     ORDER BY l.created_at_ms DESC
                     LIMIT ? OFFSET ?
                     """,
@@ -7389,7 +7409,7 @@ class Repository:
             counts = self.conn.execute(
                 """
                 SELECT
-                  (SELECT COUNT(*) FROM case_alert_links l
+                  (SELECT COUNT(DISTINCT l.alert_id) FROM case_alert_links l
                    JOIN raw_alerts ra ON ra.alert_id = l.alert_id
                    WHERE l.case_id = ?) AS raw_alerts,
                   (SELECT COUNT(*) FROM case_alert_links l

@@ -158,10 +158,17 @@ class FalsePositiveMemoryActionRenderingTest(unittest.TestCase):
         self.assertIn("function linkedAlertsBlock", JS)
         self.assertIn("${linkedAlertsBlock(linked, detail.alert_clusters || [])}", JS)
         self.assertIn("function alertClusterReviewCard", JS)
+        self.assertIn("function uniqueLinkedAlerts", JS)
+        self.assertIn("function uniqueLinkedAlertCount", JS)
+        self.assertIn("uniqueLinkedAlerts(linked).map(linkedAlertReviewCard)", JS)
+        self.assertIn("const linkedAlertCount = uniqueLinkedAlertCount(linked);", JS)
         self.assertIn("function confirmAlertClusterFalsePositive", JS)
         self.assertIn("/alert-clusters/${encodeURIComponent(clusterId)}/confirm-false-positive", JS)
         self.assertIn("确认该组为误报并写入一条长期记忆", JS)
         self.assertIn(".alert-cluster-item", CSS)
+        self.assertIn('clusterRepeatedAlerts: "同类告警 {count} 条"', JS)
+        self.assertNotIn("同类重复", JS)
+        self.assertNotIn("similar repeated", JS)
 
 
 class ManualValidationReviewRenderingTest(unittest.TestCase):

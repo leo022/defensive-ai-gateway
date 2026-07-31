@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,7 +17,12 @@ from defensive_ai_gateway.models import AgentResult, RawAlert, RecommendedAction
 from defensive_ai_gateway.normalizer import EventNormalizer
 from defensive_ai_gateway.orchestrator import Orchestrator
 from defensive_ai_gateway.policy import PolicyEngine
-from defensive_ai_gateway.sample_alerts import available_features, generate_alert, generate_alerts
+from defensive_ai_gateway.sample_alerts import (
+    available_features,
+    generate_alert,
+    generate_alerts,
+    prepare_alerts_for_delivery,
+)
 from defensive_ai_gateway.syslog_router import SyslogPortRouter
 
 
@@ -83,6 +89,11 @@ class PipelineTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertIn("invalid_raw_alert:timestamp must be an ISO-8601 value", result["errors"])
+
+        log["timestamp"] = "2026-07-24 09:03:21"
+        result = LogAdapter().dry_run(MappingProfile.from_dict(profile), log)
+        self.assertFalse(result["ok"])
+        self.assertIn("invalid_raw_alert:timestamp must include a timezone offset", result["errors"])
 
     def test_auto_infer_detects_product_and_decodes_syslog_json_envelope(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -629,6 +640,37 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual({item["product"] for item in first}, {"waf"})
         self.assertGreater(len({item["alert_id"] for item in first}), 1)
         self.assertGreaterEqual(len({item["payload"]["rule_id"] for item in first}), 1)
+
+    def test_live_sample_delivery_refreshes_fixture_identity_and_embedded_times(self):
+        fixture = generate_alert(product="rasp", scenario="attack", seed=5001)
+        original = json.loads(json.dumps(fixture))
+        delivered_at = datetime(2026, 7, 31, 14, 5, 6, tzinfo=timezone(timedelta(hours=8)))
+
+        prepared = prepare_alerts_for_delivery(
+            [fixture, fixture],
+            delivered_at=delivered_at,
+            batch_id="regression-01",
+        )
+
+        self.assertEqual(fixture, original)
+        self.assertEqual(len({item["alert_id"] for item in prepared}), 2)
+        self.assertEqual(prepared[0]["timestamp"], "2026-07-31T14:05:06+08:00")
+        self.assertRegex(
+            prepared[0]["alert_id"],
+            r"^rasp-demo-20260731140506-regression01-001$",
+        )
+        self.assertEqual(
+            prepared[0]["payload"]["event"]["attack_time"],
+            prepared[0]["timestamp"],
+        )
+        old_created = datetime.fromisoformat(original["payload"]["event"]["created_at"])
+        old_attack = datetime.fromisoformat(original["timestamp"])
+        new_created = datetime.fromisoformat(prepared[0]["payload"]["event"]["created_at"])
+        self.assertEqual(new_created - delivered_at, old_created - old_attack)
+        self.assertEqual(
+            datetime.fromisoformat(prepared[1]["timestamp"]) - delivered_at,
+            timedelta(milliseconds=1),
+        )
 
     def test_random_rasp_generation_covers_real_attack_event_shapes(self):
         alerts = [generate_alert(product="rasp", scenario="attack", seed=seed) for seed in range(1, 12)]

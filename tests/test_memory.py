@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import tempfile
 import threading
@@ -986,6 +987,36 @@ class MemoryGovernanceAPITest(unittest.TestCase):
                     (case_id,),
                 ).fetchone()[0]
                 self.assertEqual(audit_count, 1)
+            finally:
+                state.stop()
+
+    def test_reanalysis_versions_of_one_alert_count_as_one_cluster_member(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            config.database.path = str(Path(tmp) / "gateway.db")
+            config.processing.async_enabled = False
+            config.syslog.embedded_listeners_enabled = False
+            state = GatewayState(config)
+            try:
+                alert = _business_false_positive_alert(
+                    "waf-reanalysis-version-001",
+                    "2026-07-24T09:00:00+08:00",
+                )
+                result = state.orchestrator.handle_alert(alert)
+                linked = state.case_detail(result.case_id)["linked_alerts"][0]
+                old_version = copy.deepcopy(linked)
+                new_version = copy.deepcopy(linked)
+                old_version["event_id"] = "event-old"
+                old_version["normalized_event"]["created_at_ms"] = 100
+                new_version["event_id"] = "event-new"
+                new_version["normalized_event"]["created_at_ms"] = 200
+
+                clusters = state.memory.cluster_case_alerts([old_version, new_version])
+
+                self.assertEqual(len(clusters), 1)
+                self.assertEqual(clusters[0]["count"], 1)
+                self.assertEqual(clusters[0]["alert_ids"], [alert.alert_id])
+                self.assertEqual(clusters[0]["representative"]["event_id"], "event-new")
             finally:
                 state.stop()
 

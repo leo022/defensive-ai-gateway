@@ -16,7 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from defensive_ai_gateway.sample_alerts import generate_alert
+from defensive_ai_gateway.sample_alerts import generate_alert, prepare_alerts_for_delivery
 
 # 15 curated demo alerts covering all 5 products, all 3 classifications
 # (real attack / needs-manual-review / false-positive) and a spread of
@@ -204,6 +204,11 @@ def main() -> None:
     )
     parser.add_argument("--print-only", action="store_true", help="Print payloads without sending")
     parser.add_argument(
+        "--preserve-generated-identity",
+        action="store_true",
+        help="Send fixed fixture IDs/timestamps for an explicit historical replay",
+    )
+    parser.add_argument(
         "--token",
         default=os.getenv("DEFENSIVE_AI_API_TOKEN", ""),
         help="Gateway bearer token (defaults to env DEFENSIVE_AI_API_TOKEN). Set when the gateway requires auth.",
@@ -221,6 +226,13 @@ def main() -> None:
     if args.print_only:
         print(json.dumps({"generated": len(payloads), "alerts": [p for _, p in payloads]}, ensure_ascii=False, indent=2))
         return
+
+    if not args.preserve_generated_identity:
+        refreshed = prepare_alerts_for_delivery([payload for _, payload in payloads])
+        payloads = [
+            (label, refreshed[index])
+            for index, (label, _payload) in enumerate(payloads)
+        ]
 
     rows = []
     for label, payload in payloads:

@@ -843,6 +843,36 @@ class HTTPProductionBoundaryTest(unittest.TestCase):
         self.assertEqual(status, 202)
         self.assertNotEqual(spoofed["classification"], "benign")
 
+        injected["alert_id"] = "trusted-operational-demo"
+        status, operational = self._request(
+            "/api/alerts",
+            token="admin-token",
+            payload=injected,
+            headers={"X-Defensive-AI-Demo-Sample": "1"},
+        )
+        self.assertEqual(status, 202)
+        self.assertTrue(operational["case_id"].startswith("case_test_"))
+        self.assertTrue(operational["summary"].startswith("【测试样本】"))
+        self.assertTrue(operational["explanation"]["operational_test"])
+        self.assertEqual(
+            operational["explanation"]["memory_write_status"],
+            "suppressed_for_operational_test",
+        )
+        _, operational_case = self._request(
+            f"/api/cases/{operational['case_id']}", token="operator-token"
+        )
+        self.assertEqual(operational_case["approvals"], [])
+        self.assertEqual(
+            self.server.state.repo.conn.execute(
+                "SELECT COUNT(*) FROM memory_entries WHERE source_case_id = ?",
+                (operational["case_id"],),
+            ).fetchone()[0],
+            0,
+        )
+        persisted = self.server.state.repo.get_inbox_alert("trusted-operational-demo")
+        self.assertTrue(persisted["raw_alert"]["trusted_sample"])
+        self.assertTrue(persisted["raw_alert"]["operational_test"])
+
         status, inbox = self._request(
             "/api/alerts/inbox?status=completed", token="operator-token"
         )

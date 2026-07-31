@@ -52,6 +52,10 @@ class RawAlert:
     # never be allowed to set this flag themselves: it controls whether sample
     # ground-truth annotations may participate in analysis.
     trusted_sample: bool = False
+    # Set only by a trusted server-side operational-test path. These alerts are
+    # analyzed for end-to-end verification but must not write governance memory
+    # or create production response approvals.
+    operational_test: bool = False
 
 
 @dataclass

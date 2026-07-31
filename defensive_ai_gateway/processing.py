@@ -70,6 +70,7 @@ class DeadLetter:
                 "timestamp": self.alert.timestamp,
                 "payload": self.alert.payload,
                 "trusted_sample": self.alert.trusted_sample,
+                "operational_test": self.alert.operational_test,
             },
             "attempts": self.attempts,
             "reason": self.reason,

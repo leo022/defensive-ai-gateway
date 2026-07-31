@@ -449,9 +449,9 @@ const STRINGS = {
     confirmFalsePositive: "确认误报并写入长期记忆",
     falsePositiveConfirmed: "已确认误报，相关特征已写入产品长期记忆",
     memoryWriteHint: "确认后会抽取告警特征并写入产品长期记忆，后续同类高相似告警将降低置信度。",
-    alertClusters: "重复告警分组",
+    alertClusters: "同类告警分组",
     alertClusterCount: "{count} 个行为组",
-    clusterRepeatedAlerts: "同类重复 {count} 条",
+    clusterRepeatedAlerts: "同类告警 {count} 条",
     clusterRepresentative: "代表告警",
     clusterFirstSeen: "首次出现",
     clusterLastSeen: "最近出现",
@@ -571,7 +571,7 @@ const STRINGS = {
     extractingMemory: "正在抽取特征并写入记忆层...",
     extractingClusterMemory: "正在批量处置该组告警并写入一条代表性记忆...",
     falsePositiveReason: "Dashboard 人工确认：该告警符合业务场景下的误报模式",
-    clusterFalsePositiveReason: "Dashboard 人工确认：该组同类重复告警符合业务场景下的误报模式",
+    clusterFalsePositiveReason: "Dashboard 人工确认：该组同类告警符合业务场景下的误报模式",
     memoryWritten: "已写入产品长期记忆：{id}，后续同类高相似告警会降低置信。",
     clusterMemoryWritten: "已处置该组 {count} 条告警，并写入一条产品长期记忆：{id}",
     falsePositiveDone: "已确认业务误报，并写入记忆层：{id}",
@@ -1049,9 +1049,9 @@ const STRINGS = {
     confirmFalsePositive: "Confirm false positive & write long-term memory",
     falsePositiveConfirmed: "False positive confirmed; features were written to product long-term memory",
     memoryWriteHint: "Confirmation extracts alert features into product long-term memory so similar future alerts receive lower confidence.",
-    alertClusters: "Repeated alert groups",
+    alertClusters: "Similar alert groups",
     alertClusterCount: "{count} behavior group(s)",
-    clusterRepeatedAlerts: "{count} similar repeated alert(s)",
+    clusterRepeatedAlerts: "{count} similar alert(s)",
     clusterRepresentative: "Representative alert",
     clusterFirstSeen: "First seen",
     clusterLastSeen: "Last seen",
@@ -2746,15 +2746,30 @@ function alertClusterReviewCard(cluster) {
   `;
 }
 
+function uniqueLinkedAlerts(linked = []) {
+  const seen = new Set();
+  return (linked || []).filter((item) => {
+    const alertId = item?.alert_id;
+    if (!alertId || seen.has(alertId)) return false;
+    seen.add(alertId);
+    return true;
+  });
+}
+
+function uniqueLinkedAlertCount(linked = []) {
+  return uniqueLinkedAlerts(linked).length;
+}
+
 function linkedAlertsBlock(linked, clusters = []) {
   const cards = (clusters || []).length
     ? clusters.map(alertClusterReviewCard).filter(Boolean)
-    : (linked || []).map(linkedAlertReviewCard).filter(Boolean);
+    : uniqueLinkedAlerts(linked).map(linkedAlertReviewCard).filter(Boolean);
+  const alertCount = uniqueLinkedAlertCount(linked);
   return `
     <section class="detail-card linked-alerts-card">
       <div class="section-title">
         <h3>${escapeHtml(tr("alertClusters"))}</h3>
-        <span>${escapeHtml(tr("alertClusterCount", { count: clusters?.length || cards.length }))} · ${escapeHtml(tr("alertCount", { count: linked?.length || 0 }))}</span>
+        <span>${escapeHtml(tr("alertClusterCount", { count: clusters?.length || cards.length }))} · ${escapeHtml(tr("alertCount", { count: alertCount }))}</span>
       </div>
       ${cards.length
         ? `<div class="linked-alert-list">${cards.join("")}</div>`
@@ -2978,6 +2993,7 @@ function renderDetail(detail) {
   const latestRunRecord = detail.agent_runs?.[0] || {};
   const latestRun = latestRunRecord.result || {};
   const linked = detail.linked_alerts || [];
+  const linkedAlertCount = uniqueLinkedAlertCount(linked);
   const detailCounts = detail.detail_counts || {};
   const validation = detail.validation_runs?.[0] || latestRun.explanation?.validation;
   const confidence = Math.round((detail.confidence || 0) * 100);
@@ -3008,7 +3024,7 @@ function renderDetail(detail) {
           </div>
           <div>
             <span>${escapeHtml(tr("triageAlertVolume"))}</span>
-            <strong>${escapeHtml(tr("alertCount", { count: linked.length }))}</strong>
+            <strong>${escapeHtml(tr("alertCount", { count: linkedAlertCount }))}</strong>
           </div>
           <div>
             <span>${escapeHtml(tr("updatedAt"))}</span>
@@ -3042,7 +3058,7 @@ function renderDetail(detail) {
         </div>
         <div class="detail-link-list">
           ${responsePackLink(detail.case_id)}
-          ${detailLink(detail.case_id, "raw-alerts", tr("linkedRawAlerts"), tr("detailRawAlertsHint"), tr("alertCount", { count: detailCounts.raw_alerts ?? linked.length }))}
+          ${detailLink(detail.case_id, "raw-alerts", tr("linkedRawAlerts"), tr("detailRawAlertsHint"), tr("alertCount", { count: detailCounts.raw_alerts ?? linkedAlertCount }))}
           ${detailLink(detail.case_id, "normalized-evidence", tr("normalizedEvidence"), tr("detailEvidenceHint"), tr("alertCount", { count: detailCounts.normalized_evidence ?? linked.length }))}
           ${detailLink(detail.case_id, "analysis-runs", tr("agentRuns"), tr("detailRunsHint"), tr("runCount", { count: detailCounts.analysis_runs ?? detail.agent_runs?.length ?? 0 }))}
         </div>

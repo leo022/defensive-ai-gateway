@@ -80,7 +80,12 @@ class Orchestrator:
         with self.repo.transaction():
             self.repo.insert_audit(
                 new_id("audit"), trace_id, "gateway", "alert_received",
-                {"alert_id": alert.alert_id, "product": alert.product}, _commit=False,
+                {
+                    "alert_id": alert.alert_id,
+                    "product": alert.product,
+                    "operational_test": bool(alert.operational_test),
+                },
+                _commit=False,
             )
             self.repo.insert_raw_alert(alert, _commit=False)
             event_inserted = self.repo.insert_normalized_event(event, _commit=False)
@@ -116,6 +121,8 @@ class Orchestrator:
             raise ValueError("source_event_id and case_id are required for analysis replay")
         if not str(alert.alert_id or "").strip():
             raise ValueError("analysis replay requires a stable source alert id")
+        if case_id.startswith("case_test_"):
+            alert.operational_test = True
 
         lock_id = f"{alert.alert_id}:analysis-replay"
         with self._lock_for_alert(lock_id):
@@ -218,6 +225,12 @@ class Orchestrator:
             case_resolution = case_resolution or "analysis_replay"
         else:
             correlation_key = self._case_correlation_key(event)
+            if alert.operational_test:
+                digest = hashlib.sha256(event.event_id.encode("utf-8")).hexdigest()[:10]
+                suffix = f"__{digest}"
+                prefix = "case_test_"
+                readable = correlation_key.removeprefix("case_")
+                correlation_key = f"{prefix}{readable[:96 - len(prefix) - len(suffix)]}{suffix}"
             case_id, case_resolution = self.repo.resolve_case_id(
                 correlation_key,
                 event.event_id,
@@ -412,7 +425,16 @@ class Orchestrator:
         )
         analysis_skill = self.skills.for_product(event.product)
         validation = self.validator.validate(case_id, event, result, analysis_skill)
-        approvals = self.response_advisor.prepare(event.event_id, result, validation, event)
+        operational_test = bool(alert.operational_test)
+        approvals = (
+            []
+            if operational_test
+            else self.response_advisor.prepare(event.event_id, result, validation, event)
+        )
+        persist_memory = bool(record_memory and not operational_test)
+        if operational_test:
+            result.summary = f"【测试样本】 {result.summary}"
+            result.explanation["operational_test"] = True
         result.explanation["skill"] = {
             "name": analysis_skill.name,
             "version": analysis_skill.version,
@@ -427,7 +449,9 @@ class Orchestrator:
             result.explanation["analysis_replay"] = dict(replay_metadata)
         result.explanation["memory_write_status"] = (
             "committed"
-            if validation.status == "passed" and record_memory
+            if validation.status == "passed" and persist_memory
+            else "suppressed_for_operational_test"
+            if operational_test
             else "suppressed_for_analysis_replay"
             if replay_metadata
             else "suppressed_by_validator"
@@ -461,17 +485,22 @@ class Orchestrator:
             self.repo.insert_agent_run(
                 analysis_run_id, result, event.product, agent.prompt_version, event.event_id, _commit=False
             )
-            self._persist_memory_matches(memory_evaluation, case_id, analysis_run_id)
+            if not operational_test:
+                self._persist_memory_matches(memory_evaluation, case_id, analysis_run_id)
             self.repo.insert_validation(validation.to_dict(), _commit=False)
-            cancelled_approvals = self.repo.cancel_pending_approvals(
-                case_id,
-                actor=self.response_advisor.name,
-                reason=f"Superseded by analysis for event {event.event_id}",
-                _commit=False,
+            cancelled_approvals = (
+                0
+                if operational_test
+                else self.repo.cancel_pending_approvals(
+                    case_id,
+                    actor=self.response_advisor.name,
+                    reason=f"Superseded by analysis for event {event.event_id}",
+                    _commit=False,
+                )
             )
             for approval in approvals:
                 self.repo.insert_approval(approval.to_dict(), _commit=False)
-            if validation.status == "passed" and record_memory:
+            if validation.status == "passed" and persist_memory:
                 self.memory.record_case_summary(event.product, result, asset_id=asset_id, trace_id=trace_id)
             self.repo.insert_audit(
                 new_id("audit"), trace_id, agent.name, "analysis_completed", result.to_dict(), _commit=False,
@@ -512,6 +541,7 @@ class Orchestrator:
                     "correlation_key": correlation_key,
                     "resolution": case_resolution,
                     "window_ms": self.CASE_CORRELATION_WINDOW_MS,
+                    "operational_test": operational_test,
                 },
                 _commit=False,
             )

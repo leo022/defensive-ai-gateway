@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import copy
 import random
+import re
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -71,6 +74,13 @@ FEATURES_BY_SCENARIO = {
     },
 }
 HK_TZ = timezone(timedelta(hours=8))
+_DELIVERY_TIMESTAMP_KEYS = {
+    "attack_time",
+    "created_at",
+    "event_time",
+    "timestamp",
+    "trigger_time",
+}
 
 
 def available_features(product: str | None = None, scenario: str | None = None) -> dict[str, tuple[str, ...]] | tuple[str, ...]:
@@ -165,6 +175,76 @@ def generate_alerts(
         )
         for _ in range(count)
     ]
+
+
+def prepare_alerts_for_delivery(
+    alerts: list[dict[str, Any]],
+    *,
+    delivered_at: datetime | None = None,
+    batch_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return live demo occurrences with unique IDs and current, aware times.
+
+    Sample builders intentionally use fixed dates so seeded fixtures remain
+    reproducible. Delivery tools must not submit those fixture identities as
+    current security events, so this boundary refreshes them immediately before
+    transport while preserving relative offsets between embedded timestamps.
+    """
+    base_delivery = delivered_at or datetime.now(HK_TZ)
+    if base_delivery.tzinfo is None or base_delivery.utcoffset() is None:
+        raise ValueError("delivered_at must include a timezone offset")
+    rendered_batch = re.sub(r"[^a-zA-Z0-9]", "", str(batch_id or ""))[:16]
+    rendered_batch = rendered_batch or uuid.uuid4().hex[:10]
+
+    prepared: list[dict[str, Any]] = []
+    for index, source in enumerate(alerts, start=1):
+        payload = copy.deepcopy(source)
+        occurrence_time = base_delivery + timedelta(milliseconds=index - 1)
+        original_time = _parse_sample_timestamp(payload.get("timestamp"))
+        visited: set[int] = set()
+
+        def refresh_timestamps(node: Any) -> None:
+            if isinstance(node, dict):
+                if id(node) in visited:
+                    return
+                visited.add(id(node))
+                for key, value in list(node.items()):
+                    if key in _DELIVERY_TIMESTAMP_KEYS and isinstance(value, str):
+                        parsed = _parse_sample_timestamp(value)
+                        if parsed is not None:
+                            delta = parsed - original_time if original_time is not None else timedelta()
+                            node[key] = (occurrence_time + delta).isoformat()
+                    elif isinstance(value, (dict, list)):
+                        refresh_timestamps(value)
+            elif isinstance(node, list):
+                if id(node) in visited:
+                    return
+                visited.add(id(node))
+                for item in node:
+                    refresh_timestamps(item)
+
+        refresh_timestamps(payload)
+        payload["timestamp"] = occurrence_time.isoformat()
+        product = re.sub(r"[^a-z0-9]", "", str(payload.get("product") or "alert").lower())
+        payload["alert_id"] = (
+            f"{product or 'alert'}-demo-{occurrence_time.strftime('%Y%m%d%H%M%S')}"
+            f"-{rendered_batch}-{index:03d}"
+        )
+        prepared.append(payload)
+    return prepared
+
+
+def _parse_sample_timestamp(value: Any) -> datetime | None:
+    rendered = str(value or "").strip()
+    if not rendered:
+        return None
+    try:
+        parsed = datetime.fromisoformat(rendered.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed
 
 
 def _scenario(rng: random.Random, requested: str) -> str:

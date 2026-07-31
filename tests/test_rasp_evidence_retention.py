@@ -1141,7 +1141,8 @@ class RaspEvidenceRetentionTest(unittest.TestCase):
                 self.assertIn("$.event.ID", upgraded.mappings["alert_id"])
                 self.assertIn("payload.request_parameters", upgraded.mappings)
                 self.assertIn("payload.custom_context", upgraded.mappings)
-                self.assertEqual(upgraded.version, "v7")
+                self.assertEqual(upgraded.version, "v8")
+                self.assertEqual(upgraded.timestamp_offset, "+08:00")
                 evidence_types = {field["type"] for field in upgraded.evidence_fields}
                 self.assertTrue({"hook_data", "request_parameters"}.issubset(evidence_types))
             finally:
@@ -1182,6 +1183,20 @@ class RaspEvidenceRetentionTest(unittest.TestCase):
                 self.assertEqual(len(after["linked_alerts"]), 2)
                 self.assertEqual({item["alert_id"] for item in after["linked_alerts"]}, {alert.alert_id})
                 self.assertEqual(len(after["agent_runs"]), 2)
+                self.assertEqual(state.repo.list_cases()[0]["alert_count"], 1)
+                overview = state.case_triage_detail(case_id)
+                self.assertEqual(overview["detail_counts"]["raw_alerts"], 1)
+                self.assertEqual(overview["detail_counts"]["normalized_evidence"], 2)
+                raw_page = state.repo.get_case_detail_page(case_id, "raw-alerts")
+                normalized_page = state.repo.get_case_detail_page(case_id, "normalized-evidence")
+                self.assertEqual(raw_page["pagination"]["total"], 1)
+                self.assertEqual(len(raw_page["items"]), 1)
+                self.assertEqual(normalized_page["pagination"]["total"], 2)
+                disposition = state.repo.set_alert_disposition(
+                    alert.alert_id, "false_positive", "test-analyst", "replay count check"
+                )
+                self.assertEqual(disposition["case_alert_count"], 1)
+                self.assertEqual(disposition["case_false_positive_count"], 1)
                 self.assertEqual(after["agent_runs"][0]["prompt_version"], RaspAgent.prompt_version)
                 self.assertEqual(after["summary"], replay["analysis"]["summary"])
                 self.assertEqual(
