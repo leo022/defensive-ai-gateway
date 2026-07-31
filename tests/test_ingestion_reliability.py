@@ -44,6 +44,7 @@ from defensive_ai_gateway.syslog_router import SyslogPortRouter
 from scripts.simulate_syslog_ports import (
     _embedded_expected_alert,
     _prepare_syslog_samples,
+    _rfc5424_frame,
     _send_to_embedded_listeners,
 )
 
@@ -1185,6 +1186,40 @@ class SyslogDemoScriptTest(unittest.TestCase):
                 for item in results
             )
         )
+
+    def test_external_collector_frame_is_valid_rfc5424_and_keeps_native_identity(self):
+        router = SyslogPortRouter({"waf": 15140}, {"waf": "auto-waf-json"})
+        sample = _prepare_syslog_samples(
+            {"waf": 15140},
+            signing_secret="admin-secret",
+            delivered_at=datetime(
+                2026,
+                7,
+                31,
+                15,
+                30,
+                tzinfo=timezone(timedelta(hours=8)),
+            ),
+            batch_id="rfc5424",
+        )[0]
+        framed = _rfc5424_frame(
+            sample[0],
+            sample[2],
+            emitted_at=datetime(2026, 7, 31, 7, 30, tzinfo=timezone.utc),
+        )
+
+        self.assertTrue(
+            framed.startswith(b"<134>1 2026-07-31T07:30:00.000Z localhost waf - - - {")
+        )
+        self.assertTrue(framed.endswith(b"\n"))
+        alert_id, profile_id = _embedded_expected_alert(
+            router,
+            sample[0],
+            sample[1],
+            framed,
+        )
+        self.assertEqual(alert_id, "waf-demo-20260731153000-rfc5424-001")
+        self.assertEqual(profile_id, "auto-waf-json")
 
 
 class SyslogEnvelopeTest(unittest.TestCase):

@@ -11,7 +11,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
@@ -125,6 +125,25 @@ def _prepare_syslog_samples(
             )
         )
     return samples
+
+
+def _rfc5424_frame(
+    product: str,
+    data: bytes,
+    *,
+    emitted_at: datetime | None = None,
+) -> bytes:
+    """Wrap one native JSON message for a production Syslog TCP listener."""
+    timestamp = emitted_at or datetime.now(timezone.utc)
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise ValueError("emitted_at must include a timezone offset")
+    rendered_time = (
+        timestamp.astimezone(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+    header = f"<134>1 {rendered_time} localhost {product} - - - ".encode("ascii")
+    return header + data + b"\n"
 
 
 def _send_to_embedded_listeners(
@@ -306,6 +325,11 @@ def main() -> None:
         operational_test=not args.production_event,
         preserve_fixture_identity=args.preserve_fixture_identity,
     )
+    if args.running_collector and not config.syslog.embedded_listeners_enabled:
+        samples = [
+            (product, port, _rfc5424_frame(product, data))
+            for product, port, data in samples
+        ]
 
     if config.syslog.embedded_listeners_enabled or args.running_collector:
         results = _send_to_embedded_listeners(

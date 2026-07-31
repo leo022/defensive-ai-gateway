@@ -95,7 +95,7 @@ python3 scripts/simulate_syslog_ports.py --config config/dev.yaml
 
 脚本会检查 `GET /api/health`，刷新 `samples_syslog/<product>/<product>_alert.json` 的原生事件 ID 和时间后，作为不同设备发来的 syslog 报文发送到 `15140`-`15144`，并确认每条都按目标端口路由到正确 product。默认报文带有使用管理员 API Token 签发的 HMAC 运行测试标记；Gateway 仅在可信路由确认来源为本机且签名正确时启用测试隔离，禁止长期记忆写入和生产审批。`config/dev.yaml` 的内嵌监听模式会直接复用已经启动的五个监听器并轮询持久 inbox，直到每条记录变为 `completed`。
 
-生产或其他外置 Vector 场景应复用正在运行的监听器：
+生产或其他外置 Vector 场景应复用正在运行的监听器；脚本会把原生 JSON 封装为 RFC5424 TCP 帧后发送：
 
 ```bash
 DEFENSIVE_AI_API_TOKEN='<admin-token>' \
