@@ -316,6 +316,7 @@ class Orchestrator:
         match_candidates = self.memory.load_match_candidates(
             event.product,
             limit=self.memory_matcher.config.candidate_limit,
+            lookup_keys=self.memory_matcher.candidate_lookup_keys(event),
         )
         if replay_metadata:
             match_candidates = [
@@ -324,14 +325,22 @@ class Orchestrator:
                 if str(item.get("source_case_id") or "") != case_id
             ]
         memory_evaluation = self.memory_matcher.match(event, match_candidates)
-        memory_context["product_long_term"] = [
-            candidate.memory
-            for candidate in memory_evaluation.candidates
-            if candidate.overall_score >= memory_evaluation.review_threshold
-        ][: self.memory_matcher.config.top_k]
-        memory_context["memory_association"] = memory_evaluation.context_payload(
-            self.memory_matcher.config.top_k
-        )
+        if self.memory_matcher.config.inject_matches_into_model:
+            memory_context["product_long_term"] = [
+                candidate.memory
+                for candidate in memory_evaluation.candidates
+                if candidate.title_eligible
+            ][: self.memory_matcher.config.top_k]
+            memory_context["memory_association"] = memory_evaluation.context_payload(
+                self.memory_matcher.config.top_k,
+                title_eligible_only=True,
+            )
+        else:
+            memory_context["product_long_term"] = []
+            model_association = memory_evaluation.context_payload(0)
+            model_association["best_memory_id"] = ""
+            model_association["deferred_to_policy"] = True
+            memory_context["memory_association"] = model_association
         model_runtime = dict(self.llm.runtime_metadata)
         fallback_used = False
         try:
@@ -632,6 +641,10 @@ class Orchestrator:
             matcher_version=evaluation.matcher_version,
             final_effect=evaluation.final_effect,
             candidates=[candidate.to_dict() for candidate in evaluation.candidates],
+            selected_memory_id=evaluation.best_memory_id,
+            attack_signal_veto=evaluation.attack_signal_veto,
+            attack_signal_reasons=evaluation.attack_signal_reasons,
+            config_snapshot=evaluation.config_snapshot,
             _commit=False,
         )
 

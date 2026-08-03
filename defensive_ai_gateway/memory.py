@@ -200,9 +200,19 @@ class MemoryManager:
         )
         return active + pending
 
-    def load_match_candidates(self, product: str, limit: int = 100) -> list[dict[str, Any]]:
+    def load_match_candidates(
+        self,
+        product: str,
+        limit: int = 500,
+        lookup_keys: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
         """Load a broad, governed candidate pool for the independent matcher."""
-        return self.repo.query_matchable_product_memory(product, now_ms(), limit=limit)
+        return self.repo.query_matchable_product_memory(
+            product,
+            now_ms(),
+            limit=limit,
+            lookup_keys=lookup_keys,
+        )
 
     def load_evidence(
         self,
@@ -452,7 +462,9 @@ class MemoryManager:
         product = str(raw.get("product") or normalized.get("product") or "").lower()
         if not product:
             raise ValueError("alert product is missing")
-        features = self.extract_false_positive_features(linked_alert)
+        if self.policy is None:
+            raise RuntimeError("false-positive confirmation requires an active redaction policy")
+        features = self.governed_false_positive_features(linked_alert)
         identity_fields = [
             field_name
             for field_name in ("event_type", "rule_id")
@@ -463,7 +475,7 @@ class MemoryManager:
             for field_name in ("method", "uri", "process_name", "sink", "user_agent")
             if features.get(field_name)
         ]
-        content = json.dumps(
+        content_doc = self.policy.redact(
             {
                 "classification": "benign",
                 "false_positive_candidate": True,
@@ -486,6 +498,12 @@ class MemoryManager:
                     "effect": "仅在身份字段一致且方法、URI、进程、危险调用或客户端边界无冲突时，才以高度相似记忆辅助误报判断",
                 },
             },
+        )
+        sensitivity_ok = self.policy.redact(content_doc) == content_doc
+        if not sensitivity_ok:
+            raise RuntimeError("redaction policy did not produce stable memory content")
+        content = json.dumps(
+            content_doc,
             ensure_ascii=False,
             sort_keys=True,
         )
@@ -506,7 +524,7 @@ class MemoryManager:
                     "scope": f"{product}:business_false_positive:{features.get('event_type') or raw.get('event_type')}",
                     "trust_level": TRUST_MEDIUM,
                     "status": STATUS_ACTIVE,
-                    "sensitivity_ok": True,
+                    "sensitivity_ok": sensitivity_ok,
                     "approved_by": analyst,
                     "expires_at_ms": expires_at_ms or now_ms() + QUARTERLY_REVIEW_MS,
                 },
@@ -521,9 +539,9 @@ class MemoryManager:
                 {
                     "alert_id": linked_alert.get("alert_id"),
                     "case_id": linked_alert.get("case_id"),
-                    "reason": reason,
+                    "reason": content_doc.get("confirmation_reason"),
                     "features": features,
-                    "alert_cluster": cluster or None,
+                    "alert_cluster": content_doc.get("alert_cluster"),
                 },
                 _commit=False,
             )
@@ -746,6 +764,50 @@ class MemoryManager:
             "similarity_features": similarity_features[:24],
             "feature_text": stable_text,
         }
+
+    def governed_false_positive_features(self, linked_alert: dict[str, Any]) -> dict[str, Any]:
+        """Project an alert into stable, value-minimized long-term matching features."""
+        raw = self.extract_false_positive_features(linked_alert)
+        user_agent = re.sub(
+            r"\d+(?:\.\d+)+",
+            "{version}",
+            str(raw.get("user_agent") or "").strip().lower(),
+        )
+        governed = {
+            "product": raw.get("product"),
+            "event_type": raw.get("event_type"),
+            "rule_id": raw.get("rule_id"),
+            "rule_name": raw.get("rule_name"),
+            "app": raw.get("app"),
+            "host": raw.get("host") or raw.get("dst_ip"),
+            "method": raw.get("method"),
+            "uri": self._cluster_uri(raw.get("uri")),
+            "route": self._cluster_uri(raw.get("route")),
+            "user_agent": user_agent,
+            "matched_parameter_keys": self._parameter_keys(raw.get("matched_parameters")),
+            "process_name": raw.get("process_name"),
+            "parent_process": raw.get("parent_process"),
+            "sink": raw.get("sink"),
+            "signature_status": raw.get("signature_status"),
+            "sni": raw.get("sni"),
+            "protocol": raw.get("protocol"),
+            "dst_port": raw.get("dst_port"),
+            "mitre_tactic": raw.get("mitre_tactic"),
+        }
+        governed = {key: value for key, value in governed.items() if value not in (None, "", [], {})}
+        if self.policy is not None:
+            governed = self.policy.redact(governed)
+        stable_text = json.dumps(governed, ensure_ascii=False, sort_keys=True)
+        similarity_features = self._extract_similarity_features(stable_text)
+        for key in (
+            "rule_id", "event_type", "app", "host", "uri", "route", "method",
+            "user_agent", "process_name", "parent_process", "sink", "sni", "protocol",
+        ):
+            value = governed.get(key)
+            if isinstance(value, str) and value:
+                similarity_features.add(value.lower())
+        governed["similarity_features"] = sorted(similarity_features)[:24]
+        return governed
 
     def _extract_similarity_features(self, text: str) -> set[str]:
         import re

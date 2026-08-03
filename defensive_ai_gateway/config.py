@@ -128,14 +128,18 @@ class OperationsConfig:
 class MemoryMatchingConfig:
     """Deterministic memory association policy shared by every LLM backend."""
 
-    candidate_limit: int = 100
+    candidate_limit: int = 500
     top_k: int = 5
     review_threshold: float = 0.58
     apply_threshold: float = 0.78
     structured_weight: float = 0.68
     semantic_weight: float = 0.22
     retrieval_weight: float = 0.10
-    vector_dimensions: int = 256
+    vector_dimensions: int = 1024
+    min_high_fields: int = 3
+    apply_enabled: bool = False
+    allow_malicious_downgrade: bool = False
+    inject_matches_into_model: bool = False
 
 
 @dataclass
@@ -456,14 +460,36 @@ def load_config(path: str | None = None) -> GatewayConfig:
             ),
         ),
         memory_matching=MemoryMatchingConfig(
-            candidate_limit=max(1, min(int(memory_matching.get("candidate_limit", 100)), 500)),
+            candidate_limit=max(1, min(int(memory_matching.get("candidate_limit", 500)), 500)),
             top_k=max(1, min(int(memory_matching.get("top_k", 5)), 20)),
             review_threshold=float(memory_matching.get("review_threshold", 0.58)),
             apply_threshold=float(memory_matching.get("apply_threshold", 0.78)),
             structured_weight=float(memory_matching.get("structured_weight", 0.68)),
             semantic_weight=float(memory_matching.get("semantic_weight", 0.22)),
             retrieval_weight=float(memory_matching.get("retrieval_weight", 0.10)),
-            vector_dimensions=max(64, min(int(memory_matching.get("vector_dimensions", 256)), 2048)),
+            vector_dimensions=max(64, min(int(memory_matching.get("vector_dimensions", 1024)), 2048)),
+            min_high_fields=max(3, min(int(memory_matching.get("min_high_fields", 3)), 12)),
+            apply_enabled=str(
+                os.getenv(
+                    "DEFENSIVE_AI_MEMORY_APPLY_ENABLED",
+                    "1" if memory_matching.get("apply_enabled", False) else "0",
+                )
+            ).lower()
+            in {"1", "true", "yes"},
+            allow_malicious_downgrade=str(
+                os.getenv(
+                    "DEFENSIVE_AI_MEMORY_ALLOW_MALICIOUS_DOWNGRADE",
+                    "1" if memory_matching.get("allow_malicious_downgrade", False) else "0",
+                )
+            ).lower()
+            in {"1", "true", "yes"},
+            inject_matches_into_model=str(
+                os.getenv(
+                    "DEFENSIVE_AI_MEMORY_INJECT_MATCHES_INTO_MODEL",
+                    "1" if memory_matching.get("inject_matches_into_model", False) else "0",
+                )
+            ).lower()
+            in {"1", "true", "yes"},
         ),
         syslog=SyslogConfig(
             product_ports={

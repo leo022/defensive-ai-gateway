@@ -753,7 +753,12 @@ class MemoryGovernanceAPITest(unittest.TestCase):
                 self.assertEqual([match["memory_id"] for match in matches], [memory["memory_id"]])
                 self.assertIn(
                     matches[0]["final_effect"],
-                    {"downgraded_to_benign", "classification_reinforced", "review_only"},
+                    {
+                        "downgraded_to_benign",
+                        "classification_reinforced",
+                        "review_only",
+                        "apply_disabled_review",
+                    },
                 )
             finally:
                 state.stop()
@@ -881,6 +886,60 @@ class MemoryGovernanceAPITest(unittest.TestCase):
                 (result.case_id,),
             ).fetchone()[0]
             self.assertEqual(audit_count, 1)
+
+    def test_confirmed_false_positive_memory_minimizes_and_redacts_features(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            config.database.path = str(Path(tmp) / "gateway.db")
+            config.processing.async_enabled = False
+            config.syslog.embedded_listeners_enabled = False
+            state = GatewayState(config)
+            try:
+                alert = _business_false_positive_alert(
+                    "waf-sensitive-fp-001",
+                    "2026-07-24T09:00:00+08:00",
+                    src_ip="10.40.8.12",
+                    matched_parameters={
+                        "customer_email": "alice@example.com",
+                        "sequence": "1001",
+                    },
+                )
+                state.orchestrator.handle_alert(alert)
+                outcome = state.confirm_alert_false_positive(
+                    alert.alert_id,
+                    {
+                        "analyst": "analyst-lee",
+                        "reason": "approved for alice@example.com settlement flow",
+                    },
+                )
+
+                record = state.repo.get_memory(outcome["memory_id"])
+                content = json.loads(record["content"])
+                features = content["features"]
+                event = state.repo.list_memory_events(memory_id=outcome["memory_id"])[0]
+                audit_json = state.repo.conn.execute(
+                    "SELECT detail_json FROM audit_log WHERE action = 'confirm_business_false_positive'"
+                ).fetchone()[0]
+                persisted = json.dumps(
+                    {"content": content, "event": event, "audit": json.loads(audit_json)},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+
+                self.assertTrue(record["sensitivity_ok"])
+                self.assertEqual(state.policy.redact(content), content)
+                self.assertNotIn("alice@example.com", persisted)
+                self.assertNotIn("10.40.8.12", persisted)
+                self.assertNotIn("matched_parameters", features)
+                self.assertNotIn("feature_text", features)
+                self.assertNotIn("src_ip", features)
+                self.assertNotIn("user", features)
+                self.assertEqual(
+                    features["matched_parameter_keys"],
+                    ["customer_email", "sequence"],
+                )
+            finally:
+                state.stop()
 
     def test_repeated_case_alerts_are_confirmed_as_one_cluster_and_one_memory(self):
         with tempfile.TemporaryDirectory() as tmp:

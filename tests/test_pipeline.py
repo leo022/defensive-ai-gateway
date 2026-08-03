@@ -15,6 +15,7 @@ from defensive_ai_gateway.database import Repository
 from defensive_ai_gateway.log_adapter import LogAdapter, MappingProfile, demo_rasp_profile, mapping_profile_record
 from defensive_ai_gateway.llm import GatewayLLM, LLMClient, LocalHeuristicLLM, _parse_json_object
 from defensive_ai_gateway.memory import MemoryManager
+from defensive_ai_gateway.memory_matcher import MemoryMatcher
 from defensive_ai_gateway.models import AgentResult, RawAlert, RecommendedAction
 from defensive_ai_gateway.normalizer import EventNormalizer
 from defensive_ai_gateway.orchestrator import Orchestrator
@@ -773,13 +774,21 @@ class PipelineTest(unittest.TestCase):
             self.assertGreaterEqual(len(assessment["analysis_dimensions"]), 1)
             self.assertIn(payload["severity"], {"medium", "high", "critical"})
 
-    def test_active_false_positive_memory_downgrades_similar_waf_alert(self):
+    def test_sparse_legacy_false_positive_memory_cannot_downgrade_waf_alert(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = GatewayConfig()
+            config.memory_matching.apply_enabled = True
             repo = Repository(str(Path(tmp) / "gateway.db"))
             policy = PolicyEngine(config.policy)
             memory = MemoryManager(repo, policy)
-            orchestrator = Orchestrator(repo, EventNormalizer(policy), memory, LocalHeuristicLLM(), policy)
+            orchestrator = Orchestrator(
+                repo,
+                EventNormalizer(policy),
+                memory,
+                LocalHeuristicLLM(),
+                policy,
+                memory_matcher=MemoryMatcher(config.memory_matching),
+            )
             repo.save_memory(
                 {
                     "memory_id": "mem_waf_fp_synthetic_search",
@@ -807,18 +816,34 @@ class PipelineTest(unittest.TestCase):
                 alert_id=payload["alert_id"],
             )
             result = orchestrator.handle_alert(alert)
-            self.assertEqual(result.classification, "benign")
-            self.assertIn("长期记忆命中", result.summary)
+            self.assertEqual(result.classification, "suspicious")
+            self.assertNotIn("长期记忆命中", result.summary)
+            self.assertEqual(
+                result.explanation["memory_association"]["final_effect"],
+                "related_only",
+            )
+            self.assertIn(
+                "insufficient_feature_coverage",
+                result.explanation["memory_association"]["matches"][0]["comparison"]["gate_reasons"],
+            )
             self.assertTrue(any(item.get("title") == "历史误报" for item in result.explanation.get("dimensions", [])))
             self.assertTrue(any("复核" in action.action for action in result.recommended_actions))
 
-    def test_similar_false_positive_memory_can_downgrade_suspicious_alert(self):
+    def test_sparse_legacy_false_positive_memory_stays_review_only_when_apply_enabled(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = GatewayConfig()
+            config.memory_matching.apply_enabled = True
             repo = Repository(str(Path(tmp) / "gateway.db"))
             policy = PolicyEngine(config.policy)
             memory = MemoryManager(repo, policy)
-            orchestrator = Orchestrator(repo, EventNormalizer(policy), memory, LocalHeuristicLLM(), policy)
+            orchestrator = Orchestrator(
+                repo,
+                EventNormalizer(policy),
+                memory,
+                LocalHeuristicLLM(),
+                policy,
+                memory_matcher=MemoryMatcher(config.memory_matching),
+            )
             repo.save_memory(
                 {
                     "memory_id": "mem_waf_fp_synthetic_search",
@@ -850,8 +875,12 @@ class PipelineTest(unittest.TestCase):
                 alert_id=payload["alert_id"],
             )
             result = orchestrator.handle_alert(alert)
-            self.assertEqual(result.classification, "benign")
-            self.assertIn("误报", result.explanation["verdict"])
+            self.assertEqual(result.classification, "suspicious")
+            self.assertEqual(
+                result.explanation["memory_association"]["final_effect"],
+                "related_only",
+            )
+            self.assertIn("不构成命中", result.explanation["verdict"])
             self.assertTrue(any(item.get("title") == "历史误报" for item in result.explanation.get("dimensions", [])))
 
     def test_truncated_memory_context_keeps_dict_shape(self):

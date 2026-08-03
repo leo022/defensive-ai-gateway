@@ -3199,6 +3199,7 @@ class GatewayState:
             ).strip()
             if len(reason) > 1000:
                 raise ValueError("reason is too long")
+            reason = str(self.policy.redact(reason))
             expires_at_ms = (
                 self._future_expiry(body["expires_at_ms"])
                 if body.get("expires_at_ms")
@@ -3212,7 +3213,7 @@ class GatewayState:
                 disposition = self.repo.get_alert_disposition_summary(alert_id)
                 outcome = {
                     "memory_id": existing_confirmation["memory_id"],
-                    "features": self.memory.extract_false_positive_features(linked),
+                    "features": self.memory.governed_false_positive_features(linked),
                 }
                 if (
                     disposition
@@ -3333,6 +3334,7 @@ class GatewayState:
             ).strip()
             if len(reason) > 1000:
                 raise ValueError("reason is too long")
+            reason = str(self.policy.redact(reason))
             expires_at_ms = (
                 self._future_expiry(body["expires_at_ms"])
                 if body.get("expires_at_ms")
@@ -3368,7 +3370,7 @@ class GatewayState:
                 if existing_confirmation:
                     outcome = {
                         "memory_id": existing_confirmation["memory_id"],
-                        "features": self.memory.extract_false_positive_features(
+                        "features": self.memory.governed_false_positive_features(
                             representative
                         ),
                     }

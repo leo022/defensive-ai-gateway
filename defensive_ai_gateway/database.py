@@ -292,8 +292,17 @@ CREATE TABLE IF NOT EXISTS memory_matches (
   final_effect TEXT NOT NULL,
   matched_features_json TEXT NOT NULL,
   score_breakdown_json TEXT NOT NULL,
+  match_level TEXT NOT NULL DEFAULT 'weak',
+  title_eligible INTEGER NOT NULL DEFAULT 0,
+  comparison_json TEXT NOT NULL DEFAULT '{}',
+  apply_threshold REAL NOT NULL DEFAULT 1.0,
+  policy_effect TEXT NOT NULL DEFAULT 'review_only',
+  selected_candidate INTEGER NOT NULL DEFAULT 0,
+  attack_signal_veto INTEGER NOT NULL DEFAULT 0,
+  attack_signal_reasons_json TEXT NOT NULL DEFAULT '[]',
+  config_snapshot_json TEXT NOT NULL DEFAULT '{}',
   created_at_ms INTEGER NOT NULL,
-  UNIQUE (event_id, memory_id)
+  UNIQUE (analysis_run_id, memory_id)
 );
 CREATE TABLE IF NOT EXISTS audit_log (
   audit_id TEXT PRIMARY KEY,
@@ -715,7 +724,7 @@ BEGIN
 END;
 """
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 _LLM_DEFERRED_ERROR_PREFIX = "analysis_deferred:"
 _LEGACY_LLM_DEFERRED_ERROR_FRAGMENT = "remote LLM analysis deferred"
 _TERMINAL_LLM_ERROR_FRAGMENTS = (
@@ -1473,6 +1482,111 @@ class Repository:
                 )
                 self.conn.execute(
                     "INSERT OR REPLACE INTO schema_version(version, applied_at_ms) VALUES (18, ?)",
+                    (now_ms(),),
+                )
+
+            if current < 19:
+                match_columns = {
+                    row["name"]
+                    for row in self.conn.execute("PRAGMA table_info(memory_matches)").fetchall()
+                }
+                required_match_columns = {
+                    "match_level",
+                    "title_eligible",
+                    "comparison_json",
+                    "apply_threshold",
+                    "policy_effect",
+                    "selected_candidate",
+                    "attack_signal_veto",
+                    "attack_signal_reasons_json",
+                    "config_snapshot_json",
+                }
+                table_row = self.conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'memory_matches'"
+                ).fetchone()
+                table_sql = " ".join(str(table_row["sql"] or "").lower().split()) if table_row else ""
+                run_uniqueness = bool(
+                    re.search(
+                        r"unique\s*\(\s*analysis_run_id\s*,\s*memory_id\s*\)",
+                        table_sql,
+                    )
+                )
+                if not run_uniqueness or not required_match_columns.issubset(match_columns):
+                    self.conn.execute("DROP INDEX IF EXISTS idx_memory_matches_event")
+                    self.conn.execute("DROP INDEX IF EXISTS idx_memory_matches_memory")
+                    self.conn.execute("DROP INDEX IF EXISTS idx_memory_matches_case")
+                    self.conn.execute("ALTER TABLE memory_matches RENAME TO memory_matches_v18")
+                    self.conn.execute(
+                        """
+                        CREATE TABLE memory_matches (
+                          match_id TEXT PRIMARY KEY,
+                          event_id TEXT NOT NULL,
+                          alert_id TEXT NOT NULL,
+                          case_id TEXT NOT NULL,
+                          analysis_run_id TEXT NOT NULL,
+                          memory_id TEXT NOT NULL,
+                          matcher_version TEXT NOT NULL,
+                          rank INTEGER NOT NULL,
+                          structured_score REAL NOT NULL,
+                          semantic_score REAL NOT NULL,
+                          retrieval_score REAL NOT NULL,
+                          overall_score REAL NOT NULL,
+                          decision TEXT NOT NULL,
+                          final_effect TEXT NOT NULL,
+                          matched_features_json TEXT NOT NULL,
+                          score_breakdown_json TEXT NOT NULL,
+                          match_level TEXT NOT NULL DEFAULT 'weak',
+                          title_eligible INTEGER NOT NULL DEFAULT 0,
+                          comparison_json TEXT NOT NULL DEFAULT '{}',
+                          apply_threshold REAL NOT NULL DEFAULT 1.0,
+                          policy_effect TEXT NOT NULL DEFAULT 'review_only',
+                          selected_candidate INTEGER NOT NULL DEFAULT 0,
+                          attack_signal_veto INTEGER NOT NULL DEFAULT 0,
+                          attack_signal_reasons_json TEXT NOT NULL DEFAULT '[]',
+                          config_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                          created_at_ms INTEGER NOT NULL,
+                          UNIQUE (analysis_run_id, memory_id)
+                        )
+                        """
+                    )
+                    self.conn.execute(
+                        """
+                        INSERT INTO memory_matches
+                        (match_id, event_id, alert_id, case_id, analysis_run_id, memory_id,
+                         matcher_version, rank, structured_score, semantic_score, retrieval_score,
+                         overall_score, decision, final_effect, matched_features_json,
+                         score_breakdown_json, match_level, title_eligible, comparison_json,
+                         apply_threshold, policy_effect, selected_candidate, attack_signal_veto,
+                         attack_signal_reasons_json, config_snapshot_json, created_at_ms)
+                        SELECT match_id, event_id, alert_id, case_id, analysis_run_id, memory_id,
+                               matcher_version, rank, structured_score, semantic_score,
+                               retrieval_score, overall_score, decision, final_effect,
+                               matched_features_json, score_breakdown_json, 'legacy', 0, '{}',
+                               1.0,
+                               CASE WHEN decision IN ('apply', 'downgraded_to_benign',
+                                                      'classification_reinforced')
+                                    THEN 'downgrade_to_benign' ELSE 'review_only' END,
+                               CASE WHEN rank = 1 THEN 1 ELSE 0 END,
+                               CASE WHEN decision = 'attack_signal_veto' THEN 1 ELSE 0 END,
+                               '[]', '{}', created_at_ms
+                        FROM memory_matches_v18
+                        """
+                    )
+                    self.conn.execute("DROP TABLE memory_matches_v18")
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_memory_matches_event "
+                    "ON memory_matches(event_id, overall_score DESC)"
+                )
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_memory_matches_memory "
+                    "ON memory_matches(memory_id, created_at_ms DESC)"
+                )
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_memory_matches_case "
+                    "ON memory_matches(case_id, created_at_ms DESC)"
+                )
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO schema_version(version, applied_at_ms) VALUES (19, ?)",
                     (now_ms(),),
                 )
 
@@ -6526,10 +6640,23 @@ class Repository:
         self,
         product: str,
         now_ms_value: int,
-        limit: int = 100,
+        limit: int = 500,
+        lookup_keys: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Return the broad governed candidate pool before matcher hard filters."""
         with self._lock:
+            exact_keys = sorted(
+                {
+                    str(key).strip().lower()
+                    for key in lookup_keys or []
+                    if str(key).strip()
+                }
+            )[:32]
+            if exact_keys:
+                placeholders = ",".join("?" for _ in exact_keys)
+                priority = f"CASE WHEN lower(retrieval_key) IN ({placeholders}) THEN 0 ELSE 1 END, "
+            else:
+                priority = ""
             rows = self.conn.execute(
                 f"""
                 SELECT {self._MEMORY_COLUMNS} FROM memory_entries
@@ -6540,10 +6667,15 @@ class Repository:
                   AND sensitivity_ok = 1
                   AND COALESCE(approved_by, '') != ''
                   AND (expires_at_ms IS NULL OR expires_at_ms > ?)
-                ORDER BY updated_at_ms DESC, memory_id ASC
+                ORDER BY {priority}updated_at_ms DESC, memory_id ASC
                 LIMIT ?
                 """,
-                (f"product/{product.lower()}", now_ms_value, max(1, min(int(limit), 500))),
+                (
+                    f"product/{product.lower()}",
+                    now_ms_value,
+                    *exact_keys,
+                    max(1, min(int(limit), 500)),
+                ),
             ).fetchall()
             return [dict(row) for row in rows]
 
@@ -6556,23 +6688,31 @@ class Repository:
         matcher_version: str,
         final_effect: str,
         candidates: list[dict[str, Any]],
+        selected_memory_id: str | None = None,
+        attack_signal_veto: bool = False,
+        attack_signal_reasons: list[str] | None = None,
+        config_snapshot: dict[str, Any] | None = None,
         _commit: bool = True,
     ) -> None:
         with self._lock:
             created = now_ms()
             for candidate in candidates:
                 memory_id = str(candidate["memory_id"])
-                digest = hashlib.sha256(f"{event_id}\0{memory_id}".encode("utf-8")).hexdigest()[:24]
+                rank = int(candidate.get("rank") or 0)
+                selected = rank == 1 if selected_memory_id is None else memory_id == selected_memory_id
+                candidate_final_effect = final_effect if selected else "none"
+                digest = hashlib.sha256(f"{analysis_run_id}\0{memory_id}".encode("utf-8")).hexdigest()[:24]
                 self.conn.execute(
                     """
                     INSERT INTO memory_matches
                     (match_id, event_id, alert_id, case_id, analysis_run_id, memory_id,
                      matcher_version, rank, structured_score, semantic_score, retrieval_score,
                      overall_score, decision, final_effect, matched_features_json,
-                     score_breakdown_json, created_at_ms)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(event_id, memory_id) DO UPDATE SET
-                      analysis_run_id = excluded.analysis_run_id,
+                     score_breakdown_json, match_level, title_eligible, comparison_json,
+                     apply_threshold, policy_effect, selected_candidate, attack_signal_veto,
+                     attack_signal_reasons_json, config_snapshot_json, created_at_ms)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(analysis_run_id, memory_id) DO UPDATE SET
                       matcher_version = excluded.matcher_version,
                       rank = excluded.rank,
                       structured_score = excluded.structured_score,
@@ -6583,18 +6723,36 @@ class Repository:
                       final_effect = excluded.final_effect,
                       matched_features_json = excluded.matched_features_json,
                       score_breakdown_json = excluded.score_breakdown_json,
+                      match_level = excluded.match_level,
+                      title_eligible = excluded.title_eligible,
+                      comparison_json = excluded.comparison_json,
+                      apply_threshold = excluded.apply_threshold,
+                      policy_effect = excluded.policy_effect,
+                      selected_candidate = excluded.selected_candidate,
+                      attack_signal_veto = excluded.attack_signal_veto,
+                      attack_signal_reasons_json = excluded.attack_signal_reasons_json,
+                      config_snapshot_json = excluded.config_snapshot_json,
                       created_at_ms = excluded.created_at_ms
                     """,
                     (
                         f"mm_{digest}", event_id, alert_id, case_id, analysis_run_id, memory_id,
-                        matcher_version, int(candidate.get("rank") or 0),
+                        matcher_version, rank,
                         float(candidate.get("structured_score") or 0),
                         float(candidate.get("semantic_score") or 0),
                         float(candidate.get("retrieval_score") or 0),
                         float(candidate.get("overall_score") or 0),
-                        str(candidate.get("decision") or "ignored"), final_effect,
+                        str(candidate.get("decision") or "ignored"), candidate_final_effect,
                         json.dumps(candidate.get("matched_features") or [], ensure_ascii=False, sort_keys=True),
                         json.dumps(candidate.get("score_breakdown") or {}, ensure_ascii=False, sort_keys=True),
+                        str(candidate.get("match_level") or "weak"),
+                        1 if candidate.get("title_eligible") else 0,
+                        json.dumps(candidate.get("comparison") or {}, ensure_ascii=False, sort_keys=True),
+                        float(candidate.get("apply_threshold") or 1.0),
+                        str(candidate.get("policy_effect") or "review_only"),
+                        1 if selected else 0,
+                        1 if attack_signal_veto else 0,
+                        json.dumps(attack_signal_reasons or [], ensure_ascii=False, sort_keys=True),
+                        json.dumps(config_snapshot or {}, ensure_ascii=False, sort_keys=True),
                         created,
                     ),
                 )
@@ -6628,7 +6786,9 @@ class Repository:
                 SELECT match_id, event_id, alert_id, case_id, analysis_run_id, memory_id,
                        matcher_version, rank, structured_score, semantic_score, retrieval_score,
                        overall_score, decision, final_effect, matched_features_json,
-                       score_breakdown_json, created_at_ms
+                       score_breakdown_json, match_level, title_eligible, comparison_json,
+                       apply_threshold, policy_effect, selected_candidate, attack_signal_veto,
+                       attack_signal_reasons_json, config_snapshot_json, created_at_ms
                 FROM memory_matches {where}
                 ORDER BY created_at_ms DESC, overall_score DESC, match_id ASC
                 LIMIT ? OFFSET ?
@@ -6640,6 +6800,12 @@ class Repository:
                 item = dict(row)
                 item["matched_features"] = json.loads(item.pop("matched_features_json"))
                 item["score_breakdown"] = json.loads(item.pop("score_breakdown_json"))
+                item["comparison"] = json.loads(item.pop("comparison_json"))
+                item["attack_signal_reasons"] = json.loads(item.pop("attack_signal_reasons_json"))
+                item["config_snapshot"] = json.loads(item.pop("config_snapshot_json"))
+                item["title_eligible"] = bool(item["title_eligible"])
+                item["selected_candidate"] = bool(item["selected_candidate"])
+                item["attack_signal_veto"] = bool(item["attack_signal_veto"])
                 output.append(item)
             return output
 

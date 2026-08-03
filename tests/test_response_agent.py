@@ -3895,7 +3895,7 @@ class ResponseAgentTest(unittest.TestCase):
         )
 
     def test_schema_and_static_workbench_contract(self):
-        self.assertEqual(SCHEMA_VERSION, 18)
+        self.assertEqual(SCHEMA_VERSION, 19)
         tables = {
             row["name"]
             for row in self.state.repo.conn.execute(

@@ -298,14 +298,17 @@ const STRINGS = {
     memoryAssociationsPageTitle: "关联告警清单",
     memoryAssociationsRecordCount: "关联记录",
     memoryAssociationsRecords: "匹配记录",
-    memoryMatchOverall: "综合分",
+    memoryMatchOverall: "综合关联分",
     memoryMatchStructured: "结构化",
-    memoryMatchSemantic: "语义向量",
+    memoryMatchSemantic: "词法哈希",
     memoryMatchRetrieval: "检索键",
     memoryMatchDecision: "决策",
     memoryMatchDowngraded: "降级为误报",
     memoryMatchReinforced: "强化误报结论",
     memoryMatchAttackVeto: "攻击证据否决降级",
+    memoryMatchApplyDisabled: "仅评估，未应用",
+    memoryMatchMaliciousReview: "恶意结论需人工复核",
+    memoryMatchRelated: "仅部分相似",
     memoryMatchReview: "仅供复核",
     memoryMatchEligible: "达到应用阈值",
     memoryMatchIgnored: "未达到阈值",
@@ -898,14 +901,17 @@ const STRINGS = {
     memoryAssociationsPageTitle: "Associated Alert Records",
     memoryAssociationsRecordCount: "associated records",
     memoryAssociationsRecords: "Match records",
-    memoryMatchOverall: "Overall",
+    memoryMatchOverall: "Composite score",
     memoryMatchStructured: "Structured",
-    memoryMatchSemantic: "Semantic vector",
+    memoryMatchSemantic: "Lexical hash",
     memoryMatchRetrieval: "Retrieval key",
     memoryMatchDecision: "Decision",
     memoryMatchDowngraded: "Downgraded to benign",
     memoryMatchReinforced: "Benign verdict reinforced",
     memoryMatchAttackVeto: "Attack evidence vetoed downgrade",
+    memoryMatchApplyDisabled: "Evaluated, not applied",
+    memoryMatchMaliciousReview: "Malicious verdict needs review",
+    memoryMatchRelated: "Related only",
     memoryMatchReview: "Review only",
     memoryMatchEligible: "Apply threshold met",
     memoryMatchIgnored: "Below threshold",
@@ -3679,16 +3685,20 @@ function memoryMatchDecisionLabel(decision, finalEffect) {
     downgraded_to_benign: "memoryMatchDowngraded",
     classification_reinforced: "memoryMatchReinforced",
     attack_signal_veto: "memoryMatchAttackVeto",
+    apply_disabled_review: "memoryMatchApplyDisabled",
+    malicious_requires_review: "memoryMatchMaliciousReview",
+    related_only: "memoryMatchRelated",
     review_only: "memoryMatchReview",
     review: "memoryMatchReview",
     apply: "memoryMatchEligible",
+    apply_candidate: "memoryMatchEligible",
     ignored: "memoryMatchIgnored",
   }[value];
   return key ? tr(key) : text(value).replaceAll("_", " ");
 }
 
-function memoryScorePercent(value) {
-  return `${Math.round(Number(value || 0) * 100)}%`;
+function memoryScoreValue(value) {
+  return Number(value || 0).toFixed(3);
 }
 
 function renderMemoryAssociations(matches) {
@@ -3710,10 +3720,10 @@ function renderMemoryAssociations(matches) {
             </span>
           </div>
           <div class="memory-score-grid">
-            <span><small>${escapeHtml(tr("memoryMatchOverall"))}</small><strong>${escapeHtml(memoryScorePercent(match.overall_score))}</strong></span>
-            <span><small>${escapeHtml(tr("memoryMatchStructured"))}</small><strong>${escapeHtml(memoryScorePercent(match.structured_score))}</strong></span>
-            <span><small>${escapeHtml(tr("memoryMatchSemantic"))}</small><strong>${escapeHtml(memoryScorePercent(match.semantic_score))}</strong></span>
-            <span><small>${escapeHtml(tr("memoryMatchRetrieval"))}</small><strong>${escapeHtml(memoryScorePercent(match.retrieval_score))}</strong></span>
+            <span><small>${escapeHtml(tr("memoryMatchOverall"))}</small><strong>${escapeHtml(memoryScoreValue(match.overall_score))}</strong></span>
+            <span><small>${escapeHtml(tr("memoryMatchStructured"))}</small><strong>${escapeHtml(memoryScoreValue(match.structured_score))}</strong></span>
+            <span><small>${escapeHtml(tr("memoryMatchSemantic"))}</small><strong>${escapeHtml(memoryScoreValue(match.semantic_score))}</strong></span>
+            <span><small>${escapeHtml(tr("memoryMatchRetrieval"))}</small><strong>${escapeHtml(memoryScoreValue(match.retrieval_score))}</strong></span>
           </div>
           <div class="memory-score-bar" aria-hidden="true"><i style="width:${Math.min(100, Math.max(0, Number(match.overall_score || 0) * 100))}%"></i></div>
           <div class="memory-matched-features">

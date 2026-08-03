@@ -19,6 +19,7 @@ ENTITY_KEYS = {
     "app": ["app", "application", "service"],
     "method": ["method", "http_method"],
     "action": ["action", "hips_action", "rasp_action"],
+    "user_agent": ["user_agent", "user-agent"],
 }
 
 
@@ -201,6 +202,12 @@ class EventNormalizer:
                         found = True
                         break
                 if found:
+                    break
+        headers = payload.get("headers")
+        if "user_agent" not in entities and isinstance(headers, dict):
+            for key, value in headers.items():
+                if str(key).strip().lower() == "user-agent" and value not in (None, ""):
+                    entities["user_agent"] = value
                     break
         return entities
 

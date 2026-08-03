@@ -12,7 +12,8 @@ from .config import MemoryMatchingConfig
 from .models import AgentResult, NormalizedEvent, RecommendedAction, now_ms
 
 
-MATCHER_VERSION = "hybrid-memory-v4"
+MATCHER_VERSION = "hybrid-memory-v5"
+SEMANTIC_METHOD = "signed_lexical_hash_v1"
 
 _FALSE_POSITIVE_MARKERS = {
     "false_positive", "false positive", "benign", "maintenance",
@@ -210,6 +211,7 @@ class MemoryMatchEvaluation:
     final_effect: str = "none"
     attack_signal_veto: bool = False
     attack_signal_reasons: list[str] = field(default_factory=list)
+    config_snapshot: dict[str, Any] = field(default_factory=dict)
 
     @property
     def best(self) -> MemoryMatchCandidate | None:
@@ -217,8 +219,13 @@ class MemoryMatchEvaluation:
             return None
         return next((item for item in self.candidates if item.memory_id == self.best_memory_id), None)
 
-    def context_payload(self, top_k: int) -> dict[str, Any]:
-        visible = [item.to_dict() for item in self.candidates if item.overall_score >= self.review_threshold][:top_k]
+    def context_payload(self, top_k: int, *, title_eligible_only: bool = False) -> dict[str, Any]:
+        visible = [
+            item.to_dict()
+            for item in self.candidates
+            if item.overall_score >= self.review_threshold
+            and (item.title_eligible or not title_eligible_only)
+        ][:top_k]
         return {
             "matcher_version": self.matcher_version,
             "review_threshold": self.review_threshold,
@@ -227,11 +234,12 @@ class MemoryMatchEvaluation:
             "matches": visible,
             "attack_signal_veto": self.attack_signal_veto,
             "attack_signal_reasons": list(self.attack_signal_reasons),
+            "config_snapshot": dict(self.config_snapshot),
         }
 
 
 class HashingTextVectorizer:
-    """Offline deterministic vectorizer; replaceable by an enterprise embedder."""
+    """Offline lexical-hash vectorizer; replaceable by an enterprise embedder."""
 
     def __init__(self, dimensions: int = 256):
         self.dimensions = max(64, int(dimensions))
@@ -253,7 +261,8 @@ class HashingTextVectorizer:
             digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
             raw = int.from_bytes(digest, "big")
             index = raw % self.dimensions
-            vector[index] = vector.get(index, 0.0) + 1.0
+            sign = 1.0 if raw & (1 << 63) else -1.0
+            vector[index] = vector.get(index, 0.0) + sign
         norm = math.sqrt(sum(value * value for value in vector.values()))
         if norm == 0:
             return {}
@@ -293,6 +302,17 @@ class MemoryMatcher:
             matcher_version=MATCHER_VERSION,
             review_threshold=self.config.review_threshold,
             apply_threshold=self.config.apply_threshold,
+            config_snapshot={
+                "structured_weight": self.config.structured_weight,
+                "semantic_weight": self.config.semantic_weight,
+                "retrieval_weight": self.config.retrieval_weight,
+                "vector_dimensions": self.config.vector_dimensions,
+                "semantic_method": SEMANTIC_METHOD,
+                "min_high_fields": self.config.min_high_fields,
+                "apply_enabled": self.config.apply_enabled,
+                "allow_malicious_downgrade": self.config.allow_malicious_downgrade,
+                "inject_matches_into_model": self.config.inject_matches_into_model,
+            },
         )
         event_payload = {
             "product": event.product,
@@ -320,7 +340,7 @@ class MemoryMatcher:
         for rank, candidate in enumerate(candidates, start=1):
             candidate.rank = rank
             if candidate.title_eligible and candidate.policy_effect != "review_only":
-                candidate.decision = "apply"
+                candidate.decision = "apply_candidate" if self.config.apply_enabled else "apply_disabled_review"
             elif candidate.overall_score >= self.config.review_threshold:
                 candidate.decision = "review"
             else:
@@ -330,27 +350,56 @@ class MemoryMatcher:
             evaluation.best_memory_id = candidates[0].memory_id
         return evaluation
 
+    def candidate_lookup_keys(self, event: NormalizedEvent) -> list[str]:
+        """Return bounded exact keys used to prioritize older governed memories."""
+        payload = {
+            "product": event.product,
+            "event_type": event.event_type,
+            "entities": event.entities,
+            "evidence": event.evidence,
+        }
+        features = self._fingerprint(payload)
+        keys: set[str] = set()
+        for field_name in (
+            "rule_id", "event_type", "app", "host", "uri", "method",
+            "process", "sink", "user_agent",
+        ):
+            keys.update(features.get(field_name, set()))
+        return sorted(key for key in keys if key)[:32]
+
     def reconcile(self, result: AgentResult, evaluation: MemoryMatchEvaluation) -> AgentResult:
         best = evaluation.best
         association = evaluation.context_payload(self.config.top_k)
         association["evaluated_candidates"] = len(evaluation.candidates)
+        association["final_effect"] = evaluation.final_effect
         result.explanation["memory_association"] = association
         if best is None:
             return result
 
         original = result.classification
+        original_confidence = result.confidence
+        original_severity = result.severity
         score = best.overall_score
+        memory_confidence = round(min(0.9, 0.55 + 0.4 * score), 2)
         if not best.title_eligible:
             effect = "related_only"
         elif evaluation.attack_signal_veto:
             effect = "attack_signal_veto"
+        elif original == "malicious" and not self.config.allow_malicious_downgrade:
+            effect = "malicious_requires_review"
+        elif not self.config.apply_enabled:
+            effect = "apply_disabled_review"
         elif (
             best.policy_effect != "review_only"
             and original in {"malicious", "suspicious", "benign"}
         ):
             effect = "classification_reinforced" if original == "benign" else "downgraded_to_benign"
             result.classification = "benign"
-            result.confidence = round(max(result.confidence, min(0.9, 0.55 + 0.4 * score)), 2)
+            result.confidence = (
+                round(max(result.confidence, memory_confidence), 2)
+                if original == "benign"
+                else memory_confidence
+            )
             result.severity = "low" if result.confidence >= 0.7 else "medium"
         else:
             effect = "review_only"
@@ -358,9 +407,14 @@ class MemoryMatcher:
         best.decision = effect
         association["final_effect"] = effect
         association["original_classification"] = original
+        association["original_confidence"] = original_confidence
+        association["original_severity"] = original_severity
+        association["memory_confidence"] = memory_confidence
         association["final_classification"] = result.classification
+        association["final_confidence"] = result.confidence
+        association["final_severity"] = result.severity
 
-        matched = ", ".join(best.matched_features[:6]) or "语义向量"
+        matched = ", ".join(best.matched_features[:6]) or "词法哈希"
         comparison = best.comparison
         level_label = _MATCH_LEVEL_LABELS.get(best.match_level, best.match_level)
         matched_dimensions = self._dimension_labels(comparison.get("matched_fields")) or "无稳定维度"
@@ -369,7 +423,7 @@ class MemoryMatcher:
         association_verb = "命中" if best.title_eligible else "关联候选"
         evidence = (
             f"{association_verb}长期记忆 {best.memory_id}；匹配程度：{level_label}；综合分 {score:.2f}；"
-            f"结构化 {best.structured_score:.2f}；语义 {best.semantic_score:.2f}；"
+            f"结构化 {best.structured_score:.2f}；词法哈希 {best.semantic_score:.2f}；"
             f"检索键 {best.retrieval_score:.2f}；一致维度：{matched_dimensions}；"
             f"冲突维度：{conflicting_dimensions}；缺失维度：{missing_dimensions}；匹配特征：{matched}。"
         )
@@ -385,6 +439,10 @@ class MemoryMatcher:
             result.explanation["verdict"] = f"{verdict}；人工批准的长期记忆进一步支持当前误报结论"
         elif effect == "attack_signal_veto":
             result.explanation["verdict"] = f"{verdict}；相似误报记忆不覆盖当前攻击证据"
+        elif effect == "malicious_requires_review":
+            result.explanation["verdict"] = f"{verdict}；恶意结论不得由历史误报记忆自动降级，需人工复核"
+        elif effect == "apply_disabled_review":
+            result.explanation["verdict"] = f"{verdict}；长期记忆仅处于评估模式，未改写当前结论"
         else:
             result.explanation["verdict"] = f"{verdict}；长期记忆达到{level_label}，建议人工复核"
         if best.title_eligible and not result.summary.startswith("【长期记忆命中】"):
@@ -412,9 +470,10 @@ class MemoryMatcher:
         if not self._eligible(event, memory, event_features):
             return None
         memory_content = self._content(memory)
-        memory_text = json.dumps(memory, ensure_ascii=False, sort_keys=True).lower()
+        memory_text = json.dumps(memory_content, ensure_ascii=False, sort_keys=True).lower()
         memory_features = self._fingerprint(memory_content)
-        retrieval_key = self._normalize(memory.get("retrieval_key", ""), "rule_id")
+        raw_retrieval_key = str(memory.get("retrieval_key") or "")
+        retrieval_key = self._normalize(raw_retrieval_key, "rule_id")
         # Legacy governed memories may keep their exact rule/event identity only
         # in retrieval_key. Treat it as structured identity solely when it exactly
         # matches the corresponding current-event field.
@@ -427,7 +486,14 @@ class MemoryMatcher:
             match_policy = {}
         if not self._match_policy_allows(event, event_features, memory_features, match_policy):
             return None
-        retrieval_score = 1.0 if retrieval_key and retrieval_key in event_text else 0.0
+        retrieval_match_fields = [
+            field_name
+            for field_name, values in event_features.items()
+            if field_name != "tokens"
+            and values
+            and self._normalize(raw_retrieval_key, field_name) in values
+        ]
+        retrieval_score = 1.0 if retrieval_match_fields else 0.0
 
         identity_matches = set()
         for field_name in ("rule_id", "event_type"):
@@ -491,6 +557,7 @@ class MemoryMatcher:
             overall,
             apply_threshold,
         )
+        comparison["retrieval_match_fields"] = retrieval_match_fields
         return MemoryMatchCandidate(
             memory_id=str(memory.get("memory_id") or ""),
             memory=memory,
@@ -550,15 +617,18 @@ class MemoryMatcher:
             field in matched_fields and breakdown.get(field, 0.0) == 1.0
             for field in considered_fields
         )
+        coverage_gate = len(considered_fields) >= self.config.min_high_fields
         exact = (
             identity_gate
             and stable_behavior_gate
-            and len(considered_fields) >= 3
+            and coverage_gate
             and all_defined_match
+            and overall_score >= apply_threshold
         )
         high = (
             identity_gate
             and stable_behavior_gate
+            and coverage_gate
             and not boundary_conflicts
             and structured_score >= 0.72
             and overall_score >= apply_threshold
@@ -577,6 +647,8 @@ class MemoryMatcher:
             gate_reasons.append("identity_not_fully_matched")
         if not stable_behavior_gate:
             gate_reasons.append("stable_behavior_not_matched")
+        if not coverage_gate:
+            gate_reasons.append("insufficient_feature_coverage")
         if boundary_conflicts:
             gate_reasons.append("boundary_conflict")
         if structured_score < 0.72:
@@ -589,6 +661,9 @@ class MemoryMatcher:
             "missing_fields": missing_fields,
             "identity_fields": identity_defined,
             "behavior_fields": behavior_defined,
+            "considered_fields": considered_fields,
+            "considered_field_count": len(considered_fields),
+            "min_high_fields": self.config.min_high_fields,
             "gate_reasons": gate_reasons,
         }
 
@@ -825,4 +900,6 @@ class MemoryMatcher:
                 else:
                     segments.append(segment)
             normalized = "/".join(segments)
+        elif field_name == "user_agent":
+            normalized = re.sub(r"\d+(?:\.\d+)+", "{version}", normalized)
         return normalized[:256]

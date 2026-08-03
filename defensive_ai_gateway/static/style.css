@@ -3143,7 +3143,11 @@ h4 {
 
 .memory-match-decision.review-only,
 .memory-match-decision.review,
-.memory-match-decision.apply {
+.memory-match-decision.apply,
+.memory-match-decision.apply-candidate,
+.memory-match-decision.apply-disabled-review,
+.memory-match-decision.malicious-requires-review,
+.memory-match-decision.related-only {
   border-color: var(--warning-line);
   background: var(--warning-bg);
   color: var(--warning);

@@ -178,6 +178,66 @@ class MemoryMatcherUnitTest(unittest.TestCase):
         self.assertEqual(best.match_level, "exact")
         self.assertTrue(best.title_eligible)
 
+    def test_sparse_memory_cannot_become_high_confidence(self):
+        matcher = MemoryMatcher()
+        sparse = _memory("mem-sparse")
+        content = json.loads(sparse["content"])
+        content.pop("event_type", None)
+        content["features"] = {
+            "rule_id": "WAF-123-SQLI",
+            "uri": "/payments/{id}/search",
+        }
+        sparse["content"] = json.dumps(content, ensure_ascii=False, sort_keys=True)
+
+        evaluation = matcher.match(_event(), [sparse])
+
+        self.assertIsNotNone(evaluation.best)
+        self.assertGreaterEqual(evaluation.best.overall_score, matcher.config.apply_threshold)
+        self.assertEqual(evaluation.best.match_level, "related")
+        self.assertFalse(evaluation.best.title_eligible)
+        self.assertIn("insufficient_feature_coverage", evaluation.best.comparison["gate_reasons"])
+
+    def test_retrieval_key_requires_exact_field_match(self):
+        matcher = MemoryMatcher()
+        memory = _memory("mem-substring-retrieval")
+        memory["retrieval_key"] = "123"
+
+        evaluation = matcher.match(_event(), [memory])
+
+        self.assertIsNotNone(evaluation.best)
+        self.assertEqual(evaluation.best.retrieval_score, 0.0)
+        self.assertEqual(evaluation.best.comparison["retrieval_match_fields"], [])
+        self.assertLess(evaluation.best.overall_score, matcher.config.apply_threshold)
+        self.assertEqual(evaluation.best.match_level, "related")
+        self.assertFalse(evaluation.best.title_eligible)
+
+    def test_enabled_apply_uses_memory_confidence_when_direction_changes(self):
+        matcher = MemoryMatcher(MemoryMatchingConfig(apply_enabled=True))
+        evaluation = matcher.match(_event(), [_memory()])
+        result = AgentResult(
+            case_id="case-confidence",
+            agent="waf-agent",
+            classification="suspicious",
+            confidence=0.99,
+            severity="critical",
+            summary="review",
+            evidence=[],
+            missing_evidence=[],
+            recommended_actions=[],
+            dashboard_cards=[],
+            explanation={"verdict": "【需人工复核】- test", "dimensions": []},
+        )
+
+        reconciled = matcher.reconcile(result, evaluation)
+
+        self.assertEqual(reconciled.classification, "benign")
+        self.assertEqual(evaluation.final_effect, "downgraded_to_benign")
+        self.assertLess(reconciled.confidence, 0.99)
+        self.assertEqual(
+            reconciled.confidence,
+            reconciled.explanation["memory_association"]["memory_confidence"],
+        )
+
     def test_rasp_method_and_uri_boundaries_control_title_eligibility(self):
         matcher = MemoryMatcher()
         memory = _rasp_read_file_memory()
@@ -406,27 +466,32 @@ class MemoryMatcherIntegrationTest(unittest.TestCase):
             alert_id=alert_id,
         )
 
-    def test_provider_neutral_match_is_injected_reconciled_and_persisted(self):
+    def test_provider_neutral_match_is_evaluated_after_model_and_persisted(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo, llm, orchestrator = self._build(tmp)
             result = orchestrator.handle_alert(self._alert())
 
-            self.assertEqual(result.classification, "benign")
+            self.assertEqual(result.classification, "suspicious")
             self.assertIn("长期记忆命中", result.summary)
-            self.assertEqual(result.explanation["memory_association"]["final_effect"], "downgraded_to_benign")
+            self.assertEqual(result.explanation["memory_association"]["final_effect"], "apply_disabled_review")
             self.assertIn(
                 result.explanation["memory_association"]["matches"][0]["match_level"],
                 {"exact", "high"},
             )
             self.assertTrue(result.explanation["memory_association"]["matches"][0]["title_eligible"])
-            self.assertEqual(len(llm.context["memory"]["product_long_term"]), 1)
-            self.assertEqual(llm.context["memory"]["memory_association"]["best_memory_id"], "mem-approved-waf")
+            self.assertEqual(llm.context["memory"]["product_long_term"], [])
+            self.assertEqual(llm.context["memory"]["memory_association"]["best_memory_id"], "")
+            self.assertTrue(llm.context["memory"]["memory_association"]["deferred_to_policy"])
 
             matches = repo.list_memory_matches(case_id=result.case_id)
             self.assertEqual(len(matches), 1)
             self.assertEqual(matches[0]["memory_id"], "mem-approved-waf")
-            self.assertEqual(matches[0]["decision"], "downgraded_to_benign")
-            self.assertEqual(matches[0]["final_effect"], "downgraded_to_benign")
+            self.assertEqual(matches[0]["decision"], "apply_disabled_review")
+            self.assertEqual(matches[0]["final_effect"], "apply_disabled_review")
+            self.assertTrue(matches[0]["selected_candidate"])
+            self.assertTrue(matches[0]["title_eligible"])
+            self.assertEqual(matches[0]["match_level"], "exact")
+            self.assertEqual(matches[0]["config_snapshot"]["semantic_method"], "signed_lexical_hash_v1")
             self.assertGreaterEqual(matches[0]["overall_score"], 0.78)
             detail = repo.get_case(result.case_id)
             self.assertEqual(detail["memory_matches"][0]["match_id"], matches[0]["match_id"])
@@ -435,9 +500,41 @@ class MemoryMatcherIntegrationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo, _, orchestrator = self._build(tmp, classification="malicious")
             result = orchestrator.handle_alert(self._alert("alert-provider-malicious"))
-            self.assertEqual(result.classification, "benign")
+            self.assertEqual(result.classification, "malicious")
+            self.assertEqual(
+                result.explanation["memory_association"]["final_effect"],
+                "malicious_requires_review",
+            )
             matches = repo.list_memory_matches(case_id=result.case_id)
-            self.assertEqual(matches[0]["decision"], "downgraded_to_benign")
+            self.assertEqual(matches[0]["decision"], "malicious_requires_review")
+
+    def test_exact_lookup_key_is_prioritized_ahead_of_newer_candidates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repository(str(Path(tmp) / "gateway.db"))
+            older_exact = _memory("memory-older-exact")
+            newer_other = _memory("memory-newer-other")
+            older_exact["retrieval_key"] = "WAF-EXACT-LOOKUP"
+            newer_other["retrieval_key"] = "WAF-OTHER"
+            repo.save_memory(older_exact)
+            repo.save_memory(newer_other)
+            repo.conn.execute(
+                "UPDATE memory_entries SET updated_at_ms = 1 WHERE memory_id = ?",
+                (older_exact["memory_id"],),
+            )
+            repo.conn.execute(
+                "UPDATE memory_entries SET updated_at_ms = 2 WHERE memory_id = ?",
+                (newer_other["memory_id"],),
+            )
+            repo.conn.commit()
+
+            candidates = repo.query_matchable_product_memory(
+                "waf",
+                now_ms(),
+                limit=1,
+                lookup_keys=["waf-exact-lookup"],
+            )
+
+            self.assertEqual([item["memory_id"] for item in candidates], ["memory-older-exact"])
 
     def test_schema_migrates_to_memory_match_version(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -446,6 +543,79 @@ class MemoryMatcherIntegrationTest(unittest.TestCase):
             self.assertEqual(version, SCHEMA_VERSION)
             columns = {row["name"] for row in repo.conn.execute("PRAGMA table_info(memory_matches)").fetchall()}
             self.assertIn("score_breakdown_json", columns)
+            self.assertIn("comparison_json", columns)
+            self.assertIn("config_snapshot_json", columns)
+
+    def test_v18_match_history_migrates_without_overwriting_future_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "gateway.db"
+            repo = Repository(str(path))
+            repo.conn.executescript(
+                """
+                DROP TABLE memory_matches;
+                CREATE TABLE memory_matches (
+                  match_id TEXT PRIMARY KEY,
+                  event_id TEXT NOT NULL,
+                  alert_id TEXT NOT NULL,
+                  case_id TEXT NOT NULL,
+                  analysis_run_id TEXT NOT NULL,
+                  memory_id TEXT NOT NULL,
+                  matcher_version TEXT NOT NULL,
+                  rank INTEGER NOT NULL,
+                  structured_score REAL NOT NULL,
+                  semantic_score REAL NOT NULL,
+                  retrieval_score REAL NOT NULL,
+                  overall_score REAL NOT NULL,
+                  decision TEXT NOT NULL,
+                  final_effect TEXT NOT NULL,
+                  matched_features_json TEXT NOT NULL,
+                  score_breakdown_json TEXT NOT NULL,
+                  created_at_ms INTEGER NOT NULL,
+                  UNIQUE (event_id, memory_id)
+                );
+                INSERT INTO memory_matches VALUES
+                  ('mm-legacy', 'event-legacy', 'alert-legacy', 'case-legacy',
+                   'run-legacy', 'memory-legacy', 'hybrid-memory-v4', 1,
+                   0.8, 0.4, 1.0, 0.732, 'review_only', 'review_only',
+                   '[]', '{}', 1);
+                DELETE FROM schema_version;
+                INSERT INTO schema_version(version, applied_at_ms) VALUES (18, 1);
+                """
+            )
+            repo.conn.close()
+
+            migrated = Repository(str(path))
+            migrated.insert_memory_matches(
+                event_id="event-legacy",
+                alert_id="alert-legacy",
+                case_id="case-legacy",
+                analysis_run_id="run-new",
+                matcher_version="hybrid-memory-v5",
+                final_effect="apply_disabled_review",
+                candidates=[
+                    {
+                        "memory_id": "memory-legacy",
+                        "rank": 1,
+                        "structured_score": 0.9,
+                        "semantic_score": 0.5,
+                        "retrieval_score": 1.0,
+                        "overall_score": 0.82,
+                        "decision": "apply_disabled_review",
+                        "match_level": "high",
+                        "title_eligible": True,
+                    }
+                ],
+                selected_memory_id="memory-legacy",
+            )
+
+            history = migrated.list_memory_matches(event_id="event-legacy")
+            self.assertEqual(len(history), 2)
+            legacy = next(item for item in history if item["analysis_run_id"] == "run-legacy")
+            current = next(item for item in history if item["analysis_run_id"] == "run-new")
+            self.assertEqual(legacy["match_level"], "legacy")
+            self.assertEqual(legacy["config_snapshot"], {})
+            self.assertTrue(current["selected_candidate"])
+            self.assertEqual(current["final_effect"], "apply_disabled_review")
 
 
 if __name__ == "__main__":

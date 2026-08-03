@@ -52,14 +52,18 @@ operations:
   audit_retention_days: 365
   memory_history_retention_days: 365
 memory_matching:
-  candidate_limit: 100
+  candidate_limit: 500
   top_k: 5
   review_threshold: 0.58
   apply_threshold: 0.78
   structured_weight: 0.68
   semantic_weight: 0.22
   retrieval_weight: 0.10
-  vector_dimensions: 256
+  vector_dimensions: 1024
+  min_high_fields: 3
+  apply_enabled: false
+  allow_malicious_downgrade: false
+  inject_matches_into_model: false
 response_agent:
   enabled: true
   max_turns: 48
