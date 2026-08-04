@@ -101,6 +101,57 @@ class DashboardQueueMetricTest(unittest.TestCase):
         self.assertIn("const caseListRenderKeys = { pending: \"\", history: \"\" };", JS)
         self.assertIn("if (caseListRenderKeys[section] === renderKey) return;", JS)
 
+    def test_page_loading_is_single_flight_and_preserves_rendered_content(self):
+        request_layer = JS.split("function json(url, options)", 1)[1].split(
+            "function showAuthDialog", 1
+        )[0]
+        self.assertIn("const inflightGetRequests = new Map();", JS)
+        self.assertIn('method === "GET"', request_layer)
+        self.assertIn("if (inflightGetRequests.has(key)) return inflightGetRequests.get(key)", request_layer)
+        self.assertIn("inflightGetRequests.delete(key)", request_layer)
+        self.assertIn("function executeJsonRequest", request_layer)
+
+        view_loader = JS.split("function loadViewData(name)", 1)[1].split(
+            "function loadViewDataOnce", 1
+        )[0]
+        self.assertIn("const viewLoadPromises = new Map();", JS)
+        self.assertIn("if (viewLoadPromises.has(key)) return viewLoadPromises.get(key)", view_loader)
+        self.assertIn("viewLoadPromises.delete(key)", view_loader)
+
+        self.assertIn("!memoryInventoryLoaded", JS)
+        self.assertIn("!memoryAuditLoaded", JS)
+        self.assertIn("!responseTasksLoaded", JS)
+        self.assertIn("!playbookWorkspaceLoaded", JS)
+        self.assertIn("requestId !== memoryInventoryRequestId", JS)
+        self.assertIn("requestId !== memoryAuditRequestId", JS)
+        self.assertIn("requestId !== responseTasksRequestId", JS)
+        self.assertIn("requestId !== playbookWorkspaceRequestId", JS)
+
+    def test_case_detail_uses_prefetch_single_flight_and_precise_invalidation(self):
+        case_loader = JS.split("function renderCasePreview", 1)[1].split(
+            "function requestedCaseNavigation", 1
+        )[0]
+        cases_loader = JS.split("async function loadCases(options = {})", 1)[1].split(
+            "function setConfigStatus", 1
+        )[0]
+        self.assertIn("const caseDetailRequests = new Map();", JS)
+        self.assertIn("const caseDetailVersions = new Map();", JS)
+        self.assertIn("function requestCaseDetail", case_loader)
+        self.assertIn("active?.version === version", case_loader)
+        self.assertIn("function invalidateChangedCaseDetails", case_loader)
+        self.assertIn("item.updated_at_ms", case_loader)
+        self.assertIn("renderCasePreview(preview)", case_loader)
+        self.assertIn('addEventListener("pointerenter"', JS)
+        self.assertIn('addEventListener("pointerleave"', JS)
+        self.assertIn("window.setTimeout(() => prefetchCaseTriage(item.case_id), 120)", JS)
+        self.assertIn('addEventListener("focus"', JS)
+        self.assertIn("function refreshCaseWorkspace", case_loader)
+        self.assertIn("await Promise.all", case_loader)
+        self.assertIn("invalidateChangedCaseDetails(cases)", cases_loader)
+        self.assertIn("requestId !== caseListRequestIds[section]", cases_loader)
+        self.assertNotIn("detailCache.clear()", JS)
+        self.assertNotIn("await loadCases();\n    await loadTriageCase(caseId);", JS)
+
 
 class ProductBrandingTest(unittest.TestCase):
     def test_dashboard_and_detail_page_publish_consistent_favicons(self):
@@ -530,7 +581,7 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertNotIn("loadSyslogDeployment", bootstrap)
         self.assertNotIn("loadMappingProfiles", bootstrap)
 
-        view_loader = JS.split("function loadViewData(name)", 1)[1].split(
+        view_loader = JS.split("function loadViewDataOnce(name)", 1)[1].split(
             "function refreshCurrentView", 1
         )[0]
         self.assertIn('if (!canReadRuntimeConfig()) return Promise.resolve();', view_loader)

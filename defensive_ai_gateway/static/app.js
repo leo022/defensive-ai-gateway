@@ -1,4 +1,8 @@
 const detailCache = new Map();
+const caseDetailRequests = new Map();
+const caseDetailVersions = new Map();
+const inflightGetRequests = new Map();
+const viewLoadPromises = new Map();
 const THEME_KEY = "dashboard-theme";
 const LANGUAGE_KEY = "dashboard-language";
 const API_TOKEN_KEY = "defensive-ai-api-token";
@@ -1355,16 +1359,24 @@ let refreshPaused = false;
 let dashboardRefreshTimer = null;
 let dashboardRefreshPromise = null;
 let memoryItems = [];
+let memoryInventoryLoaded = false;
+let memoryInventoryRequestId = 0;
 let memoryAuditEvents = [];
+let memoryAuditLoaded = false;
+let memoryAuditRequestId = 0;
 let memoryPagination = { page: 1, size: 20, total: 0, totalPages: 1 };
 let memoryAuditPagination = { page: 1, size: 20, total: 0, totalPages: 1 };
 let memoryAssociationPagination = { page: 1, size: 20, total: 0, totalPages: 1 };
 let memoryAssociationItems = [];
 let memoryAssociationMemoryId = "";
 let responseTasks = [];
+let responseTasksLoaded = false;
+let responseTasksRequestId = 0;
 let responseConnectors = [];
 let responsePlaybooks = [];
 let shadowEvaluations = [];
+let playbookWorkspaceLoaded = false;
+let playbookWorkspaceRequestId = 0;
 let responsePolicy = {};
 let responseTaskStats = {};
 let responseTaskPagination = { page: 1, size: 20, total: 0, totalPages: 1 };
@@ -1374,6 +1386,8 @@ let memorySelectionRequestId = 0;
 let memoryAssociationRequestId = 0;
 let queueCases = [];
 const caseListRenderKeys = { pending: "", history: "" };
+const caseListsLoaded = { pending: false, history: false };
+const caseListRequestIds = { pending: 0, history: 0 };
 const casePagination = {
   pending: { page: 1, size: 20, total: 0, totalPages: 1 },
   history: { page: 1, size: 20, total: 0, totalPages: 1 },
@@ -1400,7 +1414,28 @@ async function loadSampleLog(product = selectedLogProduct()) {
   return sample;
 }
 
-async function json(url, options) {
+function json(url, options) {
+  const candidate = { ...(options || {}) };
+  const method = String(candidate.method || "GET").toUpperCase();
+  const shareable = method === "GET" && candidate.body === undefined && !candidate.signal && !candidate.headers;
+  if (!shareable) return executeJsonRequest(url, candidate);
+
+  const acceptedStatuses = Array.isArray(candidate.acceptStatuses) ? [...candidate.acceptStatuses].sort() : [];
+  const timeoutMs = Number.isFinite(candidate.timeoutMs) && candidate.timeoutMs > 0
+    ? Number(candidate.timeoutMs)
+    : REQUEST_TIMEOUT_MS;
+  const key = JSON.stringify([url, acceptedStatuses, timeoutMs, candidate.cache || ""]);
+  if (inflightGetRequests.has(key)) return inflightGetRequests.get(key);
+
+  const request = executeJsonRequest(url, candidate);
+  const tracked = request.finally(() => {
+    if (inflightGetRequests.get(key) === tracked) inflightGetRequests.delete(key);
+  });
+  inflightGetRequests.set(key, tracked);
+  return tracked;
+}
+
+async function executeJsonRequest(url, options) {
   const request = { ...(options || {}) };
   const acceptedErrorStatuses = Array.isArray(request.acceptStatuses) ? request.acceptStatuses : [];
   delete request.acceptStatuses;
@@ -1462,6 +1497,7 @@ function showAuthDialog(message = "") {
 
 function storeApiToken(value) {
   apiToken = value.trim();
+  inflightGetRequests.clear();
   try {
     if (apiToken) sessionStorage.setItem(API_TOKEN_KEY, apiToken);
     else sessionStorage.removeItem(API_TOKEN_KEY);
@@ -3288,7 +3324,18 @@ function renderCase(item) {
       </span>
     </button>
   `;
-  wrapper.querySelector(".case-card").addEventListener("click", () => {
+  const card = wrapper.querySelector(".case-card");
+  let prefetchTimer = 0;
+  card.addEventListener("pointerenter", () => {
+    if (prefetchTimer) window.clearTimeout(prefetchTimer);
+    prefetchTimer = window.setTimeout(() => prefetchCaseTriage(item.case_id), 120);
+  });
+  card.addEventListener("pointerleave", () => {
+    if (prefetchTimer) window.clearTimeout(prefetchTimer);
+    prefetchTimer = 0;
+  });
+  card.addEventListener("focus", () => prefetchCaseTriage(item.case_id), { once: true });
+  card.addEventListener("click", () => {
     openCaseTriage(item.case_id).catch((err) => showToast(tr("detailLoadFailed", { message: err.message || String(err) }), "error"));
   });
   return wrapper;
@@ -3360,6 +3407,84 @@ function renderSelectedCaseDetail(detail, caseId) {
   bindDetailActions(panel, caseId);
 }
 
+function renderCasePreview(item) {
+  const confidence = Math.round(Number(item.confidence || 0) * 100);
+  return `
+    <div class="detail-stack case-detail-preview">
+      <section class="case-detail-overview">
+        <div class="case-detail-heading">
+          <div>
+            <div class="case-detail-kicker">
+              <strong class="case-product">${escapeHtml(item.product).toUpperCase()}</strong>
+              <span class="badge ${escapeHtml(item.severity)}">${escapeHtml(item.severity)}</span>
+              <span class="case-status ${escapeHtml(caseStatusClass(item.status))}">${escapeHtml(caseStatusLabel(item.status))}</span>
+            </div>
+            <h3>${escapeHtml(caseFocusSummary(item))}</h3>
+            <p class="case-detail-id">Case ID · ${escapeHtml(item.case_id)}</p>
+          </div>
+          <div class="case-detail-confidence">
+            <span>${escapeHtml(tr("confidence"))}</span>
+            <strong>${confidence}%</strong>
+          </div>
+        </div>
+        <div class="case-context-grid">
+          <div><span>${escapeHtml(tr("classification"))}</span><strong>${escapeHtml(classificationLabel(item.classification))}</strong></div>
+          <div><span>${escapeHtml(tr("triageAlertVolume"))}</span><strong>${escapeHtml(tr("alertCount", { count: item.alert_count || 0 }))}</strong></div>
+          <div><span>${escapeHtml(tr("updatedAt"))}</span><strong>${escapeHtml(fmtTime(item.updated_at_ms || item.created_at_ms))}</strong></div>
+        </div>
+      </section>
+      <div class="loading" role="status">${escapeHtml(tr("loadingDetail"))}</div>
+    </div>
+  `;
+}
+
+function caseSummary(caseId) {
+  return queueCases.find((item) => item.case_id === caseId) || null;
+}
+
+function caseDetailVersion(caseId) {
+  return Number(caseDetailVersions.get(caseId) || 0);
+}
+
+function invalidateCaseDetail(caseId) {
+  caseDetailVersions.set(caseId, caseDetailVersion(caseId) + 1);
+  detailCache.delete(caseId);
+  caseDetailRequests.delete(caseId);
+}
+
+function invalidateChangedCaseDetails(cases) {
+  for (const item of cases || []) {
+    const cached = detailCache.get(item.case_id);
+    if (!cached) continue;
+    if (Number(item.updated_at_ms || 0) > Number(cached.updated_at_ms || 0)) {
+      invalidateCaseDetail(item.case_id);
+    }
+  }
+}
+
+function requestCaseDetail(caseId) {
+  if (detailCache.has(caseId)) return Promise.resolve(detailCache.get(caseId));
+  const version = caseDetailVersion(caseId);
+  const active = caseDetailRequests.get(caseId);
+  if (active?.version === version) return active.request;
+
+  const request = json(`/api/cases/${encodeURIComponent(caseId)}`)
+    .then((detail) => {
+      if (caseDetailVersion(caseId) === version) detailCache.set(caseId, detail);
+      return detail;
+    })
+    .finally(() => {
+      if (caseDetailRequests.get(caseId)?.request === request) caseDetailRequests.delete(caseId);
+    });
+  caseDetailRequests.set(caseId, { version, request });
+  return request;
+}
+
+function prefetchCaseTriage(caseId) {
+  if (!caseId || detailCache.has(caseId) || caseDetailRequests.has(caseId)) return;
+  requestCaseDetail(caseId).catch(() => {});
+}
+
 async function loadTriageCase(caseId) {
   selectedCaseId = caseId;
   const panel = document.querySelector("#case-detail");
@@ -3369,11 +3494,13 @@ async function loadTriageCase(caseId) {
     renderSelectedCaseDetail(detailCache.get(caseId), caseId);
     return;
   }
-  panel.innerHTML = `<div class="loading">${escapeHtml(tr("loadingDetail"))}</div>`;
+  const preview = caseSummary(caseId);
+  panel.innerHTML = preview
+    ? renderCasePreview(preview)
+    : `<div class="loading" role="status">${escapeHtml(tr("loadingDetail"))}</div>`;
   try {
-    const detail = await json(`/api/cases/${encodeURIComponent(caseId)}`);
+    const detail = await requestCaseDetail(caseId);
     if (requestId !== caseSelectionRequestId || selectedCaseId !== caseId) return;
-    detailCache.set(caseId, detail);
     renderSelectedCaseDetail(detail, caseId);
   } catch (err) {
     if (requestId !== caseSelectionRequestId || selectedCaseId !== caseId) return;
@@ -3388,6 +3515,17 @@ async function openCaseTriage(caseId) {
   if (!caseId) return;
   setView("triage");
   await loadTriageCase(caseId);
+}
+
+async function refreshCaseWorkspace(caseId) {
+  invalidateCaseDetail(caseId);
+  const detailRequest = requestCaseDetail(caseId);
+  const [detail] = await Promise.all([
+    detailRequest,
+    loadCases({ quiet: true, section: activeDashboardSection }),
+  ]);
+  if (selectedCaseId === caseId) renderSelectedCaseDetail(detail, caseId);
+  return detail;
 }
 
 function requestedCaseNavigation() {
@@ -3486,8 +3624,7 @@ async function submitManualReviewContinuation() {
         body: JSON.stringify({ reason: reason.trim() }),
       },
     );
-    await loadCases();
-    await loadTriageCase(caseId);
+    await refreshCaseWorkspace(caseId);
     const count = result.approvals?.length || 0;
     pendingManualReview = null;
     closeManualReviewDialog();
@@ -3553,8 +3690,7 @@ async function updateCaseDisposition(button, caseId) {
     });
     detailCache.set(caseId, { ...detailCache.get(caseId), ...result.case });
     if (statusNode) statusNode.textContent = tr("dispositionSaved", { status: caseStatusLabel(result.case.status) });
-    await loadCases();
-    await loadTriageCase(caseId);
+    await refreshCaseWorkspace(caseId);
     showToast(tr("dispositionSaved", { status: caseStatusLabel(result.case.status) }));
   } catch (err) {
     buttons.forEach((item) => {
@@ -3579,12 +3715,10 @@ async function confirmBusinessFalsePositive(button, caseId) {
         reason: tr("falsePositiveReason"),
       }),
     });
-    detailCache.delete(caseId);
     if (status) {
       status.textContent = tr("memoryWritten", { id: result.memory_id });
     }
-    await loadCases();
-    await loadTriageCase(caseId);
+    await refreshCaseWorkspace(caseId);
     showToast(tr("falsePositiveDone", { id: result.memory_id }));
   } catch (err) {
     button.disabled = false;
@@ -3608,15 +3742,13 @@ async function confirmAlertClusterFalsePositive(button, caseId) {
         body: JSON.stringify({ reason: tr("clusterFalsePositiveReason") }),
       },
     );
-    detailCache.delete(caseId);
     if (status) {
       status.textContent = tr("clusterMemoryWritten", {
         count: result.updated_count,
         id: result.memory_id,
       });
     }
-    await loadCases();
-    await loadTriageCase(caseId);
+    await refreshCaseWorkspace(caseId);
     showToast(tr("clusterMemoryWritten", {
       count: result.updated_count,
       id: result.memory_id,
@@ -4024,7 +4156,9 @@ async function selectMemory(memoryId) {
   selectedMemoryId = memoryId;
   renderMemoryList();
   const container = document.querySelector("#memory-detail");
-  if (container) container.innerHTML = `<p class="empty-state">${escapeHtml(tr("memoryLoading"))}</p>`;
+  const hasCurrentDetail = selectedMemoryDetail?.memory_id === memoryId;
+  if (hasCurrentDetail) renderMemoryDetail(selectedMemoryDetail);
+  else if (container) container.innerHTML = `<p class="empty-state">${escapeHtml(tr("memoryLoading"))}</p>`;
   try {
     const detail = await json(`/api/memory/${encodeURIComponent(memoryId)}`);
     if (requestId !== memorySelectionRequestId || memoryId !== selectedMemoryId) return;
@@ -4098,9 +4232,12 @@ async function openMemoryAssociations(memoryId) {
 }
 
 async function loadMemoryInventory(options = {}) {
+  const requestId = ++memoryInventoryRequestId;
   const list = document.querySelector("#memory-list");
   const status = document.querySelector("#memory-inventory-status");
-  if (list && !options.quiet) list.innerHTML = `<p class="empty-state">${escapeHtml(tr("memoryLoading"))}</p>`;
+  if (list && !options.quiet && !memoryInventoryLoaded) {
+    list.innerHTML = `<p class="empty-state">${escapeHtml(tr("memoryLoading"))}</p>`;
+  }
   if (status) {
     status.textContent = "";
     status.classList.remove("error");
@@ -4109,6 +4246,7 @@ async function loadMemoryInventory(options = {}) {
     json("/api/memory/summary"),
     json(`/api/memory?${memoryFilterQuery()}`),
   ]);
+  if (requestId !== memoryInventoryRequestId) return { errors: [], stale: true };
 
   const errors = [];
   if (summaryResult.status === "fulfilled") {
@@ -4119,7 +4257,7 @@ async function loadMemoryInventory(options = {}) {
   if (inventoryResult.status === "rejected") {
     const message = inventoryResult.reason?.message || String(inventoryResult.reason);
     errors.push(message);
-    if (list) list.innerHTML = `<p class="empty-state">${escapeHtml(message)}</p>`;
+    if (list && !memoryInventoryLoaded) list.innerHTML = `<p class="empty-state">${escapeHtml(message)}</p>`;
     if (status) {
       status.textContent = errors.join(" · ");
       status.classList.add("error");
@@ -4128,6 +4266,7 @@ async function loadMemoryInventory(options = {}) {
   }
 
   memoryItems = inventoryResult.value.memories || [];
+  memoryInventoryLoaded = true;
   applyPaginationPayload(memoryPagination, inventoryResult.value.pagination);
   if (selectedMemoryId && !memoryItems.some((item) => item.memory_id === selectedMemoryId)) {
     selectedMemoryId = "";
@@ -4154,20 +4293,26 @@ async function loadMemoryInventory(options = {}) {
 }
 
 async function loadMemoryAudit(options = {}) {
+  const requestId = ++memoryAuditRequestId;
   const list = document.querySelector("#memory-audit-list");
-  if (list && !options.quiet) list.innerHTML = `<p class="empty-state">${escapeHtml(tr("memoryLoading"))}</p>`;
+  if (list && !options.quiet && !memoryAuditLoaded) {
+    list.innerHTML = `<p class="empty-state">${escapeHtml(tr("memoryLoading"))}</p>`;
+  }
   try {
     const params = new URLSearchParams({
       limit: String(memoryAuditPagination.size),
       offset: String((memoryAuditPagination.page - 1) * memoryAuditPagination.size),
     });
     const audit = await json(`/api/memory/events?${params}`);
+    if (requestId !== memoryAuditRequestId) return { errors: [], stale: true };
     memoryAuditEvents = audit.events || [];
+    memoryAuditLoaded = true;
     applyPaginationPayload(memoryAuditPagination, audit.pagination);
     renderMemoryAudit(memoryAuditEvents, "#memory-audit-list");
     return { errors: [] };
   } catch (err) {
-    if (list) list.innerHTML = `<p class="empty-state">${escapeHtml(err.message || String(err))}</p>`;
+    if (requestId !== memoryAuditRequestId) return { errors: [], stale: true };
+    if (list && !memoryAuditLoaded) list.innerHTML = `<p class="empty-state">${escapeHtml(err.message || String(err))}</p>`;
     return { errors: [err] };
   }
 }
@@ -4313,8 +4458,11 @@ function renderResponseTasks() {
 }
 
 async function loadResponseTasks(options = {}) {
+  const requestId = ++responseTasksRequestId;
   const list = document.querySelector("#automation-task-list");
-  if (list && !options.quiet) list.innerHTML = `<p class="empty-state">${escapeHtml(tr("runtimeChecking"))}</p>`;
+  if (list && !options.quiet && !responseTasksLoaded) {
+    list.innerHTML = `<p class="empty-state">${escapeHtml(tr("runtimeChecking"))}</p>`;
+  }
   const params = new URLSearchParams({
     limit: String(responseTaskPagination.size),
     offset: String((responseTaskPagination.page - 1) * responseTaskPagination.size),
@@ -4328,7 +4476,9 @@ async function loadResponseTasks(options = {}) {
   if (assignee) params.set("assignee", assignee);
   if (slaStatus) params.set("sla_status", slaStatus);
   const payload = await json(`/api/automation/tasks?${params}`);
+  if (requestId !== responseTasksRequestId) return { stale: true };
   responseTasks = payload.tasks || [];
+  responseTasksLoaded = true;
   applyPaginationPayload(responseTaskPagination, payload.pagination);
   updateResponseStats(payload.stats || {});
   renderResponseTasks();
@@ -4477,14 +4627,19 @@ async function decideShadowEvaluation(evaluationId) {
 }
 
 async function loadPlaybookWorkspace(options = {}) {
+  const requestId = ++playbookWorkspaceRequestId;
   const list = document.querySelector("#automation-playbook-list");
-  if (list && !options.quiet) list.innerHTML = `<p class="empty-state">${escapeHtml(tr("runtimeChecking"))}</p>`;
+  if (list && !options.quiet && !playbookWorkspaceLoaded) {
+    list.innerHTML = `<p class="empty-state">${escapeHtml(tr("runtimeChecking"))}</p>`;
+  }
   const [playbookPayload, shadowPayload] = await Promise.all([
     json("/api/automation/playbooks"),
     json("/api/automation/shadow-evaluations?limit=100"),
   ]);
+  if (requestId !== playbookWorkspaceRequestId) return { stale: true };
   responsePlaybooks = playbookPayload.playbooks || [];
   shadowEvaluations = shadowPayload.evaluations || [];
+  playbookWorkspaceLoaded = true;
   renderResponsePlaybooks();
   renderShadowEvaluations();
   return { playbooks: responsePlaybooks, evaluations: shadowEvaluations };
@@ -4741,7 +4896,26 @@ function activeSecondaryView(group, fallback = "") {
   return document.querySelector(`.nav-subbutton.active[data-secondary-group="${group}"]`)?.dataset.secondaryTarget || fallback;
 }
 
+function viewLoadKey(name) {
+  if (name === "dashboard") return `${name}:${activeDashboardSection}:${caseSearchQuery(activeDashboardSection)}`;
+  if (["memory", "adapter", "automation"].includes(name)) {
+    return `${name}:${activeSecondaryView(name, "")}`;
+  }
+  return name;
+}
+
 function loadViewData(name) {
+  const key = viewLoadKey(name);
+  if (viewLoadPromises.has(key)) return viewLoadPromises.get(key);
+  const request = Promise.resolve().then(() => loadViewDataOnce(name));
+  const tracked = request.finally(() => {
+    if (viewLoadPromises.get(key) === tracked) viewLoadPromises.delete(key);
+  });
+  viewLoadPromises.set(key, tracked);
+  return tracked;
+}
+
+function loadViewDataOnce(name) {
   if (name === "triage") return Promise.resolve();
   if (name === "monitor") {
     clearDashboardRefreshTimer();
@@ -4846,6 +5020,7 @@ async function loadMonitorDashboard(options = {}) {
 
 async function loadCases(options = {}) {
   const section = options.section === "history" ? "history" : options.section === "pending" ? "pending" : activeDashboardSection;
+  const requestId = ++caseListRequestIds[section];
   activeDashboardSection = section;
   const list = document.querySelector(dashboardCaseListId(section));
   try {
@@ -4853,14 +5028,18 @@ async function loadCases(options = {}) {
     const casesData = canReadCases()
       ? await json(`/api/cases?${caseQuery}`)
       : { cases: [], pagination: {} };
-    detailCache.clear();
-    queueCases = casesData.cases || [];
+    if (requestId !== caseListRequestIds[section]) return;
+    const cases = casesData.cases || [];
+    invalidateChangedCaseDetails(cases);
+    queueCases = cases;
+    caseListsLoaded[section] = true;
     applyPaginationPayload(casePagination[section], casesData.pagination || {});
     if (section === "history") renderProcessedList(processedQueueCases(queueCases));
     else renderQueueList(pendingQueueCases(queueCases));
   } catch (err) {
+    if (requestId !== caseListRequestIds[section]) return;
     caseListRenderKeys[section] = "";
-    if (list) list.innerHTML = `<div class="empty-state">${escapeHtml(err.stack || String(err))}</div>`;
+    if (list && !caseListsLoaded[section]) list.innerHTML = `<div class="empty-state">${escapeHtml(err.stack || String(err))}</div>`;
     if (!options.quiet) showToast(tr("refreshFailed", { message: err.message || String(err) }), "error");
   }
 }
@@ -5650,14 +5829,14 @@ document.querySelectorAll(".nav-button").forEach((btn) => {
         activeChild?.dataset.secondaryTarget || btn.dataset.defaultSecondary,
       );
     }
-    loadViewData(btn.dataset.view);
+    loadViewData(btn.dataset.view).catch((err) => showToast(err.message || String(err), "error"));
   });
 });
 document.querySelectorAll(".nav-subbutton").forEach((btn) => {
   btn.addEventListener("click", () => {
     setView(btn.dataset.view);
     setSecondaryView(btn.dataset.secondaryGroup, btn.dataset.secondaryTarget);
-    loadViewData(btn.dataset.view);
+    loadViewData(btn.dataset.view).catch((err) => showToast(err.message || String(err), "error"));
   });
 });
 
