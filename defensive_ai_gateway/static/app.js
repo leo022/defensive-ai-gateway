@@ -47,6 +47,7 @@ const STRINGS = {
     adapterSubConfig: "日志配置",
     automationSecondaryNav: "自动化处置二级目录",
     automationSubTasks: "执行任务",
+    automationSubPlaybooks: "Playbook",
     automationSubConnectors: "连接器",
     automationSubPolicy: "处置策略",
     authSession: "API 认证",
@@ -72,12 +73,63 @@ const STRINGS = {
     workspaceTitleAutomation: "自动化处置",
     workspaceTitleSettings: "运行配置",
     automationTotal: "任务总量",
-    automationActive: "处理中",
+    automationUnassigned: "未认领",
+    automationSlaBreached: "SLA 违约",
+    automationSlaRisk: "即将超时",
     automationVerified: "已生效",
     automationFailed: "执行异常",
     automationTasks: "执行任务",
     automationTasksHint: "跟踪审批后的调度、设备核验、到期解封和回滚结果。",
     automationStatus: "任务状态",
+    automationPriority: "优先级",
+    automationAssignee: "负责人",
+    automationSlaState: "SLA 状态",
+    priorityCritical: "紧急",
+    priorityHigh: "高",
+    priorityMedium: "中",
+    priorityLow: "低",
+    slaBreached: "已违约",
+    slaAtRisk: "即将超时",
+    slaOnTrack: "正常",
+    slaMet: "按时完成",
+    slaUntracked: "未设置",
+    responseAcknowledge: "确认接手",
+    responseClaim: "认领",
+    responseOperations: "运营信息",
+    responseSlaDue: "SLA 截止",
+    responseHandoverNote: "交接备注",
+    responseTicketRef: "工单编号",
+    responseAssetRef: "资产编号",
+    responseAssetCriticality: "资产等级",
+    responseBusinessOwner: "业务 Owner",
+    responseOperationsSaved: "运营信息已保存",
+    playbookRegistry: "Playbook 注册",
+    playbookRegistryHint: "每次修改生成不可变版本；只有已发布版本可以绑定新任务。",
+    playbookName: "名称",
+    playbookOwner: "运营 Owner",
+    playbookProducts: "适用产品",
+    playbookRiskTier: "风险等级",
+    playbookSlaMinutes: "SLA（分钟）",
+    playbookDescription: "说明",
+    saveDraft: "保存草稿",
+    saveAndPublish: "保存并发布",
+    playbookResetForm: "重置表单",
+    playbookVersions: "版本清单",
+    playbookVersionsHint: "查看当前版本、发布状态、风险和 SLA。",
+    playbookStatusDraft: "草稿",
+    playbookStatusActive: "已发布",
+    playbookStatusRetired: "已停用",
+    playbookSaved: "Playbook 版本已保存",
+    playbookEmpty: "暂无 Playbook。",
+    shadowEvaluation: "影子评估",
+    shadowEvaluationHint: "将系统建议与分析人员决策对照，作为模式升级依据。",
+    shadowEmpty: "暂无影子评估记录。",
+    shadowAccepted: "采纳",
+    shadowRejected: "拒绝",
+    shadowModified: "需要调整",
+    shadowPending: "待评价",
+    shadowReason: "决策依据",
+    shadowDecisionSaved: "影子评估已记录",
     automationConnectorConfig: "连接器配置",
     automationConnectorHint: "配置 WAF 或边界防火墙动作接口；凭据仅填写环境变量名。",
     configuredConnectors: "已配置连接器",
@@ -650,6 +702,7 @@ const STRINGS = {
     adapterSubConfig: "Log Configuration",
     automationSecondaryNav: "Automated response sections",
     automationSubTasks: "Execution Tasks",
+    automationSubPlaybooks: "Playbooks",
     automationSubConnectors: "Connectors",
     automationSubPolicy: "Response Policy",
     authSession: "API Access",
@@ -675,12 +728,63 @@ const STRINGS = {
     workspaceTitleAutomation: "Automated Response",
     workspaceTitleSettings: "Runtime Configuration",
     automationTotal: "Total Tasks",
-    automationActive: "In Progress",
+    automationUnassigned: "Unassigned",
+    automationSlaBreached: "SLA Breached",
+    automationSlaRisk: "Due Soon",
     automationVerified: "Active",
     automationFailed: "Failures",
     automationTasks: "Execution Tasks",
     automationTasksHint: "Track approved dispatches, device verification, expiry and rollback.",
     automationStatus: "Task status",
+    automationPriority: "Priority",
+    automationAssignee: "Assignee",
+    automationSlaState: "SLA status",
+    priorityCritical: "Critical",
+    priorityHigh: "High",
+    priorityMedium: "Medium",
+    priorityLow: "Low",
+    slaBreached: "Breached",
+    slaAtRisk: "Due soon",
+    slaOnTrack: "On track",
+    slaMet: "Completed on time",
+    slaUntracked: "Not set",
+    responseAcknowledge: "Acknowledge",
+    responseClaim: "Claim",
+    responseOperations: "Operations",
+    responseSlaDue: "SLA due",
+    responseHandoverNote: "Handover note",
+    responseTicketRef: "Ticket reference",
+    responseAssetRef: "Asset reference",
+    responseAssetCriticality: "Asset criticality",
+    responseBusinessOwner: "Business owner",
+    responseOperationsSaved: "Operations details saved",
+    playbookRegistry: "Playbook Registry",
+    playbookRegistryHint: "Each edit creates an immutable version; only published versions bind to new tasks.",
+    playbookName: "Name",
+    playbookOwner: "Operations owner",
+    playbookProducts: "Products",
+    playbookRiskTier: "Risk tier",
+    playbookSlaMinutes: "SLA (minutes)",
+    playbookDescription: "Description",
+    saveDraft: "Save draft",
+    saveAndPublish: "Save and publish",
+    playbookResetForm: "Reset form",
+    playbookVersions: "Versions",
+    playbookVersionsHint: "Review the current version, publication state, risk and SLA.",
+    playbookStatusDraft: "Draft",
+    playbookStatusActive: "Published",
+    playbookStatusRetired: "Retired",
+    playbookSaved: "Playbook version saved",
+    playbookEmpty: "No playbooks.",
+    shadowEvaluation: "Shadow Evaluation",
+    shadowEvaluationHint: "Compare system recommendations with analyst decisions before changing modes.",
+    shadowEmpty: "No shadow evaluations.",
+    shadowAccepted: "Accept",
+    shadowRejected: "Reject",
+    shadowModified: "Needs changes",
+    shadowPending: "Pending review",
+    shadowReason: "Decision rationale",
+    shadowDecisionSaved: "Shadow evaluation recorded",
     automationConnectorConfig: "Connector Configuration",
     automationConnectorHint: "Configure a WAF or edge firewall action API; enter only the credential environment variable name.",
     configuredConnectors: "Configured Connectors",
@@ -1259,6 +1363,8 @@ let memoryAssociationItems = [];
 let memoryAssociationMemoryId = "";
 let responseTasks = [];
 let responseConnectors = [];
+let responsePlaybooks = [];
+let shadowEvaluations = [];
 let responsePolicy = {};
 let responseTaskStats = {};
 let responseTaskPagination = { page: 1, size: 20, total: 0, totalPages: 1 };
@@ -1388,7 +1494,7 @@ function canReadRuntimeConfig() {
 }
 
 function canReadAutomation() {
-  return hasAnyRole("read", "config", "responder");
+  return hasAnyRole("read", "config", "analyst", "responder");
 }
 
 function canReadMappingProfiles() {
@@ -1425,8 +1531,12 @@ function applySessionPermissions() {
   applyPermission(".review-button", ["analyst", "memory"]);
   applyPermission(".approval-decision", ["approver"]);
   applyPermission("#automation-connector-form input, #automation-connector-form select, #automation-connector-form button", ["config"]);
+  applyPermission("#automation-playbook-form input, #automation-playbook-form select, #automation-playbook-form textarea, #automation-playbook-form button", ["config"]);
   applyPermission("#automation-policy-form input, #automation-policy-form textarea, #automation-policy-form button", ["config"]);
   applyPermission("[data-response-action]", ["responder"]);
+  applyPermission("[data-task-operations]", ["responder"]);
+  applyPermission("[data-shadow-decision]", ["analyst", "responder"]);
+  applyPermission("[data-playbook-action]", ["config"]);
   applyPermission("[data-connector-action]", ["config"]);
   applyPermission("[data-memory-action]", ["memory"]);
   const authButton = document.querySelector("#auth-session");
@@ -4110,12 +4220,13 @@ function connectorHealthLabel(status) {
 
 function updateResponseStats(stats = {}) {
   responseTaskStats = stats;
-  const active = ["queued", "running", "retry_wait", "rollback_queued", "rollback_running", "rollback_retry"]
-    .reduce((total, status) => total + Number(stats[status] || 0), 0);
+  const operations = stats.operations || {};
   const failed = Number(stats.failed || 0) + Number(stats.rollback_failed || 0);
   const values = {
     "#automation-total": Number(stats.total || 0),
-    "#automation-active": active,
+    "#automation-unassigned": Number(operations.unassigned || 0),
+    "#automation-sla-breached": Number(operations.sla_breached || 0),
+    "#automation-sla-risk": Number(operations.sla_at_risk || 0),
     "#automation-verified": Number(stats.verified || 0),
     "#automation-failed": failed,
   };
@@ -4123,6 +4234,18 @@ function updateResponseStats(stats = {}) {
     const node = document.querySelector(selector);
     if (node) node.textContent = String(value);
   });
+}
+
+function responsePriorityLabel(priority) {
+  return tr({ critical: "priorityCritical", high: "priorityHigh", medium: "priorityMedium", low: "priorityLow" }[priority] || "priorityMedium");
+}
+
+function responseSlaLabel(status) {
+  return tr({ breached: "slaBreached", at_risk: "slaAtRisk", on_track: "slaOnTrack", met: "slaMet", untracked: "slaUntracked" }[status] || "slaUntracked");
+}
+
+function responseTaskDeadlineValue(task) {
+  return task.sla_due_at_ms ? formatDatetimeLocal(new Date(Number(task.sla_due_at_ms))) : "";
 }
 
 function renderResponseTasks() {
@@ -4141,25 +4264,47 @@ function renderResponseTasks() {
     const canRollback = ["verified", "shadowed", "rollback_failed"].includes(task.status)
       || (task.status === "failed" && Boolean(task.remote_rule_id));
     const scopeText = [scope.product, scope.host, scope.path].filter(Boolean).join(" · ") || "-";
+    const slaClass = ["breached", "at_risk"].includes(task.sla_status) ? "needs_review" : "mapped";
     return `
       <article class="automation-task-item ${escapeHtml(task.status)}">
         <div class="automation-task-head">
           <div><strong class="automation-mono">${escapeHtml(action.object || "-")}</strong><span>${escapeHtml(responseActionLabel(task.action_type))}</span></div>
-          <span class="field-status ${["failed", "rollback_failed"].includes(task.status) ? "needs_review" : "mapped"}">${escapeHtml(responseStatusLabel(task.status))}</span>
+          <div class="automation-task-badges"><span class="field-status priority-${escapeHtml(task.priority || "medium")}">${escapeHtml(responsePriorityLabel(task.priority))}</span><span class="field-status ${slaClass}">${escapeHtml(responseSlaLabel(task.sla_status))}</span><span class="field-status ${["failed", "rollback_failed"].includes(task.status) ? "needs_review" : "mapped"}">${escapeHtml(responseStatusLabel(task.status))}</span></div>
         </div>
         <dl class="automation-task-meta">
           <div><dt>${escapeHtml(tr("responseTaskId"))}</dt><dd class="automation-mono">${escapeHtml(task.task_id)}</dd></div>
           <div><dt>Case</dt><dd class="automation-mono">${escapeHtml(task.case_id)}</dd></div>
+          <div><dt>${escapeHtml(tr("automationAssignee"))}</dt><dd>${escapeHtml(task.assignee || tr("automationUnassigned"))}</dd></div>
+          <div><dt>${escapeHtml(tr("responseSlaDue"))}</dt><dd>${escapeHtml(task.sla_due_at_ms ? fmtTime(task.sla_due_at_ms) : "-")}</dd></div>
+          <div><dt>Playbook</dt><dd class="automation-mono">${escapeHtml(`${task.playbook_id || "-"} v${task.playbook_version || "-"}`)}</dd></div>
           <div><dt>${escapeHtml(tr("responseScope"))}</dt><dd>${escapeHtml(scopeText)}</dd></div>
           <div><dt>${escapeHtml(tr("responseMode"))}</dt><dd>${escapeHtml(responseModeLabel(connector.execution_mode))}</dd></div>
           <div><dt>${escapeHtml(tr("responseRemoteRule"))}</dt><dd class="automation-mono">${escapeHtml(task.remote_rule_id || "-")}</dd></div>
           <div><dt>${escapeHtml(tr("responseExpires"))}</dt><dd>${escapeHtml(task.expires_at_ms ? fmtTime(task.expires_at_ms) : "-")}</dd></div>
+          <div><dt>${escapeHtml(tr("responseTicketRef"))}</dt><dd>${escapeHtml(task.ticket_ref || "-")}</dd></div>
+          <div><dt>${escapeHtml(tr("responseAssetRef"))}</dt><dd>${escapeHtml(task.asset_ref || "-")}</dd></div>
         </dl>
         ${task.last_error ? `<p class="automation-task-error">${escapeHtml(task.last_error)}</p>` : ""}
-        ${(canDispatch || canRollback) ? `<div class="automation-task-actions">
+        <details class="automation-task-operations">
+          <summary>${escapeHtml(tr("responseOperations"))}</summary>
+          <div class="automation-operations-form" data-task-operation-form="${escapeHtml(task.task_id)}">
+            <label><span>${escapeHtml(tr("automationAssignee"))}</span><input data-operation-field="assignee" type="text" maxlength="100" value="${escapeHtml(task.assignee || "")}" /></label>
+            <label><span>${escapeHtml(tr("automationPriority"))}</span><select data-operation-field="priority">${["critical", "high", "medium", "low"].map((value) => `<option value="${value}" ${task.priority === value ? "selected" : ""}>${escapeHtml(responsePriorityLabel(value))}</option>`).join("")}</select></label>
+            <label><span>${escapeHtml(tr("responseSlaDue"))}</span><input data-operation-field="sla_due_at_ms" type="datetime-local" value="${escapeHtml(responseTaskDeadlineValue(task))}" /></label>
+            <label><span>${escapeHtml(tr("responseTicketRef"))}</span><input data-operation-field="ticket_ref" type="text" maxlength="256" value="${escapeHtml(task.ticket_ref || "")}" /></label>
+            <label><span>${escapeHtml(tr("responseAssetRef"))}</span><input data-operation-field="asset_ref" type="text" maxlength="256" value="${escapeHtml(task.asset_ref || "")}" /></label>
+            <label><span>${escapeHtml(tr("responseAssetCriticality"))}</span><select data-operation-field="asset_criticality"><option value="unknown">-</option>${["critical", "high", "medium", "low"].map((value) => `<option value="${value}" ${task.asset_criticality === value ? "selected" : ""}>${escapeHtml(responsePriorityLabel(value))}</option>`).join("")}</select></label>
+            <label><span>${escapeHtml(tr("responseBusinessOwner"))}</span><input data-operation-field="business_owner" type="text" maxlength="100" value="${escapeHtml(task.business_owner || "")}" /></label>
+            <label class="automation-field-wide"><span>${escapeHtml(tr("responseHandoverNote"))}</span><textarea data-operation-field="handover_note" rows="2" maxlength="1000">${escapeHtml(task.handover_note || "")}</textarea></label>
+            <label class="automation-acknowledge"><input data-operation-field="acknowledged" type="checkbox" ${task.acknowledged ? "checked" : ""} /><span>${escapeHtml(tr("responseAcknowledge"))}</span></label>
+            <button type="button" data-task-operations="save" data-task-id="${escapeHtml(task.task_id)}">${escapeHtml(tr("saveConfig"))}</button>
+          </div>
+        </details>
+        <div class="automation-task-actions">
+          ${!task.assignee ? `<button type="button" data-task-operations="claim" data-task-id="${escapeHtml(task.task_id)}" ${hasAnyRole("responder") ? "" : "disabled"}>${escapeHtml(tr("responseClaim"))}</button>` : ""}
           ${canDispatch ? `<button type="button" data-response-action="dispatch" data-task-id="${escapeHtml(task.task_id)}" ${hasAnyRole("responder") ? "" : "disabled"}>${escapeHtml(tr("responseDispatch"))}</button>` : ""}
           ${canRollback ? `<button type="button" data-response-action="rollback" data-task-id="${escapeHtml(task.task_id)}" ${hasAnyRole("responder") ? "" : "disabled"}>${escapeHtml(tr("responseRollback"))}</button>` : ""}
-        </div>` : ""}
+        </div>
       </article>
     `;
   }).join("");
@@ -4176,12 +4321,173 @@ async function loadResponseTasks(options = {}) {
   });
   const status = document.querySelector("#automation-status-filter")?.value || "";
   if (status) params.set("status", status);
+  const priority = document.querySelector("#automation-priority-filter")?.value || "";
+  const assignee = document.querySelector("#automation-assignee-filter")?.value.trim() || "";
+  const slaStatus = document.querySelector("#automation-sla-filter")?.value || "";
+  if (priority) params.set("priority", priority);
+  if (assignee) params.set("assignee", assignee);
+  if (slaStatus) params.set("sla_status", slaStatus);
   const payload = await json(`/api/automation/tasks?${params}`);
   responseTasks = payload.tasks || [];
   applyPaginationPayload(responseTaskPagination, payload.pagination);
   updateResponseStats(payload.stats || {});
   renderResponseTasks();
   return payload;
+}
+
+async function saveTaskOperations(taskId, mode, container = null) {
+  let body;
+  if (mode === "claim") {
+    body = { assignee: currentActor(), acknowledged: true };
+  } else {
+    const form = container || document.querySelector(`[data-task-operation-form="${CSS.escape(taskId)}"]`);
+    if (!form) return;
+    const value = (name) => form.querySelector(`[data-operation-field="${name}"]`)?.value || "";
+    body = {
+      assignee: value("assignee").trim(),
+      priority: value("priority"),
+      sla_due_at_ms: datetimeLocalMs(value("sla_due_at_ms")),
+      ticket_ref: value("ticket_ref").trim(),
+      asset_ref: value("asset_ref").trim(),
+      asset_criticality: value("asset_criticality"),
+      business_owner: value("business_owner").trim(),
+      handover_note: value("handover_note").trim(),
+      acknowledged: Boolean(form.querySelector('[data-operation-field="acknowledged"]')?.checked),
+    };
+  }
+  await json(`/api/automation/tasks/${encodeURIComponent(taskId)}/operations`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  showToast(tr("responseOperationsSaved"));
+  await loadResponseTasks({ quiet: true });
+}
+
+function playbookStatusLabel(status) {
+  return tr({ draft: "playbookStatusDraft", active: "playbookStatusActive", retired: "playbookStatusRetired" }[status] || "playbookStatusDraft");
+}
+
+function resetResponsePlaybookForm() {
+  document.querySelector("#automation-playbook-form")?.reset();
+  document.querySelector("#response-playbook-id").value = "";
+  document.querySelector("#response-playbook-products").value = "*";
+  document.querySelector("#response-playbook-risk").value = "high";
+  document.querySelector("#response-playbook-sla").value = "30";
+  document.querySelector("#automation-playbook-status").textContent = "";
+}
+
+function renderResponsePlaybooks() {
+  const list = document.querySelector("#automation-playbook-list");
+  if (!list) return;
+  if (!responsePlaybooks.length) {
+    list.innerHTML = `<p class="empty-state">${escapeHtml(tr("playbookEmpty"))}</p>`;
+    return;
+  }
+  list.innerHTML = responsePlaybooks.map((playbook) => `
+    <article class="automation-playbook-item">
+      <div class="automation-task-head">
+        <div><strong>${escapeHtml(playbook.name)}</strong><span class="automation-mono">${escapeHtml(`${playbook.playbook_id} v${playbook.version}`)}</span></div>
+        <span class="field-status ${playbook.status === "active" ? "mapped" : "needs_review"}">${escapeHtml(playbookStatusLabel(playbook.status))}</span>
+      </div>
+      <p>${escapeHtml(playbook.description || "-")}</p>
+      <div class="automation-connector-flags"><span>${escapeHtml(responsePriorityLabel(playbook.risk_tier))}</span><span>${escapeHtml(`${playbook.sla_minutes} min SLA`)}</span><span>${escapeHtml((playbook.trigger_products || []).join(", "))}</span><span>${escapeHtml(playbook.owner)}</span></div>
+      <div class="automation-task-actions"><button type="button" data-playbook-action="edit" data-playbook-id="${escapeHtml(playbook.playbook_id)}">${escapeHtml(tr("connectorEdit"))}</button>${playbook.status === "draft" ? `<button type="button" data-playbook-action="publish" data-playbook-id="${escapeHtml(playbook.playbook_id)}" data-playbook-version="${escapeHtml(String(playbook.version))}">${escapeHtml(tr("saveAndPublish"))}</button>` : ""}</div>
+    </article>
+  `).join("");
+  applySessionPermissions();
+}
+
+function editResponsePlaybook(playbookId) {
+  const playbook = responsePlaybooks.find((item) => item.playbook_id === playbookId);
+  if (!playbook) return;
+  document.querySelector("#response-playbook-id").value = playbook.playbook_id;
+  document.querySelector("#response-playbook-name").value = playbook.name;
+  document.querySelector("#response-playbook-owner").value = playbook.owner;
+  document.querySelector("#response-playbook-products").value = (playbook.trigger_products || []).join(", ");
+  document.querySelector("#response-playbook-risk").value = playbook.risk_tier;
+  document.querySelector("#response-playbook-sla").value = String(playbook.sla_minutes);
+  document.querySelector("#response-playbook-description").value = playbook.description || "";
+  document.querySelector("#response-playbook-name").focus();
+}
+
+async function saveResponsePlaybook(event) {
+  event.preventDefault();
+  const publish = event.submitter?.dataset.playbookSave === "publish";
+  const playbookId = document.querySelector("#response-playbook-id").value;
+  const body = {
+    playbook_id: playbookId || undefined,
+    name: document.querySelector("#response-playbook-name").value.trim(),
+    owner: document.querySelector("#response-playbook-owner").value.trim(),
+    trigger_products: document.querySelector("#response-playbook-products").value,
+    risk_tier: document.querySelector("#response-playbook-risk").value,
+    sla_minutes: Number(document.querySelector("#response-playbook-sla").value),
+    description: document.querySelector("#response-playbook-description").value.trim(),
+    action_type: "network.block_ip",
+    publish,
+  };
+  await json("/api/automation/playbooks", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  resetResponsePlaybookForm();
+  document.querySelector("#automation-playbook-status").textContent = tr("playbookSaved");
+  showToast(tr("playbookSaved"));
+  await loadPlaybookWorkspace({ quiet: true });
+}
+
+async function publishResponsePlaybook(playbookId, version) {
+  await json(`/api/automation/playbooks/${encodeURIComponent(playbookId)}/${encodeURIComponent(version)}/publish`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+  });
+  showToast(tr("playbookSaved"));
+  await loadPlaybookWorkspace({ quiet: true });
+}
+
+function renderShadowEvaluations() {
+  const list = document.querySelector("#automation-shadow-list");
+  if (!list) return;
+  if (!shadowEvaluations.length) {
+    list.innerHTML = `<p class="empty-state">${escapeHtml(tr("shadowEmpty"))}</p>`;
+    return;
+  }
+  list.innerHTML = shadowEvaluations.map((evaluation) => {
+    const action = evaluation.proposed_action || {};
+    const pending = evaluation.status === "pending";
+    return `<article class="automation-shadow-item">
+      <div class="automation-task-head"><div><strong class="automation-mono">${escapeHtml(action.object || evaluation.task_id)}</strong><span>${escapeHtml(`${evaluation.playbook_id} v${evaluation.playbook_version} · ${evaluation.case_id}`)}</span></div><span class="field-status ${pending ? "needs_review" : "mapped"}">${escapeHtml(pending ? tr("shadowPending") : tr({ accepted: "shadowAccepted", rejected: "shadowRejected", modified: "shadowModified" }[evaluation.status]))}</span></div>
+      ${pending ? `<div class="automation-shadow-decision" data-shadow-form="${escapeHtml(evaluation.evaluation_id)}"><select data-shadow-field="decision"><option value="accepted">${escapeHtml(tr("shadowAccepted"))}</option><option value="rejected">${escapeHtml(tr("shadowRejected"))}</option><option value="modified">${escapeHtml(tr("shadowModified"))}</option></select><textarea data-shadow-field="reason" rows="2" maxlength="1000" placeholder="${escapeHtml(tr("shadowReason"))}"></textarea><button type="button" data-shadow-decision="save" data-evaluation-id="${escapeHtml(evaluation.evaluation_id)}">${escapeHtml(tr("saveConfig"))}</button></div>` : `<p>${escapeHtml(evaluation.decision_reason || "-")}</p>`}
+    </article>`;
+  }).join("");
+  applySessionPermissions();
+}
+
+async function decideShadowEvaluation(evaluationId) {
+  const form = document.querySelector(`[data-shadow-form="${CSS.escape(evaluationId)}"]`);
+  if (!form) return;
+  await json(`/api/automation/shadow-evaluations/${encodeURIComponent(evaluationId)}/decision`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      decision: form.querySelector('[data-shadow-field="decision"]').value,
+      reason: form.querySelector('[data-shadow-field="reason"]').value.trim(),
+    }),
+  });
+  showToast(tr("shadowDecisionSaved"));
+  await loadPlaybookWorkspace({ quiet: true });
+}
+
+async function loadPlaybookWorkspace(options = {}) {
+  const list = document.querySelector("#automation-playbook-list");
+  if (list && !options.quiet) list.innerHTML = `<p class="empty-state">${escapeHtml(tr("runtimeChecking"))}</p>`;
+  const [playbookPayload, shadowPayload] = await Promise.all([
+    json("/api/automation/playbooks"),
+    json("/api/automation/shadow-evaluations?limit=100"),
+  ]);
+  responsePlaybooks = playbookPayload.playbooks || [];
+  shadowEvaluations = shadowPayload.evaluations || [];
+  renderResponsePlaybooks();
+  renderShadowEvaluations();
+  return { playbooks: responsePlaybooks, evaluations: shadowEvaluations };
 }
 
 function resetResponseConnectorForm() {
@@ -4222,14 +4528,17 @@ async function loadResponseSummary() {
   const payload = await json("/api/automation/summary");
   responsePolicy = payload.policy || {};
   responseConnectors = payload.connectors || [];
+  responsePlaybooks = payload.playbooks || [];
   updateResponseStats(payload.stats || {});
   populateResponsePolicy();
   renderResponseConnectors();
+  renderResponsePlaybooks();
   return payload;
 }
 
 function loadAutomation(section = "tasks") {
   if (section === "tasks") return loadResponseTasks();
+  if (section === "playbooks") return loadPlaybookWorkspace();
   return loadResponseSummary();
 }
 
@@ -5146,6 +5455,16 @@ document.querySelector("#automation-connector-form").addEventListener("submit", 
     showToast(err.message || String(err), "error");
   });
 });
+document.querySelector("#automation-playbook-form").addEventListener("submit", (event) => {
+  saveResponsePlaybook(event).catch((err) => {
+    document.querySelector("#automation-playbook-status").textContent = err.message || String(err);
+    showToast(err.message || String(err), "error");
+  });
+});
+document.querySelector("#response-playbook-reset").addEventListener("click", resetResponsePlaybookForm);
+document.querySelector("#automation-shadow-refresh").addEventListener("click", () => {
+  loadPlaybookWorkspace({ quiet: true }).catch((err) => showToast(err.message || String(err), "error"));
+});
 document.querySelector("#response-connector-reset").addEventListener("click", resetResponseConnectorForm);
 document.querySelector("#automation-policy-form").addEventListener("submit", (event) => {
   saveResponsePolicy(event).catch((err) => {
@@ -5154,6 +5473,37 @@ document.querySelector("#automation-policy-form").addEventListener("submit", (ev
   });
 });
 document.addEventListener("click", (event) => {
+  const operationsButton = event.target.closest("[data-task-operations]");
+  if (operationsButton && !operationsButton.disabled) {
+    operationsButton.disabled = true;
+    saveTaskOperations(
+      operationsButton.dataset.taskId,
+      operationsButton.dataset.taskOperations,
+      operationsButton.closest("[data-task-operation-form]"),
+    ).catch((err) => showToast(err.message || String(err), "error"))
+      .finally(() => { operationsButton.disabled = false; });
+    return;
+  }
+  const shadowButton = event.target.closest("[data-shadow-decision]");
+  if (shadowButton && !shadowButton.disabled) {
+    shadowButton.disabled = true;
+    decideShadowEvaluation(shadowButton.dataset.evaluationId)
+      .catch((err) => showToast(err.message || String(err), "error"))
+      .finally(() => { shadowButton.disabled = false; });
+    return;
+  }
+  const playbookButton = event.target.closest("[data-playbook-action]");
+  if (playbookButton && !playbookButton.disabled) {
+    if (playbookButton.dataset.playbookAction === "edit") {
+      editResponsePlaybook(playbookButton.dataset.playbookId);
+      return;
+    }
+    playbookButton.disabled = true;
+    publishResponsePlaybook(playbookButton.dataset.playbookId, playbookButton.dataset.playbookVersion)
+      .catch((err) => showToast(err.message || String(err), "error"))
+      .finally(() => { playbookButton.disabled = false; });
+    return;
+  }
   const responseButton = event.target.closest("[data-response-action]");
   if (responseButton && !responseButton.disabled) {
     responseButton.disabled = true;

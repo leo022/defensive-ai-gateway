@@ -3185,6 +3185,7 @@ class GatewayState:
         return {
             "policy": self.response_automation.policy(),
             "connectors": self.response_automation.connectors(),
+            "playbooks": self.response_automation.playbooks(),
             "stats": self.repo.response_task_stats(),
         }
 
@@ -3800,6 +3801,37 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 return
             self._json(200, {"connectors": self.state.response_automation.connectors()})
             return
+        if parsed.path == "/api/automation/playbooks":
+            if not self._require_roles(
+                _ROLE_READ, _ROLE_CONFIG, _ROLE_ANALYST, _ROLE_RESPONDER
+            ):
+                return
+            query = parse_qs(parsed.query)
+            self._json(
+                200,
+                {
+                    "playbooks": self.state.response_automation.playbooks(
+                        all_versions=_query_first(query, "all_versions").lower()
+                        in {"1", "true", "yes"}
+                    )
+                },
+            )
+            return
+        if parsed.path == "/api/automation/shadow-evaluations":
+            if not self._require_roles(
+                _ROLE_READ, _ROLE_CONFIG, _ROLE_ANALYST, _ROLE_RESPONDER
+            ):
+                return
+            query = parse_qs(parsed.query)
+            try:
+                evaluations = self.state.response_automation.shadow_evaluations(
+                    status=_query_first(query, "status") or None,
+                    limit=_query_int(query, "limit", 100, min_value=1, max_value=500),
+                )
+                self._json(200, {"evaluations": evaluations})
+            except ValueError as exc:
+                self._client_error(exc)
+            return
         if parsed.path == "/api/automation/tasks":
             if not self._require_roles(_ROLE_READ, _ROLE_RESPONDER):
                 return
@@ -3808,14 +3840,29 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if status and status not in RESPONSE_TASK_STATUSES:
                 self._json(400, {"error": f"unsupported response task status: {status}"})
                 return
+            priority = _query_first(query, "priority") or None
+            if priority and priority not in {"low", "medium", "high", "critical"}:
+                self._json(400, {"error": f"unsupported response task priority: {priority}"})
+                return
+            assignee = (_query_first(query, "assignee") or None)
+            if assignee and len(assignee) > 100:
+                self._json(400, {"error": "response task assignee filter is too long"})
+                return
+            sla_status = _query_first(query, "sla_status") or None
+            if sla_status and sla_status not in {"breached", "at_risk", "unassigned"}:
+                self._json(400, {"error": f"unsupported response task SLA filter: {sla_status}"})
+                return
             limit = _query_int(query, "limit", 20, min_value=1, max_value=200)
             offset = _query_int(query, "offset", 0, min_value=0)
-            total = self.state.repo.count_response_tasks(status=status)
+            total = self.state.repo.count_response_tasks(
+                status=status, priority=priority, assignee=assignee, sla_status=sla_status
+            )
             self._json(
                 200,
                 {
                     "tasks": self.state.repo.list_response_tasks(
-                        status=status, limit=limit, offset=offset
+                        status=status, priority=priority, assignee=assignee,
+                        sla_status=sla_status, limit=limit, offset=offset
                     ),
                     "stats": self.state.repo.response_task_stats(),
                     "pagination": _pagination_payload(total, limit, offset),
@@ -4094,6 +4141,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
             authorized = self._require_roles(_ROLE_CONFIG)
         elif parsed.path.startswith("/api/automation/connectors/"):
             authorized = self._require_roles(_ROLE_CONFIG)
+        elif parsed.path == "/api/automation/playbooks":
+            authorized = self._require_roles(_ROLE_CONFIG)
+        elif parsed.path.startswith("/api/automation/playbooks/"):
+            authorized = self._require_roles(_ROLE_CONFIG)
+        elif parsed.path.startswith("/api/automation/shadow-evaluations/"):
+            authorized = self._require_roles(_ROLE_ANALYST, _ROLE_RESPONDER)
         elif parsed.path.startswith("/api/automation/tasks/"):
             authorized = self._require_roles(_ROLE_RESPONDER)
         elif parsed.path == "/api/mapping-profiles":
@@ -4152,6 +4205,53 @@ class GatewayHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._server_error(exc)
             return
+        if parsed.path == "/api/automation/playbooks":
+            try:
+                body = self._governance_body(self._read_json())
+                playbook = self.state.response_automation.save_playbook(
+                    body, actor=body["_actor"]
+                )
+                self._json(200, {"ok": True, "playbook": playbook})
+            except _PayloadTooLarge:
+                self._json(413, {"error": "request body too large"})
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                self._client_error(exc)
+            except Exception as exc:
+                self._server_error(exc)
+            return
+        if parsed.path.startswith("/api/automation/playbooks/") and parsed.path.endswith("/publish"):
+            parts = parsed.path.strip("/").split("/")
+            try:
+                playbook_id = unquote(parts[-3])
+                version = int(parts[-2])
+                playbook = self.state.response_automation.publish_playbook(
+                    playbook_id, version, actor=self._authenticated_actor()
+                )
+                self._json(200, {"ok": True, "playbook": playbook})
+            except (IndexError, ValueError) as exc:
+                self._client_error(exc)
+            except KeyError:
+                self._json(404, {"error": "response playbook not found"})
+            except Exception as exc:
+                self._server_error(exc)
+            return
+        if parsed.path.startswith("/api/automation/shadow-evaluations/") and parsed.path.endswith("/decision"):
+            evaluation_id = unquote(parsed.path.split("/")[-2])
+            try:
+                body = self._governance_body(self._read_json())
+                evaluation = self.state.response_automation.decide_shadow_evaluation(
+                    evaluation_id, body, actor=body["_actor"]
+                )
+                self._json(200, {"ok": True, "evaluation": evaluation})
+            except _PayloadTooLarge:
+                self._json(413, {"error": "request body too large"})
+            except KeyError:
+                self._json(404, {"error": "shadow evaluation not found"})
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                self._client_error(exc)
+            except Exception as exc:
+                self._server_error(exc)
+            return
         if parsed.path.startswith("/api/automation/connectors/") and parsed.path.endswith("/test"):
             connector_id = unquote(parsed.path.split("/")[-2])
             try:
@@ -4195,6 +4295,23 @@ class GatewayHandler(BaseHTTPRequestHandler):
             except KeyError:
                 self._json(404, {"error": "response task not found"})
             except ValueError as exc:
+                self._client_error(exc)
+            except Exception as exc:
+                self._server_error(exc)
+            return
+        if parsed.path.startswith("/api/automation/tasks/") and parsed.path.endswith("/operations"):
+            task_id = unquote(parsed.path.split("/")[-2])
+            try:
+                body = self._governance_body(self._read_json())
+                task = self.state.response_automation.update_task_operations(
+                    task_id, body, actor=body["_actor"]
+                )
+                self._json(200, {"ok": True, "task": task})
+            except _PayloadTooLarge:
+                self._json(413, {"error": "request body too large"})
+            except KeyError:
+                self._json(404, {"error": "response task not found"})
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
                 self._client_error(exc)
             except Exception as exc:
                 self._server_error(exc)

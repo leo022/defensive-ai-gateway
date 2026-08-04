@@ -3498,7 +3498,7 @@ button.memory-audit-row:hover {
 }
 
 .automation-kpis {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
 }
 
 .automation-kpis > div {
@@ -3507,7 +3507,7 @@ button.memory-audit-row:hover {
 
 .automation-filter-form {
   display: grid;
-  grid-template-columns: minmax(220px, 280px) max-content;
+  grid-template-columns: repeat(4, minmax(150px, 1fr)) max-content;
   align-items: end;
   gap: 10px;
   padding: 14px 16px;
@@ -3532,13 +3532,15 @@ button.memory-audit-row:hover {
 }
 
 .automation-filter-form select,
+.automation-filter-form input,
 .automation-filter-form > button {
   width: 100%;
   height: 38px;
   min-height: 38px;
 }
 
-.automation-filter-form select {
+.automation-filter-form select,
+.automation-filter-form input {
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--surface);
@@ -3552,7 +3554,9 @@ button.memory-audit-row:hover {
 }
 
 .automation-task-list,
-.automation-connector-list {
+.automation-connector-list,
+.automation-playbook-list,
+.automation-shadow-list {
   display: grid;
   min-width: 0;
   gap: 10px;
@@ -3564,7 +3568,9 @@ button.memory-audit-row:hover {
 }
 
 .automation-task-item,
-.automation-connector-item {
+.automation-connector-item,
+.automation-playbook-item,
+.automation-shadow-item {
   display: grid;
   gap: 11px;
   min-width: 0;
@@ -3605,6 +3611,29 @@ button.memory-audit-row:hover {
   overflow-wrap: anywhere;
   text-align: center;
   white-space: normal;
+}
+
+.automation-task-head > .automation-task-badges {
+  display: flex;
+  flex: 0 1 auto;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.automation-task-badges .field-status {
+  white-space: nowrap;
+}
+
+.automation-task-badges .priority-critical {
+  border-color: var(--risk-line);
+  background: var(--risk-bg);
+  color: var(--risk);
+}
+
+.automation-task-badges .priority-high {
+  border-color: var(--warning-line);
+  background: var(--warning-bg);
+  color: var(--warning);
 }
 
 .automation-task-head strong,
@@ -3656,6 +3685,102 @@ button.memory-audit-row:hover {
   padding: 7px 9px;
   font-size: 12px;
   overflow-wrap: anywhere;
+}
+
+.automation-task-operations {
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+
+.automation-task-operations summary {
+  cursor: pointer;
+  color: var(--brand-strong);
+  font-size: 12px;
+  font-weight: 740;
+}
+
+.automation-operations-form {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 9px;
+  align-items: end;
+  margin-top: 10px;
+}
+
+.automation-operations-form label {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+}
+
+.automation-operations-form label > span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.automation-operations-form input,
+.automation-operations-form select,
+.automation-operations-form textarea {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink);
+  padding: 8px 9px;
+}
+
+.automation-operations-form .automation-acknowledge {
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+}
+
+.automation-operations-form .automation-acknowledge input {
+  width: 18px;
+  height: 18px;
+}
+
+.automation-playbook-grid {
+  display: grid;
+  grid-template-columns: minmax(340px, 0.9fr) minmax(420px, 1.1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.automation-playbook-grid > .panel {
+  margin-top: 0;
+  overflow: hidden;
+}
+
+.automation-shadow-panel {
+  grid-column: 1 / -1;
+}
+
+.automation-playbook-item > p,
+.automation-shadow-item > p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.automation-shadow-decision {
+  display: grid;
+  grid-template-columns: minmax(140px, 0.3fr) minmax(260px, 1fr) max-content;
+  gap: 8px;
+  align-items: end;
+}
+
+.automation-shadow-decision select,
+.automation-shadow-decision textarea {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink);
+  padding: 8px 9px;
 }
 
 .automation-config-grid {
@@ -5437,7 +5562,8 @@ body.response-agent-open {
     grid-template-columns: 1fr;
   }
 
-  .automation-config-grid {
+  .automation-config-grid,
+  .automation-playbook-grid {
     grid-template-columns: 1fr;
   }
 
@@ -5452,7 +5578,8 @@ body.response-agent-open {
 
 @media (max-width: 900px) {
   .automation-kpis,
-  .automation-task-meta {
+  .automation-task-meta,
+  .automation-operations-form {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
@@ -5586,6 +5713,8 @@ body.response-agent-open {
   .memory-kpis,
   .automation-kpis,
   .automation-task-meta,
+  .automation-operations-form,
+  .automation-shadow-decision,
   .settings-form {
     grid-template-columns: 1fr;
   }
@@ -5594,6 +5723,11 @@ body.response-agent-open {
   .automation-task-actions {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .automation-task-head > .automation-task-badges {
+    justify-content: flex-start;
+    flex-wrap: wrap;
   }
 
   .automation-filter-form select,

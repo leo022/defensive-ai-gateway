@@ -21,6 +21,9 @@ from .network_safety import pinned_endpoint_handlers, resolve_http_endpoint_pin
 ACTION_BLOCK_IP = "network.block_ip"
 SUPPORTED_RESPONSE_ACTIONS = {ACTION_BLOCK_IP}
 RESPONSE_EXECUTION_MODES = {"shadow", "manual", "auto"}
+RESPONSE_PRIORITIES = {"low", "medium", "high", "critical"}
+RESPONSE_RISK_TIERS = {"low", "medium", "high", "critical"}
+SHADOW_EVALUATION_STATUSES = {"pending", "accepted", "rejected", "modified"}
 RESPONSE_TASK_STATUSES = {
     "waiting_configuration",
     "waiting_dispatch",
@@ -199,6 +202,78 @@ def normalize_response_policy(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def normalize_response_playbook(
+    payload: dict[str, Any], *, playbook_id: str = ""
+) -> dict[str, Any]:
+    identifier = str(
+        playbook_id or payload.get("playbook_id") or new_id("playbook")
+    ).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{3,128}", identifier):
+        raise ValueError("invalid playbook id")
+    name = " ".join(str(payload.get("name") or "").split())
+    description = str(payload.get("description") or "").strip()
+    owner = " ".join(str(payload.get("owner") or "").split())
+    action_type = str(payload.get("action_type") or ACTION_BLOCK_IP).strip()
+    risk_tier = str(payload.get("risk_tier") or "high").strip().lower()
+    if len(name) < 2 or len(name) > 100:
+        raise ValueError("playbook name must contain 2-100 characters")
+    if len(description) > 1000:
+        raise ValueError("playbook description is too long")
+    if len(owner) < 2 or len(owner) > 100:
+        raise ValueError("playbook owner must contain 2-100 characters")
+    if action_type not in SUPPORTED_RESPONSE_ACTIONS:
+        raise ValueError("unsupported playbook action type")
+    if risk_tier not in RESPONSE_RISK_TIERS:
+        raise ValueError("invalid playbook risk tier")
+    sla_minutes = int(payload.get("sla_minutes") or 30)
+    if sla_minutes < 5 or sla_minutes > 10_080:
+        raise ValueError("playbook SLA must be between 5 and 10080 minutes")
+    raw_products = payload.get("trigger_products") or ["*"]
+    if isinstance(raw_products, str):
+        raw_products = raw_products.replace("\n", ",").split(",")
+    if not isinstance(raw_products, list):
+        raise ValueError("trigger_products must be a list or comma-separated string")
+    trigger_products: list[str] = []
+    for value in raw_products:
+        product = str(value).strip().lower()
+        if not product:
+            continue
+        if product != "*" and not re.fullmatch(r"[a-z0-9_.-]{2,50}", product):
+            raise ValueError(f"invalid trigger product: {product}")
+        if product not in trigger_products:
+            trigger_products.append(product)
+    if not trigger_products or len(trigger_products) > 50:
+        raise ValueError("playbook must contain 1-50 trigger products")
+    definition = payload.get("definition") or {
+        "schema_version": "response-playbook/v1",
+        "entry_conditions": {
+            "validator_status": "passed",
+            "approval_quorum": "required",
+        },
+        "steps": [
+            {"type": "validate"}, {"type": "approve"},
+            {"type": "execute", "action_type": action_type},
+            {"type": "verify"}, {"type": "rollback"},
+        ],
+    }
+    if not isinstance(definition, dict):
+        raise ValueError("playbook definition must be an object")
+    encoded = json.dumps(definition, ensure_ascii=False, sort_keys=True)
+    if len(encoded.encode("utf-8")) > 65_536:
+        raise ValueError("playbook definition is too large")
+    return {
+        "playbook_id": identifier,
+        "name": name,
+        "description": description,
+        "trigger_products": trigger_products,
+        "action_type": action_type,
+        "risk_tier": risk_tier,
+        "owner": owner,
+        "sla_minutes": sla_minutes,
+        "definition": definition,
+    }
+
+
 class ResponseAutomationService:
     def __init__(self, repo, *, allow_loopback_connectors: bool = False):  # noqa: ANN001
         self.repo = repo
@@ -231,6 +306,189 @@ class ResponseAutomationService:
 
     def connectors(self) -> list[dict[str, Any]]:
         return [self._public_connector(item) for item in self.repo.list_response_connectors()]
+
+    def playbooks(self, *, all_versions: bool = False) -> list[dict[str, Any]]:
+        return self.repo.list_response_playbooks(all_versions=all_versions)
+
+    def save_playbook(
+        self, payload: dict[str, Any], *, actor: str, playbook_id: str = ""
+    ) -> dict[str, Any]:
+        normalized = normalize_response_playbook(payload, playbook_id=playbook_id)
+        with self.repo.transaction():
+            saved = self.repo.create_response_playbook_version(
+                normalized, actor=actor, _commit=False
+            )
+            self.repo.insert_audit(
+                new_id("audit"),
+                saved["playbook_id"],
+                actor,
+                "response_playbook_version_created",
+                {
+                    "playbook_id": saved["playbook_id"],
+                    "version": saved["version"],
+                    "action_type": saved["action_type"],
+                    "risk_tier": saved["risk_tier"],
+                    "owner": saved["owner"],
+                    "sla_minutes": saved["sla_minutes"],
+                },
+                _commit=False,
+            )
+            if bool(payload.get("publish")):
+                saved = self.publish_playbook(
+                    saved["playbook_id"], int(saved["version"]), actor=actor
+                )
+            return saved
+
+    def publish_playbook(
+        self, playbook_id: str, version: int, *, actor: str
+    ) -> dict[str, Any]:
+        with self.repo.transaction():
+            saved = self.repo.publish_response_playbook(
+                playbook_id, version, actor=actor, _commit=False
+            )
+            if not saved:
+                raise KeyError("response playbook not found")
+            self.repo.insert_audit(
+                new_id("audit"),
+                playbook_id,
+                actor,
+                "response_playbook_published",
+                {
+                    "playbook_id": playbook_id,
+                    "version": int(version),
+                    "action_type": saved["action_type"],
+                    "risk_tier": saved["risk_tier"],
+                },
+                _commit=False,
+            )
+            return saved
+
+    def update_task_operations(
+        self, task_id: str, payload: dict[str, Any], *, actor: str
+    ) -> dict[str, Any]:
+        current = self.repo.get_response_task(task_id)
+        if not current:
+            raise KeyError("response task not found")
+        updates: dict[str, Any] = {}
+        if "priority" in payload:
+            priority = str(payload.get("priority") or "").strip().lower()
+            if priority not in RESPONSE_PRIORITIES:
+                raise ValueError("invalid response task priority")
+            updates["priority"] = priority
+        if "assignee" in payload:
+            assignee = " ".join(str(payload.get("assignee") or "").split())
+            if len(assignee) > 100:
+                raise ValueError("response task assignee is too long")
+            updates["assignee"] = assignee
+        if "sla_due_at_ms" in payload:
+            raw_deadline = payload.get("sla_due_at_ms")
+            deadline = None if raw_deadline in {None, ""} else int(raw_deadline)
+            if current.get("sla_completed_at_ms") is not None and deadline != current.get(
+                "sla_due_at_ms"
+            ):
+                raise ValueError("completed response task SLA deadline cannot be changed")
+            if deadline is not None and (
+                deadline < int(current["created_at_ms"])
+                or deadline > int(current["created_at_ms"]) + 30 * 86_400_000
+            ):
+                raise ValueError("response task SLA deadline is outside the allowed window")
+            updates["sla_due_at_ms"] = deadline
+        if "acknowledged" in payload:
+            updates["acknowledged_at_ms"] = (
+                int(current.get("acknowledged_at_ms") or now_ms())
+                if bool(payload.get("acknowledged")) else None
+            )
+        limits = {
+            "handover_note": 1000,
+            "ticket_ref": 256,
+            "asset_ref": 256,
+            "business_owner": 100,
+        }
+        for field, maximum in limits.items():
+            if field in payload:
+                value = str(payload.get(field) or "").strip()
+                if len(value) > maximum:
+                    raise ValueError(f"{field} is too long")
+                updates[field] = value
+        if "asset_criticality" in payload:
+            criticality = str(payload.get("asset_criticality") or "unknown").lower()
+            if criticality not in {"unknown", *RESPONSE_PRIORITIES}:
+                raise ValueError("invalid asset criticality")
+            updates["asset_criticality"] = criticality
+        if not updates:
+            raise ValueError("response task operations update is empty")
+        with self.repo.transaction():
+            saved = self.repo.update_response_task_operations(
+                task_id, updates, actor=actor, _commit=False
+            )
+            if not saved:
+                raise KeyError("response task not found")
+            self.repo.insert_audit(
+                new_id("audit"),
+                saved["case_id"],
+                actor,
+                "response_task_operations_updated",
+                {
+                    "case_id": saved["case_id"],
+                    "task_id": task_id,
+                    "changed_fields": sorted(updates),
+                    "priority": saved["priority"],
+                    "assignee": saved["assignee"],
+                    "sla_due_at_ms": saved.get("sla_due_at_ms"),
+                    "acknowledged": saved["acknowledged"],
+                },
+                _commit=False,
+            )
+            return saved
+
+    def shadow_evaluations(
+        self, *, status: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        if status and status not in SHADOW_EVALUATION_STATUSES:
+            raise ValueError("unsupported shadow evaluation status")
+        return self.repo.list_shadow_evaluations(status=status, limit=limit)
+
+    def decide_shadow_evaluation(
+        self, evaluation_id: str, payload: dict[str, Any], *, actor: str
+    ) -> dict[str, Any]:
+        decision = str(payload.get("decision") or "").strip().lower()
+        if decision not in {"accepted", "rejected", "modified"}:
+            raise ValueError("shadow evaluation decision must be accepted, rejected or modified")
+        reason = " ".join(str(payload.get("reason") or "").split())
+        if len(reason) < 5 or len(reason) > 1000:
+            raise ValueError("shadow evaluation reason must contain 5-1000 characters")
+        actual_action = payload.get("actual_action") or {}
+        if decision == "modified" and not isinstance(actual_action, dict):
+            raise ValueError("modified shadow evaluation requires an actual_action object")
+        with self.repo.transaction():
+            decided = self.repo.decide_shadow_evaluation(
+                evaluation_id,
+                status=decision,
+                actor=actor,
+                reason=reason,
+                actual_action=actual_action if isinstance(actual_action, dict) else {},
+                _commit=False,
+            )
+            if not decided:
+                raise KeyError("shadow evaluation not found")
+            if not decided.pop("decision_recorded", False):
+                raise ValueError("shadow evaluation is no longer pending")
+            self.repo.insert_audit(
+                new_id("audit"),
+                decided["case_id"],
+                actor,
+                "response_shadow_evaluation_decided",
+                {
+                    "case_id": decided["case_id"],
+                    "task_id": decided["task_id"],
+                    "evaluation_id": evaluation_id,
+                    "decision": decision,
+                    "playbook_id": decided["playbook_id"],
+                    "playbook_version": decided["playbook_version"],
+                },
+                _commit=False,
+            )
+            return decided
 
     @staticmethod
     def _public_connector(connector: dict[str, Any]) -> dict[str, Any]:
@@ -345,6 +603,10 @@ class ResponseAutomationService:
             rejection_error = str(exc)
         connectors = self.repo.list_response_connectors(enabled_only=True)
         connector = connectors[0] if len(connectors) == 1 else None
+        product = str((action.get("scope") or {}).get("product") or "").lower()
+        playbook = self.repo.active_response_playbook(action["action_type"], product)
+        if not playbook:
+            raise RuntimeError("no active response playbook matches the approved action")
         if connector:
             action["duration_seconds"] = min(
                 int(action.get("duration_seconds") or policy["default_ttl_seconds"]),
@@ -386,6 +648,10 @@ class ResponseAutomationService:
                 "idempotency_key": idempotency_key,
                 "max_attempts": 5,
                 "available_at_ms": created,
+                "priority": playbook["risk_tier"],
+                "sla_due_at_ms": created + int(playbook["sla_minutes"]) * 60_000,
+                "playbook_id": playbook["playbook_id"],
+                "playbook_version": int(playbook["version"]),
                 "created_by": actor,
                 "created_at_ms": created,
             },
@@ -405,6 +671,10 @@ class ResponseAutomationService:
                     "object": action["object"],
                     "status": status,
                     "connector_id": task.get("connector_id") or "",
+                    "playbook_id": task["playbook_id"],
+                    "playbook_version": task["playbook_version"],
+                    "priority": task["priority"],
+                    "sla_due_at_ms": task["sla_due_at_ms"],
                 },
                 _commit=False,
             )
@@ -602,26 +872,56 @@ class ResponseAutomationService:
                 )
         if connector["execution_mode"] == "shadow":
             final = "rolled_back" if rollback else "shadowed"
-            result = self.repo.finish_response_task(
-                task["task_id"],
-                final,
-                expected_status="rollback_running" if rollback else "running",
-                require_active_case=not rollback,
-            )
-            if not result:
+            with self.repo.transaction():
+                result = self.repo.finish_response_task(
+                    task["task_id"],
+                    final,
+                    expected_status="rollback_running" if rollback else "running",
+                    require_active_case=not rollback,
+                    _commit=False,
+                )
+                if not result:
+                    if not rollback:
+                        self.repo.finish_response_task(
+                            task["task_id"],
+                            "cancelled",
+                            expected_status="running",
+                            error="case became terminal",
+                            _commit=False,
+                        )
+                    return
+                self.repo.insert_audit(
+                    new_id("audit"), task["case_id"], "response-dispatcher",
+                    "response_task_shadowed" if not rollback else "response_rollback_completed",
+                    {"case_id": task["case_id"], "task_id": task["task_id"], "status": final},
+                    _commit=False,
+                )
                 if not rollback:
-                    self.repo.finish_response_task(
-                        task["task_id"],
-                        "cancelled",
-                        expected_status="running",
-                        error="case became terminal",
+                    evaluation, created = self.repo.ensure_shadow_evaluation(
+                        {
+                            "evaluation_id": new_id("shadow_eval"),
+                            "task_id": task["task_id"],
+                            "playbook_id": result["playbook_id"],
+                            "playbook_version": result["playbook_version"],
+                            "proposed_action": result["action"],
+                        },
+                        _commit=False,
                     )
-                return
-            self.repo.insert_audit(
-                new_id("audit"), task["case_id"], "response-dispatcher",
-                "response_task_shadowed" if not rollback else "response_rollback_completed",
-                {"case_id": task["case_id"], "task_id": task["task_id"], "status": final},
-            )
+                    if created:
+                        self.repo.insert_audit(
+                            new_id("audit"),
+                            task["case_id"],
+                            "response-dispatcher",
+                            "response_shadow_evaluation_created",
+                            {
+                                "case_id": task["case_id"],
+                                "task_id": task["task_id"],
+                                "evaluation_id": evaluation["evaluation_id"],
+                                "playbook_id": evaluation["playbook_id"],
+                                "playbook_version": evaluation["playbook_version"],
+                            },
+                            _commit=False,
+                        )
             return
         operation = "rollback" if rollback else "apply"
         response, http_status, request_hash = self._request(

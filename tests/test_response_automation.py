@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import threading
 import time
@@ -12,8 +13,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from defensive_ai_gateway.app import GatewayState, build_server
-from defensive_ai_gateway.config import GatewayConfig
-from defensive_ai_gateway.database import SCHEMA_VERSION
+from defensive_ai_gateway.config import AuthPrincipalConfig, GatewayConfig
+from defensive_ai_gateway.database import SCHEMA_VERSION, Repository
 from defensive_ai_gateway.models import NormalizedEvent
 from defensive_ai_gateway.response_automation import ACTION_BLOCK_IP, compile_response_action
 
@@ -137,6 +138,14 @@ class ApprovalResponseTaskTest(unittest.TestCase):
                         break
                     time.sleep(0.02)
                 self.assertEqual(task["status"], "shadowed")
+                self.assertEqual(task["playbook_id"], "playbook_network_block_source")
+                self.assertEqual(task["playbook_version"], 1)
+                self.assertEqual(task["priority"], "high")
+                self.assertGreater(task["sla_due_at_ms"], task["created_at_ms"])
+                evaluations = state.response_automation.shadow_evaluations()
+                self.assertEqual(len(evaluations), 1)
+                self.assertEqual(evaluations[0]["task_id"], task_id)
+                self.assertEqual(evaluations[0]["status"], "pending")
                 self.assertEqual(state.repo.count_response_tasks(), 1)
                 refreshed = state.repo.get_approval(approval["approval_id"])
                 self.assertEqual(refreshed["response_task"]["task_id"], task_id)
@@ -205,9 +214,350 @@ class ApprovalResponseTaskTest(unittest.TestCase):
                         "response_policy",
                         "response_tasks",
                         "response_attempts",
+                        "response_playbooks",
+                        "response_shadow_evaluations",
                     }.issubset(tables)
                 )
                 self.assertFalse(state.response_automation.policy()["enabled"])
+                playbooks = state.response_automation.playbooks()
+                self.assertEqual(len(playbooks), 1)
+                self.assertEqual(playbooks[0]["status"], "active")
+            finally:
+                state.stop()
+
+    def test_schema_v19_migrates_existing_response_task_to_operations_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "gateway.db"
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.executescript(
+                    """
+                    CREATE TABLE schema_version (
+                      version INTEGER PRIMARY KEY,
+                      applied_at_ms INTEGER NOT NULL
+                    );
+                    INSERT INTO schema_version(version, applied_at_ms) VALUES (19, 1);
+                    CREATE TABLE response_tasks (
+                      task_id TEXT PRIMARY KEY,
+                      approval_id TEXT NOT NULL UNIQUE,
+                      case_id TEXT NOT NULL,
+                      event_id TEXT NOT NULL,
+                      action_type TEXT NOT NULL,
+                      action_json TEXT NOT NULL,
+                      connector_id TEXT,
+                      connector_version INTEGER NOT NULL DEFAULT 0,
+                      connector_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                      status TEXT NOT NULL,
+                      idempotency_key TEXT NOT NULL UNIQUE,
+                      attempts INTEGER NOT NULL DEFAULT 0,
+                      max_attempts INTEGER NOT NULL DEFAULT 5,
+                      available_at_ms INTEGER NOT NULL,
+                      claimed_at_ms INTEGER,
+                      remote_rule_id TEXT NOT NULL DEFAULT '',
+                      last_error TEXT NOT NULL DEFAULT '',
+                      verified_at_ms INTEGER,
+                      expires_at_ms INTEGER,
+                      created_by TEXT NOT NULL,
+                      created_at_ms INTEGER NOT NULL,
+                      updated_at_ms INTEGER NOT NULL
+                    );
+                    INSERT INTO response_tasks(
+                      task_id, approval_id, case_id, event_id, action_type, action_json,
+                      status, idempotency_key, available_at_ms, verified_at_ms,
+                      created_by, created_at_ms, updated_at_ms
+                    ) VALUES (
+                      'task-legacy', 'approval-legacy', 'case-legacy', 'event-legacy',
+                      'network.block_ip', '{}', 'verified', 'legacy-key', 1000, 2000,
+                      'legacy', 1000, 2100
+                    );
+                    """
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            repo = Repository(str(db_path))
+            try:
+                migrated = repo.get_response_task("task-legacy")
+                self.assertEqual(migrated["priority"], "medium")
+                self.assertEqual(migrated["playbook_id"], "playbook_network_block_source")
+                self.assertEqual(migrated["playbook_version"], 1)
+                self.assertEqual(migrated["sla_due_at_ms"], 1_801_000)
+                self.assertEqual(migrated["sla_completed_at_ms"], 2_000)
+                self.assertEqual(migrated["sla_status"], "met")
+                self.assertEqual(repo.list_response_playbooks()[0]["status"], "active")
+                self.assertEqual(
+                    repo.conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0],
+                    SCHEMA_VERSION,
+                )
+            finally:
+                repo.conn.close()
+
+    def test_playbook_versions_bind_immutably_to_new_tasks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._state(tmp)
+            try:
+                playbook = state.response_automation.save_playbook(
+                    {
+                        "playbook_id": "playbook_waf_block_source",
+                        "name": "WAF 来源封禁",
+                        "description": "WAF 高危来源的受控临时封禁。",
+                        "owner": "SOC Response",
+                        "trigger_products": ["waf"],
+                        "action_type": "network.block_ip",
+                        "risk_tier": "critical",
+                        "sla_minutes": 15,
+                        "publish": True,
+                    },
+                    actor="config-admin",
+                )
+                self.assertEqual(playbook["status"], "active")
+                state.response_automation.save_policy(
+                    {"enabled": True, "protected_cidrs": []}, actor="config-admin"
+                )
+                result = state.orchestrator.handle_alert(_waf_alert("response-playbook-1"))
+                approval = self._executable_approval(state, result.case_id)
+                decided = state.decide_approval(
+                    approval["approval_id"],
+                    {"decision": "approved", "actor": "approver", "reason": "reviewed"},
+                )
+                task = decided["response_task"]
+                self.assertEqual(task["playbook_id"], playbook["playbook_id"])
+                self.assertEqual(task["playbook_version"], playbook["version"])
+                self.assertEqual(task["priority"], "critical")
+                self.assertEqual(task["sla_due_at_ms"] - task["created_at_ms"], 900_000)
+
+                new_version = state.response_automation.save_playbook(
+                    {
+                        **playbook,
+                        "risk_tier": "high",
+                        "sla_minutes": 30,
+                        "publish": True,
+                    },
+                    actor="config-admin",
+                    playbook_id=playbook["playbook_id"],
+                )
+                self.assertEqual(new_version["version"], playbook["version"] + 1)
+                self.assertEqual(
+                    state.repo.get_response_task(task["task_id"])["playbook_version"],
+                    playbook["version"],
+                )
+            finally:
+                state.stop()
+
+    def test_playbook_create_rolls_back_when_audit_write_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._state(tmp)
+            try:
+                with patch.object(
+                    state.repo,
+                    "insert_audit",
+                    side_effect=RuntimeError("audit unavailable"),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "audit unavailable"):
+                        state.response_automation.save_playbook(
+                            {
+                                "playbook_id": "playbook_atomic_create",
+                                "name": "Atomic create",
+                                "owner": "SOC Response",
+                                "trigger_products": ["waf"],
+                                "risk_tier": "high",
+                                "sla_minutes": 20,
+                            },
+                            actor="config-admin",
+                        )
+                self.assertIsNone(
+                    state.repo.get_response_playbook("playbook_atomic_create", 1)
+                )
+            finally:
+                state.stop()
+
+    def test_task_operations_support_assignment_sla_and_external_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._state(tmp)
+            try:
+                state.response_automation.save_policy(
+                    {"enabled": True, "protected_cidrs": []}, actor="config-admin"
+                )
+                result = state.orchestrator.handle_alert(_waf_alert("response-operations-1"))
+                approval = self._executable_approval(state, result.case_id)
+                decided = state.decide_approval(
+                    approval["approval_id"],
+                    {"decision": "approved", "actor": "approver", "reason": "reviewed"},
+                )
+                task = decided["response_task"]
+                updated = state.response_automation.update_task_operations(
+                    task["task_id"],
+                    {
+                        "assignee": "soc-responder-a",
+                        "priority": "critical",
+                        "sla_due_at_ms": task["created_at_ms"],
+                        "acknowledged": True,
+                        "handover_note": "交接给白班确认业务影响。",
+                        "ticket_ref": "INC-2026-0042",
+                        "asset_ref": "CMDB-APP-17",
+                        "asset_criticality": "high",
+                        "business_owner": "Payments Platform",
+                    },
+                    actor="soc-responder-a",
+                )
+                self.assertEqual(updated["assignee"], "soc-responder-a")
+                self.assertEqual(updated["priority"], "critical")
+                self.assertTrue(updated["acknowledged"])
+                self.assertEqual(updated["ticket_ref"], "INC-2026-0042")
+                self.assertEqual(updated["asset_ref"], "CMDB-APP-17")
+                self.assertEqual(updated["sla_status"], "breached")
+                filtered = state.repo.list_response_tasks(
+                    priority="critical", assignee="soc-responder-a", sla_status="breached"
+                )
+                self.assertEqual([item["task_id"] for item in filtered], [task["task_id"]])
+                operations = state.repo.response_task_stats()["operations"]
+                self.assertEqual(operations["unassigned"], 0)
+                self.assertEqual(operations["acknowledged"], 1)
+                self.assertEqual(operations["sla_breached"], 1)
+
+                terminal = state.repo.finish_response_task(
+                    task["task_id"], "failed", expected_status=task["status"], error="test"
+                )
+                completed_at = terminal["sla_completed_at_ms"]
+                changed = state.response_automation.update_task_operations(
+                    task["task_id"],
+                    {"handover_note": "终态补充说明不应改变 SLA 结果。"},
+                    actor="soc-responder-b",
+                )
+                self.assertEqual(changed["sla_completed_at_ms"], completed_at)
+                self.assertEqual(changed["sla_status"], "breached")
+                with self.assertRaisesRegex(ValueError, "SLA deadline cannot be changed"):
+                    state.response_automation.update_task_operations(
+                        task["task_id"],
+                        {"sla_due_at_ms": task["created_at_ms"] + 600_000},
+                        actor="soc-responder-b",
+                    )
+            finally:
+                state.stop()
+
+    def test_task_operations_roll_back_when_audit_write_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._state(tmp)
+            try:
+                state.response_automation.save_policy(
+                    {"enabled": True, "protected_cidrs": []}, actor="config-admin"
+                )
+                result = state.orchestrator.handle_alert(_waf_alert("response-operations-atomic-1"))
+                approval = self._executable_approval(state, result.case_id)
+                decided = state.decide_approval(
+                    approval["approval_id"],
+                    {"decision": "approved", "actor": "approver", "reason": "reviewed"},
+                )
+                task_id = decided["response_task"]["task_id"]
+                with patch.object(
+                    state.repo,
+                    "insert_audit",
+                    side_effect=RuntimeError("audit unavailable"),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "audit unavailable"):
+                        state.response_automation.update_task_operations(
+                            task_id,
+                            {"assignee": "soc-responder-a", "acknowledged": True},
+                            actor="soc-responder-a",
+                        )
+                unchanged = state.repo.get_response_task(task_id)
+                self.assertEqual(unchanged["assignee"], "")
+                self.assertFalse(unchanged["acknowledged"])
+            finally:
+                state.stop()
+
+    def test_shadow_evaluation_is_decided_once_with_audited_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._state(tmp)
+            try:
+                state.response_automation.save_connector(
+                    {
+                        "name": "Shadow WAF",
+                        "endpoint": "https://waf.invalid/response",
+                        "execution_mode": "shadow",
+                        "enabled": True,
+                    },
+                    actor="config-admin",
+                )
+                state.response_automation.save_policy(
+                    {"enabled": True, "protected_cidrs": []}, actor="config-admin"
+                )
+                result = state.orchestrator.handle_alert(_waf_alert("response-shadow-review-1"))
+                approval = self._executable_approval(state, result.case_id)
+                decided = state.decide_approval(
+                    approval["approval_id"],
+                    {"decision": "approved", "actor": "approver", "reason": "reviewed"},
+                )
+                task_id = decided["response_task"]["task_id"]
+                deadline = time.time() + 2
+                evaluations = []
+                while time.time() < deadline:
+                    evaluations = state.response_automation.shadow_evaluations()
+                    if evaluations:
+                        break
+                    time.sleep(0.02)
+                self.assertEqual(len(evaluations), 1)
+                evaluation = state.response_automation.decide_shadow_evaluation(
+                    evaluations[0]["evaluation_id"],
+                    {"decision": "accepted", "reason": "证据充分，建议动作与人工判断一致。"},
+                    actor="soc-analyst",
+                )
+                self.assertEqual(evaluation["status"], "accepted")
+                self.assertEqual(evaluation["task_id"], task_id)
+                with self.assertRaisesRegex(ValueError, "no longer pending"):
+                    state.response_automation.decide_shadow_evaluation(
+                        evaluations[0]["evaluation_id"],
+                        {"decision": "rejected", "reason": "重复提交不应覆盖原决策。"},
+                        actor="soc-analyst",
+                    )
+            finally:
+                state.stop()
+
+    def test_shadow_decision_rolls_back_when_audit_write_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._state(tmp)
+            try:
+                state.response_automation.save_connector(
+                    {
+                        "name": "Atomic Shadow WAF",
+                        "endpoint": "https://waf.invalid/response",
+                        "execution_mode": "shadow",
+                        "enabled": True,
+                    },
+                    actor="config-admin",
+                )
+                state.response_automation.save_policy(
+                    {"enabled": True, "protected_cidrs": []}, actor="config-admin"
+                )
+                result = state.orchestrator.handle_alert(_waf_alert("response-shadow-atomic-1"))
+                approval = self._executable_approval(state, result.case_id)
+                state.decide_approval(
+                    approval["approval_id"],
+                    {"decision": "approved", "actor": "approver", "reason": "reviewed"},
+                )
+                deadline = time.time() + 2
+                evaluations = []
+                while time.time() < deadline:
+                    evaluations = state.response_automation.shadow_evaluations()
+                    if evaluations:
+                        break
+                    time.sleep(0.02)
+                self.assertEqual(len(evaluations), 1)
+                evaluation_id = evaluations[0]["evaluation_id"]
+                with patch.object(
+                    state.repo,
+                    "insert_audit",
+                    side_effect=RuntimeError("audit unavailable"),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "audit unavailable"):
+                        state.response_automation.decide_shadow_evaluation(
+                            evaluation_id,
+                            {"decision": "accepted", "reason": "证据与人工结论保持一致。"},
+                            actor="soc-analyst",
+                        )
+                pending = state.response_automation.shadow_evaluations(status="pending")
+                self.assertEqual([item["evaluation_id"] for item in pending], [evaluation_id])
             finally:
                 state.stop()
 
@@ -440,6 +790,7 @@ class RealConnectorLifecycleTest(unittest.TestCase):
                 task = self._wait_for(state, task_id, "rolled_back")
                 self.assertEqual(task["status"], "rolled_back")
                 self.assertEqual(task["remote_rule_id"], "rule-42")
+                self.assertIsNotNone(task["sla_completed_at_ms"])
                 self.assertNotIn("verify", _ResponseConnectorHandler.operations)
                 self.assertEqual(_ResponseConnectorHandler.operations[-1], "rollback")
             finally:
@@ -647,6 +998,18 @@ class ResponseAutomationHTTPRoleTest(unittest.TestCase):
             config.auth.api_token = "admin-token-value"
             config.auth.approver_token = "approver-token-value"
             config.auth.responder_token = "responder-token-value"
+            config.auth.principals = [
+                AuthPrincipalConfig(
+                    actor="config-only",
+                    token="config-only-token-value",
+                    roles=["config"],
+                ),
+                AuthPrincipalConfig(
+                    actor="analyst-only",
+                    token="analyst-only-token-value",
+                    roles=["analyst"],
+                ),
+            ]
             server = build_server(config)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -700,6 +1063,73 @@ class ResponseAutomationHTTPRoleTest(unittest.TestCase):
                 )
                 self.assertEqual(status, 200)
                 self.assertEqual(payload["tasks"], [])
+
+                for token in ("config-only-token-value", "analyst-only-token-value"):
+                    status, _ = self._request(
+                        base,
+                        "/api/automation/playbooks",
+                        token,
+                    )
+                    self.assertEqual(status, 200)
+                    status, _ = self._request(
+                        base,
+                        "/api/automation/shadow-evaluations",
+                        token,
+                    )
+                    self.assertEqual(status, 200)
+
+                playbook_body = {
+                    "playbook_id": "playbook_api_waf_block",
+                    "name": "API WAF block",
+                    "owner": "SOC Response",
+                    "trigger_products": ["waf"],
+                    "action_type": "network.block_ip",
+                    "risk_tier": "high",
+                    "sla_minutes": 20,
+                    "publish": True,
+                }
+                status, _ = self._request(
+                    base,
+                    "/api/automation/playbooks",
+                    config.auth.responder_token,
+                    playbook_body,
+                )
+                self.assertEqual(status, 403)
+                status, payload = self._request(
+                    base,
+                    "/api/automation/playbooks",
+                    config.auth.api_token,
+                    playbook_body,
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(payload["playbook"]["status"], "active")
+                status, payload = self._request(
+                    base,
+                    "/api/automation/playbooks?all_versions=true",
+                    config.auth.responder_token,
+                )
+                self.assertEqual(status, 200)
+                self.assertTrue(
+                    any(
+                        item["playbook_id"] == "playbook_api_waf_block"
+                        for item in payload["playbooks"]
+                    )
+                )
+
+                status, _ = self._request(
+                    base,
+                    "/api/automation/tasks/missing-task/operations",
+                    config.auth.approver_token,
+                    {"assignee": "approver"},
+                )
+                self.assertEqual(status, 403)
+                status, _ = self._request(
+                    base,
+                    "/api/automation/tasks/missing-task/operations",
+                    config.auth.responder_token,
+                    {"assignee": "soc-responder"},
+                )
+                self.assertEqual(status, 404)
             finally:
                 server.shutdown()
                 server.server_close()

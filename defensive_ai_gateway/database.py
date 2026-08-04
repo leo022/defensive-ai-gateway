@@ -436,6 +436,20 @@ CREATE TABLE IF NOT EXISTS response_tasks (
   last_error TEXT NOT NULL DEFAULT '',
   verified_at_ms INTEGER,
   expires_at_ms INTEGER,
+  priority TEXT NOT NULL DEFAULT 'medium',
+  assignee TEXT NOT NULL DEFAULT '',
+  sla_due_at_ms INTEGER,
+  sla_completed_at_ms INTEGER,
+  acknowledged_at_ms INTEGER,
+  handover_note TEXT NOT NULL DEFAULT '',
+  ticket_ref TEXT NOT NULL DEFAULT '',
+  asset_ref TEXT NOT NULL DEFAULT '',
+  asset_criticality TEXT NOT NULL DEFAULT 'unknown',
+  business_owner TEXT NOT NULL DEFAULT '',
+  playbook_id TEXT NOT NULL DEFAULT 'playbook_network_block_source',
+  playbook_version INTEGER NOT NULL DEFAULT 1,
+  operations_updated_by TEXT NOT NULL DEFAULT '',
+  operations_updated_at_ms INTEGER NOT NULL DEFAULT 0,
   created_by TEXT NOT NULL,
   created_at_ms INTEGER NOT NULL,
   updated_at_ms INTEGER NOT NULL,
@@ -444,11 +458,50 @@ CREATE TABLE IF NOT EXISTS response_tasks (
   FOREIGN KEY (event_id) REFERENCES normalized_events(event_id),
   FOREIGN KEY (connector_id) REFERENCES response_connectors(connector_id),
   CHECK (action_type = 'network.block_ip'),
+  CHECK (priority IN ('low','medium','high','critical')),
+  CHECK (asset_criticality IN ('unknown','low','medium','high','critical')),
   CHECK (status IN (
     'waiting_configuration','waiting_dispatch','paused','queued','running',
     'retry_wait','verified','shadowed','failed','cancelled',
     'rollback_queued','rollback_running','rollback_retry','rolled_back','rollback_failed'
   ))
+);
+CREATE TABLE IF NOT EXISTS response_playbooks (
+  playbook_id TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'draft',
+  trigger_products_json TEXT NOT NULL DEFAULT '["*"]',
+  action_type TEXT NOT NULL,
+  risk_tier TEXT NOT NULL DEFAULT 'high',
+  owner TEXT NOT NULL,
+  sla_minutes INTEGER NOT NULL DEFAULT 30,
+  definition_json TEXT NOT NULL DEFAULT '{}',
+  created_by TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  published_by TEXT NOT NULL DEFAULT '',
+  published_at_ms INTEGER,
+  PRIMARY KEY (playbook_id, version),
+  CHECK (status IN ('draft','active','retired')),
+  CHECK (risk_tier IN ('low','medium','high','critical')),
+  CHECK (sla_minutes BETWEEN 5 AND 10080)
+);
+CREATE TABLE IF NOT EXISTS response_shadow_evaluations (
+  evaluation_id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL UNIQUE,
+  playbook_id TEXT NOT NULL,
+  playbook_version INTEGER NOT NULL,
+  proposed_action_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  analyst_actor TEXT NOT NULL DEFAULT '',
+  decision_reason TEXT NOT NULL DEFAULT '',
+  actual_action_json TEXT NOT NULL DEFAULT '{}',
+  decided_at_ms INTEGER,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  FOREIGN KEY (task_id) REFERENCES response_tasks(task_id) ON DELETE CASCADE,
+  CHECK (status IN ('pending','accepted','rejected','modified'))
 );
 CREATE TABLE IF NOT EXISTS response_attempts (
   attempt_id TEXT PRIMARY KEY,
@@ -662,6 +715,10 @@ CREATE INDEX IF NOT EXISTS idx_response_tasks_status ON response_tasks(status, a
 CREATE INDEX IF NOT EXISTS idx_response_tasks_case ON response_tasks(case_id, created_at_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_response_tasks_created_id
   ON response_tasks(created_at_ms DESC, task_id);
+CREATE INDEX IF NOT EXISTS idx_response_playbooks_status
+  ON response_playbooks(status, action_type, created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_response_shadow_status
+  ON response_shadow_evaluations(status, created_at_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_response_attempts_task ON response_attempts(task_id, created_at_ms ASC);
 CREATE INDEX IF NOT EXISTS idx_case_response_artifacts_case
   ON case_response_artifacts(case_id, version DESC);
@@ -724,7 +781,7 @@ BEGIN
 END;
 """
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 _LLM_DEFERRED_ERROR_PREFIX = "analysis_deferred:"
 _LEGACY_LLM_DEFERRED_ERROR_FRAGMENT = "remote LLM analysis deferred"
 _TERMINAL_LLM_ERROR_FRAGMENTS = (
@@ -1590,6 +1647,105 @@ class Repository:
                     (now_ms(),),
                 )
 
+            if current < 20:
+                task_columns = {
+                    row["name"]
+                    for row in self.conn.execute("PRAGMA table_info(response_tasks)").fetchall()
+                }
+                task_additions = {
+                    "priority": "TEXT NOT NULL DEFAULT 'medium'",
+                    "assignee": "TEXT NOT NULL DEFAULT ''",
+                    "sla_due_at_ms": "INTEGER",
+                    "sla_completed_at_ms": "INTEGER",
+                    "acknowledged_at_ms": "INTEGER",
+                    "handover_note": "TEXT NOT NULL DEFAULT ''",
+                    "ticket_ref": "TEXT NOT NULL DEFAULT ''",
+                    "asset_ref": "TEXT NOT NULL DEFAULT ''",
+                    "asset_criticality": "TEXT NOT NULL DEFAULT 'unknown'",
+                    "business_owner": "TEXT NOT NULL DEFAULT ''",
+                    "playbook_id": "TEXT NOT NULL DEFAULT 'playbook_network_block_source'",
+                    "playbook_version": "INTEGER NOT NULL DEFAULT 1",
+                    "operations_updated_by": "TEXT NOT NULL DEFAULT ''",
+                    "operations_updated_at_ms": "INTEGER NOT NULL DEFAULT 0",
+                }
+                for column, declaration in task_additions.items():
+                    if column not in task_columns:
+                        self.conn.execute(
+                            f"ALTER TABLE response_tasks ADD COLUMN {column} {declaration}"
+                        )
+                required_tables = {"response_playbooks", "response_shadow_evaluations"}
+                actual_tables = {
+                    row["name"]
+                    for row in self.conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    ).fetchall()
+                }
+                if not required_tables.issubset(actual_tables):
+                    raise RuntimeError("schema v20 response operations tables are incomplete")
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_response_tasks_operations "
+                    "ON response_tasks(priority, assignee, sla_due_at_ms)"
+                )
+                created = now_ms()
+                definition = {
+                    "schema_version": "response-playbook/v1",
+                    "entry_conditions": {
+                        "validator_status": "passed",
+                        "approval_quorum": "required",
+                        "evidence_fields": ["src_ip"],
+                    },
+                    "steps": [
+                        {"type": "validate", "control": "protected_network_and_ttl"},
+                        {"type": "approve", "control": "policy_quorum"},
+                        {"type": "execute", "action_type": "network.block_ip"},
+                        {"type": "verify", "required": True},
+                        {"type": "rollback", "on": ["ttl", "case_terminal", "manual"]},
+                    ],
+                }
+                self.conn.execute(
+                    """
+                    INSERT OR IGNORE INTO response_playbooks(
+                      playbook_id, version, name, description, status,
+                      trigger_products_json, action_type, risk_tier, owner,
+                      sla_minutes, definition_json, created_by, created_at_ms,
+                      published_by, published_at_ms
+                    ) VALUES (?, 1, ?, ?, 'active', ?, ?, 'high', ?, 30, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "playbook_network_block_source",
+                        "恶意来源 IP 临时封禁",
+                        "审批后临时封禁已持久化证据中的来源 IP，并完成设备核验和到期回滚。",
+                        json.dumps(["*"], ensure_ascii=False),
+                        "network.block_ip",
+                        "Security Operations",
+                        json.dumps(definition, ensure_ascii=False, sort_keys=True),
+                        "system-migration",
+                        created,
+                        "system-migration",
+                        created,
+                    ),
+                )
+                self.conn.execute(
+                    """
+                    UPDATE response_tasks
+                    SET sla_due_at_ms = created_at_ms + 1800000,
+                        operations_updated_at_ms = created_at_ms
+                    WHERE sla_due_at_ms IS NULL
+                    """
+                )
+                self.conn.execute(
+                    """
+                    UPDATE response_tasks
+                    SET sla_completed_at_ms = COALESCE(verified_at_ms, updated_at_ms)
+                    WHERE sla_completed_at_ms IS NULL
+                      AND status IN ('verified','shadowed','failed','cancelled','rolled_back','rollback_failed')
+                    """
+                )
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO schema_version(version, applied_at_ms) VALUES (20, ?)",
+                    (now_ms(),),
+                )
+
             self.conn.commit()
 
     def readiness_check(self) -> dict[str, Any]:
@@ -2389,6 +2545,18 @@ class Repository:
         payload["connector_snapshot"] = json.loads(
             payload.pop("connector_snapshot_json") or "{}"
         )
+        deadline = payload.get("sla_due_at_ms")
+        status = str(payload.get("status") or "")
+        completed_at = payload.get("sla_completed_at_ms")
+        if deadline is None:
+            sla_status = "untracked"
+        elif completed_at is not None:
+            sla_status = "met" if int(completed_at) <= int(deadline) else "breached"
+        else:
+            remaining = int(deadline) - now_ms()
+            sla_status = "breached" if remaining <= 0 else "at_risk" if remaining <= 900_000 else "on_track"
+        payload["sla_status"] = sla_status
+        payload["acknowledged"] = payload.get("acknowledged_at_ms") is not None
         return payload
 
     def create_response_task(
@@ -2402,8 +2570,15 @@ class Repository:
                   connector_id, connector_version, connector_snapshot_json,
                   status, idempotency_key, attempts, max_attempts, available_at_ms,
                   claimed_at_ms, remote_rule_id, last_error, verified_at_ms,
-                  expires_at_ms, created_by, created_at_ms, updated_at_ms
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, '', '', NULL, NULL, ?, ?, ?)
+                  expires_at_ms, priority, assignee, sla_due_at_ms, sla_completed_at_ms,
+                  acknowledged_at_ms, handover_note, ticket_ref, asset_ref,
+                  asset_criticality, business_owner, playbook_id, playbook_version,
+                  operations_updated_by, operations_updated_at_ms,
+                  created_by, created_at_ms, updated_at_ms
+                ) VALUES (
+                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, '', '', NULL,
+                  NULL, ?, '', ?, NULL, NULL, '', '', '', 'unknown', '', ?, ?, ?, ?, ?, ?, ?
+                )
                 """,
                 (
                     task["task_id"], task["approval_id"], task["case_id"], task["event_id"],
@@ -2412,8 +2587,13 @@ class Repository:
                     task.get("connector_id"), int(task.get("connector_version", 0)),
                     json.dumps(task.get("connector_snapshot") or {}, ensure_ascii=False, sort_keys=True),
                     task["status"], task["idempotency_key"], int(task.get("max_attempts", 5)),
-                    int(task.get("available_at_ms", now_ms())), task["created_by"],
-                    int(task["created_at_ms"]), int(task["created_at_ms"]),
+                    int(task.get("available_at_ms", now_ms())),
+                    str(task.get("priority") or "medium"),
+                    int(task["sla_due_at_ms"]) if task.get("sla_due_at_ms") is not None else None,
+                    str(task.get("playbook_id") or "playbook_network_block_source"),
+                    int(task.get("playbook_version") or 1),
+                    str(task["created_by"]), int(task["created_at_ms"]),
+                    task["created_by"], int(task["created_at_ms"]), int(task["created_at_ms"]),
                 ),
             )
             row = self.conn.execute(
@@ -2442,30 +2622,82 @@ class Repository:
             ]
             return payload
 
+    @staticmethod
+    def _response_task_filters(
+        *, status: str | None = None, priority: str | None = None,
+        assignee: str | None = None, sla_status: str | None = None,
+    ) -> tuple[str, list[Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        active = (
+            "'waiting_configuration','waiting_dispatch','paused','queued','running',"
+            "'retry_wait','rollback_queued','rollback_running','rollback_retry'"
+        )
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if priority:
+            clauses.append("priority = ?")
+            params.append(priority)
+        if assignee == "__unassigned__":
+            clauses.append("sla_completed_at_ms IS NULL AND status IN (" + active + ") AND assignee = ''")
+        elif assignee:
+            clauses.append("assignee = ?")
+            params.append(assignee)
+        if sla_status == "breached":
+            clauses.append(
+                "sla_due_at_ms IS NOT NULL AND ((sla_completed_at_ms IS NULL AND status IN (" + active + ") AND sla_due_at_ms <= ?) "
+                "OR sla_completed_at_ms > sla_due_at_ms)"
+            )
+            params.append(now_ms())
+        elif sla_status == "at_risk":
+            current = now_ms()
+            clauses.append(
+                "sla_completed_at_ms IS NULL AND status IN (" + active + ") "
+                "AND sla_due_at_ms BETWEEN ? AND ?"
+            )
+            params.extend([current, current + 900_000])
+        elif sla_status == "unassigned":
+            clauses.append(
+                "sla_completed_at_ms IS NULL AND status IN (" + active + ") AND assignee = ''"
+            )
+        return (f"WHERE {' AND '.join(clauses)}" if clauses else "", params)
+
     def list_response_tasks(
-        self, *, status: str | None = None, limit: int = 20, offset: int = 0
+        self, *, status: str | None = None, priority: str | None = None,
+        assignee: str | None = None, sla_status: str | None = None,
+        limit: int = 20, offset: int = 0,
     ) -> list[dict[str, Any]]:
         with self._lock:
-            where = "WHERE status = ?" if status else ""
-            params: list[Any] = [status] if status else []
+            where, params = self._response_task_filters(
+                status=status, priority=priority, assignee=assignee, sla_status=sla_status
+            )
             params.extend([max(1, min(int(limit), 200)), max(0, int(offset))])
             rows = self.conn.execute(
-                f"SELECT * FROM response_tasks {where} ORDER BY created_at_ms DESC LIMIT ? OFFSET ?",
+                f"""SELECT * FROM response_tasks {where}
+                    ORDER BY
+                      CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1
+                                    WHEN 'medium' THEN 2 ELSE 3 END,
+                      sla_due_at_ms ASC, created_at_ms DESC
+                    LIMIT ? OFFSET ?""",
                 params,
             ).fetchall()
             return [self._response_task_row(row) for row in rows]
 
-    def count_response_tasks(self, *, status: str | None = None) -> int:
+    def count_response_tasks(
+        self, *, status: str | None = None, priority: str | None = None,
+        assignee: str | None = None, sla_status: str | None = None,
+    ) -> int:
         with self._lock:
-            if status:
-                row = self.conn.execute(
-                    "SELECT COUNT(*) AS count FROM response_tasks WHERE status = ?", (status,)
-                ).fetchone()
-            else:
-                row = self.conn.execute("SELECT COUNT(*) AS count FROM response_tasks").fetchone()
+            where, params = self._response_task_filters(
+                status=status, priority=priority, assignee=assignee, sla_status=sla_status
+            )
+            row = self.conn.execute(
+                f"SELECT COUNT(*) AS count FROM response_tasks {where}", params
+            ).fetchone()
             return int(row["count"])
 
-    def response_task_stats(self) -> dict[str, int]:
+    def response_task_stats(self) -> dict[str, Any]:
         with self._lock:
             stats = {
                 str(row["status"]): int(row["count"])
@@ -2474,7 +2706,289 @@ class Repository:
                 ).fetchall()
             }
             stats["total"] = sum(stats.values())
+            current = now_ms()
+            active = (
+                "'waiting_configuration','waiting_dispatch','paused','queued','running',"
+                "'retry_wait','rollback_queued','rollback_running','rollback_retry'"
+            )
+            operations = self.conn.execute(
+                f"""
+                SELECT
+                  SUM(CASE WHEN sla_completed_at_ms IS NULL AND status IN ({active}) AND assignee = '' THEN 1 ELSE 0 END) AS unassigned,
+                  SUM(CASE WHEN acknowledged_at_ms IS NOT NULL THEN 1 ELSE 0 END) AS acknowledged,
+                  SUM(CASE WHEN sla_completed_at_ms IS NULL AND status IN ({active}) AND sla_due_at_ms <= ? THEN 1 ELSE 0 END) AS sla_breached,
+                  SUM(CASE WHEN sla_completed_at_ms IS NULL AND status IN ({active}) AND sla_due_at_ms BETWEEN ? AND ? THEN 1 ELSE 0 END) AS sla_at_risk
+                FROM response_tasks
+                """,
+                (current, current, current + 900_000),
+            ).fetchone()
+            shadow = self.conn.execute(
+                "SELECT status, COUNT(*) AS count FROM response_shadow_evaluations GROUP BY status"
+            ).fetchall()
+            completed = self.conn.execute(
+                "SELECT created_at_ms, verified_at_ms FROM response_tasks "
+                "WHERE verified_at_ms IS NOT NULL ORDER BY verified_at_ms - created_at_ms"
+            ).fetchall()
+            durations = [
+                max(0, int(row["verified_at_ms"]) - int(row["created_at_ms"]))
+                for row in completed
+            ]
+            def percentile(values: list[int], fraction: float) -> int | None:
+                if not values:
+                    return None
+                return values[min(len(values) - 1, max(0, int((len(values) - 1) * fraction)))]
+            stats["operations"] = {
+                "unassigned": int(operations["unassigned"] or 0),
+                "acknowledged": int(operations["acknowledged"] or 0),
+                "sla_breached": int(operations["sla_breached"] or 0),
+                "sla_at_risk": int(operations["sla_at_risk"] or 0),
+                "shadow": {str(row["status"]): int(row["count"]) for row in shadow},
+                "time_to_control_p50_ms": percentile(durations, 0.50),
+                "time_to_control_p95_ms": percentile(durations, 0.95),
+            }
             return stats
+
+    def update_response_task_operations(
+        self, task_id: str, updates: dict[str, Any], *, actor: str,
+        _commit: bool = True,
+    ) -> dict[str, Any] | None:
+        allowed = {
+            "priority", "assignee", "sla_due_at_ms", "acknowledged_at_ms",
+            "handover_note", "ticket_ref", "asset_ref", "asset_criticality",
+            "business_owner",
+        }
+        fields = {key: value for key, value in updates.items() if key in allowed}
+        if not fields:
+            return self.get_response_task(task_id)
+        timestamp = now_ms()
+        assignments = [f"{key} = ?" for key in fields]
+        params = list(fields.values())
+        assignments.extend(
+            ["operations_updated_by = ?", "operations_updated_at_ms = ?", "updated_at_ms = ?"]
+        )
+        params.extend([actor, timestamp, timestamp, task_id])
+        with self._lock:
+            cur = self.conn.execute(
+                f"UPDATE response_tasks SET {', '.join(assignments)} WHERE task_id = ?",
+                params,
+            )
+            if _commit:
+                self.conn.commit()
+            return self.get_response_task(task_id) if cur.rowcount else None
+
+    @staticmethod
+    def _response_playbook_row(row: sqlite3.Row) -> dict[str, Any]:
+        payload = dict(row)
+        payload["trigger_products"] = json.loads(
+            payload.pop("trigger_products_json") or "[]"
+        )
+        payload["definition"] = json.loads(payload.pop("definition_json") or "{}")
+        return payload
+
+    def list_response_playbooks(self, *, all_versions: bool = False) -> list[dict[str, Any]]:
+        with self._lock:
+            if all_versions:
+                rows = self.conn.execute(
+                    "SELECT * FROM response_playbooks ORDER BY created_at_ms DESC, version DESC"
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    """
+                    SELECT p.* FROM response_playbooks p
+                    JOIN (
+                      SELECT playbook_id, MAX(version) AS version
+                      FROM response_playbooks GROUP BY playbook_id
+                    ) latest
+                      ON latest.playbook_id = p.playbook_id AND latest.version = p.version
+                    ORDER BY p.created_at_ms DESC, p.playbook_id ASC
+                    """
+                ).fetchall()
+            return [self._response_playbook_row(row) for row in rows]
+
+    def get_response_playbook(self, playbook_id: str, version: int) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM response_playbooks WHERE playbook_id = ? AND version = ?",
+                (playbook_id, int(version)),
+            ).fetchone()
+            return self._response_playbook_row(row) if row else None
+
+    def active_response_playbook(
+        self, action_type: str, product: str
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT * FROM response_playbooks
+                WHERE status = 'active' AND action_type = ?
+                ORDER BY published_at_ms DESC, version DESC
+                """,
+                (action_type,),
+            ).fetchall()
+            normalized_product = str(product or "").lower()
+            wildcard: dict[str, Any] | None = None
+            for row in rows:
+                playbook = self._response_playbook_row(row)
+                products = {str(item).lower() for item in playbook["trigger_products"]}
+                if normalized_product in products:
+                    return playbook
+                if "*" in products and wildcard is None:
+                    wildcard = playbook
+            return wildcard
+
+    def create_response_playbook_version(
+        self, playbook: dict[str, Any], *, actor: str, _commit: bool = True
+    ) -> dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COALESCE(MAX(version), 0) AS version FROM response_playbooks WHERE playbook_id = ?",
+                (playbook["playbook_id"],),
+            ).fetchone()
+            version = int(row["version"] or 0) + 1
+            timestamp = now_ms()
+            self.conn.execute(
+                """
+                INSERT INTO response_playbooks(
+                  playbook_id, version, name, description, status,
+                  trigger_products_json, action_type, risk_tier, owner,
+                  sla_minutes, definition_json, created_by, created_at_ms
+                ) VALUES (?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    playbook["playbook_id"], version, playbook["name"],
+                    playbook.get("description", ""),
+                    json.dumps(playbook["trigger_products"], ensure_ascii=False, sort_keys=True),
+                    playbook["action_type"], playbook["risk_tier"], playbook["owner"],
+                    int(playbook["sla_minutes"]),
+                    json.dumps(playbook["definition"], ensure_ascii=False, sort_keys=True),
+                    actor, timestamp,
+                ),
+            )
+            if _commit:
+                self.conn.commit()
+            return self.get_response_playbook(playbook["playbook_id"], version) or {}
+
+    def publish_response_playbook(
+        self, playbook_id: str, version: int, *, actor: str,
+        _commit: bool = True,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            target = self.conn.execute(
+                "SELECT status FROM response_playbooks WHERE playbook_id = ? AND version = ?",
+                (playbook_id, int(version)),
+            ).fetchone()
+            if not target:
+                return None
+            timestamp = now_ms()
+            self.conn.execute(
+                "UPDATE response_playbooks SET status = 'retired' "
+                "WHERE playbook_id = ? AND status = 'active' AND version != ?",
+                (playbook_id, int(version)),
+            )
+            self.conn.execute(
+                """
+                UPDATE response_playbooks
+                SET status = 'active', published_by = ?, published_at_ms = ?
+                WHERE playbook_id = ? AND version = ?
+                """,
+                (actor, timestamp, playbook_id, int(version)),
+            )
+            if _commit:
+                self.conn.commit()
+            return self.get_response_playbook(playbook_id, int(version))
+
+    @staticmethod
+    def _shadow_evaluation_row(row: sqlite3.Row) -> dict[str, Any]:
+        payload = dict(row)
+        payload["proposed_action"] = json.loads(payload.pop("proposed_action_json") or "{}")
+        payload["actual_action"] = json.loads(payload.pop("actual_action_json") or "{}")
+        return payload
+
+    def ensure_shadow_evaluation(
+        self, evaluation: dict[str, Any], *, _commit: bool = True
+    ) -> tuple[dict[str, Any], bool]:
+        with self._lock:
+            timestamp = now_ms()
+            cur = self.conn.execute(
+                """
+                INSERT OR IGNORE INTO response_shadow_evaluations(
+                  evaluation_id, task_id, playbook_id, playbook_version,
+                  proposed_action_json, status, created_at_ms, updated_at_ms
+                ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+                """,
+                (
+                    evaluation["evaluation_id"], evaluation["task_id"],
+                    evaluation["playbook_id"], int(evaluation["playbook_version"]),
+                    json.dumps(evaluation["proposed_action"], ensure_ascii=False, sort_keys=True),
+                    timestamp, timestamp,
+                ),
+            )
+            row = self.conn.execute(
+                "SELECT * FROM response_shadow_evaluations WHERE task_id = ?",
+                (evaluation["task_id"],),
+            ).fetchone()
+            if _commit:
+                self.conn.commit()
+            if not row:
+                raise RuntimeError("shadow evaluation was not persisted")
+            return self._shadow_evaluation_row(row), cur.rowcount > 0
+
+    def list_shadow_evaluations(
+        self, *, status: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            where = "WHERE e.status = ?" if status else ""
+            params: list[Any] = [status] if status else []
+            params.append(max(1, min(int(limit), 500)))
+            rows = self.conn.execute(
+                f"""
+                SELECT e.*, t.case_id, t.priority, t.assignee, t.sla_due_at_ms
+                FROM response_shadow_evaluations e
+                JOIN response_tasks t ON t.task_id = e.task_id
+                {where}
+                ORDER BY CASE e.status WHEN 'pending' THEN 0 ELSE 1 END,
+                         e.created_at_ms DESC LIMIT ?
+                """,
+                params,
+            ).fetchall()
+            return [self._shadow_evaluation_row(row) for row in rows]
+
+    def decide_shadow_evaluation(
+        self, evaluation_id: str, *, status: str, actor: str,
+        reason: str, actual_action: dict[str, Any] | None = None,
+        _commit: bool = True,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            timestamp = now_ms()
+            cur = self.conn.execute(
+                """
+                UPDATE response_shadow_evaluations
+                SET status = ?, analyst_actor = ?, decision_reason = ?,
+                    actual_action_json = ?, decided_at_ms = ?, updated_at_ms = ?
+                WHERE evaluation_id = ? AND status = 'pending'
+                """,
+                (
+                    status, actor, reason,
+                    json.dumps(actual_action or {}, ensure_ascii=False, sort_keys=True),
+                    timestamp, timestamp, evaluation_id,
+                ),
+            )
+            row = self.conn.execute(
+                """
+                SELECT e.*, t.case_id, t.priority, t.assignee, t.sla_due_at_ms
+                FROM response_shadow_evaluations e
+                JOIN response_tasks t ON t.task_id = e.task_id
+                WHERE e.evaluation_id = ?
+                """,
+                (evaluation_id,),
+            ).fetchone()
+            if _commit:
+                self.conn.commit()
+            if not row:
+                return None
+            payload = self._shadow_evaluation_row(row)
+            payload["decision_recorded"] = cur.rowcount > 0
+            return payload
 
     def response_task_preflight(self, task_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -2628,7 +3142,16 @@ class Repository:
         _commit: bool = True,
     ) -> dict[str, Any] | None:
         with self._lock:
-            verified_at = now_ms() if status in {"verified", "shadowed", "rolled_back"} else None
+            timestamp = now_ms()
+            verified_at = timestamp if status in {"verified", "shadowed", "rolled_back"} else None
+            sla_completed_at = (
+                timestamp
+                if status in {
+                    "verified", "shadowed", "failed", "cancelled", "rolled_back",
+                    "rollback_failed",
+                }
+                else None
+            )
             expires_at = None
             if status == "verified":
                 row = self.conn.execute(
@@ -2653,14 +3176,15 @@ class Repository:
                     remote_rule_id = CASE WHEN ? != '' THEN ? ELSE remote_rule_id END,
                     last_error = ?, available_at_ms = ?, claimed_at_ms = NULL,
                     verified_at_ms = COALESCE(?, verified_at_ms),
-                    expires_at_ms = COALESCE(?, expires_at_ms), updated_at_ms = ?
+                    expires_at_ms = COALESCE(?, expires_at_ms),
+                    sla_completed_at_ms = COALESCE(sla_completed_at_ms, ?), updated_at_ms = ?
                 WHERE task_id = ? AND status = ?
                 {active_case_clause}
                 """,
                 (
                     status, remote_rule_id, remote_rule_id, str(error)[:2000],
-                    now_ms() + max(0, int(retry_delay_ms)), verified_at, expires_at,
-                    now_ms(), task_id, expected_status,
+                    timestamp + max(0, int(retry_delay_ms)), verified_at, expires_at,
+                    sla_completed_at, timestamp, task_id, expected_status,
                 ),
             )
             if _commit:
@@ -2815,13 +3339,14 @@ class Repository:
             cancelled = self.conn.execute(
                 """
                 UPDATE response_tasks
-                SET status = 'cancelled', last_error = 'case became terminal', updated_at_ms = ?
+                SET status = 'cancelled', last_error = 'case became terminal',
+                    sla_completed_at_ms = COALESCE(sla_completed_at_ms, ?), updated_at_ms = ?
                 WHERE case_id = ? AND status IN (
                   'waiting_configuration','waiting_dispatch','paused','queued','retry_wait'
                 )
                   AND remote_rule_id = ''
                 """,
-                (timestamp, case_id),
+                (timestamp, timestamp, case_id),
             ).rowcount
             if _commit:
                 self.conn.commit()

@@ -52,6 +52,7 @@
             <button id="automation-nav-parent" class="nav-button nav-parent" type="button" data-view="automation" data-secondary-group="automation" data-default-secondary="tasks"><span data-i18n="navAutomation">自动化处置</span></button>
             <div id="automation-submenu" class="nav-submenu" role="group" data-i18n-aria-label="automationSecondaryNav">
               <button id="automation-tab-tasks" class="nav-subbutton active" type="button" data-view="automation" data-secondary-group="automation" data-secondary-target="tasks" aria-controls="automation-tasks-panel" data-i18n="automationSubTasks">执行任务</button>
+              <button id="automation-tab-playbooks" class="nav-subbutton" type="button" data-view="automation" data-secondary-group="automation" data-secondary-target="playbooks" aria-controls="automation-playbooks-panel" data-i18n="automationSubPlaybooks">Playbook</button>
               <button id="automation-tab-connectors" class="nav-subbutton" type="button" data-view="automation" data-secondary-group="automation" data-secondary-target="connectors" aria-controls="automation-connectors-panel" data-i18n="automationSubConnectors">连接器</button>
               <button id="automation-tab-policy" class="nav-subbutton" type="button" data-view="automation" data-secondary-group="automation" data-secondary-target="policy" aria-controls="automation-policy-panel" data-i18n="automationSubPolicy">处置策略</button>
             </div>
@@ -411,7 +412,9 @@
             <div id="automation-tasks-panel" class="secondary-view active" aria-labelledby="automation-tab-tasks" data-secondary-panel="automation" data-secondary-name="tasks">
               <section class="stats automation-kpis">
                 <div><span id="automation-total">0</span><label data-i18n="automationTotal">任务总量</label></div>
-                <div><span id="automation-active">0</span><label data-i18n="automationActive">处理中</label></div>
+                <div><span id="automation-unassigned">0</span><label data-i18n="automationUnassigned">未认领</label></div>
+                <div><span id="automation-sla-breached">0</span><label data-i18n="automationSlaBreached">SLA 违约</label></div>
+                <div><span id="automation-sla-risk">0</span><label data-i18n="automationSlaRisk">即将超时</label></div>
                 <div><span id="automation-verified">0</span><label data-i18n="automationVerified">已生效</label></div>
                 <div><span id="automation-failed">0</span><label data-i18n="automationFailed">执行异常</label></div>
               </section>
@@ -422,10 +425,39 @@
                 </div>
                 <form id="automation-task-filter" class="automation-filter-form">
                   <label><span data-i18n="automationStatus">任务状态</span><select id="automation-status-filter"><option value="" data-i18n="caseSearchAll">全部</option><option value="waiting_configuration" data-i18n="responseWaitingConfiguration">待配置</option><option value="waiting_dispatch" data-i18n="responseWaitingDispatch">待调度</option><option value="paused" data-i18n="responsePaused">已暂停</option><option value="queued" data-i18n="responseQueued">已入队</option><option value="verified" data-i18n="responseVerified">已生效</option><option value="shadowed" data-i18n="responseShadowed">影子执行</option><option value="failed" data-i18n="responseFailed">执行失败</option><option value="rolled_back" data-i18n="responseRolledBack">已回滚</option><option value="rollback_failed" data-i18n="responseRollbackFailed">回滚失败</option></select></label>
+                  <label><span data-i18n="automationPriority">优先级</span><select id="automation-priority-filter"><option value="" data-i18n="caseSearchAll">全部</option><option value="critical" data-i18n="priorityCritical">紧急</option><option value="high" data-i18n="priorityHigh">高</option><option value="medium" data-i18n="priorityMedium">中</option><option value="low" data-i18n="priorityLow">低</option></select></label>
+                  <label><span data-i18n="automationAssignee">负责人</span><input id="automation-assignee-filter" type="text" maxlength="100" /></label>
+                  <label><span data-i18n="automationSlaState">SLA 状态</span><select id="automation-sla-filter"><option value="" data-i18n="caseSearchAll">全部</option><option value="breached" data-i18n="slaBreached">已违约</option><option value="at_risk" data-i18n="slaAtRisk">即将超时</option><option value="unassigned" data-i18n="automationUnassigned">未认领</option></select></label>
                   <button type="submit" data-i18n="applyFilter">应用筛选</button>
                 </form>
                 <div id="automation-task-list" class="automation-task-list"></div>
                 <div id="automation-pagination" class="list-pagination-slot"></div>
+              </section>
+            </div>
+            <div id="automation-playbooks-panel" class="secondary-view" aria-labelledby="automation-tab-playbooks" data-secondary-panel="automation" data-secondary-name="playbooks" hidden>
+              <section class="automation-playbook-grid">
+                <section class="panel automation-playbook-form-panel">
+                  <div class="panel-heading"><div><h2 data-i18n="playbookRegistry">Playbook 注册</h2><p data-i18n="playbookRegistryHint">每次修改生成不可变版本；只有已发布版本可以绑定新任务。</p></div></div>
+                  <form id="automation-playbook-form" class="settings-form automation-form">
+                    <input id="response-playbook-id" type="hidden" />
+                    <label class="automation-field-wide"><span data-i18n="playbookName">名称</span><input id="response-playbook-name" type="text" maxlength="100" required /></label>
+                    <label><span data-i18n="playbookOwner">运营 Owner</span><input id="response-playbook-owner" type="text" maxlength="100" required /></label>
+                    <label><span data-i18n="playbookProducts">适用产品</span><input id="response-playbook-products" type="text" value="*" placeholder="waf, rasp" required /></label>
+                    <label><span data-i18n="playbookRiskTier">风险等级</span><select id="response-playbook-risk"><option value="critical" data-i18n="priorityCritical">紧急</option><option value="high" selected data-i18n="priorityHigh">高</option><option value="medium" data-i18n="priorityMedium">中</option><option value="low" data-i18n="priorityLow">低</option></select></label>
+                    <label><span data-i18n="playbookSlaMinutes">SLA（分钟）</span><input id="response-playbook-sla" type="number" min="5" max="10080" value="30" required /></label>
+                    <label class="automation-field-wide"><span data-i18n="playbookDescription">说明</span><textarea id="response-playbook-description" rows="4" maxlength="1000"></textarea></label>
+                    <div class="form-actions"><button type="submit" data-playbook-save="draft" data-i18n="saveDraft">保存草稿</button><button type="submit" data-playbook-save="publish" data-i18n="saveAndPublish">保存并发布</button><button id="response-playbook-reset" type="button" data-i18n="playbookResetForm">重置表单</button></div>
+                    <p id="automation-playbook-status" class="form-status" aria-live="polite"></p>
+                  </form>
+                </section>
+                <section class="panel automation-playbook-list-panel">
+                  <div class="panel-heading"><div><h2 data-i18n="playbookVersions">版本清单</h2><p data-i18n="playbookVersionsHint">查看当前版本、发布状态、风险和 SLA。</p></div></div>
+                  <div id="automation-playbook-list" class="automation-playbook-list"></div>
+                </section>
+                <section class="panel automation-shadow-panel">
+                  <div class="panel-heading"><div><h2 data-i18n="shadowEvaluation">影子评估</h2><p data-i18n="shadowEvaluationHint">将系统建议与分析人员决策对照，作为模式升级依据。</p></div><button id="automation-shadow-refresh" type="button" data-i18n="refresh">刷新</button></div>
+                  <div id="automation-shadow-list" class="automation-shadow-list"></div>
+                </section>
               </section>
             </div>
             <div id="automation-connectors-panel" class="secondary-view" aria-labelledby="automation-tab-connectors" data-secondary-panel="automation" data-secondary-name="connectors" hidden>

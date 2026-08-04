@@ -240,6 +240,7 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
             "adapter-tab-intake": ("adapter", "intake", "adapter-intake-panel", "adapter-submenu"),
             "adapter-tab-config": ("adapter", "config", "adapter-config-panel", "adapter-submenu"),
             "automation-tab-tasks": ("automation", "tasks", "automation-tasks-panel", "automation-submenu"),
+            "automation-tab-playbooks": ("automation", "playbooks", "automation-playbooks-panel", "automation-submenu"),
             "automation-tab-connectors": ("automation", "connectors", "automation-connectors-panel", "automation-submenu"),
             "automation-tab-policy": ("automation", "policy", "automation-policy-panel", "automation-submenu"),
         }
@@ -268,6 +269,7 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertNotIn("hidden", self.elements["adapter-intake-panel"]["attrs"])
         self.assertIn("hidden", self.elements["adapter-config-panel"]["attrs"])
         self.assertNotIn("hidden", self.elements["automation-tasks-panel"]["attrs"])
+        self.assertIn("hidden", self.elements["automation-playbooks-panel"]["attrs"])
         self.assertIn("hidden", self.elements["automation-connectors-panel"]["attrs"])
         self.assertIn("hidden", self.elements["automation-policy-panel"]["attrs"])
         self.assertNotIn('class="secondary-nav"', HTML)
@@ -285,6 +287,9 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
             "infer-form": "adapter-config-panel",
             "dry-run-form": "adapter-config-panel",
             "automation-task-list": "automation-tasks-panel",
+            "automation-playbook-form": "automation-playbooks-panel",
+            "automation-playbook-list": "automation-playbooks-panel",
+            "automation-shadow-list": "automation-playbooks-panel",
             "automation-connector-form": "automation-connectors-panel",
             "automation-policy-form": "automation-policy-panel",
         }
@@ -305,6 +310,7 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
             "adapterSubConfig",
             "automationSecondaryNav",
             "automationSubTasks",
+            "automationSubPlaybooks",
             "automationSubConnectors",
             "automationSubPolicy",
         ):
@@ -391,9 +397,41 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertIn("function connectorHealthLabel(status)", JS)
         self.assertIn("function responseActionLabel(actionType)", JS)
         self.assertIn('{ "network.block_ip": "responseActionBlockSourceIp" }', JS)
-        self.assertIn("grid-template-columns: minmax(220px, 280px) max-content;", CSS)
+        self.assertIn("grid-template-columns: repeat(4, minmax(150px, 1fr)) max-content;", CSS)
         self.assertIn(".automation-filter-form > button {\n  align-self: end;", CSS)
         self.assertIn("height: 38px;\n  min-height: 38px;", CSS)
+
+    def test_response_p0_operations_playbook_and_shadow_contract(self):
+        for field_id in (
+            "automation-priority-filter",
+            "automation-assignee-filter",
+            "automation-sla-filter",
+            "response-playbook-name",
+            "response-playbook-owner",
+            "response-playbook-products",
+            "response-playbook-risk",
+            "response-playbook-sla",
+        ):
+            with self.subTest(field=field_id):
+                self.assertIn(field_id, self.elements)
+        for function_name in (
+            "saveTaskOperations",
+            "renderResponsePlaybooks",
+            "saveResponsePlaybook",
+            "renderShadowEvaluations",
+            "decideShadowEvaluation",
+            "loadPlaybookWorkspace",
+        ):
+            self.assertIn(f"function {function_name}", JS)
+        self.assertIn('applyPermission("[data-task-operations]", ["responder"])', JS)
+        self.assertIn('applyPermission("[data-playbook-action]", ["config"])', JS)
+        self.assertIn('applyPermission("[data-shadow-decision]", ["analyst", "responder"])', JS)
+        self.assertIn('data-i18n="playbookResetForm"', HTML)
+        self.assertIn('playbookResetForm: "重置表单"', JS)
+        self.assertIn('playbookResetForm: "Reset form"', JS)
+        self.assertIn(".automation-operations-form", CSS)
+        self.assertIn(".automation-playbook-grid", CSS)
+        self.assertIn(".automation-shadow-decision", CSS)
 
     def test_mapping_confirmation_uses_a_full_width_workspace_row(self):
         self.assertIn("mapping-result-panel", self.elements["field-mapping-table"]["ancestors"])
