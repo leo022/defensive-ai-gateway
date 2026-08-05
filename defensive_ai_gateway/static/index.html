@@ -57,7 +57,13 @@
               <button id="automation-tab-policy" class="nav-subbutton" type="button" data-view="automation" data-secondary-group="automation" data-secondary-target="policy" aria-controls="automation-policy-panel" data-i18n="automationSubPolicy">处置策略</button>
             </div>
           </div>
-          <button class="nav-button" type="button" data-view="settings" data-i18n="navSettings">运行配置</button>
+          <div id="settings-nav-group" class="nav-group" data-view-group="settings">
+            <button id="settings-nav-parent" class="nav-button nav-parent" type="button" data-view="settings" data-secondary-group="settings" data-default-secondary="model"><span data-i18n="navSettings">运行配置</span></button>
+            <div id="settings-submenu" class="nav-submenu" role="group" data-i18n-aria-label="settingsSecondaryNav">
+              <button id="settings-tab-model" class="nav-subbutton active" type="button" data-view="settings" data-secondary-group="settings" data-secondary-target="model" aria-controls="settings-model-panel" data-i18n="settingsSubModel">模型服务</button>
+              <button id="settings-tab-harness" class="nav-subbutton" type="button" data-view="settings" data-secondary-group="settings" data-secondary-target="harness" aria-controls="settings-harness-panel" data-i18n="settingsSubHarness">Agent Harness</button>
+            </div>
+          </div>
         </nav>
         <div class="sidebar-footer">
           <button id="auth-session" class="utility-button" type="button" data-i18n="authSession" hidden>API 认证</button>
@@ -498,6 +504,7 @@
             </div>
           </section>
           <section id="settings-view" class="view">
+            <div id="settings-model-panel" class="secondary-view active" aria-labelledby="settings-tab-model" data-secondary-panel="settings" data-secondary-name="model">
             <section class="panel settings-panel">
               <div class="panel-heading">
                 <div>
@@ -548,6 +555,70 @@
             <p id="llm-config-status" class="form-status"></p>
           </form>
             </section>
+            </div>
+            <div id="settings-harness-panel" class="secondary-view" aria-labelledby="settings-tab-harness" data-secondary-panel="settings" data-secondary-name="harness" hidden>
+              <section class="panel harness-control-panel">
+                <div class="panel-heading harness-control-heading">
+                  <div>
+                    <h2 data-i18n="harnessTitle">Agent Harness</h2>
+                    <p data-i18n="harnessHint">版本化调查边界与审批策略</p>
+                  </div>
+                  <div id="harness-active-summary" class="harness-active-summary" aria-live="polite"></div>
+                </div>
+                <form id="harness-profile-form" class="harness-profile-form">
+                  <section class="harness-form-section" aria-labelledby="harness-profile-heading">
+                    <h3 id="harness-profile-heading" data-i18n="harnessProfile">配置档案</h3>
+                    <div class="harness-field-grid harness-field-grid-profile">
+                      <label><span data-i18n="harnessProfileName">名称</span><input id="harness-profile-name" type="text" minlength="2" maxlength="100" required /></label>
+                      <label class="harness-field-wide"><span data-i18n="harnessProfileDescription">变更说明</span><textarea id="harness-profile-description" rows="2" maxlength="1000"></textarea></label>
+                    </div>
+                  </section>
+                  <section class="harness-form-section" aria-labelledby="harness-budget-heading">
+                    <h3 id="harness-budget-heading" data-i18n="harnessBudget">调查预算</h3>
+                    <div class="harness-field-grid">
+                      <label><span data-i18n="harnessMaxTurns">最大轮次</span><input id="harness-max-turns" data-harness-field="max_turns" type="number" required /></label>
+                      <label><span data-i18n="harnessMaxToolCalls">工具调用上限</span><input id="harness-max-tool-calls" data-harness-field="max_tool_calls" type="number" required /></label>
+                      <label><span data-i18n="harnessMaxWallSeconds">运行时限（秒）</span><input id="harness-max-wall-seconds" data-harness-field="max_wall_seconds" type="number" required /></label>
+                      <label><span data-i18n="harnessToolResultBytes">单次工具结果（字节）</span><input id="harness-tool-result-bytes" data-harness-field="tool_result_max_bytes" type="number" required /></label>
+                      <label><span data-i18n="harnessRawChunkBytes">原始证据分块（字节）</span><input id="harness-raw-chunk-bytes" data-harness-field="raw_chunk_max_bytes" type="number" required /></label>
+                    </div>
+                  </section>
+                  <section class="harness-form-section" aria-labelledby="harness-correlation-heading">
+                    <h3 id="harness-correlation-heading" data-i18n="harnessCorrelation">关联边界</h3>
+                    <div class="harness-field-grid">
+                      <label><span data-i18n="harnessCorrelationWindow">关联窗口（分钟）</span><input id="harness-correlation-window" data-harness-field="correlation_window_minutes" type="number" required /></label>
+                      <label><span data-i18n="harnessScanLimit">候选扫描上限</span><input id="harness-scan-limit" data-harness-field="correlation_scan_limit" type="number" required /></label>
+                      <label><span data-i18n="harnessScanBytes">扫描字节上限</span><input id="harness-scan-bytes" data-harness-field="correlation_scan_max_bytes" type="number" required /></label>
+                    </div>
+                  </section>
+                  <section class="harness-form-section" aria-labelledby="harness-approval-heading">
+                    <h3 id="harness-approval-heading" data-i18n="harnessApproval">审批策略</h3>
+                    <div class="harness-field-grid">
+                      <label><span data-i18n="harnessApprovalQuorum">新审批单法定人数</span><input id="harness-approval-quorum" type="number" required /></label>
+                    </div>
+                  </section>
+                  <div class="form-actions">
+                    <button type="submit" data-i18n="harnessSaveDraft">保存新草稿</button>
+                    <button id="harness-reset-active" type="button" data-i18n="harnessResetActive">恢复生效值</button>
+                  </div>
+                  <p id="harness-profile-status" class="form-status" aria-live="polite"></p>
+                </form>
+              </section>
+              <section class="harness-governance-layout">
+                <section class="panel harness-controls-panel">
+                  <div class="panel-heading"><div><h2 data-i18n="harnessLockedControls">强制控制</h2></div></div>
+                  <div id="harness-fixed-controls" class="harness-fixed-controls"></div>
+                </section>
+                <section class="panel harness-tools-panel">
+                  <div class="panel-heading"><div><h2 data-i18n="harnessTools">工具契约</h2></div></div>
+                  <div id="harness-tool-list" class="harness-tool-list"></div>
+                </section>
+              </section>
+              <section class="panel harness-versions-panel">
+                <div class="panel-heading"><div><h2 data-i18n="harnessVersions">配置版本</h2></div><button id="harness-refresh" type="button" data-i18n="refresh">刷新</button></div>
+                <div id="harness-version-list" class="harness-version-list"></div>
+              </section>
+            </div>
           </section>
           <section id="adapter-view" class="view">
             <div id="adapter-intake-panel" class="secondary-view active" aria-labelledby="adapter-tab-intake" data-secondary-panel="adapter" data-secondary-name="intake">

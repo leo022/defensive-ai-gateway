@@ -191,6 +191,8 @@ class ResponseAgentConfig:
     """Bounded investigation loop used by the Case response workbench."""
 
     enabled: bool = True
+    profile_id: str = "deployment-default"
+    profile_version: int = 0
     max_turns: int = 48
     max_tool_calls: int = 40
     max_wall_seconds: int = 900

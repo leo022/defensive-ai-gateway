@@ -22,6 +22,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from .config import GatewayConfig, LLMConfig, load_config
 from .case_response import CaseResponseService
 from .database import AlertIdentityConflict, PROVISIONAL_CASE_STATUSES, Repository
+from .harness_control import AgentHarnessControlService
 from .json_safety import loads_bounded_json
 from .log_adapter import (
     AUTO_PROFILE,
@@ -692,6 +693,28 @@ class GatewayState:
         )
         self._syslog_deployment = {"collector_address": "", "source_cidrs": []}
         self._restore_runtime_settings()
+        approval_actors = {"api-admin"}
+        if str(config.auth.approver_token or "").strip():
+            approval_actors.add("soc-approver")
+        approval_actors.update(
+            str(principal.actor or "").strip()
+            for principal in config.auth.principals
+            if str(principal.actor or "").strip()
+            and _ROLE_APPROVER
+            in {str(role).strip().lower() for role in principal.roles}
+        )
+        # The deployment config is the safety floor. A published UI profile may
+        # raise the quorum when more approver identities exist, but never lower it.
+        minimum_quorum = max(1, int(config.policy.approval_quorum))
+        self.agent_harness = AgentHarnessControlService(
+            self.repo,
+            config,
+            minimum_approval_quorum=minimum_quorum,
+            maximum_approval_quorum=max(
+                minimum_quorum, min(5, len(approval_actors))
+            ),
+        )
+        self.agent_harness.apply(self.agent_harness.ensure_active())
         self.policy = PolicyEngine(config.policy)
         self.case_response = CaseResponseService(self.repo, self.policy)
         self.normalizer = EventNormalizer(self.policy)
@@ -1621,6 +1644,22 @@ class GatewayState:
                 "timeout_seconds": llm.timeout_seconds,
                 "runtime": runtime,
             }
+
+    def agent_harness_payload(self) -> dict:
+        with self.lock:
+            return self.agent_harness.payload()
+
+    def save_agent_harness_profile(self, payload: dict) -> dict:
+        actor = str(payload.get("_actor") or "runtime-operator")
+        with self.lock:
+            profile = self.agent_harness.create_version(payload, actor=actor)
+            return {"profile": profile, **self.agent_harness.payload()}
+
+    def publish_agent_harness_profile(self, version: int, *, actor: str) -> dict:
+        with self.lock:
+            profile = self.agent_harness.publish(int(version), actor=actor)
+            self.agent_harness.apply(profile)
+            return {"profile": profile, **self.agent_harness.payload()}
 
     def update_llm_config(self, payload: dict) -> dict:
         with self.lock:
@@ -3756,6 +3795,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
             endpoint = parse_qs(parsed.query).get("endpoint", [""])[0]
             self._json(200, self.state.list_ollama_models(endpoint))
             return
+        if parsed.path == "/api/config/agent-harness":
+            if not self._require_roles(_ROLE_CONFIG):
+                return
+            self._json(200, self.state.agent_harness_payload())
+            return
         if parsed.path == "/api/config/syslog":
             if not self._require_roles(_ROLE_CONFIG):
                 return
@@ -4337,6 +4381,40 @@ class GatewayHandler(BaseHTTPRequestHandler):
             except _PayloadTooLarge:
                 self._json(413, {"error": "request body too large"})
             except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                self._client_error(exc)
+            except Exception as exc:
+                self._server_error(exc)
+            return
+        if parsed.path == "/api/config/agent-harness":
+            try:
+                saved = self.state.save_agent_harness_profile(
+                    self._governance_body(
+                        self._read_json(), actor_field="_actor"
+                    )
+                )
+                self._json(201, {"ok": True, **saved})
+            except _PayloadTooLarge:
+                self._json(413, {"error": "request body too large"})
+            except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                self._client_error(exc)
+            except Exception as exc:
+                self._server_error(exc)
+            return
+        if (
+            parsed.path.startswith("/api/config/agent-harness/")
+            and parsed.path.endswith("/publish")
+        ):
+            parts = parsed.path.strip("/").split("/")
+            try:
+                if len(parts) != 5 or parts[2] != "agent-harness":
+                    raise ValueError("invalid agent harness publish path")
+                published = self.state.publish_agent_harness_profile(
+                    int(parts[3]), actor=self._authenticated_actor()
+                )
+                self._json(200, {"ok": True, **published})
+            except KeyError:
+                self._json(404, {"error": "agent harness profile not found"})
+            except (ValueError, TypeError) as exc:
                 self._client_error(exc)
             except Exception as exc:
                 self._server_error(exc)

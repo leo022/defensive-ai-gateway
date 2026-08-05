@@ -1,4 +1,9 @@
-# Harness 回放说明
+# 离线 Harness 回放说明
+
+本文所述 Harness 是发布前的离线样例回放器，不是 Dashboard 中的运行时
+Agent Harness 配置页。两者职责不同：离线 Harness 负责回归评测，运行时
+Agent Harness 负责版本化调查预算与审批边界。运行时配置详见
+`docs/RESPONSE_AGENT.md` 的“配置与运维”，且不会开放任意工具或直接生产执行。
 
 `scripts/run_harness.py` 用于在不启动 HTTP 服务的情况下，把 `samples/*.json` 全量回放一遍，验证归一化、agent 路由、LLM 适配、记忆写入和结构化输出是否仍可工作。
 

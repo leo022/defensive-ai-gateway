@@ -2027,6 +2027,199 @@ h4 {
   opacity: 1;
 }
 
+.harness-control-panel,
+.harness-versions-panel,
+.harness-controls-panel,
+.harness-tools-panel {
+  overflow: hidden;
+}
+
+.harness-control-heading {
+  align-items: center;
+}
+
+.harness-active-summary {
+  display: grid;
+  justify-items: end;
+  gap: 3px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.harness-active-summary strong {
+  color: var(--ink-strong);
+  font-size: 13px;
+}
+
+.harness-profile-form {
+  padding: 0 16px 16px;
+}
+
+.harness-form-section {
+  padding: 16px 0;
+  border-top: 1px solid var(--line);
+}
+
+.harness-form-section:first-child {
+  border-top: 0;
+}
+
+.harness-form-section h3 {
+  margin: 0 0 12px;
+  color: var(--ink-strong);
+  font-size: 13px;
+  font-weight: 760;
+  letter-spacing: 0;
+}
+
+.harness-field-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.harness-field-grid-profile {
+  grid-template-columns: minmax(220px, 0.8fr) minmax(320px, 2fr);
+}
+
+.harness-field-grid label {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+}
+
+.harness-field-grid label > span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.harness-field-grid input,
+.harness-field-grid textarea {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink);
+  padding: 9px 10px;
+}
+
+.harness-field-grid textarea {
+  min-height: 72px;
+  resize: vertical;
+  font-family: inherit;
+}
+
+.harness-governance-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr);
+  gap: 12px;
+}
+
+.harness-governance-layout > .panel {
+  margin-top: 12px;
+}
+
+.harness-fixed-controls,
+.harness-tool-list,
+.harness-version-list {
+  display: grid;
+  gap: 8px;
+  padding: 14px 16px 16px;
+}
+
+.harness-tool-list {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.harness-control-item,
+.harness-tool-item,
+.harness-version-item {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-2);
+}
+
+.harness-control-item,
+.harness-tool-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 11px;
+}
+
+.harness-control-item strong,
+.harness-tool-item code {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--ink);
+  font-size: 12px;
+  letter-spacing: 0;
+}
+
+.harness-control-item span,
+.harness-tool-item span,
+.harness-version-item small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.harness-version-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+}
+
+.harness-version-main {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.harness-version-main > div,
+.harness-version-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.harness-version-main p {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.harness-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px 8px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 720;
+}
+
+.harness-status.active {
+  border-color: var(--success-line);
+  background: var(--success-bg);
+  color: var(--success);
+}
+
+.harness-status.draft {
+  border-color: var(--brand-line);
+  background: var(--brand-bg);
+  color: var(--brand-strong);
+}
+
 .model-picker {
   display: flex;
   gap: 8px;
@@ -5563,8 +5756,13 @@ body.response-agent-open {
   }
 
   .automation-config-grid,
-  .automation-playbook-grid {
+  .automation-playbook-grid,
+  .harness-governance-layout {
     grid-template-columns: 1fr;
+  }
+
+  .harness-field-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .memory-kpis {
@@ -5596,6 +5794,27 @@ body.response-agent-open {
   .workspace-header {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .harness-control-heading {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .harness-active-summary {
+    justify-items: start;
+  }
+
+  .harness-field-grid,
+  .harness-field-grid-profile,
+  .harness-tool-list,
+  .harness-version-item {
+    grid-template-columns: 1fr;
+  }
+
+  .harness-version-actions button,
+  .harness-profile-form .form-actions button {
+    width: 100%;
   }
 
   .dashboard-hero {

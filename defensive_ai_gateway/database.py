@@ -636,6 +636,21 @@ CREATE TABLE IF NOT EXISTS response_agent_report_refs (
   PRIMARY KEY (report_id, claim_id, ref_type, ref_id, source_event_id),
   FOREIGN KEY (report_id) REFERENCES response_agent_reports(report_id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS agent_harness_profiles (
+  profile_id TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  schema_version TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'draft',
+  settings_json TEXT NOT NULL DEFAULT '{}',
+  created_by TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  published_by TEXT NOT NULL DEFAULT '',
+  published_at_ms INTEGER,
+  PRIMARY KEY (profile_id, version),
+  CHECK (status IN ('draft','active','retired'))
+);
 CREATE TABLE IF NOT EXISTS alert_dispositions (
   alert_id TEXT PRIMARY KEY,
   case_id TEXT NOT NULL,
@@ -717,6 +732,10 @@ CREATE INDEX IF NOT EXISTS idx_response_tasks_created_id
   ON response_tasks(created_at_ms DESC, task_id);
 CREATE INDEX IF NOT EXISTS idx_response_playbooks_status
   ON response_playbooks(status, action_type, created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_harness_profiles_status
+  ON agent_harness_profiles(status, published_at_ms DESC, version DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_harness_profiles_one_active
+  ON agent_harness_profiles(profile_id) WHERE status = 'active';
 CREATE INDEX IF NOT EXISTS idx_response_shadow_status
   ON response_shadow_evaluations(status, created_at_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_response_attempts_task ON response_attempts(task_id, created_at_ms ASC);
@@ -781,7 +800,7 @@ BEGIN
 END;
 """
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 _LLM_DEFERRED_ERROR_PREFIX = "analysis_deferred:"
 _LEGACY_LLM_DEFERRED_ERROR_FRAGMENT = "remote LLM analysis deferred"
 _TERMINAL_LLM_ERROR_FRAGMENTS = (
@@ -1743,6 +1762,35 @@ class Repository:
                 )
                 self.conn.execute(
                     "INSERT OR REPLACE INTO schema_version(version, applied_at_ms) VALUES (20, ?)",
+                    (now_ms(),),
+                )
+
+            if current < 21:
+                harness_table = self.conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'agent_harness_profiles'"
+                ).fetchone()
+                if not harness_table:
+                    raise RuntimeError("schema v21 agent_harness_profiles table is missing")
+                harness_columns = {
+                    row["name"]
+                    for row in self.conn.execute(
+                        "PRAGMA table_info(agent_harness_profiles)"
+                    ).fetchall()
+                }
+                required = {
+                    "profile_id",
+                    "version",
+                    "schema_version",
+                    "status",
+                    "settings_json",
+                    "created_by",
+                    "published_by",
+                }
+                if not required.issubset(harness_columns):
+                    raise RuntimeError("schema v21 agent harness profile is incomplete")
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO schema_version(version, applied_at_ms) VALUES (21, ?)",
                     (now_ms(),),
                 )
 
@@ -2896,6 +2944,133 @@ class Repository:
             if _commit:
                 self.conn.commit()
             return self.get_response_playbook(playbook_id, int(version))
+
+    @staticmethod
+    def _agent_harness_profile_row(row: sqlite3.Row) -> dict[str, Any]:
+        payload = dict(row)
+        payload["settings"] = json.loads(payload.pop("settings_json") or "{}")
+        return payload
+
+    def list_agent_harness_profiles(
+        self, profile_id: str | None = None, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            safe_limit = max(1, min(int(limit), 500))
+            if profile_id is None:
+                rows = self.conn.execute(
+                    "SELECT * FROM agent_harness_profiles "
+                    "ORDER BY profile_id ASC, version DESC, created_at_ms DESC "
+                    "LIMIT ?",
+                    (safe_limit,),
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    "SELECT * FROM agent_harness_profiles WHERE profile_id = ? "
+                    "ORDER BY version DESC, created_at_ms DESC LIMIT ?",
+                    (str(profile_id), safe_limit),
+                ).fetchall()
+            return [self._agent_harness_profile_row(row) for row in rows]
+
+    def get_agent_harness_profile(
+        self, profile_id: str, version: int
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM agent_harness_profiles "
+                "WHERE profile_id = ? AND version = ?",
+                (str(profile_id), int(version)),
+            ).fetchone()
+            return self._agent_harness_profile_row(row) if row else None
+
+    def active_agent_harness_profile(
+        self, profile_id: str | None = None
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            if profile_id is None:
+                row = self.conn.execute(
+                    "SELECT * FROM agent_harness_profiles WHERE status = 'active' "
+                    "ORDER BY published_at_ms DESC, version DESC LIMIT 1"
+                ).fetchone()
+            else:
+                row = self.conn.execute(
+                    "SELECT * FROM agent_harness_profiles "
+                    "WHERE profile_id = ? AND status = 'active' "
+                    "ORDER BY published_at_ms DESC, version DESC LIMIT 1",
+                    (str(profile_id),),
+                ).fetchone()
+            return self._agent_harness_profile_row(row) if row else None
+
+    def create_agent_harness_profile_version(
+        self, profile: dict[str, Any], *, actor: str, _commit: bool = True
+    ) -> dict[str, Any]:
+        with self._lock:
+            profile_id = str(profile["profile_id"])
+            row = self.conn.execute(
+                "SELECT COALESCE(MAX(version), 0) AS version "
+                "FROM agent_harness_profiles WHERE profile_id = ?",
+                (profile_id,),
+            ).fetchone()
+            version = int(row["version"] or 0) + 1
+            timestamp = now_ms()
+            self.conn.execute(
+                """
+                INSERT INTO agent_harness_profiles(
+                  profile_id, version, name, description, schema_version,
+                  status, settings_json, created_by, created_at_ms
+                ) VALUES (?, ?, ?, ?, ?, 'draft', ?, ?, ?)
+                """,
+                (
+                    profile_id,
+                    version,
+                    str(profile["name"]),
+                    str(profile.get("description") or ""),
+                    str(profile["schema_version"]),
+                    json.dumps(
+                        profile["settings"], ensure_ascii=False, sort_keys=True
+                    ),
+                    str(actor),
+                    timestamp,
+                ),
+            )
+            if _commit:
+                self.conn.commit()
+            return self.get_agent_harness_profile(profile_id, version) or {}
+
+    def publish_agent_harness_profile(
+        self,
+        profile_id: str,
+        version: int,
+        *,
+        actor: str,
+        _commit: bool = True,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            target = self.conn.execute(
+                "SELECT status FROM agent_harness_profiles "
+                "WHERE profile_id = ? AND version = ?",
+                (str(profile_id), int(version)),
+            ).fetchone()
+            if not target:
+                return None
+            if str(target["status"]) != "draft":
+                raise ValueError("only a draft agent harness profile can be published")
+            timestamp = now_ms()
+            self.conn.execute(
+                "UPDATE agent_harness_profiles SET status = 'retired' "
+                "WHERE profile_id = ? AND status = 'active'",
+                (str(profile_id),),
+            )
+            self.conn.execute(
+                """
+                UPDATE agent_harness_profiles
+                SET status = 'active', published_by = ?, published_at_ms = ?
+                WHERE profile_id = ? AND version = ?
+                """,
+                (str(actor), timestamp, str(profile_id), int(version)),
+            )
+            if _commit:
+                self.conn.commit()
+            return self.get_agent_harness_profile(str(profile_id), int(version))
 
     @staticmethod
     def _shadow_evaluation_row(row: sqlite3.Row) -> dict[str, Any]:

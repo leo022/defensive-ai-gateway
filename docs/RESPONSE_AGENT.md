@@ -381,6 +381,21 @@ DEFENSIVE_AI_RESPONSE_AGENT_CORRELATION_SCAN_MAX_BYTES
 DEFENSIVE_AI_RESPONSE_AGENT_RAW_CHUNK_MAX_BYTES
 ```
 
+Dashboard 的“运行配置 -> Agent Harness”提供同一组调查预算的人工配置，并纳入
+版本治理：配置角色先保存不可变草稿，再显式发布；每次创建与发布都会写入审计日志，
+进程重启后恢复最近的生效版本。配置文件和环境变量仍是部署默认值，
+`approval_quorum` 同时作为页面不可降低的审批安全下限。
+
+页面可调整最大轮次、工具调用数、墙钟时限、单次工具结果、关联窗口、候选与字节扫描
+上限、原始证据分块，以及新审批单法定人数。所有值均有服务端边界。已开始的调查会话
+持有完整预算和 Harness 版本快照，已创建的审批单也保留原法定
+人数；发布新版本只影响之后创建的会话与审批单。
+
+以下控制不属于可配置项：Case scope 由控制器注入、工具仅限控制器作用域内的只读查询、
+源证据快照不可变、结论必须绑定证据引用、提示注入进入人工复核、敏感输出确定性阻断，
+以及调查 Agent 不直接执行生产动作。后续引入 Tool/Skill Registry 时必须继续沿用这些
+锁定边界，页面不能成为扩大模型权限的旁路。
+
 部署升级必须先做 SQLite 在线备份并执行 `PRAGMA quick_check`。进程启动时会将遗留的 `running/synthesizing/validating` 会话恢复为 `queued`；人工暂停和等待输入状态保持不变。
 
 Agent worker 纳入 `/api/ready` 依赖检查；功能开启但 worker 异常退出时，服务进入 `not_ready`，避免入口健康但调查任务无人消费。
@@ -389,7 +404,7 @@ Agent worker 纳入 `/api/ready` 依赖检查；功能开启但 worker 异常退
 
 ### 第二阶段：可配置外部只读 Skill
 
-- 引入版本化 Tool/Skill Registry，而不是直接增加自由工具。
+- 在现有版本化 Agent Harness 控制面上引入 Tool/Skill Registry，而不是直接增加自由工具。
 - 把第一阶段 v2 的本地 SQLite DSL 作为权限与审计基线。
 - 增加受控 CMDB、EDR 查询、SIEM 检索、对象存储归档和威胁情报只读适配器。
 - 每个工具声明数据等级、Case scope、网络 allowlist、超时、结果上限和审计字段。

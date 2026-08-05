@@ -13,7 +13,7 @@
 - 运行时：Python 3.11+，仅标准库。
 - API：内置 HTTP server，接收产品告警。
 - 数据库：SQLite。
-- Dashboard：静态 HTML/CSS/JS，支持 Case 展开、日志适配 Profile 配置与 dry-run、LLM 配置、浅色/深色模式与误报确认写入记忆。
+- Dashboard：静态 HTML/CSS/JS，支持 Case 展开、日志适配 Profile 配置与 dry-run、LLM 配置、版本化 Agent Harness 调查边界、浅色/深色模式与误报确认写入记忆。
 - LLM：默认本地规则分析器，保留企业 LLM Gateway HTTP 适配器。
 - Demo LLM：外网开发可使用本地 Ollama `gemma3:4b` 或同等 4B 级别模型验证提示词、结构化输出和 agent 编排。
 - 安全动作：默认只读；明确的来源 IP 临时封禁可在 Validator、审批、全局开关、保护网段和连接器健康检查全部通过后进入受控处置，其他动作只生成审批建议。
@@ -31,6 +31,7 @@
 - 引入向量库和图谱，用于记忆和实体关系。
 - 接入 SOAR/工单系统，但保持高影响动作人工审批。
 - 建立 Harness 回放集，作为 prompt、skill、模型和工具权限变更门禁。
+- 在运行时 Agent Harness 的不可变版本与审计基线上扩展 Tool/Skill Registry；只读能力先进入影子评估，高影响动作继续复用审批和受控执行链。
 
 ## 3. 核心模块
 
@@ -41,6 +42,7 @@
 - `agents/`：HIPS、RASP、NDR、WAF、SIEM 专属 Agent。
 - `policy.py`：脱敏、只读策略、动作审批判定。
 - `response_automation.py`：审批后持久化处置任务、连接器调用、设备核验、有限重试与补偿回滚。
+- `harness_control.py`：版本化运行时调查预算与审批边界；锁定 Case scope、只读工具、证据门禁和禁止直接生产执行等安全控制。
 - `memory.py`：多层记忆管理（短期 Case / 产品长期 / 资产画像 / 组织知识 + 不可改证据库），含晋升五门禁与去毒/过期/冲突治理，详见 `docs/MEMORY.md`。
 - `llm.py`：本地分析器与企业 LLM Gateway 适配器。
 - `database.py`：SQLite schema 与仓储。

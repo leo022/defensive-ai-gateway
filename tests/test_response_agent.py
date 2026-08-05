@@ -3824,6 +3824,8 @@ class ResponseAgentTest(unittest.TestCase):
     def test_report_contract_retry_stops_at_wall_budget(self):
         llm = _BlockingAgentLLM("report", contract_error=True)
         self.state.response_agent.set_llm(llm)
+        original_budget = self.state.response_agent.config.max_wall_seconds
+        self.state.response_agent.config.max_wall_seconds = 1
         case_id = self._case("response-agent-report-contract-wall-budget")
         artifact = self.state.case_response.generate(
             case_id, actor="analyst"
@@ -3835,9 +3837,10 @@ class ResponseAgentTest(unittest.TestCase):
             actor="analyst",
         )
         self.assertTrue(llm.entered.wait(timeout=3))
-        original_budget = self.state.response_agent.config.max_wall_seconds
-        self.state.response_agent.config.max_wall_seconds = 0
         try:
+            # The runtime limit is frozen into the session at creation. Wait for
+            # that immutable budget instead of mutating live config mid-session.
+            time.sleep(1.05)
             llm.release.set()
             self.assertTrue(llm.returned.wait(timeout=2))
             exhausted = self._wait(
@@ -3895,7 +3898,7 @@ class ResponseAgentTest(unittest.TestCase):
         )
 
     def test_schema_and_static_workbench_contract(self):
-        self.assertEqual(SCHEMA_VERSION, 20)
+        self.assertEqual(SCHEMA_VERSION, 21)
         tables = {
             row["name"]
             for row in self.state.repo.conn.execute(

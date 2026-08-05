@@ -929,6 +929,18 @@ class ResponseInvestigationAgent:
         self._wakeup = threading.Event()
         self._thread: threading.Thread | None = None
 
+    def _budget_value(
+        self, budget_or_session: dict[str, Any] | None, key: str
+    ) -> int:
+        payload = budget_or_session or {}
+        budget = (
+            payload.get("budget")
+            if isinstance(payload.get("budget"), dict)
+            else payload
+        )
+        fallback = int(getattr(self.config, key))
+        return max(1, _integer((budget or {}).get(key), fallback))
+
     def set_llm(self, llm) -> None:  # noqa: ANN001
         with self._llm_lock:
             self._llm = llm
@@ -1018,6 +1030,7 @@ class ResponseInvestigationAgent:
                 "max_turns": self.config.max_turns,
                 "max_tool_calls": self.config.max_tool_calls,
                 "max_wall_seconds": self.config.max_wall_seconds,
+                "tool_result_max_bytes": self.config.tool_result_max_bytes,
                 "correlation_window_minutes": self.config.correlation_window_minutes,
                 "correlation_scan_limit": self.config.correlation_scan_limit,
                 "correlation_scan_max_bytes": self.config.correlation_scan_max_bytes,
@@ -1032,6 +1045,8 @@ class ResponseInvestigationAgent:
             "model_metadata": {
                 **dict(self._current_llm().runtime_metadata),
                 "agent_version": AGENT_VERSION,
+                "harness_profile_id": self.config.profile_id,
+                "harness_profile_version": self.config.profile_version,
                 "controller_tools": list(CONTROLLER_TOOLS),
                 "database_access": "controller_scoped_read_only",
                 "direct_execution": False,
@@ -1287,8 +1302,9 @@ class ResponseInvestigationAgent:
                 time.monotonic() - run_started
             )
             if (
-                int(usage.get("turns") or 0) >= self.config.max_turns
-                or elapsed >= self.config.max_wall_seconds
+                int(usage.get("turns") or 0)
+                >= self._budget_value(current, "max_turns")
+                or elapsed >= self._budget_value(current, "max_wall_seconds")
             ):
                 usage["active_seconds"] = round(elapsed, 3)
                 self.repo.update_response_agent_session(session_id, usage=usage)
@@ -1478,7 +1494,9 @@ class ResponseInvestigationAgent:
 
             tool_name = decision["tool_name"]
             arguments = decision.get("arguments") or {}
-            if int(usage.get("tool_calls") or 0) >= self.config.max_tool_calls:
+            if int(usage.get("tool_calls") or 0) >= self._budget_value(
+                current, "max_tool_calls"
+            ):
                 self._persist_active_seconds(session_id, usage, run_started)
                 exhausted = self.repo.transition_response_agent_session(
                     session_id,
@@ -1642,6 +1660,7 @@ class ResponseInvestigationAgent:
                     arguments,
                     source,
                     artifact,
+                    budget=current.get("budget"),
                 )
             except _ToolRejected as exc:
                 usage["tool_calls"] = int(usage.get("tool_calls") or 0) + 1
@@ -1697,9 +1716,11 @@ class ResponseInvestigationAgent:
                 self.repo.update_response_agent_session(session_id, usage=usage)
                 continue
             tool_rejections = 0
-            result = self._compact_query_tool_result(tool_name, result)
+            result = self._compact_query_tool_result(
+                tool_name, result, budget=current.get("budget")
+            )
             result = self._sanitize_controller_tool_value(
-                result, self.config.tool_result_max_bytes
+                result, self._budget_value(current, "tool_result_max_bytes")
             )
             finished = self.repo.finish_response_agent_tool_call(
                 call["call_id"],
@@ -2406,6 +2427,9 @@ class ResponseInvestigationAgent:
                 "offset": max(0, min(_integer(raw.get("offset"), 0), 100_000)),
             }
         if tool_name == "search_related_alerts":
+            correlation_window = self._budget_value(
+                session, "correlation_window_minutes"
+            )
             products_value = raw.get("products")
             if isinstance(products_value, str):
                 products_value = products_value.split(",")
@@ -2431,15 +2455,18 @@ class ResponseInvestigationAgent:
                     min(
                         _integer(
                             raw.get("window_minutes"),
-                            self.config.correlation_window_minutes,
+                            correlation_window,
                         ),
-                        self.config.correlation_window_minutes,
+                        correlation_window,
                     ),
                 ),
                 "limit": max(1, min(_integer(raw.get("limit"), 20), 20)),
                 "offset": max(0, min(_integer(raw.get("offset"), 0), 100_000)),
             }
         if tool_name == "read_raw_alert_chunk":
+            raw_chunk_max_bytes = self._budget_value(
+                session, "raw_chunk_max_bytes"
+            )
             alert_id = str(raw.get("alert_id") or "").strip()
             if (
                 not alert_id
@@ -2470,9 +2497,9 @@ class ResponseInvestigationAgent:
                     min(
                         _integer(
                             raw.get("max_bytes"),
-                            self.config.raw_chunk_max_bytes,
+                            raw_chunk_max_bytes,
                         ),
-                        self.config.raw_chunk_max_bytes,
+                        raw_chunk_max_bytes,
                     ),
                 ),
             }
@@ -2585,6 +2612,7 @@ class ResponseInvestigationAgent:
     def _forensic_related_inventory(
         self,
         case_id: str,
+        budget: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         items: list[dict[str, Any]] = []
         offset = 0
@@ -2598,9 +2626,15 @@ class ResponseInvestigationAgent:
         ):
             page = self.repo.query_response_agent_related_alerts(
                 case_id,
-                window_ms=self.config.correlation_window_minutes * 60 * 1_000,
-                scan_limit=self.config.correlation_scan_limit,
-                scan_max_bytes=self.config.correlation_scan_max_bytes,
+                window_ms=self._budget_value(
+                    budget, "correlation_window_minutes"
+                )
+                * 60
+                * 1_000,
+                scan_limit=self._budget_value(budget, "correlation_scan_limit"),
+                scan_max_bytes=self._budget_value(
+                    budget, "correlation_scan_max_bytes"
+                ),
                 limit=min(50, FORENSIC_INVENTORY_MAX_ALERTS - len(items)),
                 offset=offset,
             )
@@ -2670,10 +2704,11 @@ class ResponseInvestigationAgent:
     def _build_forensic_coverage(
         self,
         source: dict[str, Any],
+        budget: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         case_id = str(source["case"]["case_id"])
         linked = self._forensic_linked_inventory(case_id)
-        related = self._forensic_related_inventory(case_id)
+        related = self._forensic_related_inventory(case_id, budget=budget)
         if linked is None or related is None:
             raise _ToolRejected(
                 "case_scope_missing",
@@ -3179,7 +3214,7 @@ class ResponseInvestigationAgent:
                     "arbitrary_sql": False,
                     "external_connectors": False,
                     "correlation_window_minutes": (
-                        self.config.correlation_window_minutes
+                        self._budget_value(budget, "correlation_window_minutes")
                     ),
                 },
                 "inventory": {
@@ -3395,6 +3430,7 @@ class ResponseInvestigationAgent:
         self,
         tool_name: str,
         result: dict[str, Any],
+        budget: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Preserve page control and one compact fact record for every returned alert."""
         if tool_name == "query_forensic_coverage":
@@ -3417,7 +3453,9 @@ class ResponseInvestigationAgent:
             }
         )
         metadata = self._sanitize_controller_tool_value(metadata, 4_000)
-        total_budget = max(4_000, int(self.config.tool_result_max_bytes))
+        total_budget = max(
+            4_000, self._budget_value(budget, "tool_result_max_bytes")
+        )
         metadata_bytes = len(
             json.dumps(metadata, ensure_ascii=False, sort_keys=True).encode("utf-8")
         )
@@ -3681,6 +3719,7 @@ class ResponseInvestigationAgent:
         arguments: dict[str, Any],
         source: dict[str, Any],
         artifact: dict[str, Any],
+        budget: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         events = list(source.get("events") or [])
         all_event_refs = [
@@ -3770,13 +3809,15 @@ class ResponseInvestigationAgent:
                 window_ms=(
                     _integer(
                         arguments.get("window_minutes"),
-                        self.config.correlation_window_minutes,
+                        self._budget_value(budget, "correlation_window_minutes"),
                     )
                     * 60
                     * 1_000
                 ),
-                scan_limit=self.config.correlation_scan_limit,
-                scan_max_bytes=self.config.correlation_scan_max_bytes,
+                scan_limit=self._budget_value(budget, "correlation_scan_limit"),
+                scan_max_bytes=self._budget_value(
+                    budget, "correlation_scan_max_bytes"
+                ),
                 limit=_integer(arguments.get("limit"), 20),
                 offset=_integer(arguments.get("offset"), 0),
             )
@@ -3798,12 +3839,16 @@ class ResponseInvestigationAgent:
             ]
             return page, refs
         if tool_name == "query_forensic_coverage":
-            return self._build_forensic_coverage(source)
+            return self._build_forensic_coverage(source, budget=budget)
         if tool_name == "read_raw_alert_chunk":
             raw = self.repo.get_response_agent_raw_alert(
                 str(source["case"]["case_id"]),
                 str(arguments.get("alert_id") or ""),
-                window_ms=self.config.correlation_window_minutes * 60 * 1_000,
+                window_ms=self._budget_value(
+                    budget, "correlation_window_minutes"
+                )
+                * 60
+                * 1_000,
             )
             if raw is None:
                 raise _ToolRejected(
@@ -3844,7 +3889,7 @@ class ResponseInvestigationAgent:
                 _integer(arguments.get("offset"), 0),
                 _integer(
                     arguments.get("max_bytes"),
-                    self.config.raw_chunk_max_bytes,
+                    self._budget_value(budget, "raw_chunk_max_bytes"),
                 ),
             )
             result = {
@@ -4243,7 +4288,7 @@ class ResponseInvestigationAgent:
             for attempt in range(1, 4):
                 if (
                     self._active_elapsed(usage, synthesis_started)
-                    >= self.config.max_wall_seconds
+                    >= self._budget_value(current, "max_wall_seconds")
                 ):
                     self._exhaust_synthesis_wall_budget(
                         session_id,
@@ -4277,7 +4322,7 @@ class ResponseInvestigationAgent:
                         return
                     if (
                         self._active_elapsed(usage, synthesis_started)
-                        >= self.config.max_wall_seconds
+                        >= self._budget_value(current, "max_wall_seconds")
                     ):
                         self._exhaust_synthesis_wall_budget(
                             session_id,
@@ -4376,6 +4421,7 @@ class ResponseInvestigationAgent:
         report_id = new_id("response_agent_report")
         model_synthesis_applied = isinstance(candidate, dict) and bool(candidate)
         model_metadata = {
+            **dict(current.get("model_metadata") or {}),
             **dict(llm.runtime_metadata),
             "agent_version": AGENT_VERSION,
             "deterministic_validation": True,
@@ -5498,7 +5544,7 @@ class ResponseInvestigationAgent:
                     "mode": "controller_scoped_read_only",
                     "arbitrary_sql": False,
                     "correlation_window_minutes": (
-                        self.config.correlation_window_minutes
+                        self._budget_value(session, "correlation_window_minutes")
                     ),
                     "raw_log_access": "redacted_utf8_chunks",
                 },

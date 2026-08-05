@@ -54,6 +54,49 @@ const STRINGS = {
     automationSubPlaybooks: "Playbook",
     automationSubConnectors: "连接器",
     automationSubPolicy: "处置策略",
+    settingsSecondaryNav: "运行配置二级目录",
+    settingsSubModel: "模型服务",
+    settingsSubHarness: "Agent Harness",
+    harnessTitle: "Agent Harness",
+    harnessHint: "版本化调查边界与审批策略",
+    harnessProfile: "配置档案",
+    harnessProfileName: "名称",
+    harnessProfileDescription: "变更说明",
+    harnessBudget: "调查预算",
+    harnessMaxTurns: "最大轮次",
+    harnessMaxToolCalls: "工具调用上限",
+    harnessMaxWallSeconds: "运行时限（秒）",
+    harnessToolResultBytes: "单次工具结果（字节）",
+    harnessRawChunkBytes: "原始证据分块（字节）",
+    harnessCorrelation: "关联边界",
+    harnessCorrelationWindow: "关联窗口（分钟）",
+    harnessScanLimit: "候选扫描上限",
+    harnessScanBytes: "扫描字节上限",
+    harnessApproval: "审批策略",
+    harnessApprovalQuorum: "新审批单法定人数",
+    harnessSaveDraft: "保存新草稿",
+    harnessResetActive: "恢复生效值",
+    harnessLockedControls: "强制控制",
+    harnessTools: "工具契约",
+    harnessVersions: "配置版本",
+    harnessActiveSummary: "生效版本 v{version}",
+    harnessActiveScope: "仅影响新会话和新审批单",
+    harnessDraftSaved: "草稿 v{version} 已保存",
+    harnessPublished: "版本 v{version} 已发布",
+    harnessPublish: "发布",
+    harnessPublishConfirm: "发布版本 v{version}？新建调查会话和新审批单将使用该版本。",
+    harnessEmpty: "暂无配置版本",
+    harnessCreatedBy: "{actor} · {time}",
+    harnessMandatory: "必需",
+    harnessOptional: "按需",
+    harnessLocked: "锁定",
+    harnessControlCaseScope: "Case 范围由控制器注入",
+    harnessControlReadOnly: "工具仅限受控只读查询",
+    harnessControlSnapshot: "源证据快照不可变",
+    harnessControlEvidence: "结论必须绑定证据引用",
+    harnessControlInjection: "提示注入进入人工复核",
+    harnessControlSensitive: "敏感输出确定性阻断",
+    harnessControlNoExecution: "调查 Agent 不直接执行生产动作",
     authSession: "API 认证",
     authTitle: "API 认证",
     authToken: "访问 Token",
@@ -709,6 +752,49 @@ const STRINGS = {
     automationSubPlaybooks: "Playbooks",
     automationSubConnectors: "Connectors",
     automationSubPolicy: "Response Policy",
+    settingsSecondaryNav: "Runtime configuration sections",
+    settingsSubModel: "Model Service",
+    settingsSubHarness: "Agent Harness",
+    harnessTitle: "Agent Harness",
+    harnessHint: "Versioned investigation boundaries and approval policy",
+    harnessProfile: "Profile",
+    harnessProfileName: "Name",
+    harnessProfileDescription: "Change summary",
+    harnessBudget: "Investigation Budget",
+    harnessMaxTurns: "Maximum turns",
+    harnessMaxToolCalls: "Tool call limit",
+    harnessMaxWallSeconds: "Runtime limit (seconds)",
+    harnessToolResultBytes: "Tool result limit (bytes)",
+    harnessRawChunkBytes: "Raw evidence chunk (bytes)",
+    harnessCorrelation: "Correlation Boundary",
+    harnessCorrelationWindow: "Correlation window (minutes)",
+    harnessScanLimit: "Candidate scan limit",
+    harnessScanBytes: "Scan byte limit",
+    harnessApproval: "Approval Policy",
+    harnessApprovalQuorum: "Quorum for new approvals",
+    harnessSaveDraft: "Save new draft",
+    harnessResetActive: "Restore active values",
+    harnessLockedControls: "Mandatory Controls",
+    harnessTools: "Tool Contracts",
+    harnessVersions: "Configuration Versions",
+    harnessActiveSummary: "Active version v{version}",
+    harnessActiveScope: "Applies only to new sessions and approvals",
+    harnessDraftSaved: "Draft v{version} saved",
+    harnessPublished: "Version v{version} published",
+    harnessPublish: "Publish",
+    harnessPublishConfirm: "Publish version v{version}? New investigation sessions and approvals will use it.",
+    harnessEmpty: "No configuration versions",
+    harnessCreatedBy: "{actor} · {time}",
+    harnessMandatory: "Required",
+    harnessOptional: "On demand",
+    harnessLocked: "Locked",
+    harnessControlCaseScope: "The controller injects Case scope",
+    harnessControlReadOnly: "Tools are controller-scoped and read-only",
+    harnessControlSnapshot: "Source evidence snapshots are immutable",
+    harnessControlEvidence: "Conclusions require evidence references",
+    harnessControlInjection: "Prompt injection requires human review",
+    harnessControlSensitive: "Sensitive output is deterministically blocked",
+    harnessControlNoExecution: "The investigation agent cannot execute production actions",
     authSession: "API Access",
     authTitle: "API Access",
     authToken: "Access token",
@@ -1379,6 +1465,7 @@ let playbookWorkspaceLoaded = false;
 let playbookWorkspaceRequestId = 0;
 let responsePolicy = {};
 let responseTaskStats = {};
+let agentHarnessPayload = null;
 let responseTaskPagination = { page: 1, size: 20, total: 0, totalPages: 1 };
 let selectedMemoryId = "";
 let selectedMemoryDetail = null;
@@ -1557,6 +1644,8 @@ function applyPermission(selector, roles) {
 
 function applySessionPermissions() {
   applyPermission("#llm-form input, #llm-form select, #llm-form button", ["config"]);
+  applyPermission("#harness-profile-form input, #harness-profile-form textarea, #harness-profile-form button", ["config"]);
+  applyPermission("[data-harness-publish]", ["config"]);
   applyPermission("#resume-llm-deferred", ["analyst"]);
   applyPermission('#profile-form button[type="submit"]', ["config"]);
   applyPermission("#save-inferred-profile", ["config"]);
@@ -4898,7 +4987,7 @@ function activeSecondaryView(group, fallback = "") {
 
 function viewLoadKey(name) {
   if (name === "dashboard") return `${name}:${activeDashboardSection}:${caseSearchQuery(activeDashboardSection)}`;
-  if (["memory", "adapter", "automation"].includes(name)) {
+  if (["memory", "adapter", "automation", "settings"].includes(name)) {
     return `${name}:${activeSecondaryView(name, "")}`;
   }
   return name;
@@ -4924,6 +5013,10 @@ function loadViewDataOnce(name) {
   if (name === "dashboard") return loadCases({ section: activeDashboardSection });
   if (name === "settings") {
     if (!canReadRuntimeConfig()) return Promise.resolve();
+    if (activeSecondaryView("settings", "model") === "harness") {
+      stopOllamaModelRefresh();
+      return loadAgentHarnessConfig().catch((err) => setHarnessStatus(err.message || String(err), true));
+    }
     return loadLlmConfig().catch((err) => setConfigStatus(err.message || String(err), true));
   }
   if (name === "memory") {
@@ -5048,6 +5141,154 @@ function setConfigStatus(message, isError = false) {
   const status = document.querySelector("#llm-config-status");
   status.textContent = message;
   status.classList.toggle("error", isError);
+}
+
+function setHarnessStatus(message, isError = false) {
+  const status = document.querySelector("#harness-profile-status");
+  if (!status) return;
+  status.textContent = message;
+  status.classList.toggle("error", isError);
+}
+
+const HARNESS_FIELDS = {
+  max_turns: "#harness-max-turns",
+  max_tool_calls: "#harness-max-tool-calls",
+  max_wall_seconds: "#harness-max-wall-seconds",
+  tool_result_max_bytes: "#harness-tool-result-bytes",
+  correlation_window_minutes: "#harness-correlation-window",
+  correlation_scan_limit: "#harness-scan-limit",
+  correlation_scan_max_bytes: "#harness-scan-bytes",
+  raw_chunk_max_bytes: "#harness-raw-chunk-bytes",
+};
+
+const HARNESS_CONTROL_LABELS = {
+  case_scope: "harnessControlCaseScope",
+  controller_scoped_read_only: "harnessControlReadOnly",
+  immutable_source_snapshot: "harnessControlSnapshot",
+  evidence_reference_validation: "harnessControlEvidence",
+  prompt_injection_review: "harnessControlInjection",
+  sensitive_output_block: "harnessControlSensitive",
+  no_direct_production_execution: "harnessControlNoExecution",
+};
+
+function harnessStatusLabel(status) {
+  return playbookStatusLabel(status);
+}
+
+function applyHarnessConstraints(payload) {
+  const constraints = payload?.constraints?.response_agent || {};
+  Object.entries(HARNESS_FIELDS).forEach(([key, selector]) => {
+    const input = document.querySelector(selector);
+    const range = constraints[key] || {};
+    if (!input) return;
+    if (Number.isFinite(Number(range.min))) input.min = String(range.min);
+    if (Number.isFinite(Number(range.max))) input.max = String(range.max);
+  });
+  const quorum = document.querySelector("#harness-approval-quorum");
+  const quorumRange = payload?.constraints?.approval?.quorum || {};
+  if (quorum && Number.isFinite(Number(quorumRange.min))) quorum.min = String(quorumRange.min);
+  if (quorum && Number.isFinite(Number(quorumRange.max))) quorum.max = String(quorumRange.max);
+}
+
+function populateHarnessForm(profile) {
+  if (!profile) return;
+  document.querySelector("#harness-profile-name").value = profile.name || "";
+  document.querySelector("#harness-profile-description").value = profile.description || "";
+  const settings = profile.settings?.response_agent || {};
+  Object.entries(HARNESS_FIELDS).forEach(([key, selector]) => {
+    const input = document.querySelector(selector);
+    if (input && settings[key] != null) input.value = String(settings[key]);
+  });
+  const quorum = profile.settings?.approval?.quorum;
+  if (quorum != null) document.querySelector("#harness-approval-quorum").value = String(quorum);
+}
+
+function renderAgentHarness(payload, formProfile = null) {
+  agentHarnessPayload = payload;
+  applyHarnessConstraints(payload);
+  const active = payload?.active || null;
+  populateHarnessForm(formProfile || active);
+
+  const summary = document.querySelector("#harness-active-summary");
+  summary.innerHTML = active
+    ? `<strong>${escapeHtml(tr("harnessActiveSummary", { version: active.version }))}</strong><span>${escapeHtml(tr("harnessActiveScope"))}</span>`
+    : `<span>${escapeHtml(tr("harnessEmpty"))}</span>`;
+
+  const controls = document.querySelector("#harness-fixed-controls");
+  controls.innerHTML = (payload?.fixed_controls || []).map((control) => `
+    <div class="harness-control-item">
+      <strong>${escapeHtml(tr(HARNESS_CONTROL_LABELS[control.control_id] || control.control_id))}</strong>
+      <span>${escapeHtml(tr("harnessLocked"))}</span>
+    </div>
+  `).join("");
+
+  const tools = document.querySelector("#harness-tool-list");
+  tools.innerHTML = (payload?.tools || []).map((tool) => `
+    <div class="harness-tool-item">
+      <code>${escapeHtml(tool.name)}</code>
+      <span>${escapeHtml(tr(tool.mandatory ? "harnessMandatory" : "harnessOptional"))}</span>
+    </div>
+  `).join("");
+
+  const versions = document.querySelector("#harness-version-list");
+  const rows = payload?.versions || [];
+  versions.innerHTML = rows.length ? rows.map((profile) => `
+    <article class="harness-version-item">
+      <div class="harness-version-main">
+        <div><strong>${escapeHtml(`${profile.name} · v${profile.version}`)}</strong><span class="harness-status ${escapeHtml(profile.status)}">${escapeHtml(harnessStatusLabel(profile.status))}</span></div>
+        <p>${escapeHtml(profile.description || "-")}</p>
+        <small>${escapeHtml(tr("harnessCreatedBy", { actor: profile.created_by || "-", time: fmtTime(profile.created_at_ms) }))}</small>
+      </div>
+      <div class="harness-version-actions">
+        ${profile.status === "draft" ? `<button type="button" data-harness-publish="${escapeHtml(String(profile.version))}">${escapeHtml(tr("harnessPublish"))}</button>` : ""}
+      </div>
+    </article>
+  `).join("") : `<p class="empty-state">${escapeHtml(tr("harnessEmpty"))}</p>`;
+  applySessionPermissions();
+}
+
+async function loadAgentHarnessConfig() {
+  const payload = await json("/api/config/agent-harness");
+  renderAgentHarness(payload);
+  setHarnessStatus("");
+  return payload;
+}
+
+async function saveAgentHarnessProfile(event) {
+  event.preventDefault();
+  const responseAgent = {};
+  Object.entries(HARNESS_FIELDS).forEach(([key, selector]) => {
+    responseAgent[key] = Number(document.querySelector(selector).value);
+  });
+  const result = await json("/api/config/agent-harness", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      name: document.querySelector("#harness-profile-name").value.trim(),
+      description: document.querySelector("#harness-profile-description").value.trim(),
+      settings: {
+        response_agent: responseAgent,
+        approval: { quorum: Number(document.querySelector("#harness-approval-quorum").value) },
+      },
+    }),
+  });
+  renderAgentHarness(result, result.profile);
+  const message = tr("harnessDraftSaved", { version: result.profile.version });
+  setHarnessStatus(message);
+  showToast(message);
+}
+
+async function publishAgentHarnessProfile(version) {
+  if (!window.confirm(tr("harnessPublishConfirm", { version }))) return;
+  const result = await json(`/api/config/agent-harness/${encodeURIComponent(version)}/publish`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  renderAgentHarness(result, result.profile);
+  const message = tr("harnessPublished", { version: result.profile.version });
+  setHarnessStatus(message);
+  showToast(message);
 }
 
 function setProfileStatus(message, isError = false) {
@@ -5361,6 +5602,7 @@ function stopOllamaModelRefresh() {
 function ollamaModelRefreshAllowed() {
   return !document.hidden
     && document.querySelector("#settings-view")?.classList.contains("active") === true
+    && activeSecondaryView("settings", "model") === "model"
     && document.querySelector("#llm-provider")?.value === "ollama";
 }
 
@@ -5652,6 +5894,14 @@ document.querySelector("#automation-policy-form").addEventListener("submit", (ev
   });
 });
 document.addEventListener("click", (event) => {
+  const harnessButton = event.target.closest("[data-harness-publish]");
+  if (harnessButton && !harnessButton.disabled) {
+    harnessButton.disabled = true;
+    publishAgentHarnessProfile(harnessButton.dataset.harnessPublish)
+      .catch((err) => setHarnessStatus(err.message || String(err), true))
+      .finally(() => { harnessButton.disabled = false; });
+    return;
+  }
   const operationsButton = event.target.closest("[data-task-operations]");
   if (operationsButton && !operationsButton.disabled) {
     operationsButton.disabled = true;
@@ -5743,6 +5993,16 @@ document.querySelector("#language-switch").addEventListener("click", () => {
 });
 document.querySelector("#llm-form").addEventListener("submit", (event) => {
   saveLlmConfig(event).catch((err) => setConfigStatus(err.message || String(err), true));
+});
+document.querySelector("#harness-profile-form").addEventListener("submit", (event) => {
+  saveAgentHarnessProfile(event).catch((err) => setHarnessStatus(err.message || String(err), true));
+});
+document.querySelector("#harness-reset-active").addEventListener("click", () => {
+  populateHarnessForm(agentHarnessPayload?.active);
+  setHarnessStatus("");
+});
+document.querySelector("#harness-refresh").addEventListener("click", () => {
+  loadAgentHarnessConfig().catch((err) => setHarnessStatus(err.message || String(err), true));
 });
 document.querySelector("#reload-llm-config").addEventListener("click", () => {
   loadLlmConfig().catch((err) => setConfigStatus(err.message || String(err), true));

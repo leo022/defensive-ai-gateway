@@ -294,6 +294,8 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
             "automation-tab-playbooks": ("automation", "playbooks", "automation-playbooks-panel", "automation-submenu"),
             "automation-tab-connectors": ("automation", "connectors", "automation-connectors-panel", "automation-submenu"),
             "automation-tab-policy": ("automation", "policy", "automation-policy-panel", "automation-submenu"),
+            "settings-tab-model": ("settings", "model", "settings-model-panel", "settings-submenu"),
+            "settings-tab-harness": ("settings", "harness", "settings-harness-panel", "settings-submenu"),
         }
         for tab_id, (group, target, panel_id, submenu_id) in expected_tabs.items():
             with self.subTest(tab=tab_id):
@@ -311,10 +313,12 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertEqual(self.elements["adapter-submenu"]["attrs"]["role"], "group")
         self.assertEqual(self.elements["dashboard-submenu"]["attrs"]["role"], "group")
         self.assertEqual(self.elements["automation-submenu"]["attrs"]["role"], "group")
+        self.assertEqual(self.elements["settings-submenu"]["attrs"]["role"], "group")
         self.assertEqual(self.elements["dashboard-nav-parent"]["attrs"]["data-default-secondary"], "pending")
         self.assertEqual(self.elements["memory-nav-parent"]["attrs"]["data-default-secondary"], "inventory")
         self.assertEqual(self.elements["adapter-nav-parent"]["attrs"]["data-default-secondary"], "intake")
         self.assertEqual(self.elements["automation-nav-parent"]["attrs"]["data-default-secondary"], "tasks")
+        self.assertEqual(self.elements["settings-nav-parent"]["attrs"]["data-default-secondary"], "model")
         self.assertNotIn("hidden", self.elements["memory-inventory-panel"]["attrs"])
         self.assertIn("hidden", self.elements["memory-audit-panel"]["attrs"])
         self.assertNotIn("hidden", self.elements["adapter-intake-panel"]["attrs"])
@@ -323,6 +327,8 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertIn("hidden", self.elements["automation-playbooks-panel"]["attrs"])
         self.assertIn("hidden", self.elements["automation-connectors-panel"]["attrs"])
         self.assertIn("hidden", self.elements["automation-policy-panel"]["attrs"])
+        self.assertNotIn("hidden", self.elements["settings-model-panel"]["attrs"])
+        self.assertIn("hidden", self.elements["settings-harness-panel"]["attrs"])
         self.assertNotIn('class="secondary-nav"', HTML)
 
         containment = {
@@ -343,6 +349,9 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
             "automation-shadow-list": "automation-playbooks-panel",
             "automation-connector-form": "automation-connectors-panel",
             "automation-policy-form": "automation-policy-panel",
+            "llm-form": "settings-model-panel",
+            "harness-profile-form": "settings-harness-panel",
+            "harness-version-list": "settings-harness-panel",
         }
         for element_id, panel_id in containment.items():
             with self.subTest(element=element_id):
@@ -364,6 +373,9 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
             "automationSubPlaybooks",
             "automationSubConnectors",
             "automationSubPolicy",
+            "settingsSecondaryNav",
+            "settingsSubModel",
+            "settingsSubHarness",
         ):
             self.assertEqual(JS.count(f"{key}:"), 2)
         self.assertIn("function setSecondaryView", JS)
@@ -382,6 +394,28 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertIn('languageAria: "Switch to Chinese"', JS)
         self.assertEqual(JS.count("footer:"), 2)
         self.assertIn('data-i18n="footer"', HTML)
+
+    def test_agent_harness_uses_versioned_governed_configuration(self):
+        for field_id in (
+            "harness-max-turns",
+            "harness-max-tool-calls",
+            "harness-max-wall-seconds",
+            "harness-tool-result-bytes",
+            "harness-correlation-window",
+            "harness-scan-limit",
+            "harness-scan-bytes",
+            "harness-raw-chunk-bytes",
+            "harness-approval-quorum",
+        ):
+            self.assertIn(field_id, self.elements)
+        self.assertIn('json("/api/config/agent-harness")', JS)
+        self.assertIn('json("/api/config/agent-harness", {', JS)
+        self.assertIn("/api/config/agent-harness/${encodeURIComponent(version)}/publish", JS)
+        self.assertIn("function renderAgentHarness", JS)
+        self.assertEqual(JS.count("harnessActiveScope:"), 2)
+        self.assertIn('applyPermission("[data-harness-publish]", ["config"])', JS)
+        self.assertEqual(JS.count("harnessControlNoExecution:"), 2)
+        self.assertIn(".harness-governance-layout", CSS)
 
     def test_triage_mobile_layout_compacts_navigation_and_prevents_control_overflow(self):
         set_view = JS.split("function setView(name)", 1)[1].split(
