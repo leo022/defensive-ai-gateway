@@ -1486,6 +1486,7 @@ let currentSession = null;
 let ollamaModelLoadRequestId = 0;
 let ollamaModelRefreshTimer = 0;
 let ollamaModelFocusRefreshTimer = 0;
+let navigationVisibilityFrame = 0;
 let apiToken = "";
 let pendingManualReview = null;
 try {
@@ -1843,6 +1844,26 @@ function toggleLanguage() {
   saveLanguagePreference(currentLanguage === "en" ? "zh" : "en");
 }
 
+function keepActiveNavigationVisible() {
+  if (navigationVisibilityFrame) window.cancelAnimationFrame(navigationVisibilityFrame);
+  navigationVisibilityFrame = window.requestAnimationFrame(() => {
+    navigationVisibilityFrame = 0;
+    const navigation = document.querySelector(".primary-nav");
+    const activeItem = document.querySelector('.nav-subbutton[aria-current="page"]')
+      || document.querySelector('.nav-button[aria-current="page"]');
+    if (!navigation || !activeItem || navigation.scrollWidth <= navigation.clientWidth) return;
+
+    const navigationRect = navigation.getBoundingClientRect();
+    const activeRect = activeItem.getBoundingClientRect();
+    const edgePadding = 8;
+    if (activeRect.left < navigationRect.left + edgePadding) {
+      navigation.scrollLeft -= navigationRect.left + edgePadding - activeRect.left;
+    } else if (activeRect.right > navigationRect.right - edgePadding) {
+      navigation.scrollLeft += activeRect.right - navigationRect.right + edgePadding;
+    }
+  });
+}
+
 function applyLanguage() {
   document.documentElement.lang = currentLanguage === "en" ? "en" : "zh-CN";
   document.title = tr("appTitle");
@@ -1889,6 +1910,7 @@ function applyLanguage() {
     }
   }
   applySessionPermissions();
+  keepActiveNavigationVisible();
 }
 
 function renderLogProductOptions() {
@@ -4949,6 +4971,7 @@ function setView(name) {
   updateWorkspaceTitle(name);
   clearDashboardRefreshTimer();
   if (name !== "settings") stopOllamaModelRefresh();
+  keepActiveNavigationVisible();
 }
 
 function updateTriageBackLabel() {
@@ -4979,6 +5002,7 @@ function setSecondaryView(group, name) {
     updateWorkspaceTitle("dashboard");
     updateTriageBackLabel();
   }
+  keepActiveNavigationVisible();
 }
 
 function activeSecondaryView(group, fallback = "") {
@@ -5991,6 +6015,7 @@ document.querySelector("#language-switch").addEventListener("click", () => {
   toggleLanguage();
   refreshCurrentView().catch((err) => showToast(err.message || String(err), "error"));
 });
+window.addEventListener("resize", keepActiveNavigationVisible);
 document.querySelector("#llm-form").addEventListener("submit", (event) => {
   saveLlmConfig(event).catch((err) => setConfigStatus(err.message || String(err), true));
 });

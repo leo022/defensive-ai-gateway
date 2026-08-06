@@ -379,6 +379,7 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         ):
             self.assertEqual(JS.count(f"{key}:"), 2)
         self.assertIn("function setSecondaryView", JS)
+        self.assertIn("function keepActiveNavigationVisible()", JS)
         self.assertIn("function loadViewData", JS)
         self.assertIn("function toggleLanguage()", JS)
         self.assertIn('saveLanguagePreference(currentLanguage === "en" ? "zh" : "en")', JS)
@@ -386,6 +387,22 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertNotIn("event.currentTarget.dataset.languageValue", JS)
         self.assertIn('.nav-subbutton[data-secondary-group=', JS)
         self.assertIn('btn.setAttribute("aria-current", "page")', JS)
+        navigation_visibility = JS.split(
+            "function keepActiveNavigationVisible()", 1
+        )[1].split("function applyLanguage()", 1)[0]
+        for rule in (
+            'document.querySelector(\'.nav-subbutton[aria-current="page"]\')',
+            "window.requestAnimationFrame",
+            "navigation.scrollWidth <= navigation.clientWidth",
+            "navigation.scrollLeft -=",
+            "navigation.scrollLeft +=",
+        ):
+            with self.subTest(navigation_rule=rule):
+                self.assertIn(rule, navigation_visibility)
+        self.assertIn(
+            'window.addEventListener("resize", keepActiveNavigationVisible);',
+            JS,
+        )
         self.assertIn(".nav-group.active .nav-subbutton.active", CSS)
         self.assertIn("grid-template-columns: repeat(2, minmax(0, 1fr))", CSS)
         self.assertIn('workspaceEyebrow: "安全运营"', JS)
@@ -485,6 +502,34 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertIn("grid-template-columns: repeat(4, minmax(150px, 1fr)) max-content;", CSS)
         self.assertIn(".automation-filter-form > button {\n  align-self: end;", CSS)
         self.assertIn("height: 38px;\n  min-height: 38px;", CSS)
+
+    def test_grid_managed_panels_share_the_final_alignment_contract(self):
+        for layout_class in (
+            "dashboard-grid",
+            "memory-workbench",
+            "automation-playbook-grid",
+            "automation-config-grid",
+            "adapter-grid",
+        ):
+            with self.subTest(layout=layout_class):
+                self.assertIn(f'class="{layout_class} panel-grid"', HTML)
+
+        self.assertIn(
+            'class="harness-governance-layout panel-grid panel-grid-offset"',
+            HTML,
+        )
+        self.assertIn(
+            ".panel-grid > .panel {\n  min-width: 0;\n  margin-top: 0;",
+            CSS,
+        )
+        self.assertIn(
+            ".panel-grid.panel-grid-offset > .panel {\n  margin-top: 12px;",
+            CSS,
+        )
+        self.assertGreater(
+            CSS.rfind(".panel-grid > .panel {"),
+            CSS.rfind(".panel + .panel,\n.panel {"),
+        )
 
     def test_response_p0_operations_playbook_and_shadow_contract(self):
         for field_id in (
