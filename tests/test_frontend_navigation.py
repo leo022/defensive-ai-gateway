@@ -519,7 +519,7 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
             HTML,
         )
         self.assertIn(
-            ".panel-grid > .panel {\n  min-width: 0;\n  margin-top: 0;",
+            ".panel-grid > .panel {\n  align-self: stretch;\n  min-width: 0;\n  margin-top: 0;",
             CSS,
         )
         self.assertIn(
@@ -529,6 +529,17 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertGreater(
             CSS.rfind(".panel-grid > .panel {"),
             CSS.rfind(".panel + .panel,\n.panel {"),
+        )
+
+    def test_harness_profile_fields_align_controls_from_the_top(self):
+        profile_grid = HTML.split(
+            'class="harness-field-grid harness-field-grid-profile"', 1
+        )[1].split("</div>", 1)[0]
+        self.assertIn('id="harness-profile-name"', profile_grid)
+        self.assertIn('id="harness-profile-description"', profile_grid)
+        self.assertIn(
+            ".harness-field-grid label {\n  display: grid;\n  align-content: start;",
+            CSS,
         )
 
     def test_response_p0_operations_playbook_and_shadow_contract(self):

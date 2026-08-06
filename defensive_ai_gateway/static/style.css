@@ -2084,6 +2084,7 @@ h4 {
 
 .harness-field-grid label {
   display: grid;
+  align-content: start;
   min-width: 0;
   gap: 6px;
 }
@@ -6791,6 +6792,7 @@ main {
 }
 
 .panel-grid > .panel {
+  align-self: stretch;
   min-width: 0;
   margin-top: 0;
 }
