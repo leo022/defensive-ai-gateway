@@ -23,6 +23,10 @@ const LOG_PRODUCT_OPTIONS = [
   { product: "rasp", label: "RASP" },
   { product: "siem", label: "SIEM" },
 ];
+const ACCOUNT_ROLE_I18N = {
+  admin: "userRoleAdmin",
+  operator: "userRoleOperator",
+};
 const DEFAULT_SYSLOG_CONFIGS = [
   { product: "waf", label: "WAF", port: 15140, protocol: "tcp", profile: "auto-waf-json", saved: false },
   { product: "hips", label: "HIPS", port: 15141, protocol: "tcp", profile: "auto-hips-json", saved: false },
@@ -57,6 +61,36 @@ const STRINGS = {
     settingsSecondaryNav: "运行配置二级目录",
     settingsSubModel: "模型服务",
     settingsSubHarness: "Agent Harness",
+    settingsSubUsers: "用户管理",
+    userManagementTitle: "用户管理",
+    userManagementHint: "维护管理员与操作员账户",
+    userActor: "用户标识",
+    userIdentity: "身份",
+    userRole: "角色",
+    userActions: "操作",
+    userCreate: "新增用户",
+    userListLabel: "用户列表",
+    userCreateSuccess: "用户 {actor} 已创建",
+    userRoleSaved: "{actor} 的角色已更新",
+    userTokenReset: "{actor} 的 Token 已重置",
+    userTokenActive: "有效",
+    userTokenMissing: "无 Token",
+    userSaveRole: "保存角色",
+    userResetToken: "重置 Token",
+    userDelete: "删除",
+    userDeleted: "用户 {actor} 已删除",
+    userEmpty: "暂无用户",
+    userLoading: "正在加载用户…",
+    userTokenTitle: "新 Token",
+    userTokenOnce: "此 Token 仅显示一次，页面已脱敏。",
+    userTokenCopy: "复制 Token",
+    userTokenCopied: "Token 已复制",
+    userTokenCopyFailed: "复制失败，请重试",
+    userTokenResetConfirm: "重置 {actor} 的 Token？旧 Token 将立即失效。",
+    userDeleteConfirm: "删除用户 {actor}？该账户的 Token 将立即失效。",
+    userRoleAdmin: "管理员",
+    userRoleOperator: "操作员",
+    userBuiltinAdmin: "内置管理员",
     harnessTitle: "Agent Harness",
     harnessHint: "版本化调查边界与审批策略",
     harnessProfile: "配置档案",
@@ -755,6 +789,36 @@ const STRINGS = {
     settingsSecondaryNav: "Runtime configuration sections",
     settingsSubModel: "Model Service",
     settingsSubHarness: "Agent Harness",
+    settingsSubUsers: "User Management",
+    userManagementTitle: "User Management",
+    userManagementHint: "Manage administrator and operator accounts",
+    userActor: "User ID",
+    userIdentity: "Identity",
+    userRole: "Role",
+    userActions: "Actions",
+    userCreate: "Add user",
+    userListLabel: "User list",
+    userCreateSuccess: "User {actor} created",
+    userRoleSaved: "Role updated for {actor}",
+    userTokenReset: "Token reset for {actor}",
+    userTokenActive: "Active",
+    userTokenMissing: "No token",
+    userSaveRole: "Save role",
+    userResetToken: "Reset token",
+    userDelete: "Delete",
+    userDeleted: "User {actor} deleted",
+    userEmpty: "No users",
+    userLoading: "Loading users…",
+    userTokenTitle: "New Token",
+    userTokenOnce: "This token is shown once and masked on screen.",
+    userTokenCopy: "Copy token",
+    userTokenCopied: "Token copied",
+    userTokenCopyFailed: "Copy failed; try again",
+    userTokenResetConfirm: "Reset the token for {actor}? The old token will stop working immediately.",
+    userDeleteConfirm: "Delete user {actor}? Its token will stop working immediately.",
+    userRoleAdmin: "Administrator",
+    userRoleOperator: "Operator",
+    userBuiltinAdmin: "Built-in administrator",
     harnessTitle: "Agent Harness",
     harnessHint: "Versioned investigation boundaries and approval policy",
     harnessProfile: "Profile",
@@ -1466,6 +1530,9 @@ let playbookWorkspaceRequestId = 0;
 let responsePolicy = {};
 let responseTaskStats = {};
 let agentHarnessPayload = null;
+let authUsersPayload = { roles: Object.keys(ACCOUNT_ROLE_I18N), users: [] };
+let authUsersLoaded = false;
+let authUserOneTimeToken = "";
 let responseTaskPagination = { page: 1, size: 20, total: 0, totalPages: 1 };
 let selectedMemoryId = "";
 let selectedMemoryDetail = null;
@@ -1617,6 +1684,10 @@ function canReadRuntimeConfig() {
   return hasAnyRole("config");
 }
 
+function canManageUsers() {
+  return hasAnyRole("user_admin");
+}
+
 function canReadAutomation() {
   return hasAnyRole("read", "config", "analyst", "responder");
 }
@@ -1632,7 +1703,7 @@ function currentActor() {
 function applyPermission(selector, roles) {
   const allowed = hasAnyRole(...roles);
   document.querySelectorAll(selector).forEach((control) => {
-    control.disabled = !allowed;
+    control.disabled = !allowed || control.dataset.permissionLock === "true";
     if (allowed) {
       if (control.dataset.permissionDenied === "true") control.removeAttribute("title");
       delete control.dataset.permissionDenied;
@@ -1647,6 +1718,7 @@ function applySessionPermissions() {
   applyPermission("#llm-form input, #llm-form select, #llm-form button", ["config"]);
   applyPermission("#harness-profile-form input, #harness-profile-form textarea, #harness-profile-form button", ["config"]);
   applyPermission("[data-harness-publish]", ["config"]);
+  applyPermission("#auth-user-form input, #auth-user-form select, #auth-user-form button, [data-auth-user-action], [data-auth-user-role]", ["user_admin"]);
   applyPermission("#resume-llm-deferred", ["analyst"]);
   applyPermission('#profile-form button[type="submit"]', ["config"]);
   applyPermission("#save-inferred-profile", ["config"]);
@@ -1665,8 +1737,21 @@ function applySessionPermissions() {
   applyPermission("[data-playbook-action]", ["config"]);
   applyPermission("[data-connector-action]", ["config"]);
   applyPermission("[data-memory-action]", ["memory"]);
+  const userTab = document.querySelector("#settings-tab-users");
+  const userPanel = document.querySelector("#settings-users-panel");
+  const userAccess = canManageUsers();
+  if (userTab) userTab.hidden = !userAccess;
+  if (!userAccess) {
+    if (userTab?.classList.contains("active")) setSecondaryView("settings", "model");
+    if (userPanel) userPanel.hidden = true;
+    authUsersPayload = { roles: Object.keys(ACCOUNT_ROLE_I18N), users: [] };
+    authUsersLoaded = false;
+    const userList = document.querySelector("#auth-user-list");
+    if (userList) userList.replaceChildren();
+  }
   const authButton = document.querySelector("#auth-session");
   if (authButton) {
+    authButton.hidden = false;
     if (currentSession?.actor) authButton.title = sessionIdentityText();
     else authButton.removeAttribute("title");
   }
@@ -1687,6 +1772,193 @@ async function loadSession() {
     currentSession = { actor: "", roles: [] };
     applySessionPermissions();
     throw err;
+  }
+}
+
+function accountRoleLabel(role) {
+  return tr(ACCOUNT_ROLE_I18N[role] || role);
+}
+
+function renderAuthUsers() {
+  const list = document.querySelector("#auth-user-list");
+  if (!list) return;
+  const users = Array.isArray(authUsersPayload.users) ? authUsersPayload.users : [];
+  const roles = authUsersPayload.roles?.length ? authUsersPayload.roles : Object.keys(ACCOUNT_ROLE_I18N);
+  if (!users.length) {
+    list.innerHTML = `<div class="empty-state user-empty-state">${escapeHtml(tr("userEmpty"))}</div>`;
+    return;
+  }
+  list.innerHTML = users.map((user) => {
+    const tokenState = user.token_active ? "active" : "revoked";
+    const fingerprint = user.token_fingerprint
+      ? `<code>${escapeHtml(user.token_fingerprint)}</code>`
+      : "";
+    const protectedAccount = user.actor === "admin";
+    const roleLocked = protectedAccount || user.actor === currentActor();
+    const deleteLocked = protectedAccount || user.actor === currentActor();
+    const roleOptions = roles.map((role) => `
+      <option value="${escapeHtml(role)}" ${user.role === role ? "selected" : ""}>${escapeHtml(accountRoleLabel(role))}</option>
+    `).join("");
+    return `
+      <div class="user-list-row" role="listitem">
+        <div class="user-identity-cell">
+          <strong>${escapeHtml(user.actor)}</strong>
+          ${protectedAccount ? `<span class="user-source">${escapeHtml(tr("userBuiltinAdmin"))}</span>` : ""}
+          ${user.updated_at_ms ? `<small>${escapeHtml(fmtTime(user.updated_at_ms))}</small>` : ""}
+        </div>
+        <div class="user-role-control">
+          <select data-auth-user-role="${escapeHtml(user.actor)}" aria-label="${escapeHtml(tr("userRole"))}" ${roleLocked ? 'data-permission-lock="true" disabled' : ""}>${roleOptions}</select>
+          <button type="button" data-auth-user-action="role" data-actor="${escapeHtml(user.actor)}" ${roleLocked ? 'data-permission-lock="true" disabled' : ""}>${escapeHtml(tr("userSaveRole"))}</button>
+        </div>
+        <div class="user-token-cell">
+          <span class="user-token-state ${tokenState}">${escapeHtml(tr(user.token_active ? "userTokenActive" : "userTokenMissing"))}</span>
+          ${fingerprint}
+        </div>
+        <div class="user-row-actions">
+          <button type="button" data-auth-user-action="reset" data-actor="${escapeHtml(user.actor)}">${escapeHtml(tr("userResetToken"))}</button>
+          <button class="danger" type="button" data-auth-user-action="delete" data-actor="${escapeHtml(user.actor)}" ${deleteLocked ? 'data-permission-lock="true" disabled' : ""}>${escapeHtml(tr("userDelete"))}</button>
+        </div>
+      </div>
+    `;
+  }).join("");
+  applyPermission("#auth-user-form input, #auth-user-form select, #auth-user-form button, [data-auth-user-action], [data-auth-user-role]", ["user_admin"]);
+}
+
+function setAuthUserStatus(message = "", error = false, selector = "#auth-user-list-status") {
+  const node = document.querySelector(selector);
+  if (!node) return;
+  node.textContent = message;
+  node.classList.toggle("error", error);
+}
+
+async function loadAuthUsers() {
+  setAuthUserStatus(tr("userLoading"));
+  try {
+    const payload = await json("/api/config/users");
+    authUsersPayload = {
+      roles: Array.isArray(payload.roles) ? payload.roles.map(String) : Object.keys(ACCOUNT_ROLE_I18N),
+      users: Array.isArray(payload.users) ? payload.users : [],
+    };
+    authUsersLoaded = true;
+    renderAuthUsers();
+    setAuthUserStatus("");
+    return authUsersPayload;
+  } catch (err) {
+    setAuthUserStatus(err.message || String(err), true);
+    throw err;
+  }
+}
+
+function showAuthUserToken(actor, token) {
+  const dialog = document.querySelector("#auth-user-token-dialog");
+  authUserOneTimeToken = String(token || "");
+  document.querySelector("#auth-user-token-actor").textContent = actor;
+  document.querySelector("#auth-user-token-value").value = maskAuthUserToken(authUserOneTimeToken);
+  document.querySelector("#auth-user-token-status").textContent = "";
+  if (!dialog.open) dialog.showModal();
+  window.setTimeout(() => document.querySelector("#auth-user-token-copy").focus(), 0);
+}
+
+function maskAuthUserToken(token) {
+  const value = String(token || "");
+  if (!value) return "";
+  if (value.length < 14) return "••••••••";
+  return `${value.slice(0, 7)}••••••••${value.slice(-6)}`;
+}
+
+async function copyAuthUserToken() {
+  const status = document.querySelector("#auth-user-token-status");
+  try {
+    if (!authUserOneTimeToken) throw new Error("empty token");
+    if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(authUserOneTimeToken);
+    else {
+      const copySource = document.createElement("textarea");
+      copySource.value = authUserOneTimeToken;
+      copySource.setAttribute("readonly", "");
+      copySource.style.position = "fixed";
+      copySource.style.opacity = "0";
+      document.body.append(copySource);
+      copySource.select();
+      const copied = document.execCommand("copy");
+      copySource.remove();
+      if (!copied) throw new Error("copy rejected");
+    }
+    status.textContent = tr("userTokenCopied");
+    status.classList.remove("error");
+  } catch (err) {
+    status.textContent = tr("userTokenCopyFailed");
+    status.classList.add("error");
+  }
+}
+
+async function createAuthUser(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const actor = String(form.elements.namedItem("actor")?.value || "").trim();
+  const role = String(form.elements.namedItem("role")?.value || "operator");
+  setAuthUserStatus("", false, "#auth-user-form-status");
+  try {
+    const result = await json("/api/config/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ actor, role }),
+    });
+    showAuthUserToken(result.user.actor, result.token);
+    form.reset();
+    await loadAuthUsers();
+    setAuthUserStatus(tr("userCreateSuccess", { actor }), false, "#auth-user-form-status");
+  } catch (err) {
+    setAuthUserStatus(err.message || String(err), true, "#auth-user-form-status");
+  }
+}
+
+async function saveAuthUserRole(actor) {
+  const role = document.querySelector(`[data-auth-user-role="${CSS.escape(actor)}"]`)?.value || "operator";
+  const result = await json(`/api/config/users/${encodeURIComponent(actor)}/role`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ role }),
+  });
+  if (actor === currentActor()) await loadSession();
+  await loadAuthUsers();
+  setAuthUserStatus(tr("userRoleSaved", { actor }));
+  return result;
+}
+
+async function resetAuthUserToken(actor) {
+  if (!window.confirm(tr("userTokenResetConfirm", { actor }))) return;
+  const result = await json(`/api/config/users/${encodeURIComponent(actor)}/token/reset`, { method: "POST" });
+  if (actor === currentActor()) {
+    storeApiToken(result.token);
+    await loadSession();
+  }
+  showAuthUserToken(actor, result.token);
+  await loadAuthUsers();
+  setAuthUserStatus(tr("userTokenReset", { actor }));
+}
+
+async function deleteAuthUser(actor) {
+  if (!window.confirm(tr("userDeleteConfirm", { actor }))) return;
+  await json(`/api/config/users/${encodeURIComponent(actor)}`, { method: "DELETE" });
+  await loadAuthUsers();
+  setAuthUserStatus(tr("userDeleted", { actor }));
+}
+
+async function handleAuthUserAction(event) {
+  const button = event.target.closest("[data-auth-user-action]");
+  if (!button || button.disabled) return;
+  const actor = String(button.dataset.actor || "");
+  button.disabled = true;
+  try {
+    if (button.dataset.authUserAction === "role") await saveAuthUserRole(actor);
+    if (button.dataset.authUserAction === "reset") await resetAuthUserToken(actor);
+    if (button.dataset.authUserAction === "delete") await deleteAuthUser(actor);
+  } catch (err) {
+    setAuthUserStatus(err.message || String(err), true);
+  } finally {
+    if (document.body.contains(button)) {
+      button.disabled = !hasAnyRole("user_admin") || button.dataset.permissionLock === "true";
+    }
   }
 }
 
@@ -1898,6 +2170,7 @@ function applyLanguage() {
   renderSyslogConfigTable();
   renderSyslogDeployment();
   renderLogProductOptions();
+  if (authUsersLoaded) renderAuthUsers();
   renderMemoryList();
   renderMemoryAudit(memoryAuditEvents, "#memory-audit-list");
   if (selectedMemoryDetail) renderMemoryDetail(selectedMemoryDetail);
@@ -5037,7 +5310,12 @@ function loadViewDataOnce(name) {
   if (name === "dashboard") return loadCases({ section: activeDashboardSection });
   if (name === "settings") {
     if (!canReadRuntimeConfig()) return Promise.resolve();
-    if (activeSecondaryView("settings", "model") === "harness") {
+    const section = activeSecondaryView("settings", "model");
+    if (section === "users") {
+      stopOllamaModelRefresh();
+      return canManageUsers() ? loadAuthUsers() : Promise.resolve();
+    }
+    if (section === "harness") {
       stopOllamaModelRefresh();
       return loadAgentHarnessConfig().catch((err) => setHarnessStatus(err.message || String(err), true));
     }
@@ -6137,6 +6415,17 @@ async function loadApplicationData() {
 
 document.querySelector("#auth-session").addEventListener("click", () => showAuthDialog());
 document.querySelector("#auth-close").addEventListener("click", () => document.querySelector("#auth-dialog").close());
+document.querySelector("#auth-users-refresh").addEventListener("click", () => {
+  loadAuthUsers().catch(() => {});
+});
+document.querySelector("#auth-user-form").addEventListener("submit", createAuthUser);
+document.querySelector("#auth-user-list").addEventListener("click", handleAuthUserAction);
+document.querySelector("#auth-user-token-copy").addEventListener("click", copyAuthUserToken);
+document.querySelector("#auth-user-token-dialog").addEventListener("close", () => {
+  authUserOneTimeToken = "";
+  document.querySelector("#auth-user-token-value").value = "";
+  document.querySelector("#auth-user-token-status").textContent = "";
+});
 document.querySelector("#manual-review-close").addEventListener("click", closeManualReviewDialog);
 document.querySelector("#manual-review-cancel").addEventListener("click", closeManualReviewDialog);
 document.querySelector("#manual-review-dialog").addEventListener("close", () => {

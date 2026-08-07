@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import tempfile
@@ -74,6 +75,54 @@ class ApprovalQuorumTest(unittest.TestCase):
                 self.assertEqual(final["status"], "approved")
                 self.assertEqual(final["vote_count"], 2)
                 self.assertEqual(final["execution_status"], "not_executed")
+            finally:
+                state.stop()
+    def test_initial_admin_is_hashed_once_and_protected_from_lockout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = GatewayConfig()
+            config.database.path = str(Path(tmp) / "gateway.db")
+            config.processing.async_enabled = False
+            state = GatewayState(config)
+            try:
+                initial_token = (
+                    "Bxv+CMUsaOKnPEenVDbgDK4N667Jmlz9VToX0e7N895wsmlJb/"
+                    "o7giLWLtatLIGB"
+                )
+                admin = state.repo.get_auth_user("admin")
+                self.assertIsNotNone(admin)
+                self.assertIn("user_admin", admin["roles"])
+                stored = state.repo.conn.execute(
+                    "SELECT token_hash FROM auth_users WHERE actor = 'admin'"
+                ).fetchone()["token_hash"]
+                self.assertEqual(stored, hashlib.sha256(initial_token.encode()).hexdigest())
+                self.assertNotEqual(stored, initial_token)
+
+                created = state.create_auth_user(
+                    {"actor": "bootstrap-operator", "role": "operator"},
+                    changed_by="admin",
+                )
+                self.assertTrue(created["token"].startswith("dag_"))
+                self.assertEqual(created["user"]["role"], "operator")
+                self.assertNotIn(
+                    "user_admin", state.repo.get_auth_user("bootstrap-operator")["roles"]
+                )
+                with self.assertRaisesRegex(ValueError, "cannot be demoted"):
+                    state.update_auth_user_role(
+                        "admin", {"role": "operator"}, changed_by="admin"
+                    )
+                with self.assertRaisesRegex(ValueError, "cannot be deleted"):
+                    state.delete_auth_user("admin", changed_by="admin")
+
+                restarted = GatewayState(config)
+                try:
+                    self.assertEqual(
+                        restarted.repo.conn.execute(
+                            "SELECT token_hash FROM auth_users WHERE actor = 'admin'"
+                        ).fetchone()["token_hash"],
+                        stored,
+                    )
+                finally:
+                    restarted.stop()
             finally:
                 state.stop()
 
@@ -758,21 +807,22 @@ class HTTPProductionBoundaryTest(unittest.TestCase):
         token: str = "",
         payload: dict | None = None,
         headers: dict[str, str] | None = None,
+        method: str = "",
     ) -> tuple[int, dict]:
         request_headers = dict(headers or {})
         if token:
             request_headers["Authorization"] = f"Bearer {token}"
         data = None
-        method = "GET"
+        request_method = method or "GET"
         if payload is not None:
             data = json.dumps(payload).encode("utf-8")
             request_headers["Content-Type"] = "application/json"
-            method = "POST"
+            request_method = method or "POST"
         request = urllib.request.Request(
             self.base + path,
             data=data,
             headers=request_headers,
-            method=method,
+            method=request_method,
         )
         try:
             with urllib.request.urlopen(request, timeout=5) as response:
@@ -890,6 +940,134 @@ class HTTPProductionBoundaryTest(unittest.TestCase):
                 payload={"provider": "local"},
             )[0],
             403,
+        )
+
+    def test_admin_manages_operator_lifecycle_without_storing_tokens(self):
+        initial_admin_token = (
+            "Bxv+CMUsaOKnPEenVDbgDK4N667Jmlz9VToX0e7N895wsmlJb/"
+            "o7giLWLtatLIGB"
+        )
+        self.assertEqual(
+            self._request("/api/config/users", token="operator-token")[0], 403
+        )
+        self.assertEqual(
+            self._request("/api/config/users", token="config-only-token")[0], 403
+        )
+        status, session = self._request("/api/session", token=initial_admin_token)
+        self.assertEqual(status, 200)
+        self.assertEqual(session["actor"], "admin")
+        self.assertIn("user_admin", session["roles"])
+
+        status, initial = self._request("/api/config/users", token=initial_admin_token)
+        self.assertEqual(status, 200)
+        self.assertEqual(initial["roles"], ["admin", "operator"])
+        self.assertEqual([user["actor"] for user in initial["users"]], ["admin"])
+        self.assertEqual(initial["users"][0]["role"], "admin")
+        self.assertNotIn(initial_admin_token, json.dumps(initial))
+
+        status, created = self._request(
+            "/api/config/users",
+            token="admin-token",
+            payload={"actor": "alice.soc", "role": "operator"},
+        )
+        self.assertEqual(status, 201)
+        first_token = created["token"]
+        self.assertTrue(first_token.startswith("dag_"))
+        self.assertNotIn("token_hash", created["user"])
+        self.assertEqual(created["user"]["role"], "operator")
+
+        stored = self.server.state.repo.conn.execute(
+            "SELECT token_hash, roles_json FROM auth_users WHERE actor = ?",
+            ("alice.soc",),
+        ).fetchone()
+        self.assertEqual(len(stored["token_hash"]), 64)
+        self.assertNotEqual(stored["token_hash"], first_token)
+        stored_roles = set(json.loads(stored["roles_json"]))
+        self.assertIn("config", stored_roles)
+        self.assertNotIn("user_admin", stored_roles)
+
+        status, session = self._request("/api/session", token=first_token)
+        self.assertEqual(status, 200)
+        self.assertEqual(session["actor"], "alice.soc")
+        self.assertIn("config", session["roles"])
+        self.assertNotIn("user_admin", session["roles"])
+        self.assertEqual(self._request("/api/config/llm", token=first_token)[0], 200)
+        self.assertEqual(
+            self._request(
+                "/api/config/users",
+                token=first_token,
+            )[0],
+            403,
+        )
+
+        status, updated = self._request(
+            "/api/config/users/alice.soc/role",
+            token="admin-token",
+            payload={"role": "admin"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(updated["user"]["role"], "admin")
+        self.assertEqual(self._request("/api/config/users", token=first_token)[0], 200)
+
+        status, updated = self._request(
+            "/api/config/users/alice.soc/role",
+            token="admin-token",
+            payload={"role": "operator"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(updated["user"]["role"], "operator")
+        self.assertEqual(self._request("/api/config/users", token=first_token)[0], 403)
+
+        status, rotated = self._request(
+            "/api/config/users/alice.soc/token/reset",
+            token="admin-token",
+            payload={},
+        )
+        self.assertEqual(status, 200)
+        second_token = rotated["token"]
+        self.assertNotEqual(second_token, first_token)
+        self.assertEqual(self._request("/api/session", token=first_token)[0], 401)
+        self.assertEqual(self._request("/api/session", token=second_token)[0], 200)
+
+        self.assertEqual(
+            self._request(
+                "/api/config/users/alice.soc",
+                token=second_token,
+                method="DELETE",
+            )[0],
+            403,
+        )
+        status, deleted = self._request(
+            "/api/config/users/alice.soc",
+            token="admin-token",
+            method="DELETE",
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(deleted["actor"], "alice.soc")
+        self.assertEqual(self._request("/api/session", token=second_token)[0], 401)
+        self.assertIsNone(self.server.state.repo.get_auth_user("alice.soc"))
+        self.assertEqual(
+            self._request(
+                "/api/config/users/admin", token="admin-token", method="DELETE"
+            )[0],
+            400,
+        )
+
+        audit_json = "\n".join(
+            row["detail_json"]
+            for row in self.server.state.repo.conn.execute(
+                "SELECT detail_json FROM audit_log WHERE trace_id = ? ORDER BY created_at_ms",
+                ("auth-user:alice.soc",),
+            ).fetchall()
+        )
+        self.assertNotIn(first_token, audit_json)
+        self.assertNotIn(second_token, audit_json)
+        self.assertIn("previous_token_fingerprint", audit_json)
+        self.assertIsNotNone(
+            self.server.state.repo.conn.execute(
+                "SELECT 1 FROM audit_log WHERE trace_id = ? AND action = ?",
+                ("auth-user:alice.soc", "auth_user_deleted"),
+            ).fetchone()
         )
 
     def test_signed_loopback_syslog_isolated_and_spoofed_markers_rejected(self):

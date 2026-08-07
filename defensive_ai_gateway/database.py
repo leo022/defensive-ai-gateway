@@ -314,6 +314,17 @@ CREATE TABLE IF NOT EXISTS audit_log (
   detail_json TEXT NOT NULL,
   created_at_ms INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS auth_users (
+  actor TEXT PRIMARY KEY,
+  token_hash TEXT UNIQUE,
+  token_fingerprint TEXT NOT NULL DEFAULT '',
+  roles_json TEXT NOT NULL,
+  created_by TEXT NOT NULL,
+  updated_by TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  token_rotated_at_ms INTEGER
+);
 CREATE TABLE IF NOT EXISTS mapping_profiles (
   profile_id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -721,6 +732,7 @@ CREATE INDEX IF NOT EXISTS idx_memory_matches_memory ON memory_matches(memory_id
 CREATE INDEX IF NOT EXISTS idx_memory_matches_case ON memory_matches(case_id, created_at_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_case ON audit_log(case_id, created_at_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_memory ON audit_log(memory_id, created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_auth_users_updated ON auth_users(updated_at_ms DESC, actor);
 CREATE INDEX IF NOT EXISTS idx_validation_case ON validation_runs(case_id, created_at_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_validation_review_case ON validation_review_resolutions(case_id, created_at_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_approvals_case ON action_approvals(case_id, created_at_ms DESC);
@@ -800,7 +812,7 @@ BEGIN
 END;
 """
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 _LLM_DEFERRED_ERROR_PREFIX = "analysis_deferred:"
 _LEGACY_LLM_DEFERRED_ERROR_FRAGMENT = "remote LLM analysis deferred"
 _TERMINAL_LLM_ERROR_FRAGMENTS = (
@@ -1794,7 +1806,218 @@ class Repository:
                     (now_ms(),),
                 )
 
+            if current < 22:
+                auth_user_table = self.conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'auth_users'"
+                ).fetchone()
+                if not auth_user_table:
+                    raise RuntimeError("schema v22 auth_users table is missing")
+                auth_user_columns = {
+                    row["name"]
+                    for row in self.conn.execute(
+                        "PRAGMA table_info(auth_users)"
+                    ).fetchall()
+                }
+                required = {
+                    "actor",
+                    "token_hash",
+                    "token_fingerprint",
+                    "roles_json",
+                    "created_by",
+                    "updated_by",
+                    "created_at_ms",
+                    "updated_at_ms",
+                    "token_rotated_at_ms",
+                }
+                if not required.issubset(auth_user_columns):
+                    raise RuntimeError("schema v22 auth user columns are incomplete")
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_auth_users_updated "
+                    "ON auth_users(updated_at_ms DESC, actor)"
+                )
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO schema_version(version, applied_at_ms) VALUES (22, ?)",
+                    (now_ms(),),
+                )
+
             self.conn.commit()
+
+    # ---- managed API identities ------------------------------------------
+
+    @staticmethod
+    def _auth_user_payload(row: sqlite3.Row) -> dict[str, Any]:
+        roles = loads_bounded_json(str(row["roles_json"] or "[]"))
+        return {
+            "actor": str(row["actor"]),
+            "roles": [str(role) for role in roles] if isinstance(roles, list) else [],
+            "token_active": bool(row["token_hash"]),
+            "token_fingerprint": str(row["token_fingerprint"] or ""),
+            "source": "managed",
+            "created_by": str(row["created_by"]),
+            "updated_by": str(row["updated_by"]),
+            "created_at_ms": int(row["created_at_ms"]),
+            "updated_at_ms": int(row["updated_at_ms"]),
+            "token_rotated_at_ms": (
+                int(row["token_rotated_at_ms"])
+                if row["token_rotated_at_ms"] is not None
+                else None
+            ),
+        }
+
+    def list_auth_users(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM auth_users ORDER BY actor COLLATE NOCASE ASC"
+            ).fetchall()
+            return [self._auth_user_payload(row) for row in rows]
+
+    def get_auth_user(self, actor: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM auth_users WHERE actor = ?", (str(actor),)
+            ).fetchone()
+            return self._auth_user_payload(row) if row else None
+
+    def find_auth_user_by_token_hash(self, token_hash: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM auth_users WHERE token_hash = ?",
+                (str(token_hash),),
+            ).fetchone()
+            return self._auth_user_payload(row) if row else None
+
+    def has_active_auth_users(self) -> bool:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT 1 FROM auth_users WHERE token_hash IS NOT NULL LIMIT 1"
+            ).fetchone()
+            return row is not None
+
+    def create_auth_user(
+        self,
+        actor: str,
+        roles: list[str],
+        token_hash: str,
+        token_fingerprint: str,
+        changed_by: str,
+        *,
+        _commit: bool = True,
+    ) -> dict[str, Any]:
+        with self._lock:
+            created = now_ms()
+            self.conn.execute(
+                """
+                INSERT INTO auth_users(
+                  actor, token_hash, token_fingerprint, roles_json,
+                  created_by, updated_by, created_at_ms, updated_at_ms,
+                  token_rotated_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(actor),
+                    str(token_hash),
+                    str(token_fingerprint),
+                    json.dumps(roles, ensure_ascii=False, sort_keys=True),
+                    str(changed_by),
+                    str(changed_by),
+                    created,
+                    created,
+                    created,
+                ),
+            )
+            if _commit:
+                self.conn.commit()
+            return self.get_auth_user(actor) or {}
+
+    def update_auth_user_roles(
+        self,
+        actor: str,
+        roles: list[str],
+        changed_by: str,
+        *,
+        _commit: bool = True,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            updated = now_ms()
+            cur = self.conn.execute(
+                """
+                UPDATE auth_users
+                SET roles_json = ?, updated_by = ?, updated_at_ms = ?
+                WHERE actor = ?
+                """,
+                (
+                    json.dumps(roles, ensure_ascii=False, sort_keys=True),
+                    str(changed_by),
+                    updated,
+                    str(actor),
+                ),
+            )
+            if _commit:
+                self.conn.commit()
+            return self.get_auth_user(actor) if cur.rowcount else None
+
+    def reset_auth_user_token(
+        self,
+        actor: str,
+        token_hash: str,
+        token_fingerprint: str,
+        changed_by: str,
+        *,
+        _commit: bool = True,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            updated = now_ms()
+            cur = self.conn.execute(
+                """
+                UPDATE auth_users
+                SET token_hash = ?, token_fingerprint = ?, updated_by = ?,
+                    updated_at_ms = ?, token_rotated_at_ms = ?
+                WHERE actor = ?
+                """,
+                (
+                    str(token_hash),
+                    str(token_fingerprint),
+                    str(changed_by),
+                    updated,
+                    updated,
+                    str(actor),
+                ),
+            )
+            if _commit:
+                self.conn.commit()
+            return self.get_auth_user(actor) if cur.rowcount else None
+
+    def revoke_auth_user_token(
+        self,
+        actor: str,
+        changed_by: str,
+        *,
+        _commit: bool = True,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            updated = now_ms()
+            cur = self.conn.execute(
+                """
+                UPDATE auth_users
+                SET token_hash = NULL, token_fingerprint = '', updated_by = ?,
+                    updated_at_ms = ?
+                WHERE actor = ?
+                """,
+                (str(changed_by), updated, str(actor)),
+            )
+            if _commit:
+                self.conn.commit()
+            return self.get_auth_user(actor) if cur.rowcount else None
+
+    def delete_auth_user(self, actor: str, *, _commit: bool = True) -> bool:
+        with self._lock:
+            cur = self.conn.execute(
+                "DELETE FROM auth_users WHERE actor = ?", (str(actor),)
+            )
+            if _commit:
+                self.conn.commit()
+            return bool(cur.rowcount)
 
     def readiness_check(self) -> dict[str, Any]:
         """Verify that the live database has the expected schema and is writable.

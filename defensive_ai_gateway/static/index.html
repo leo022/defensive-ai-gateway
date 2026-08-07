@@ -62,6 +62,7 @@
             <div id="settings-submenu" class="nav-submenu" role="group" data-i18n-aria-label="settingsSecondaryNav">
               <button id="settings-tab-model" class="nav-subbutton active" type="button" data-view="settings" data-secondary-group="settings" data-secondary-target="model" aria-controls="settings-model-panel" data-i18n="settingsSubModel">模型服务</button>
               <button id="settings-tab-harness" class="nav-subbutton" type="button" data-view="settings" data-secondary-group="settings" data-secondary-target="harness" aria-controls="settings-harness-panel" data-i18n="settingsSubHarness">Agent Harness</button>
+              <button id="settings-tab-users" class="nav-subbutton" type="button" data-view="settings" data-secondary-group="settings" data-secondary-target="users" aria-controls="settings-users-panel" data-i18n="settingsSubUsers" hidden>用户管理</button>
             </div>
           </div>
         </nav>
@@ -619,6 +620,36 @@
                 <div id="harness-version-list" class="harness-version-list"></div>
               </section>
             </div>
+            <div id="settings-users-panel" class="secondary-view" aria-labelledby="settings-tab-users" data-secondary-panel="settings" data-secondary-name="users" hidden>
+              <section class="panel user-management-panel">
+                <div class="panel-heading">
+                  <div>
+                    <h2 data-i18n="userManagementTitle">用户管理</h2>
+                    <p data-i18n="userManagementHint">维护管理员与操作员账户</p>
+                  </div>
+                  <button id="auth-users-refresh" type="button" data-i18n="refresh">刷新</button>
+                </div>
+                <form id="auth-user-form" class="user-create-form">
+                  <label>
+                    <span data-i18n="userActor">用户标识</span>
+                    <input id="auth-user-actor" name="actor" type="text" minlength="2" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9._@-]{1,63}" autocomplete="off" required />
+                  </label>
+                  <label>
+                    <span data-i18n="userRole">角色</span>
+                    <select id="auth-user-role" name="role">
+                      <option value="operator" data-i18n="userRoleOperator" selected>操作员</option>
+                      <option value="admin" data-i18n="userRoleAdmin">管理员</option>
+                    </select>
+                  </label>
+                  <div class="form-actions">
+                    <button type="submit" data-i18n="userCreate">新增用户</button>
+                  </div>
+                  <p id="auth-user-form-status" class="form-status" aria-live="polite"></p>
+                </form>
+                <div id="auth-user-list" class="user-list" role="list" data-i18n-aria-label="userListLabel"></div>
+                <p id="auth-user-list-status" class="form-status user-list-status" aria-live="polite"></p>
+              </section>
+            </div>
           </section>
           <section id="adapter-view" class="view">
             <div id="adapter-intake-panel" class="secondary-view active" aria-labelledby="adapter-tab-intake" data-secondary-panel="adapter" data-secondary-name="intake">
@@ -823,6 +854,26 @@
         <div class="form-actions">
           <button type="submit" data-i18n="authConnect">连接</button>
           <button id="auth-clear" type="button" data-i18n="authClear">清除</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="auth-user-token-dialog" class="auth-dialog auth-user-token-dialog" aria-describedby="auth-user-token-note">
+      <form method="dialog">
+        <div class="auth-dialog-heading">
+          <h2 data-i18n="userTokenTitle">新 Token</h2>
+          <button id="auth-user-token-close" class="icon-button" type="submit" aria-label="关闭" data-i18n-aria-label="authClose">&times;</button>
+        </div>
+        <p id="auth-user-token-note" data-i18n="userTokenOnce">此 Token 仅显示一次，页面已脱敏。</p>
+        <label>
+          <span id="auth-user-token-actor"></span>
+          <div class="user-token-copy-row">
+            <input id="auth-user-token-value" type="text" autocomplete="off" readonly spellcheck="false" />
+            <button id="auth-user-token-copy" class="primary" type="button" data-i18n="userTokenCopy">复制 Token</button>
+          </div>
+        </label>
+        <p id="auth-user-token-status" class="form-status" aria-live="polite"></p>
+        <div class="form-actions">
+          <button type="submit" data-i18n="authClose">关闭</button>
         </div>
       </form>
     </dialog>

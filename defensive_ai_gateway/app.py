@@ -8,6 +8,8 @@ import ipaddress
 import json
 import mimetypes
 import os
+import re
+import secrets
 import shutil
 import socket
 import threading
@@ -117,6 +119,7 @@ _ROLE_APPROVER = "approver"
 _ROLE_MEMORY = "memory"
 _ROLE_CONFIG = "config"
 _ROLE_RESPONDER = "responder"
+_ROLE_USER_ADMIN = "user_admin"
 _ALL_ROLES = {
     _ROLE_READ,
     _ROLE_INGEST,
@@ -126,6 +129,22 @@ _ALL_ROLES = {
     _ROLE_CONFIG,
     _ROLE_RESPONDER,
 }
+_KNOWN_ROLES = {*_ALL_ROLES, _ROLE_USER_ADMIN}
+_ADMIN_ROLES = {*_ALL_ROLES, _ROLE_USER_ADMIN}
+_OPERATOR_ROLES = set(_ALL_ROLES)
+_ROLE_ORDER = (
+    _ROLE_READ,
+    _ROLE_ANALYST,
+    _ROLE_APPROVER,
+    _ROLE_MEMORY,
+    _ROLE_CONFIG,
+    _ROLE_RESPONDER,
+    _ROLE_INGEST,
+)
+_ACCOUNT_ROLE_ORDER = ("admin", "operator")
+_INITIAL_ADMIN_ACTOR = "admin"
+_INITIAL_ADMIN_TOKEN = "Bxv+CMUsaOKnPEenVDbgDK4N667Jmlz9VToX0e7N895wsmlJb/o7giLWLtatLIGB"
+_AUTH_ACTOR_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]{1,63}$")
 _SYSLOG_PRODUCT_ORDER = ("waf", "hips", "ndr", "rasp", "siem")
 _SYSLOG_DEPLOYMENT_MAX_CIDRS = 64
 
@@ -526,6 +545,10 @@ def _looks_like_standard_alert(payload: dict) -> bool:
     return any(k in payload for k in _STANDARD_ALERT_KEYS)
 
 
+def _auth_token_digest(token: str) -> str:
+    return hashlib.sha256(str(token).encode("utf-8")).hexdigest()
+
+
 def _build_raw_alert(payload: dict, product: str) -> RawAlert:
     alert_payload = dict(payload.get("payload", payload))
     # These fields are produced only by the server-side mapping pipeline. A
@@ -687,6 +710,7 @@ class GatewayState:
         self.config_path = config_path
         self.lock = threading.RLock()
         self.repo = Repository(config.database.path)
+        self._ensure_initial_admin()
         self.response_automation = ResponseAutomationService(
             self.repo,
             allow_loopback_connectors=config.auth.demo_mode,
@@ -1644,6 +1668,238 @@ class GatewayState:
                 "timeout_seconds": llm.timeout_seconds,
                 "runtime": runtime,
             }
+
+    @staticmethod
+    def _roles_for_account_role(role: str) -> list[str]:
+        roles = _ADMIN_ROLES if role == "admin" else _OPERATOR_ROLES
+        return [
+            item
+            for item in (*_ROLE_ORDER, _ROLE_USER_ADMIN)
+            if item in roles
+        ]
+
+    @staticmethod
+    def _account_role_for_user(user: dict) -> str:
+        return "admin" if _ROLE_USER_ADMIN in set(user.get("roles") or []) else "operator"
+
+    @classmethod
+    def _public_auth_user(cls, user: dict) -> dict:
+        return {
+            "actor": str(user.get("actor") or ""),
+            "role": cls._account_role_for_user(user),
+            "token_active": bool(user.get("token_active")),
+            "token_fingerprint": str(user.get("token_fingerprint") or ""),
+            "source": "managed",
+            "created_by": str(user.get("created_by") or ""),
+            "updated_by": str(user.get("updated_by") or ""),
+            "created_at_ms": user.get("created_at_ms"),
+            "updated_at_ms": user.get("updated_at_ms"),
+            "token_rotated_at_ms": user.get("token_rotated_at_ms"),
+        }
+
+    def _ensure_initial_admin(self) -> None:
+        if self.repo.get_auth_user(_INITIAL_ADMIN_ACTOR):
+            return
+        digest = _auth_token_digest(_INITIAL_ADMIN_TOKEN)
+        owner = self.repo.find_auth_user_by_token_hash(digest)
+        if owner:
+            raise RuntimeError("initial admin token is already assigned to another user")
+        fingerprint = f"sha256:{digest[:12]}"
+        roles = self._roles_for_account_role("admin")
+        with self.repo.transaction():
+            self.repo.create_auth_user(
+                _INITIAL_ADMIN_ACTOR,
+                roles,
+                digest,
+                fingerprint,
+                "system-bootstrap",
+                _commit=False,
+            )
+            self.repo.insert_audit(
+                new_id("audit"),
+                f"auth-user:{_INITIAL_ADMIN_ACTOR}",
+                "system-bootstrap",
+                "auth_user_bootstrapped",
+                {
+                    "target_actor": _INITIAL_ADMIN_ACTOR,
+                    "role": "admin",
+                    "token_fingerprint": fingerprint,
+                },
+                _commit=False,
+            )
+
+    def auth_users_payload(self) -> dict:
+        with self.lock:
+            users = [self._public_auth_user(user) for user in self.repo.list_auth_users()]
+            return {"roles": list(_ACCOUNT_ROLE_ORDER), "users": users}
+
+    @staticmethod
+    def _normalized_account_role(value: object) -> str:
+        role = str(value or "operator").strip().lower()
+        if role not in _ACCOUNT_ROLE_ORDER:
+            raise ValueError("role must be admin or operator")
+        return role
+
+    def _reserved_auth_actors(self) -> set[str]:
+        return {
+            "api-admin",
+            "ingest-collector",
+            "soc-operator",
+            "soc-approver",
+            "soc-responder",
+            *(
+                str(principal.actor or "").strip()
+                for principal in self.config.auth.principals
+                if str(principal.actor or "").strip()
+            ),
+        }
+
+    def _new_managed_auth_token(self) -> tuple[str, str, str]:
+        for _ in range(4):
+            token = f"dag_{secrets.token_urlsafe(32)}"
+            digest = _auth_token_digest(token)
+            if self.repo.find_auth_user_by_token_hash(digest) is None:
+                return token, digest, f"sha256:{digest[:12]}"
+        raise RuntimeError("could not allocate a unique authentication token")
+
+    def create_auth_user(self, payload: dict, *, changed_by: str) -> dict:
+        actor = str(payload.get("actor") or "").strip()
+        if not _AUTH_ACTOR_PATTERN.fullmatch(actor):
+            raise ValueError(
+                "actor must be 2-64 characters using letters, numbers, '.', '_', '@' or '-'"
+            )
+        role = self._normalized_account_role(payload.get("role"))
+        roles = self._roles_for_account_role(role)
+        with self.lock:
+            if actor in self._reserved_auth_actors() or self.repo.get_auth_user(actor):
+                raise ValueError("actor already exists or is deployment-managed")
+            token, digest, fingerprint = self._new_managed_auth_token()
+            with self.repo.transaction():
+                user = self.repo.create_auth_user(
+                    actor,
+                    roles,
+                    digest,
+                    fingerprint,
+                    changed_by,
+                    _commit=False,
+                )
+                self.repo.insert_audit(
+                    new_id("audit"),
+                    f"auth-user:{actor}",
+                    changed_by,
+                    "auth_user_created",
+                    {"target_actor": actor, "role": role},
+                    _commit=False,
+                )
+            return {"user": self._public_auth_user(user), "token": token}
+
+    def update_auth_user_role(
+        self,
+        actor: str,
+        payload: dict,
+        *,
+        changed_by: str,
+    ) -> dict:
+        role = self._normalized_account_role(payload.get("role"))
+        roles = self._roles_for_account_role(role)
+        with self.lock:
+            existing = self.repo.get_auth_user(actor)
+            if not existing:
+                raise KeyError(actor)
+            if actor == _INITIAL_ADMIN_ACTOR and role != "admin":
+                raise ValueError("the built-in admin cannot be demoted")
+            if actor == changed_by and role != "admin":
+                raise ValueError("the current admin cannot demote their own account")
+            with self.repo.transaction():
+                user = self.repo.update_auth_user_roles(
+                    actor, roles, changed_by, _commit=False
+                )
+                self.repo.insert_audit(
+                    new_id("audit"),
+                    f"auth-user:{actor}",
+                    changed_by,
+                    "auth_user_role_updated",
+                    {
+                        "target_actor": actor,
+                        "previous_role": self._account_role_for_user(existing),
+                        "role": role,
+                    },
+                    _commit=False,
+                )
+            return {"user": self._public_auth_user(user or {})}
+
+    def reset_auth_user_token(self, actor: str, *, changed_by: str) -> dict:
+        with self.lock:
+            if not self.repo.get_auth_user(actor):
+                raise KeyError(actor)
+            token, digest, fingerprint = self._new_managed_auth_token()
+            with self.repo.transaction():
+                user = self.repo.reset_auth_user_token(
+                    actor,
+                    digest,
+                    fingerprint,
+                    changed_by,
+                    _commit=False,
+                )
+                self.repo.insert_audit(
+                    new_id("audit"),
+                    f"auth-user:{actor}",
+                    changed_by,
+                    "auth_user_token_reset",
+                    {"target_actor": actor, "token_fingerprint": fingerprint},
+                    _commit=False,
+                )
+            return {"user": self._public_auth_user(user or {}), "token": token}
+
+    def revoke_auth_user_token(self, actor: str, *, changed_by: str) -> dict:
+        with self.lock:
+            existing = self.repo.get_auth_user(actor)
+            if not existing:
+                raise KeyError(actor)
+            if actor == changed_by:
+                raise ValueError("the current user cannot revoke their own token")
+            with self.repo.transaction():
+                user = self.repo.revoke_auth_user_token(
+                    actor, changed_by, _commit=False
+                )
+                self.repo.insert_audit(
+                    new_id("audit"),
+                    f"auth-user:{actor}",
+                    changed_by,
+                    "auth_user_token_revoked",
+                    {
+                        "target_actor": actor,
+                        "previous_token_fingerprint": existing["token_fingerprint"],
+                    },
+                    _commit=False,
+                )
+            return {"user": self._public_auth_user(user or {})}
+
+    def delete_auth_user(self, actor: str, *, changed_by: str) -> dict:
+        with self.lock:
+            existing = self.repo.get_auth_user(actor)
+            if not existing:
+                raise KeyError(actor)
+            if actor == _INITIAL_ADMIN_ACTOR:
+                raise ValueError("the built-in admin cannot be deleted")
+            if actor == changed_by:
+                raise ValueError("the current admin cannot delete their own account")
+            with self.repo.transaction():
+                self.repo.insert_audit(
+                    new_id("audit"),
+                    f"auth-user:{actor}",
+                    changed_by,
+                    "auth_user_deleted",
+                    {
+                        "target_actor": actor,
+                        "role": self._account_role_for_user(existing),
+                        "previous_token_fingerprint": existing["token_fingerprint"],
+                    },
+                    _commit=False,
+                )
+                if not self.repo.delete_auth_user(actor, _commit=False):
+                    raise KeyError(actor)
+            return {"actor": actor}
 
     def agent_harness_payload(self) -> dict:
         with self.lock:
@@ -3543,7 +3799,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         )
 
     def _principal(self) -> dict | None:
-        """Resolve a bearer token to a fixed identity and least-privilege roles."""
+        """Resolve a bearer token to a deployment or managed least-privilege identity."""
         auth = self.state.config.auth
         configured = [
             auth.api_token,
@@ -3556,7 +3812,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         header = self.headers.get("Authorization", "")
         token = header[len("Bearer ") :] if header.startswith("Bearer ") else ""
         candidates = [
-            (auth.api_token, "api-admin", _ALL_ROLES),
+            (auth.api_token, "api-admin", _ADMIN_ROLES),
             (auth.ingest_token, "ingest-collector", {_ROLE_INGEST}),
             (auth.operator_token, "soc-operator", {_ROLE_READ, _ROLE_ANALYST, _ROLE_MEMORY}),
             (auth.approver_token, "soc-approver", {_ROLE_READ, _ROLE_APPROVER, _ROLE_MEMORY}),
@@ -3565,15 +3821,25 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 (
                     principal.token,
                     principal.actor,
-                    {str(role).strip().lower() for role in principal.roles} & _ALL_ROLES,
+                    {str(role).strip().lower() for role in principal.roles} & _KNOWN_ROLES,
                 )
                 for principal in auth.principals
             ),
         ]
+        for expected, actor, roles in candidates:
+            if expected and token and hmac.compare_digest(token, expected):
+                return {"actor": actor, "roles": set(roles)}
+        repo = getattr(self.state, "repo", None)
+        if token and repo is not None:
+            managed = repo.find_auth_user_by_token_hash(
+                _auth_token_digest(token)
+            )
+            if managed:
+                return {
+                    "actor": managed["actor"],
+                    "roles": set(managed["roles"]) & _KNOWN_ROLES,
+                }
         if any(configured):
-            for expected, actor, roles in candidates:
-                if expected and token and hmac.compare_digest(token, expected):
-                    return {"actor": actor, "roles": set(roles)}
             return None
         if self._trusted_local_demo_request() and auth.allow_loopback_no_token:
             return {"actor": "local-demo-operator", "roles": set(_ALL_ROLES)}
@@ -3583,6 +3849,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             and not auth.require_token_when_remote
         ):
             return {"actor": "explicit-demo-operator", "roles": set(_ALL_ROLES)}
+        if repo is not None and repo.has_active_auth_users():
+            return None
         return None
 
     def _authorized(self) -> bool:
@@ -3784,6 +4052,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 200,
                 {"actor": principal["actor"], "roles": sorted(principal["roles"])},
             )
+            return
+        if parsed.path == "/api/config/users":
+            if not self._require_roles(_ROLE_USER_ADMIN):
+                return
+            self._json(200, self.state.auth_users_payload())
             return
         if parsed.path in ("/api/config/llm", "/api/config/llm/models"):
             # Sensitive: exposes provider/endpoint and probes the LLM backend.
@@ -4177,7 +4450,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if not self._allow_api_request(parsed.path):
             return
-        if parsed.path.startswith("/api/config/"):
+        if parsed.path == "/api/config/users" or parsed.path.startswith("/api/config/users/"):
+            authorized = self._require_roles(_ROLE_USER_ADMIN)
+        elif parsed.path.startswith("/api/config/"):
             authorized = self._require_roles(_ROLE_CONFIG)
         elif parsed.path == "/api/automation/policy":
             authorized = self._require_roles(_ROLE_CONFIG)
@@ -4221,6 +4496,51 @@ class GatewayHandler(BaseHTTPRequestHandler):
             authorized = self._require_auth()
         if not authorized:
             return
+        if parsed.path == "/api/config/users":
+            try:
+                created = self.state.create_auth_user(
+                    self._read_json(), changed_by=self._authenticated_actor()
+                )
+                self._json(201, {"ok": True, **created})
+            except _PayloadTooLarge:
+                self._json(413, {"error": "request body too large"})
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                self._client_error(exc)
+            except Exception as exc:
+                self._server_error(exc)
+            return
+        if parsed.path.startswith("/api/config/users/"):
+            parts = parsed.path.strip("/").split("/")
+            try:
+                if len(parts) < 5 or parts[:3] != ["api", "config", "users"]:
+                    raise ValueError("invalid user management path")
+                actor = unquote(parts[3])
+                if len(parts) == 5 and parts[4] == "role":
+                    result = self.state.update_auth_user_role(
+                        actor,
+                        self._read_json(),
+                        changed_by=self._authenticated_actor(),
+                    )
+                elif len(parts) == 6 and parts[4:] == ["token", "reset"]:
+                    result = self.state.reset_auth_user_token(
+                        actor, changed_by=self._authenticated_actor()
+                    )
+                elif len(parts) == 6 and parts[4:] == ["token", "revoke"]:
+                    result = self.state.revoke_auth_user_token(
+                        actor, changed_by=self._authenticated_actor()
+                    )
+                else:
+                    raise ValueError("invalid user management action")
+                self._json(200, {"ok": True, **result})
+            except _PayloadTooLarge:
+                self._json(413, {"error": "request body too large"})
+            except KeyError:
+                self._json(404, {"error": "managed user not found"})
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                self._client_error(exc)
+            except Exception as exc:
+                self._server_error(exc)
+            return
         if parsed.path == "/api/automation/policy":
             try:
                 body = self._governance_body(self._read_json())
@@ -4235,6 +4555,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._server_error(exc)
             return
+
         if parsed.path == "/api/automation/connectors":
             try:
                 body = self._governance_body(self._read_json())
@@ -4845,6 +5166,34 @@ class GatewayHandler(BaseHTTPRequestHandler):
         except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
             self._client_error(exc)
         except Exception as exc:  # pragma: no cover - surfaced to local operator
+            self._server_error(exc)
+
+    def do_DELETE(self):  # noqa: N802
+        parsed = urlparse(self.path)
+        if not self._allow_api_request(parsed.path):
+            return
+        if not parsed.path.startswith("/api/config/users/"):
+            if not self._require_auth():
+                return
+            self._json(404, {"error": "not found"})
+            return
+        if not self._require_roles(_ROLE_USER_ADMIN):
+            return
+        parts = parsed.path.strip("/").split("/")
+        if len(parts) != 4 or parts[:3] != ["api", "config", "users"]:
+            self._json(404, {"error": "managed user not found"})
+            return
+        actor = unquote(parts[3])
+        try:
+            result = self.state.delete_auth_user(
+                actor, changed_by=self._authenticated_actor()
+            )
+            self._json(200, {"ok": True, **result})
+        except KeyError:
+            self._json(404, {"error": "managed user not found"})
+        except (ValueError, TypeError) as exc:
+            self._client_error(exc)
+        except Exception as exc:
             self._server_error(exc)
 
     def do_HEAD(self):  # noqa: N802

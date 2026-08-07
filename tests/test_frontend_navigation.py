@@ -296,6 +296,7 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
             "automation-tab-policy": ("automation", "policy", "automation-policy-panel", "automation-submenu"),
             "settings-tab-model": ("settings", "model", "settings-model-panel", "settings-submenu"),
             "settings-tab-harness": ("settings", "harness", "settings-harness-panel", "settings-submenu"),
+            "settings-tab-users": ("settings", "users", "settings-users-panel", "settings-submenu"),
         }
         for tab_id, (group, target, panel_id, submenu_id) in expected_tabs.items():
             with self.subTest(tab=tab_id):
@@ -329,6 +330,7 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertIn("hidden", self.elements["automation-policy-panel"]["attrs"])
         self.assertNotIn("hidden", self.elements["settings-model-panel"]["attrs"])
         self.assertIn("hidden", self.elements["settings-harness-panel"]["attrs"])
+        self.assertIn("hidden", self.elements["settings-users-panel"]["attrs"])
         self.assertNotIn('class="secondary-nav"', HTML)
 
         containment = {
@@ -352,6 +354,8 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
             "llm-form": "settings-model-panel",
             "harness-profile-form": "settings-harness-panel",
             "harness-version-list": "settings-harness-panel",
+            "auth-user-form": "settings-users-panel",
+            "auth-user-list": "settings-users-panel",
         }
         for element_id, panel_id in containment.items():
             with self.subTest(element=element_id):
@@ -376,6 +380,7 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
             "settingsSecondaryNav",
             "settingsSubModel",
             "settingsSubHarness",
+            "settingsSubUsers",
         ):
             self.assertEqual(JS.count(f"{key}:"), 2)
         self.assertIn("function setSecondaryView", JS)
@@ -411,6 +416,49 @@ class FrontendSecondaryNavigationTest(unittest.TestCase):
         self.assertIn('languageAria: "Switch to Chinese"', JS)
         self.assertEqual(JS.count("footer:"), 2)
         self.assertIn('data-i18n="footer"', HTML)
+
+    def test_user_management_is_admin_scoped_and_masks_one_time_tokens(self):
+        self.assertIn('id="auth-user-token-dialog"', HTML)
+        self.assertIn(
+            'id="auth-user-token-value" type="text" autocomplete="off" readonly',
+            HTML,
+        )
+        self.assertIn('id="settings-tab-users"', HTML)
+        self.assertIn('data-i18n="settingsSubUsers" hidden', HTML)
+        self.assertIn('name="role"', HTML)
+        self.assertIn('value="operator"', HTML)
+        self.assertIn('value="admin"', HTML)
+        self.assertIn('json("/api/config/users")', JS)
+        self.assertIn('/api/config/users/${encodeURIComponent(actor)}/role', JS)
+        self.assertIn('/api/config/users/${encodeURIComponent(actor)}/token/reset', JS)
+        self.assertIn('/api/config/users/${encodeURIComponent(actor)}`, { method: "DELETE" }', JS)
+        self.assertIn(
+            '["user_admin"]',
+            JS,
+        )
+        self.assertIn('control.dataset.permissionLock === "true"', JS)
+        self.assertIn('data-permission-lock="true" disabled', JS)
+        self.assertIn('userTab.hidden = !userAccess', JS)
+        self.assertIn('authButton.hidden = false', JS)
+        self.assertNotIn("token_hash", JS)
+        self.assertIn(".user-list-row", CSS)
+        self.assertIn(".user-token-state.revoked", CSS)
+        self.assertIn(".user-token-copy-row", CSS)
+        self.assertIn("authUserOneTimeToken = String(token || \"\")", JS)
+        self.assertIn("maskAuthUserToken(authUserOneTimeToken)", JS)
+        self.assertIn("navigator.clipboard.writeText(authUserOneTimeToken)", JS)
+        self.assertNotIn('auth-user-token-value").value = token', JS)
+        for key in (
+            "userManagementTitle",
+            "userCreate",
+            "userSaveRole",
+            "userResetToken",
+            "userDelete",
+            "userTokenOnce",
+            "userRoleAdmin",
+            "userRoleOperator",
+        ):
+            self.assertEqual(JS.count(f"{key}:"), 2)
 
     def test_agent_harness_uses_versioned_governed_configuration(self):
         for field_id in (

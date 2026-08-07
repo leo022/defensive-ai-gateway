@@ -67,6 +67,16 @@ python3 -m defensive_ai_gateway --config config/dev.yaml
 | 查询延迟队列 | `GET /api/alerts/inbox?status=deferred&limit=100&offset=0` |
 | 查询死信队列 | `GET /api/alerts/inbox?status=dead_letter&limit=100&offset=0` |
 
+全新数据库会初始化内置用户 `admin`，首次登录 Token 为：
+
+```text
+Bxv+CMUsaOKnPEenVDbgDK4N667Jmlz9VToX0e7N895wsmlJb/o7giLWLtatLIGB
+```
+
+系统只将该值的 SHA-256 摘要写入数据库。首次登录后应立即在“运行配置 → 用户管理”
+重置 Token；后续重启不会覆盖已重置的值。管理员可以新增、删除用户及重置 Token，
+操作员拥有相同的日常运营权限，但不能访问用户管理。
+
 开发配置默认使用确定性的本地规则分析器 `local-rule-analyst`，无需外部模型服务即可运行。
 
 ## 模型服务配置
