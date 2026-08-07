@@ -28,6 +28,7 @@ from defensive_ai_gateway.models import RawAlert
 from defensive_ai_gateway.response_agent import (
     CONTROLLER_TOOLS,
     MANDATORY_TOOLS,
+    REPORT_RETRY_SCHEMA,
     REPORT_SCHEMA,
     _raw_stream_progress,
 )
@@ -79,9 +80,11 @@ class _TransientContractAgentLLM:
         self.report_failures = report_failures
         self.planner_contract_errors = 0
         self.report_contract_errors = 0
+        self.report_schemas = []
 
     def generate_structured(self, prompt, context, schema=None):  # noqa: ANN001
         if prompt.startswith("Write a complete"):
+            self.report_schemas.append(schema)
             if self.report_contract_errors < self.report_failures:
                 self.report_contract_errors += 1
                 raise LLMResponseContractError("synthetic malformed report response")
@@ -903,6 +906,13 @@ class ResponseAgentTest(unittest.TestCase):
         self.assertEqual(final["last_error"], "")
         self.assertEqual(llm.planner_contract_errors, 2)
         self.assertEqual(llm.report_contract_errors, 2)
+        self.assertEqual(
+            [
+                schema["x-controller-output-token-budget"]
+                for schema in llm.report_schemas
+            ],
+            [6_144, 4_096, 4_096],
+        )
         planner_rejections = [
             step
             for step in final["steps"]
@@ -4212,6 +4222,21 @@ class StructuredLLMContractTest(unittest.TestCase):
         ):
             self.assertNotIn(controller_owned, REPORT_SCHEMA["properties"])
             self.assertNotIn(controller_owned, REPORT_SCHEMA["required"])
+        self.assertEqual(
+            REPORT_RETRY_SCHEMA["x-controller-output-token-budget"],
+            4_096,
+        )
+        self.assertEqual(
+            set(REPORT_RETRY_SCHEMA["required"]),
+            {
+                "title",
+                "executive_summary",
+                "conclusion",
+                "impact",
+                "response_plan",
+                "final_assessment",
+            },
+        )
 
     def test_provider_neutral_parser_accepts_supported_gateway_shapes(self):
         expected = {"action": "finish", "rationale": "done"}

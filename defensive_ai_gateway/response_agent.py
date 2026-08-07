@@ -218,6 +218,59 @@ REPORT_SCHEMA = {
         "final_assessment",
     ],
 }
+REPORT_RETRY_SCHEMA = {
+    "x-controller-output-token-budget": 4_096,
+    "type": "object",
+    "properties": {
+        "title": {"type": "string", "maxLength": 160},
+        "executive_summary": {"type": "string", "maxLength": 600},
+        "conclusion": {"type": "object"},
+        "impact": {"type": "string", "maxLength": 600},
+        "response_plan": {
+            "type": "array",
+            "maxItems": 4,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "step_id": {"type": "string", "maxLength": 80},
+                    "stage": {"type": "string", "maxLength": 80},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["observe", "approve_required"],
+                    },
+                    "action": {"type": "string", "maxLength": 500},
+                    "rationale": {"type": "string", "maxLength": 500},
+                    "success_criteria": {"type": "string", "maxLength": 500},
+                    "rollback": {"type": "string", "maxLength": 500},
+                    "evidence_refs": {
+                        "type": "array",
+                        "maxItems": 12,
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": [
+                    "step_id",
+                    "stage",
+                    "mode",
+                    "action",
+                    "rationale",
+                    "success_criteria",
+                    "rollback",
+                    "evidence_refs",
+                ],
+            },
+        },
+        "final_assessment": {"type": "string", "maxLength": 600},
+    },
+    "required": [
+        "title",
+        "executive_summary",
+        "conclusion",
+        "impact",
+        "response_plan",
+        "final_assessment",
+    ],
+}
 
 FORENSIC_WORKSTREAMS = (
     {
@@ -4296,10 +4349,8 @@ class ResponseInvestigationAgent:
                 "in the executive summary or final assessment. Do not expose chain-of-thought. "
                 f"Write all operator-facing prose in "
                 f"{'English' if report_language == 'en' else 'Simplified Chinese'}. "
-                "Return only one JSON object matching this schema: "
-                f"{json.dumps(REPORT_SCHEMA, ensure_ascii=False)}\n"
-                f"CONTEXT={self.policy.truncate_prompt_payload(context)}"
             )
+            rendered_context = self.policy.truncate_prompt_payload(context)
             for attempt in range(1, 4):
                 if (
                     self._active_elapsed(usage, synthesis_started)
@@ -4320,19 +4371,28 @@ class ResponseInvestigationAgent:
                     )
                     if not updated:
                         return
+                attempt_schema = (
+                    REPORT_SCHEMA if attempt == 1 else REPORT_RETRY_SCHEMA
+                )
                 structured_prompt = prompt
                 if attempt > 1:
                     structured_prompt += (
-                        "\nRETRY_FEEDBACK=The previous response was not one valid JSON "
-                        "object. Return only the requested JSON object without markdown. "
-                        "Keep every narrative field concise and obey the stated item limits "
-                        "so the complete closing brace fits within the output budget."
+                        "RETRY_FEEDBACK=The previous full narrative patch exceeded the "
+                        "provider response boundary. Return only the compact rescue patch "
+                        "below without markdown. Do not add fields from the larger schema. "
+                        "The controller will merge this patch into its complete evidence-"
+                        "grounded report. "
                     )
+                structured_prompt += (
+                    "Return only one JSON object matching this schema: "
+                    f"{json.dumps(attempt_schema, ensure_ascii=False)}\n"
+                    f"CONTEXT={rendered_context}"
+                )
                 try:
                     candidate = llm.generate_structured(
                         structured_prompt,
                         context,
-                        REPORT_SCHEMA,
+                        attempt_schema,
                     )
                     latest = self.repo.get_response_agent_session(session_id)
                     if not latest or latest["status"] != "synthesizing":
@@ -4367,6 +4427,9 @@ class ResponseInvestigationAgent:
                             "code": "model_response_contract",
                             "retry": retry,
                             "attempt": attempt,
+                            "schema_mode": (
+                                "full" if attempt == 1 else "compact_retry"
+                            ),
                         },
                         [],
                         expected_statuses=("synthesizing",),
