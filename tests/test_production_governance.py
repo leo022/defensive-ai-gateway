@@ -1070,6 +1070,32 @@ class HTTPProductionBoundaryTest(unittest.TestCase):
             ).fetchone()
         )
 
+    def test_managed_admin_reset_shadows_matching_deployment_token(self):
+        initial_admin_token = (
+            "Bxv+CMUsaOKnPEenVDbgDK4N667Jmlz9VToX0e7N895wsmlJb/"
+            "o7giLWLtatLIGB"
+        )
+        self.server.state.config.auth.api_token = initial_admin_token
+
+        status, session = self._request("/api/session", token=initial_admin_token)
+        self.assertEqual(status, 200)
+        self.assertEqual(session["actor"], "admin")
+
+        status, rotated = self._request(
+            "/api/config/users/admin/token/reset",
+            token=initial_admin_token,
+            payload={},
+        )
+        self.assertEqual(status, 200)
+        replacement_token = rotated["token"]
+        self.assertNotEqual(replacement_token, initial_admin_token)
+        self.assertEqual(self._request("/api/session", token=initial_admin_token)[0], 401)
+
+        status, session = self._request("/api/session", token=replacement_token)
+        self.assertEqual(status, 200)
+        self.assertEqual(session["actor"], "admin")
+        self.assertIn("user_admin", session["roles"])
+
     def test_signed_loopback_syslog_isolated_and_spoofed_markers_rejected(self):
         def vector_payload(alert_id: str, source_ip: str, *, valid_signature: bool = True) -> dict:
             native = json.loads(

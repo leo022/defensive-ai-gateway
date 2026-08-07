@@ -3811,8 +3811,29 @@ class GatewayHandler(BaseHTTPRequestHandler):
         ]
         header = self.headers.get("Authorization", "")
         token = header[len("Bearer ") :] if header.startswith("Bearer ") else ""
+        repo = getattr(self.state, "repo", None)
+        if token and repo is not None:
+            managed = repo.find_auth_user_by_token_hash(_auth_token_digest(token))
+            if managed:
+                return {
+                    "actor": managed["actor"],
+                    "roles": set(managed["roles"]) & _KNOWN_ROLES,
+                }
+
+        deployment_api_token = auth.api_token
+        if (
+            token
+            and deployment_api_token
+            and repo is not None
+            and hmac.compare_digest(token, deployment_api_token)
+            and hmac.compare_digest(deployment_api_token, _INITIAL_ADMIN_TOKEN)
+            and repo.get_auth_user(_INITIAL_ADMIN_ACTOR) is not None
+        ):
+            # Once the managed bootstrap admin exists, the bootstrap token must
+            # rotate only through that account and cannot fall back to api-admin.
+            deployment_api_token = ""
         candidates = [
-            (auth.api_token, "api-admin", _ADMIN_ROLES),
+            (deployment_api_token, "api-admin", _ADMIN_ROLES),
             (auth.ingest_token, "ingest-collector", {_ROLE_INGEST}),
             (auth.operator_token, "soc-operator", {_ROLE_READ, _ROLE_ANALYST, _ROLE_MEMORY}),
             (auth.approver_token, "soc-approver", {_ROLE_READ, _ROLE_APPROVER, _ROLE_MEMORY}),
@@ -3829,16 +3850,6 @@ class GatewayHandler(BaseHTTPRequestHandler):
         for expected, actor, roles in candidates:
             if expected and token and hmac.compare_digest(token, expected):
                 return {"actor": actor, "roles": set(roles)}
-        repo = getattr(self.state, "repo", None)
-        if token and repo is not None:
-            managed = repo.find_auth_user_by_token_hash(
-                _auth_token_digest(token)
-            )
-            if managed:
-                return {
-                    "actor": managed["actor"],
-                    "roles": set(managed["roles"]) & _KNOWN_ROLES,
-                }
         if any(configured):
             return None
         if self._trusted_local_demo_request() and auth.allow_loopback_no_token:
