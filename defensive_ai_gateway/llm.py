@@ -33,6 +33,8 @@ _RETRYABLE_HTTP_CODES = {408, 425, 429, 500, 502, 503, 504}
 ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_LLM_OUTPUT_TOKENS = 4096
 MAX_LLM_OUTPUT_TOKENS = 16_384
+DEFAULT_LLM_TIMEOUT_CAP_SECONDS = 120.0
+LONG_STRUCTURED_OUTPUT_TIMEOUT_SECONDS = 240.0
 ANTHROPIC_MAX_TOKENS = DEFAULT_LLM_OUTPUT_TOKENS
 CONTROLLER_OUTPUT_TOKEN_BUDGET_KEY = "x-controller-output-token-budget"
 GATEWAY_USER_AGENT = "defensive-ai-gateway/1.0"
@@ -73,12 +75,15 @@ def is_websocket_upgrade_required(status: int, body: str) -> bool:
     return int(status) == 426 and "websocket" in str(body or "").lower()
 
 
-def _bounded_timeout(value: Any) -> float:
+def _bounded_timeout(
+    value: Any,
+    maximum: float = DEFAULT_LLM_TIMEOUT_CAP_SECONDS,
+) -> float:
     try:
         timeout = float(value)
     except (TypeError, ValueError):
         timeout = 30.0
-    return max(1.0, min(timeout, 120.0))
+    return max(1.0, min(timeout, maximum))
 
 
 def _validate_http_endpoint(
@@ -140,8 +145,9 @@ def _open_with_retry(
     *,
     bypass_proxy: bool = False,
     endpoint_pin: EndpointPin | None = None,
+    timeout_cap_seconds: float = DEFAULT_LLM_TIMEOUT_CAP_SECONDS,
 ):
-    bounded_timeout = _bounded_timeout(timeout)
+    bounded_timeout = _bounded_timeout(timeout, timeout_cap_seconds)
     attempts = max(1, min(int(max_retries) + 1, 4))
     for attempt in range(attempts):
         try:
@@ -1001,13 +1007,25 @@ class GatewayLLM(LLMClient):
             api_key,
             max_tokens=max_output_tokens,
         )
+        large_structured_output = (
+            max_output_tokens > DEFAULT_LLM_OUTPUT_TOKENS
+        )
+        request_timeout = self.config.timeout_seconds
+        timeout_cap = DEFAULT_LLM_TIMEOUT_CAP_SECONDS
+        if large_structured_output:
+            request_timeout = max(
+                float(request_timeout),
+                LONG_STRUCTURED_OUTPUT_TIMEOUT_SECONDS,
+            )
+            timeout_cap = LONG_STRUCTURED_OUTPUT_TIMEOUT_SECONDS
         try:
             with _open_with_retry(
                 req,
-                self.config.timeout_seconds,
+                request_timeout,
                 self.config.max_retries,
                 bypass_proxy=True,
                 endpoint_pin=endpoint_pin,
+                timeout_cap_seconds=timeout_cap,
             ) as resp:
                 if resp.status >= 400:
                     if resp.status < 500 and resp.status not in _RETRYABLE_HTTP_CODES:

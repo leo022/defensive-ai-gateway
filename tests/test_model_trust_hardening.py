@@ -985,6 +985,7 @@ class ModelTransportBoundaryTest(unittest.TestCase):
 
         payload = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
         self.assertEqual(payload["max_output_tokens"], 8_192)
+        self.assertEqual(urlopen.call_args.kwargs["timeout"], 240.0)
         self.assertEqual(result, {"title": "complete report"})
 
     def test_openai_chat_completions_request_and_response_are_adapted(self):
