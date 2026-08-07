@@ -944,6 +944,49 @@ class ModelTransportBoundaryTest(unittest.TestCase):
         self.assertEqual(result["classification"], "suspicious")
         self.assertEqual(result["model"], "gpt-5.5")
 
+    def test_structured_gateway_request_honors_bounded_schema_output_budget(self):
+        response = _Response(
+            json.dumps(
+                {
+                    "object": "response",
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": '{"title":"complete report"}',
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ).encode()
+        )
+        llm = GatewayLLM(
+            LLMConfig(
+                provider="gateway",
+                endpoint="https://kkcoder.com/v1/responses",
+                api_key="secret-value",
+                model="claude-haiku",
+                allowed_hosts=["kkcoder.com"],
+            )
+        )
+        schema = {
+            "x-controller-output-token-budget": 8_192,
+            "type": "object",
+        }
+        resolution = [(None, None, None, None, ("8.8.8.8", 443))]
+        with patch("defensive_ai_gateway.llm.socket.getaddrinfo", return_value=resolution):
+            with patch(
+                "defensive_ai_gateway.llm._open_no_redirect", return_value=response
+            ) as urlopen:
+                result = llm.generate_structured("report prompt", {}, schema)
+
+        payload = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
+        self.assertEqual(payload["max_output_tokens"], 8_192)
+        self.assertEqual(result, {"title": "complete report"})
+
     def test_openai_chat_completions_request_and_response_are_adapted(self):
         result_json = {
             "classification": "benign",

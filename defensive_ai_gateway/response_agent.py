@@ -140,6 +140,7 @@ TURN_SCHEMA = {
     "required": ["action", "rationale"],
 }
 REPORT_SCHEMA = {
+    "x-controller-output-token-budget": 8_192,
     "type": "object",
     "properties": {
         "title": {"type": "string"},
@@ -4276,6 +4277,9 @@ class ResponseInvestigationAgent:
                 "such as none, N/A or 无 for rationale, success criteria or rollback. "
                 "Risk aggravating_factors and mitigating_factors must be JSON arrays of "
                 "complete sentences, never a string or an array of individual characters. "
+                "Keep the JSON concise: use at most 8 findings, 8 attack-chain events, "
+                "8 related events, 8 hypotheses and 8 response steps, plus one concise "
+                "entry for each controller-provided forensic workstream. "
                 "Proposed production actions must use observe or approve_required. "
                 "Do not discuss snapshots, hashes, tool allowlists or controller mechanics "
                 "in the executive summary or final assessment. Do not expose chain-of-thought. "
@@ -4309,7 +4313,9 @@ class ResponseInvestigationAgent:
                 if attempt > 1:
                     structured_prompt += (
                         "\nRETRY_FEEDBACK=The previous response was not one valid JSON "
-                        "object. Return only the requested JSON object without markdown."
+                        "object. Return only the requested JSON object without markdown. "
+                        "Keep every narrative field concise and obey the stated item limits "
+                        "so the complete closing brace fits within the output budget."
                     )
                 try:
                     candidate = llm.generate_structured(

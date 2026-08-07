@@ -31,7 +31,10 @@ MAX_LLM_ERROR_BYTES = 4096
 MAX_LLM_ATTEMPTS = 2
 _RETRYABLE_HTTP_CODES = {408, 425, 429, 500, 502, 503, 504}
 ANTHROPIC_VERSION = "2023-06-01"
-ANTHROPIC_MAX_TOKENS = 4096
+DEFAULT_LLM_OUTPUT_TOKENS = 4096
+MAX_LLM_OUTPUT_TOKENS = 16_384
+ANTHROPIC_MAX_TOKENS = DEFAULT_LLM_OUTPUT_TOKENS
+CONTROLLER_OUTPUT_TOKEN_BUDGET_KEY = "x-controller-output-token-budget"
 GATEWAY_USER_AGENT = "defensive-ai-gateway/1.0"
 _WEBSOCKET_ENDPOINT_PATH_SEGMENTS = frozenset({"realtime", "socket.io", "websocket", "ws"})
 WEBSOCKET_ENDPOINT_GUIDANCE = (
@@ -239,8 +242,9 @@ def build_gateway_request(
     context: dict[str, Any],
     api_key: str = "",
     *,
-    max_tokens: int = ANTHROPIC_MAX_TOKENS,
+    max_tokens: int = DEFAULT_LLM_OUTPUT_TOKENS,
 ) -> urllib.request.Request:
+    bounded_max_tokens = max(1, min(int(max_tokens), MAX_LLM_OUTPUT_TOKENS))
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
@@ -249,7 +253,7 @@ def build_gateway_request(
     if is_anthropic_messages_endpoint(endpoint):
         payload: dict[str, Any] = {
             "model": model,
-            "max_tokens": max(1, min(int(max_tokens), ANTHROPIC_MAX_TOKENS)),
+            "max_tokens": bounded_max_tokens,
             "messages": [{"role": "user", "content": prompt}],
         }
         headers["anthropic-version"] = ANTHROPIC_VERSION
@@ -263,13 +267,13 @@ def build_gateway_request(
                     "content": [{"type": "input_text", "text": prompt}],
                 }
             ],
-            "max_output_tokens": max(1, min(int(max_tokens), ANTHROPIC_MAX_TOKENS)),
+            "max_output_tokens": bounded_max_tokens,
         }
     elif is_openai_chat_completions_endpoint(endpoint):
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": max(1, min(int(max_tokens), ANTHROPIC_MAX_TOKENS)),
+            "max_tokens": bounded_max_tokens,
         }
     else:
         payload = {"model": model, "prompt": prompt, "context": context}
@@ -359,6 +363,23 @@ def parse_structured_gateway_response(parsed: Any) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise LLMResponseContractError("LLM gateway returned a non-object structured result")
     return dict(parsed)
+
+
+def _structured_output_token_budget(
+    schema: dict[str, Any] | None,
+) -> int:
+    if not isinstance(schema, dict):
+        return DEFAULT_LLM_OUTPUT_TOKENS
+    try:
+        requested = int(
+            schema.get(
+                CONTROLLER_OUTPUT_TOKEN_BUDGET_KEY,
+                DEFAULT_LLM_OUTPUT_TOKENS,
+            )
+        )
+    except (TypeError, ValueError):
+        requested = DEFAULT_LLM_OUTPUT_TOKENS
+    return max(1, min(requested, MAX_LLM_OUTPUT_TOKENS))
 
 
 class LLMClient:
@@ -922,7 +943,11 @@ class GatewayLLM(LLMClient):
         self._circuit.before_request()
         try:
             result = parse_structured_gateway_response(
-                self._request_json(prompt, context)
+                self._request_json(
+                    prompt,
+                    context,
+                    max_output_tokens=_structured_output_token_budget(schema),
+                )
             )
         except AlertNonRetryableError:
             raise
@@ -942,7 +967,11 @@ class GatewayLLM(LLMClient):
             ) from exc
 
     def _request_json(
-        self, prompt: str, context: dict[str, Any]
+        self,
+        prompt: str,
+        context: dict[str, Any],
+        *,
+        max_output_tokens: int = DEFAULT_LLM_OUTPUT_TOKENS,
     ) -> dict[str, Any]:
         if not self.config.endpoint:
             raise LLMEndpointConfigurationError("LLM endpoint is not configured")
@@ -970,6 +999,7 @@ class GatewayLLM(LLMClient):
             prompt,
             context,
             api_key,
+            max_tokens=max_output_tokens,
         )
         try:
             with _open_with_retry(

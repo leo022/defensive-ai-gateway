@@ -28,6 +28,7 @@ from defensive_ai_gateway.models import RawAlert
 from defensive_ai_gateway.response_agent import (
     CONTROLLER_TOOLS,
     MANDATORY_TOOLS,
+    REPORT_SCHEMA,
     _raw_stream_progress,
 )
 from defensive_ai_gateway.syslog_router import SyslogPortRouter
@@ -4197,6 +4198,12 @@ class ResponseAgentHTTPRoleTest(unittest.TestCase):
 
 
 class StructuredLLMContractTest(unittest.TestCase):
+    def test_report_schema_requests_bounded_large_output_budget(self):
+        self.assertEqual(
+            REPORT_SCHEMA["x-controller-output-token-budget"],
+            8_192,
+        )
+
     def test_provider_neutral_parser_accepts_supported_gateway_shapes(self):
         expected = {"action": "finish", "rationale": "done"}
         encoded = json.dumps(expected)
