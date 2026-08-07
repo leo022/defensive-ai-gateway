@@ -973,7 +973,7 @@ class ModelTransportBoundaryTest(unittest.TestCase):
             )
         )
         schema = {
-            "x-controller-output-token-budget": 8_192,
+            "x-controller-output-token-budget": 6_144,
             "type": "object",
         }
         resolution = [(None, None, None, None, ("8.8.8.8", 443))]
@@ -984,7 +984,7 @@ class ModelTransportBoundaryTest(unittest.TestCase):
                 result = llm.generate_structured("report prompt", {}, schema)
 
         payload = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
-        self.assertEqual(payload["max_output_tokens"], 8_192)
+        self.assertEqual(payload["max_output_tokens"], 6_144)
         self.assertEqual(urlopen.call_args.kwargs["timeout"], 240.0)
         self.assertEqual(result, {"title": "complete report"})
 

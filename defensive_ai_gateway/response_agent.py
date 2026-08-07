@@ -140,25 +140,38 @@ TURN_SCHEMA = {
     "required": ["action", "rationale"],
 }
 REPORT_SCHEMA = {
-    "x-controller-output-token-budget": 8_192,
+    "x-controller-output-token-budget": 6_144,
     "type": "object",
     "properties": {
-        "title": {"type": "string"},
-        "executive_summary": {"type": "string"},
+        "title": {"type": "string", "maxLength": 200},
+        "executive_summary": {"type": "string", "maxLength": 1_200},
         "conclusion": {"type": "object"},
-        "findings": {"type": "array", "items": {"type": "object"}},
-        "attack_chain": {"type": "array", "items": {"type": "object"}},
-        "related_activity": {"type": "array", "items": {"type": "object"}},
+        "findings": {
+            "type": "array",
+            "maxItems": 6,
+            "items": {"type": "object"},
+        },
+        "attack_chain": {
+            "type": "array",
+            "maxItems": 6,
+            "items": {"type": "object"},
+        },
+        "related_activity": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {"type": "object"},
+        },
         "risk_assessment": {"type": "object"},
-        "hypothesis_assessment": {"type": "array", "items": {"type": "object"}},
-        "cross_source_correlation": {"type": "object"},
+        "hypothesis_assessment": {
+            "type": "array",
+            "maxItems": 6,
+            "items": {"type": "object"},
+        },
         "scope_assessment": {"type": "object"},
-        "impact": {"type": "string"},
-        "forensic_workstreams": {"type": "array", "items": {"type": "object"}},
-        "evidence_gaps": {"type": "array", "items": {"type": "string"}},
-        "prior_analysis_context": {"type": "object"},
+        "impact": {"type": "string", "maxLength": 1_200},
         "response_plan": {
             "type": "array",
+            "maxItems": 6,
             "items": {
                 "type": "object",
                 "properties": {
@@ -189,7 +202,7 @@ REPORT_SCHEMA = {
                 ],
             },
         },
-        "final_assessment": {"type": "string"},
+        "final_assessment": {"type": "string", "maxLength": 1_200},
     },
     "required": [
         "title",
@@ -200,11 +213,7 @@ REPORT_SCHEMA = {
         "related_activity",
         "risk_assessment",
         "hypothesis_assessment",
-        "cross_source_correlation",
         "scope_assessment",
-        "forensic_workstreams",
-        "evidence_gaps",
-        "prior_analysis_context",
         "response_plan",
         "final_assessment",
     ],
@@ -4277,9 +4286,11 @@ class ResponseInvestigationAgent:
                 "such as none, N/A or 无 for rationale, success criteria or rollback. "
                 "Risk aggravating_factors and mitigating_factors must be JSON arrays of "
                 "complete sentences, never a string or an array of individual characters. "
-                "Keep the JSON concise: use at most 8 findings, 8 attack-chain events, "
-                "8 related events, 8 hypotheses and 8 response steps, plus one concise "
-                "entry for each controller-provided forensic workstream. "
+                "Keep the JSON concise: use at most 6 findings, 6 attack-chain events, "
+                "8 related events, 6 hypotheses and 6 response steps. Do not repeat "
+                "controller-owned forensic workstreams, evidence gaps, cross-source "
+                "inventory or prior-analysis context; the controller attaches those "
+                "complete locked sections after synthesis. "
                 "Proposed production actions must use observe or approve_required. "
                 "Do not discuss snapshots, hashes, tool allowlists or controller mechanics "
                 "in the executive summary or final assessment. Do not expose chain-of-thought. "

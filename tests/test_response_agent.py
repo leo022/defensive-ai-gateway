@@ -4201,8 +4201,17 @@ class StructuredLLMContractTest(unittest.TestCase):
     def test_report_schema_requests_bounded_large_output_budget(self):
         self.assertEqual(
             REPORT_SCHEMA["x-controller-output-token-budget"],
-            8_192,
+            6_144,
         )
+        self.assertEqual(REPORT_SCHEMA["properties"]["findings"]["maxItems"], 6)
+        for controller_owned in (
+            "cross_source_correlation",
+            "forensic_workstreams",
+            "evidence_gaps",
+            "prior_analysis_context",
+        ):
+            self.assertNotIn(controller_owned, REPORT_SCHEMA["properties"])
+            self.assertNotIn(controller_owned, REPORT_SCHEMA["required"])
 
     def test_provider_neutral_parser_accepts_supported_gateway_shapes(self):
         expected = {"action": "finish", "rationale": "done"}
