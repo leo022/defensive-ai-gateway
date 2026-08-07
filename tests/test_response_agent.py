@@ -81,10 +81,12 @@ class _TransientContractAgentLLM:
         self.planner_contract_errors = 0
         self.report_contract_errors = 0
         self.report_schemas = []
+        self.report_prompts = []
 
     def generate_structured(self, prompt, context, schema=None):  # noqa: ANN001
-        if prompt.startswith("Write a complete"):
+        if prompt.startswith(("Write a complete", "Return a compact JSON rescue patch")):
             self.report_schemas.append(schema)
+            self.report_prompts.append(prompt)
             if self.report_contract_errors < self.report_failures:
                 self.report_contract_errors += 1
                 raise LLMResponseContractError("synthetic malformed report response")
@@ -912,6 +914,14 @@ class ResponseAgentTest(unittest.TestCase):
                 for schema in llm.report_schemas
             ],
             [6_144, 4_096, 4_096],
+        )
+        self.assertTrue(llm.report_prompts[0].startswith("Write a complete"))
+        self.assertTrue(
+            all(
+                prompt.startswith("Return a compact JSON rescue patch")
+                and "Write a complete final" not in prompt
+                for prompt in llm.report_prompts[1:]
+            )
         )
         planner_rejections = [
             step
