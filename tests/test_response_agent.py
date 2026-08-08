@@ -242,7 +242,7 @@ class _NarrativeAgentLLM:
             }
         self.report_context = context
         related = context.get("controller_related_activity") or []
-        refs = list((related[0] if related else {}).get("evidence_refs") or [])
+        refs = list(context.get("allowed_evidence_ref_ids") or [])[:1]
         return {
             "title": "Attack-focused investigation",
             "executive_summary": "The correlated activity supports a malicious exploitation campaign.",
@@ -260,7 +260,7 @@ class _NarrativeAgentLLM:
                     "claim_state": "inferred",
                     "statement": "Multiple related events share the same source and target.",
                     "significance": "The pattern is inconsistent with an isolated probe.",
-                    "evidence_refs": refs,
+                    "evidence_refs": [*refs, "model-invented-ref"],
                 }
             ],
             "attack_chain": [
@@ -2176,7 +2176,11 @@ class ResponseAgentTest(unittest.TestCase):
 
         self.assertEqual(
             context["context_contract_version"],
-            "response-agent-synthesis-context-v2",
+            "response-agent-synthesis-context-v3",
+        )
+        self.assertEqual(
+            context["allowed_evidence_ref_ids"],
+            [f"raw-alert:alert-{index:02d}" for index in range(20)],
         )
         self.assertTrue(context["controller_related_activity"])
         self.assertTrue(context["controller_attack_chain_seed"])
@@ -2582,14 +2586,15 @@ class ResponseAgentTest(unittest.TestCase):
             {"completed", "review", "blocked", "failed", "paused"},
         )
 
-        self.assertIn(
+        self.assertEqual(
             session["status"],
-            {"completed", "review"},
+            "completed",
             (session.get("report") or {}).get("validation")
             or session.get("last_error"),
         )
         self.assertIsNotNone(llm.report_context)
         self.assertTrue(llm.report_context["controller_related_activity"])
+        self.assertTrue(llm.report_context["allowed_evidence_ref_ids"])
         report = session["report"]
         self.assertTrue(report["model_metadata"]["model_synthesis_applied"])
         self.assertEqual(
@@ -2597,9 +2602,78 @@ class ResponseAgentTest(unittest.TestCase):
             "llm_synthesis_with_controller_evidence",
         )
         self.assertEqual(report["content"]["title"], "Attack-focused investigation")
+        self.assertEqual(report["validation"]["warnings"], [])
+        self.assertEqual(
+            report["model_metadata"]["model_synthesis_adjustment_count"],
+            1,
+        )
+        self.assertEqual(
+            report["content"]["scope"]["model_synthesis_adjustments"],
+            ["finding_unknown_refs_filtered:campaign"],
+        )
+        self.assertNotIn(
+            "model-invented-ref",
+            report["content"]["findings"][0]["evidence_refs"],
+        )
         self.assertNotEqual(
             report["content"]["attack_chain"][0]["timestamp"],
             "model-must-not-change-time",
+        )
+
+    def test_model_evidence_reconciliation_prevents_recoverable_review(self):
+        report = {
+            "findings": [
+                {
+                    "claim_id": "F2",
+                    "claim_state": "confirmed",
+                    "evidence_refs": ["trusted-ref", "invented-ref"],
+                },
+                {
+                    "claim_id": "F3",
+                    "claim_state": "inferred",
+                    "evidence_refs": ["invented-ref"],
+                },
+            ],
+            "hypothesis_assessment": [
+                {
+                    "hypothesis_id": "post-exploitation-host-impact",
+                    "disposition": "supported",
+                    "supporting_evidence_refs": ["invented-ref"],
+                    "contradicting_evidence_refs": [],
+                }
+            ],
+            "risk_assessment": {"evidence_refs": ["trusted-ref"]},
+            "scope_assessment": {"evidence_refs": ["trusted-ref"]},
+            "forensic_workstreams": [],
+            "response_plan": [],
+        }
+
+        adjustments = self.state.response_agent._reconcile_model_evidence_refs(
+            report,
+            {"trusted-ref"},
+        )
+
+        self.assertEqual(report["findings"][0]["claim_state"], "confirmed")
+        self.assertEqual(
+            report["findings"][0]["evidence_refs"],
+            ["trusted-ref"],
+        )
+        self.assertEqual(report["findings"][1]["claim_state"], "unverified")
+        self.assertEqual(report["findings"][1]["evidence_refs"], [])
+        self.assertEqual(
+            report["hypothesis_assessment"][0]["disposition"],
+            "unresolved",
+        )
+        self.assertEqual(
+            adjustments,
+            [
+                "finding_unknown_refs_filtered:F2",
+                "finding_unknown_refs_filtered:F3",
+                "finding_state_normalized:F3",
+                "hypothesis_supporting_unknown_refs_filtered:"
+                "post-exploitation-host-impact",
+                "hypothesis_disposition_normalized:post-exploitation-host-impact",
+            ],
         )
 
     def test_forensic_coverage_reads_syslog_and_correlated_host_evidence(self):

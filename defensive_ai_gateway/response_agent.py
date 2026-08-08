@@ -14,7 +14,7 @@ from .models import new_id, now_ms
 
 
 REPORT_SCHEMA_VERSION = "response-investigation-report-v7"
-AGENT_VERSION = "response-investigation-agent-v12"
+AGENT_VERSION = "response-investigation-agent-v13"
 TOOL_VERSION = "7"
 FORENSIC_INVENTORY_MAX_ALERTS = 200
 ACTIVE_STATUSES = {
@@ -4408,6 +4408,25 @@ class ResponseInvestigationAgent:
             )
         return compact
 
+    @staticmethod
+    def _authoritative_evidence_ref_manifest(
+        session: dict[str, Any],
+        artifact: dict[str, Any],
+    ) -> dict[str, dict[str, Any]]:
+        manifest: dict[str, dict[str, Any]] = {}
+        for call in session.get("tool_calls") or []:
+            if call.get("status") != "completed":
+                continue
+            for ref in call.get("evidence_refs") or []:
+                ref_id = str(ref.get("ref_id") or "")
+                if ref_id:
+                    manifest[ref_id] = dict(ref)
+        for ref in artifact.get("evidence_refs") or []:
+            ref_id = str(ref.get("ref_id") or "")
+            if ref_id:
+                manifest.setdefault(ref_id, dict(ref))
+        return manifest
+
     def _report_synthesis_context(
         self,
         session: dict[str, Any],
@@ -4421,8 +4440,14 @@ class ResponseInvestigationAgent:
             for call in session.get("tool_calls") or []
             if call.get("status") == "completed"
         ]
+        allowed_evidence_ref_ids = sorted(
+            self._authoritative_evidence_ref_manifest(
+                session,
+                artifact,
+            )
+        )
         context = {
-            "context_contract_version": "response-agent-synthesis-context-v2",
+            "context_contract_version": "response-agent-synthesis-context-v3",
             "goal": self._sanitize_controller_tool_value(session["goal"], 400),
             "anchor_case": self._sanitize_controller_tool_value(
                 source.get("case") or {}, 900
@@ -4475,6 +4500,10 @@ class ResponseInvestigationAgent:
                     for call in completed_calls[-40:]
                 ],
                 600,
+            ),
+            "allowed_evidence_ref_ids": self._sanitize_controller_tool_value(
+                allowed_evidence_ref_ids,
+                4_000,
             ),
             "response_playbook": self._sanitize_controller_tool_value(
                 (pack.get("playbook") or {}).get("steps") or [], 600
@@ -4577,7 +4606,9 @@ class ResponseInvestigationAgent:
                 "in the report. Keep controller facts, identifiers and timestamps exact. "
                 "Every confirmed or inferred finding, attack-chain event, related event, "
                 "risk assessment and proposed response must cite provided evidence ref_id "
-                "values. Every source or target identifier named in a proposed response "
+                "values copied exactly from allowed_evidence_ref_ids; never create, "
+                "abbreviate or transform a ref_id. Every source or target identifier "
+                "named in a proposed response "
                 "must cite evidence for that specific identifier. Do not use placeholders "
                 "such as none, N/A or 无 for rationale, success criteria or rollback. "
                 "Risk aggravating_factors and mitigating_factors must be JSON arrays of "
@@ -4752,7 +4783,12 @@ class ResponseInvestigationAgent:
         )
         if not validating:
             return
-        report_content = self._normalize_report(candidate, base, current)
+        report_content = self._normalize_report(
+            candidate,
+            base,
+            current,
+            artifact,
+        )
         trusted_digest_paths = self._report_trusted_digest_paths(
             report_content,
             current,
@@ -4778,6 +4814,12 @@ class ResponseInvestigationAgent:
                 else "deterministic_fallback"
             ),
             "model_synthesis_applied": model_synthesis_applied,
+            "model_synthesis_adjustment_count": len(
+                (report_content.get("scope") or {}).get(
+                    "model_synthesis_adjustments"
+                )
+                or []
+            ),
             "report_language": report_language,
         }
         terminal_status = {
@@ -5960,6 +6002,7 @@ class ResponseInvestigationAgent:
         candidate: dict[str, Any],
         base: dict[str, Any],
         session: dict[str, Any],
+        artifact: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized = copy.deepcopy(base)
         if isinstance(candidate, dict) and candidate:
@@ -6113,6 +6156,18 @@ class ResponseInvestigationAgent:
             normalized["scope"]["model_synthesis_disposition"] = (
                 "narrative_applied_controller_facts_locked"
             )
+            if artifact is not None:
+                normalized["scope"]["model_synthesis_adjustments"] = (
+                    self._reconcile_model_evidence_refs(
+                        normalized,
+                        set(
+                            self._authoritative_evidence_ref_manifest(
+                                session,
+                                artifact,
+                            )
+                        ),
+                    )
+                )
         else:
             normalized["scope"]["model_synthesis_disposition"] = (
                 "deterministic_fallback"
@@ -6126,6 +6181,103 @@ class ResponseInvestigationAgent:
         )
         self._compact_final_report(normalized)
         return normalized
+
+    @staticmethod
+    def _reconcile_model_evidence_refs(
+        report: dict[str, Any],
+        allowed_ref_ids: set[str],
+    ) -> list[str]:
+        """Repair model-only citation defects before the report gate runs."""
+        adjustments: list[str] = []
+
+        def normalize_refs(
+            item: dict[str, Any],
+            key: str,
+            section: str,
+            item_id: str,
+        ) -> list[str]:
+            requested = list(
+                dict.fromkeys(
+                    str(ref)
+                    for ref in item.get(key) or []
+                    if str(ref).strip()
+                )
+            )[:64]
+            retained = [ref for ref in requested if ref in allowed_ref_ids]
+            item[key] = retained
+            if len(retained) != len(requested):
+                adjustments.append(f"{section}_unknown_refs_filtered:{item_id}")
+            return retained
+
+        for index, claim in enumerate(report.get("findings") or [], start=1):
+            if not isinstance(claim, dict):
+                continue
+            claim_id = str(claim.get("claim_id") or f"finding-{index}")
+            refs = normalize_refs(
+                claim,
+                "evidence_refs",
+                "finding",
+                claim_id,
+            )
+            if claim.get("claim_state") in {"confirmed", "inferred"} and not refs:
+                claim["claim_state"] = "unverified"
+                adjustments.append(f"finding_state_normalized:{claim_id}")
+
+        for index, hypothesis in enumerate(
+            report.get("hypothesis_assessment") or [], start=1
+        ):
+            if not isinstance(hypothesis, dict):
+                continue
+            hypothesis_id = str(
+                hypothesis.get("hypothesis_id") or f"hypothesis-{index}"
+            )
+            supporting = normalize_refs(
+                hypothesis,
+                "supporting_evidence_refs",
+                "hypothesis_supporting",
+                hypothesis_id,
+            )
+            normalize_refs(
+                hypothesis,
+                "contradicting_evidence_refs",
+                "hypothesis_contradicting",
+                hypothesis_id,
+            )
+            if (
+                hypothesis.get("disposition")
+                in {"supported", "partially_supported"}
+                and not supporting
+            ):
+                hypothesis["disposition"] = "unresolved"
+                adjustments.append(
+                    f"hypothesis_disposition_normalized:{hypothesis_id}"
+                )
+
+        ref_sections = (
+            ("risk_assessment", [report.get("risk_assessment") or {}], "risk"),
+            ("scope_assessment", [report.get("scope_assessment") or {}], "scope"),
+            (
+                "forensic_workstreams",
+                report.get("forensic_workstreams") or [],
+                "workstream",
+            ),
+            ("response_plan", report.get("response_plan") or [], "step"),
+        )
+        for section, items, id_prefix in ref_sections:
+            for index, item in enumerate(items, start=1):
+                if not isinstance(item, dict):
+                    continue
+                item_id = str(
+                    item.get(f"{id_prefix}_id") or f"{section}-{index}"
+                )
+                normalize_refs(
+                    item,
+                    "evidence_refs",
+                    section,
+                    item_id,
+                )
+
+        return list(dict.fromkeys(adjustments))[:64]
 
     @staticmethod
     def _non_compromise_attack_status(base_status: str) -> str:
@@ -7141,20 +7293,15 @@ class ResponseInvestigationAgent:
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         errors: list[str] = []
         warnings: list[str] = []
-        ref_manifest: dict[str, dict[str, Any]] = {}
+        ref_manifest = self._authoritative_evidence_ref_manifest(
+            session,
+            artifact,
+        )
         for call in session.get("tool_calls") or []:
             if call.get("status") != "completed":
                 continue
             if call.get("tool_name") not in CONTROLLER_TOOLS:
                 errors.append("tool_outside_allowlist")
-            for ref in call.get("evidence_refs") or []:
-                ref_id = str(ref.get("ref_id") or "")
-                if ref_id:
-                    ref_manifest[ref_id] = dict(ref)
-        for ref in artifact.get("evidence_refs") or []:
-            ref_id = str(ref.get("ref_id") or "")
-            if ref_id:
-                ref_manifest.setdefault(ref_id, dict(ref))
 
         completed_calls = [
             call
