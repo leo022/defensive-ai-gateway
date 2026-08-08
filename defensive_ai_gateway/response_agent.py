@@ -3680,6 +3680,43 @@ class ResponseInvestigationAgent:
             if not isinstance(item, dict):
                 continue
             metrics = item.get("analysis_metrics") or {}
+            evidence_refs: list[str] = []
+            for ref in item.get("evidence_refs") or []:
+                rendered_ref = str(ref).strip()
+                if not rendered_ref or rendered_ref in evidence_refs:
+                    continue
+                candidate_refs = [*evidence_refs, rendered_ref]
+                if len(
+                    json.dumps(
+                        candidate_refs,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ).encode("utf-8")
+                ) > 800:
+                    continue
+                evidence_refs = candidate_refs
+                if len(evidence_refs) >= 8:
+                    break
+
+            core_metrics = self._sanitize_controller_tool_value(
+                {
+                    "source_count": metrics.get("source_count"),
+                    "products": list(metrics.get("products") or [])[:8],
+                    "product_count": metrics.get("product_count"),
+                    "linked_count": metrics.get("linked_count"),
+                    "correlated_count": metrics.get("correlated_count"),
+                    "independent_product_corroboration": metrics.get(
+                        "independent_product_corroboration"
+                    ),
+                    "verified_syslog_integrity_count": metrics.get(
+                        "verified_syslog_integrity_count"
+                    ),
+                    "observed_response_statuses": list(
+                        metrics.get("observed_response_statuses") or []
+                    )[:8],
+                },
+                700,
+            )
             compact_workstream = self._sanitize_controller_tool_value(
                 {
                     "workstream_id": _text(item.get("workstream_id"), 128),
@@ -3691,33 +3728,60 @@ class ResponseInvestigationAgent:
                         _text(step, 320)
                         for step in item.get("collection_steps") or []
                     ][:1],
+                    "evidence_refs": evidence_refs,
+                    "analysis_metrics": core_metrics,
                 },
-                1_400,
+                2_200,
             )
+            required_keys = {
+                "workstream_id",
+                "title",
+                "domain",
+                "status",
+                "coverage_summary",
+                "collection_steps",
+                "evidence_refs",
+                "analysis_metrics",
+            }
+
+            def retains_evidence_core(candidate: dict[str, Any]) -> bool:
+                candidate_metrics = candidate.get("analysis_metrics") or {}
+                return (
+                    required_keys.issubset(candidate)
+                    and candidate.get("evidence_refs") == evidence_refs
+                    and all(
+                        candidate_metrics.get(key) == value
+                        for key, value in core_metrics.items()
+                    )
+                )
+
+            optional_metrics = {
+                "capture_gaps": list(metrics.get("capture_gaps") or [])[:8],
+                "capture_gap_alerts": metrics.get("capture_gap_alerts") or {},
+                "capture_mapping_gaps": list(
+                    metrics.get("capture_mapping_gaps") or []
+                )[:8],
+                "request_payload_profiles": list(
+                    metrics.get("request_payload_profiles") or []
+                )[:4],
+                "correlation_pivots": list(
+                    metrics.get("correlation_pivots") or []
+                )[:8],
+            }
+            for key, value in optional_metrics.items():
+                candidate = copy.deepcopy(compact_workstream)
+                candidate.setdefault("analysis_metrics", {})[key] = value
+                candidate = self._sanitize_controller_tool_value(candidate, 2_200)
+                if retains_evidence_core(candidate) and key in (
+                    candidate.get("analysis_metrics") or {}
+                ):
+                    compact_workstream = candidate
+
             optional_fields = {
-                "analysis_metrics": {
-                    "source_count": metrics.get("source_count"),
-                    "products": list(metrics.get("products") or [])[:8],
-                    "product_count": metrics.get("product_count"),
-                    "linked_count": metrics.get("linked_count"),
-                    "correlated_count": metrics.get("correlated_count"),
-                    "independent_product_corroboration": metrics.get(
-                        "independent_product_corroboration"
-                    ),
-                    "capture_gaps": list(metrics.get("capture_gaps") or [])[:8],
-                    "capture_gap_alerts": metrics.get("capture_gap_alerts") or {},
-                    "observed_response_statuses": list(
-                        metrics.get("observed_response_statuses") or []
-                    )[:8],
-                    "request_payload_profiles": list(
-                        metrics.get("request_payload_profiles") or []
-                    )[:4],
-                },
                 "collection_steps": [
                     _text(step, 320)
                     for step in item.get("collection_steps") or []
                 ][:2],
-                "evidence_refs": list(item.get("evidence_refs") or [])[:8],
                 "evidence_sources": [
                     {
                         key: source.get(key)
@@ -3733,22 +3797,14 @@ class ResponseInvestigationAgent:
                     if isinstance(source, dict)
                 ][:4],
             }
-            required_keys = {
-                "workstream_id",
-                "title",
-                "domain",
-                "status",
-                "coverage_summary",
-                "collection_steps",
-            }
             for key, value in optional_fields.items():
                 retained_keys = set(compact_workstream)
                 candidate = self._sanitize_controller_tool_value(
                     {**compact_workstream, key: value},
-                    1_800,
+                    2_200,
                 )
                 if (
-                    required_keys.issubset(candidate)
+                    retains_evidence_core(candidate)
                     and retained_keys.issubset(candidate)
                     and key in candidate
                 ):
@@ -4296,6 +4352,35 @@ class ResponseInvestigationAgent:
         candidate: dict[str, Any] = {}
         usage = dict(current.get("usage") or {})
         if not llm.is_deterministic:
+            prior_contract_rejections = sum(
+                1
+                for step in current.get("steps") or []
+                if step.get("phase") == "synthesis_rejected"
+                and (step.get("detail") or {}).get("code")
+                == "model_response_contract"
+            )
+            first_attempt = prior_contract_rejections + 1
+            if first_attempt > 3:
+                self._persist_active_seconds(
+                    session_id,
+                    usage,
+                    synthesis_started,
+                )
+                paused = self.repo.transition_response_agent_session(
+                    session_id,
+                    ("synthesizing",),
+                    "paused",
+                    last_error="report_contract_error:model_response_contract",
+                )
+                if paused:
+                    self._audit(
+                        paused,
+                        "response-agent",
+                        "response_agent_model_paused",
+                        error_type="LLMResponseContractError",
+                        rejection_code="model_response_contract",
+                    )
+                return
             usage["model_calls"] = int(usage.get("model_calls") or 0) + 1
             updated = self.repo.update_response_agent_session(
                 session_id,
@@ -4351,7 +4436,7 @@ class ResponseInvestigationAgent:
                 f"{'English' if report_language == 'en' else 'Simplified Chinese'}. "
             )
             rendered_context = self.policy.truncate_prompt_payload(context)
-            for attempt in range(1, 4):
+            for attempt in range(first_attempt, 4):
                 if (
                     self._active_elapsed(usage, synthesis_started)
                     >= self._budget_value(current, "max_wall_seconds")
@@ -4362,7 +4447,7 @@ class ResponseInvestigationAgent:
                         synthesis_started,
                     )
                     return
-                if attempt > 1:
+                if attempt > first_attempt:
                     usage["model_calls"] = int(usage.get("model_calls") or 0) + 1
                     updated = self.repo.update_response_agent_session(
                         session_id,

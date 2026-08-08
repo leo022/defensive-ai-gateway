@@ -100,6 +100,36 @@ class _TransientContractAgentLLM:
         }
 
 
+class _PauseResumeReportLLM:
+    is_deterministic = False
+    runtime_metadata = {
+        "provider": "test",
+        "model": "pause-resume-report-model",
+        "endpoint_host": "",
+    }
+
+    def __init__(self):
+        self.report_prompts = []
+        self.report_schemas = []
+        self.compact_entered = threading.Event()
+        self.release_compact = threading.Event()
+
+    def generate_structured(self, prompt, context, schema=None):  # noqa: ANN001
+        if prompt.startswith(("Write a complete", "Return a compact JSON rescue patch")):
+            self.report_prompts.append(prompt)
+            self.report_schemas.append(schema)
+            if len(self.report_prompts) == 1:
+                raise LLMResponseContractError("synthetic malformed full report")
+            if len(self.report_prompts) == 2:
+                self.compact_entered.set()
+                self.release_compact.wait(timeout=3)
+            return {}
+        return {
+            "action": "finish",
+            "rationale": "The controller evidence floor is complete; synthesize now.",
+        }
+
+
 class _BlockingAgentLLM:
     is_deterministic = False
     runtime_metadata = {
@@ -1012,6 +1042,80 @@ class ResponseAgentTest(unittest.TestCase):
         self.assertFalse((rejections[-1].get("detail") or {}).get("retry"))
         self.assertGreater(paused["usage"]["active_seconds"], 0.0)
 
+        report_calls = len(llm.report_schemas)
+        self.state.response_agent.resume(
+            started["session_id"], actor="analyst"
+        )
+        paused_again = self._wait(
+            self.state.response_agent,
+            started["session_id"],
+            {"paused", "failed", "completed", "review"},
+        )
+        self.assertEqual(paused_again["status"], "paused")
+        self.assertEqual(
+            paused_again["last_error"],
+            "report_contract_error:model_response_contract",
+        )
+        self.assertEqual(len(llm.report_schemas), report_calls)
+        self.assertEqual(
+            len(
+                [
+                    step
+                    for step in paused_again["steps"]
+                    if step["phase"] == "synthesis_rejected"
+                ]
+            ),
+            3,
+        )
+
+    def test_report_contract_retry_mode_survives_pause_and_resume(self):
+        llm = _PauseResumeReportLLM()
+        self.state.response_agent.set_llm(llm)
+        case_id = self._case("response-agent-report-resume-retry-mode")
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        started = self.state.response_agent.create(
+            case_id,
+            artifact=artifact,
+            goal="preserve compact report retry mode across resume",
+            actor="analyst",
+        )
+
+        self.assertTrue(llm.compact_entered.wait(timeout=5))
+        paused = self.state.response_agent.pause(
+            started["session_id"], actor="analyst"
+        )
+        self.assertEqual(paused["status"], "paused")
+        llm.release_compact.set()
+        time.sleep(0.1)
+
+        self.state.response_agent.resume(
+            started["session_id"], actor="analyst"
+        )
+        final = self._wait(
+            self.state.response_agent,
+            started["session_id"],
+            {"completed", "review", "blocked", "failed", "paused"},
+        )
+
+        self.assertIn(final["status"], {"completed", "review"})
+        self.assertEqual(len(llm.report_prompts), 3)
+        self.assertTrue(llm.report_prompts[0].startswith("Write a complete"))
+        self.assertTrue(
+            all(
+                prompt.startswith("Return a compact JSON rescue patch")
+                for prompt in llm.report_prompts[1:]
+            )
+        )
+        self.assertEqual(
+            [
+                schema["x-controller-output-token-budget"]
+                for schema in llm.report_schemas
+            ],
+            [6_144, 4_096, 4_096],
+        )
+
     def test_model_failure_pauses_without_heuristic_fallback(self):
         self.state.response_agent.set_llm(_BrokenAgentLLM())
         case_id = self._case("response-agent-model-pause")
@@ -1872,7 +1976,47 @@ class ResponseAgentTest(unittest.TestCase):
                         "analysis_metrics": {
                             "source_count": 1,
                             "products": ["rasp"],
+                            "product_count": 1,
+                            "linked_count": 1,
+                            "correlated_count": 0,
+                            "independent_product_corroboration": False,
+                            "verified_syslog_integrity_count": 1,
+                            "observed_response_statuses": ["200"],
+                            "capture_gaps": [
+                                f"oversized-capture-gap-{entry}-" + "x" * 120
+                                for entry in range(8)
+                            ],
+                            "capture_gap_alerts": {
+                                f"field-{entry}": [
+                                    f"alert-{candidate:02d}"
+                                    for candidate in range(20)
+                                ]
+                                for entry in range(8)
+                            },
+                            "request_payload_profiles": [
+                                {
+                                    "alert_id": f"alert-{entry:02d}",
+                                    "state": "captured_nonempty",
+                                    "method": "POST",
+                                    "reason": "request_content_present",
+                                }
+                                for entry in range(8)
+                            ],
                         },
+                        "evidence_refs": [
+                            f"raw-alert:alert-{entry:02d}"
+                            for entry in range(4)
+                        ],
+                        "evidence_sources": [
+                            {
+                                "alert_id": f"alert-{entry:02d}",
+                                "product": "rasp",
+                                "event_type": "runtime_detection",
+                                "relation": "linked_to_case",
+                                "evidence_ref": f"raw-alert:alert-{entry:02d}",
+                            }
+                            for entry in range(4)
+                        ],
                     }
                     for index in range(8)
                 ],
@@ -1884,6 +2028,41 @@ class ResponseAgentTest(unittest.TestCase):
             self.state.response_agent.config.tool_result_max_bytes,
         )
         self.assertEqual(len(coverage["activity_inventory"]), 20)
+        expected_workstream_refs = [
+            f"raw-alert:alert-{entry:02d}" for entry in range(4)
+        ]
+        for workstream in coverage["workstreams"]:
+            self.assertEqual(
+                workstream["evidence_refs"],
+                expected_workstream_refs,
+            )
+            self.assertEqual(
+                workstream["analysis_metrics"]["source_count"],
+                1,
+            )
+            self.assertEqual(
+                workstream["analysis_metrics"]["observed_response_statuses"],
+                ["200"],
+            )
+        hypotheses = self.state.response_agent._hypothesis_assessment(
+            [
+                {
+                    **coverage["workstreams"][0],
+                    "domain": "server_runtime",
+                }
+            ],
+            "zh",
+        )
+        host_impact = next(
+            item
+            for item in hypotheses
+            if item["hypothesis_id"] == "post-exploitation-host-impact"
+        )
+        self.assertEqual(host_impact["disposition"], "partially_supported")
+        self.assertEqual(
+            host_impact["supporting_evidence_refs"],
+            expected_workstream_refs,
+        )
         for index, item in enumerate(coverage["activity_inventory"]):
             facts = item["investigation_facts"]
             self.assertEqual(facts["source_ip"], "43.154.138.159")
