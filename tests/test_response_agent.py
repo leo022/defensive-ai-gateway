@@ -89,7 +89,10 @@ class _TransientContractAgentLLM:
             self.report_prompts.append(prompt)
             if self.report_contract_errors < self.report_failures:
                 self.report_contract_errors += 1
-                raise LLMResponseContractError("synthetic malformed report response")
+                raise LLMResponseContractError(
+                    "synthetic truncated report response",
+                    reason_code="output_truncated",
+                )
             return {}
         if self.planner_contract_errors < self.planner_failures:
             self.planner_contract_errors += 1
@@ -943,7 +946,7 @@ class ResponseAgentTest(unittest.TestCase):
                 schema["x-controller-output-token-budget"]
                 for schema in llm.report_schemas
             ],
-            [6_144, 4_096, 4_096],
+            [12_288, 8_192, 8_192],
         )
         self.assertTrue(llm.report_prompts[0].startswith("Write a complete"))
         self.assertTrue(
@@ -969,6 +972,12 @@ class ResponseAgentTest(unittest.TestCase):
         self.assertEqual(len(report_rejections), 2)
         self.assertTrue(all((step.get("detail") or {}).get("retry") for step in planner_rejections))
         self.assertTrue(all((step.get("detail") or {}).get("retry") for step in report_rejections))
+        self.assertTrue(
+            all(
+                (step.get("detail") or {}).get("reason") == "output_truncated"
+                for step in report_rejections
+            )
+        )
 
     def test_persistent_planner_contract_error_pauses_after_bounded_retries(self):
         llm = _TransientContractAgentLLM(planner_failures=3)
@@ -1113,7 +1122,7 @@ class ResponseAgentTest(unittest.TestCase):
                 schema["x-controller-output-token-budget"]
                 for schema in llm.report_schemas
             ],
-            [6_144, 4_096, 4_096],
+            [12_288, 8_192, 8_192],
         )
 
     def test_model_failure_pauses_without_heuristic_fallback(self):
@@ -4400,8 +4409,9 @@ class StructuredLLMContractTest(unittest.TestCase):
     def test_report_schema_requests_bounded_large_output_budget(self):
         self.assertEqual(
             REPORT_SCHEMA["x-controller-output-token-budget"],
-            6_144,
+            12_288,
         )
+        self.assertTrue(REPORT_SCHEMA["x-controller-native-structured-output"])
         self.assertEqual(REPORT_SCHEMA["properties"]["findings"]["maxItems"], 6)
         for controller_owned in (
             "cross_source_correlation",
@@ -4413,8 +4423,9 @@ class StructuredLLMContractTest(unittest.TestCase):
             self.assertNotIn(controller_owned, REPORT_SCHEMA["required"])
         self.assertEqual(
             REPORT_RETRY_SCHEMA["x-controller-output-token-budget"],
-            4_096,
+            8_192,
         )
+        self.assertTrue(REPORT_RETRY_SCHEMA["x-controller-native-structured-output"])
         self.assertEqual(
             set(REPORT_RETRY_SCHEMA["required"]),
             {
@@ -4455,6 +4466,33 @@ class StructuredLLMContractTest(unittest.TestCase):
                 )
         with self.assertRaises(LLMResponseContractError):
             parse_structured_gateway_response({"response": "[]"})
+
+    def test_provider_neutral_parser_classifies_truncated_structured_outputs(self):
+        payloads = [
+            {
+                "type": "message",
+                "stop_reason": "max_tokens",
+                "content": [{"type": "text", "text": '{"partial":'}],
+            },
+            {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [],
+            },
+            {
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {"content": '{"partial":'},
+                    }
+                ]
+            },
+        ]
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                with self.assertRaises(LLMResponseContractError) as raised:
+                    parse_structured_gateway_response(payload)
+                self.assertEqual(raised.exception.reason_code, "output_truncated")
 
     def test_gateway_and_ollama_structured_generation_preserve_generic_schema(self):
         schema = {

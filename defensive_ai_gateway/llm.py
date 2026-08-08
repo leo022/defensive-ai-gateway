@@ -37,6 +37,7 @@ DEFAULT_LLM_TIMEOUT_CAP_SECONDS = 120.0
 LONG_STRUCTURED_OUTPUT_TIMEOUT_SECONDS = 240.0
 ANTHROPIC_MAX_TOKENS = DEFAULT_LLM_OUTPUT_TOKENS
 CONTROLLER_OUTPUT_TOKEN_BUDGET_KEY = "x-controller-output-token-budget"
+CONTROLLER_NATIVE_STRUCTURED_OUTPUT_KEY = "x-controller-native-structured-output"
 GATEWAY_USER_AGENT = "defensive-ai-gateway/1.0"
 _WEBSOCKET_ENDPOINT_PATH_SEGMENTS = frozenset({"realtime", "socket.io", "websocket", "ws"})
 WEBSOCKET_ENDPOINT_GUIDANCE = (
@@ -51,6 +52,15 @@ class LLMEndpointConfigurationError(AlertNonRetryableError):
 
 class LLMResponseContractError(AlertNonRetryableError):
     """A successful response cannot satisfy the configured JSON contract."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason_code: str = "invalid_structured_output",
+    ) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
 
 
 def is_websocket_endpoint(endpoint: str) -> bool:
@@ -241,6 +251,57 @@ def resolve_gateway_api_key(
     return ""
 
 
+def _anthropic_structured_output_schema(
+    schema: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Convert a controller schema to Anthropic's supported JSON Schema subset."""
+    if not isinstance(schema, dict) or not schema.get(
+        CONTROLLER_NATIVE_STRUCTURED_OUTPUT_KEY
+    ):
+        return None
+
+    unsupported_constraints = {
+        "exclusiveMaximum",
+        "exclusiveMinimum",
+        "maxItems",
+        "maxLength",
+        "maxProperties",
+        "minItems",
+        "minLength",
+        "minProperties",
+        "minimum",
+        "maximum",
+        "multipleOf",
+        "pattern",
+        "uniqueItems",
+    }
+
+    def transform(value: Any) -> Any:
+        if isinstance(value, list):
+            return [transform(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        transformed = {}
+        for key, item in value.items():
+            if str(key).startswith("x-controller-") or key in unsupported_constraints:
+                continue
+            if key == "properties" and isinstance(item, dict):
+                transformed[key] = {
+                    property_name: transform(property_schema)
+                    for property_name, property_schema in item.items()
+                }
+            else:
+                transformed[key] = transform(item)
+        if transformed.get("type") == "object" and isinstance(
+            transformed.get("properties"), dict
+        ):
+            transformed["additionalProperties"] = False
+        return transformed
+
+    transformed = transform(schema)
+    return transformed if isinstance(transformed, dict) else None
+
+
 def build_gateway_request(
     endpoint: str,
     model: str,
@@ -249,6 +310,7 @@ def build_gateway_request(
     api_key: str = "",
     *,
     max_tokens: int = DEFAULT_LLM_OUTPUT_TOKENS,
+    structured_schema: dict[str, Any] | None = None,
 ) -> urllib.request.Request:
     bounded_max_tokens = max(1, min(int(max_tokens), MAX_LLM_OUTPUT_TOKENS))
     headers = {
@@ -262,6 +324,14 @@ def build_gateway_request(
             "max_tokens": bounded_max_tokens,
             "messages": [{"role": "user", "content": prompt}],
         }
+        native_schema = _anthropic_structured_output_schema(structured_schema)
+        if native_schema is not None:
+            payload["output_config"] = {
+                "format": {
+                    "type": "json_schema",
+                    "schema": native_schema,
+                }
+            }
         headers["anthropic-version"] = ANTHROPIC_VERSION
     elif is_openai_responses_endpoint(endpoint):
         payload = {
@@ -349,6 +419,40 @@ def parse_gateway_response(parsed: Any, model: str) -> dict[str, Any]:
 
 def parse_structured_gateway_response(parsed: Any) -> dict[str, Any]:
     """Extract a provider-neutral JSON object without applying alert enums."""
+    if isinstance(parsed, dict):
+        stop_reason = str(parsed.get("stop_reason") or "").strip().lower()
+        if stop_reason == "max_tokens":
+            raise LLMResponseContractError(
+                "LLM structured output reached the provider token limit",
+                reason_code="output_truncated",
+            )
+        if stop_reason == "refusal":
+            raise LLMResponseContractError(
+                "LLM refused the structured output request",
+                reason_code="model_refusal",
+            )
+        if str(parsed.get("status") or "").strip().lower() == "incomplete":
+            detail = parsed.get("incomplete_details") or {}
+            reason = str(detail.get("reason") or "").strip().lower()
+            raise LLMResponseContractError(
+                "LLM structured output was incomplete",
+                reason_code=(
+                    "output_truncated"
+                    if reason in {"max_output_tokens", "max_tokens"}
+                    else "output_incomplete"
+                ),
+            )
+        choices = parsed.get("choices")
+        if isinstance(choices, list) and any(
+            isinstance(choice, dict)
+            and str(choice.get("finish_reason") or "").strip().lower()
+            in {"length", "max_tokens"}
+            for choice in choices
+        ):
+            raise LLMResponseContractError(
+                "LLM structured output reached the provider token limit",
+                reason_code="output_truncated",
+            )
     if (
         isinstance(parsed, dict)
         and parsed.get("type") == "message"
@@ -356,7 +460,10 @@ def parse_structured_gateway_response(parsed: Any) -> dict[str, Any]:
     ):
         text = _text_from_content(parsed["content"])
         if not text:
-            raise LLMResponseContractError("Anthropic gateway returned no text content")
+            raise LLMResponseContractError(
+                "Anthropic gateway returned no text content",
+                reason_code="empty_output",
+            )
         parsed = _parse_strict_json_object(text)
     elif isinstance(parsed, dict):
         text = _openai_response_text(parsed)
@@ -367,7 +474,10 @@ def parse_structured_gateway_response(parsed: Any) -> dict[str, Any]:
         elif isinstance(parsed.get("result"), dict):
             parsed = parsed["result"]
     if not isinstance(parsed, dict):
-        raise LLMResponseContractError("LLM gateway returned a non-object structured result")
+        raise LLMResponseContractError(
+            "LLM gateway returned a non-object structured result",
+            reason_code="non_object_output",
+        )
     return dict(parsed)
 
 
@@ -953,6 +1063,7 @@ class GatewayLLM(LLMClient):
                     prompt,
                     context,
                     max_output_tokens=_structured_output_token_budget(schema),
+                    structured_schema=schema,
                 )
             )
         except AlertNonRetryableError:
@@ -978,6 +1089,7 @@ class GatewayLLM(LLMClient):
         context: dict[str, Any],
         *,
         max_output_tokens: int = DEFAULT_LLM_OUTPUT_TOKENS,
+        structured_schema: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not self.config.endpoint:
             raise LLMEndpointConfigurationError("LLM endpoint is not configured")
@@ -1006,6 +1118,7 @@ class GatewayLLM(LLMClient):
             context,
             api_key,
             max_tokens=max_output_tokens,
+            structured_schema=structured_schema,
         )
         large_structured_output = (
             max_output_tokens > DEFAULT_LLM_OUTPUT_TOKENS
@@ -1052,10 +1165,14 @@ class GatewayLLM(LLMClient):
             parsed = loads_bounded_json(body)
         except ValueError as exc:
             raise LLMResponseContractError(
-                f"LLM gateway returned invalid JSON response: {body[:200]}"
+                "LLM gateway returned invalid JSON response",
+                reason_code="gateway_invalid_json",
             ) from exc
         if not isinstance(parsed, dict):
-            raise LLMResponseContractError("LLM gateway returned non-object JSON")
+            raise LLMResponseContractError(
+                "LLM gateway returned non-object JSON",
+                reason_code="gateway_non_object_json",
+            )
         return parsed
 
 
@@ -1302,24 +1419,30 @@ def _parse_strict_json_object(text: str) -> dict[str, Any]:
         flags=re.DOTALL,
     ).strip()
     if not rendered:
-        raise LLMResponseContractError("LLM returned an empty structured result")
+        raise LLMResponseContractError(
+            "LLM returned an empty structured result",
+            reason_code="empty_output",
+        )
     try:
         parsed = loads_bounded_json(rendered)
     except ValueError as exc:
         match = re.search(r"\{.*\}", rendered, re.DOTALL)
         if not match:
             raise LLMResponseContractError(
-                "LLM returned invalid structured JSON"
+                "LLM returned invalid structured JSON",
+                reason_code="invalid_json",
             ) from exc
         try:
             parsed = loads_bounded_json(match.group(0))
         except ValueError as nested_exc:
             raise LLMResponseContractError(
-                "LLM returned invalid structured JSON"
+                "LLM returned invalid structured JSON",
+                reason_code="invalid_json",
             ) from nested_exc
     if not isinstance(parsed, dict):
         raise LLMResponseContractError(
-            "LLM returned a non-object structured result"
+            "LLM returned a non-object structured result",
+            reason_code="non_object_output",
         )
     return parsed
 

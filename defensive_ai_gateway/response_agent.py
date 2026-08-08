@@ -14,7 +14,7 @@ from .models import new_id, now_ms
 
 
 REPORT_SCHEMA_VERSION = "response-investigation-report-v7"
-AGENT_VERSION = "response-investigation-agent-v10"
+AGENT_VERSION = "response-investigation-agent-v11"
 TOOL_VERSION = "7"
 FORENSIC_INVENTORY_MAX_ALERTS = 200
 ACTIVE_STATUSES = {
@@ -139,68 +139,234 @@ TURN_SCHEMA = {
     },
     "required": ["action", "rationale"],
 }
+_REPORT_CONCLUSION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "classification": {
+            "type": "string",
+            "enum": [
+                "malicious",
+                "suspicious",
+                "benign",
+                "insufficient_evidence",
+            ],
+        },
+        "confidence": {"type": "number"},
+        "statement": {"type": "string"},
+        "basis": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["classification", "confidence", "statement", "basis"],
+}
+_REPORT_RESPONSE_STEP_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "step_id": {"type": "string", "maxLength": 80},
+        "stage": {"type": "string", "maxLength": 80},
+        "mode": {
+            "type": "string",
+            "enum": ["observe", "approve_required"],
+        },
+        "action": {"type": "string", "maxLength": 500},
+        "rationale": {"type": "string", "maxLength": 500},
+        "success_criteria": {"type": "string", "maxLength": 500},
+        "rollback": {"type": "string", "maxLength": 500},
+        "evidence_refs": {
+            "type": "array",
+            "maxItems": 12,
+            "items": {"type": "string"},
+        },
+    },
+    "required": [
+        "step_id",
+        "stage",
+        "mode",
+        "action",
+        "rationale",
+        "success_criteria",
+        "rollback",
+        "evidence_refs",
+    ],
+}
 REPORT_SCHEMA = {
-    "x-controller-output-token-budget": 6_144,
+    "x-controller-output-token-budget": 12_288,
+    "x-controller-native-structured-output": True,
     "type": "object",
     "properties": {
         "title": {"type": "string", "maxLength": 200},
         "executive_summary": {"type": "string", "maxLength": 1_200},
-        "conclusion": {"type": "object"},
+        "conclusion": _REPORT_CONCLUSION_SCHEMA,
         "findings": {
-            "type": "array",
-            "maxItems": 6,
-            "items": {"type": "object"},
-        },
-        "attack_chain": {
-            "type": "array",
-            "maxItems": 6,
-            "items": {"type": "object"},
-        },
-        "related_activity": {
-            "type": "array",
-            "maxItems": 8,
-            "items": {"type": "object"},
-        },
-        "risk_assessment": {"type": "object"},
-        "hypothesis_assessment": {
-            "type": "array",
-            "maxItems": 6,
-            "items": {"type": "object"},
-        },
-        "scope_assessment": {"type": "object"},
-        "impact": {"type": "string", "maxLength": 1_200},
-        "response_plan": {
             "type": "array",
             "maxItems": 6,
             "items": {
                 "type": "object",
                 "properties": {
-                    "step_id": {"type": "string"},
-                    "stage": {"type": "string"},
-                    "mode": {
+                    "claim_id": {"type": "string"},
+                    "title": {"type": "string"},
+                    "severity": {
                         "type": "string",
-                        "enum": ["observe", "approve_required"],
+                        "enum": ["critical", "high", "medium", "low", "info"],
                     },
-                    "action": {"type": "string"},
-                    "rationale": {"type": "string"},
-                    "success_criteria": {"type": "string"},
-                    "rollback": {"type": "string"},
+                    "claim_state": {
+                        "type": "string",
+                        "enum": ["confirmed", "inferred", "unverified"],
+                    },
+                    "statement": {"type": "string"},
+                    "significance": {"type": "string"},
                     "evidence_refs": {
                         "type": "array",
                         "items": {"type": "string"},
                     },
                 },
                 "required": [
-                    "step_id",
-                    "stage",
-                    "mode",
-                    "action",
-                    "rationale",
-                    "success_criteria",
-                    "rollback",
+                    "claim_id",
+                    "title",
+                    "severity",
+                    "claim_state",
+                    "statement",
+                    "significance",
                     "evidence_refs",
                 ],
             },
+        },
+        "attack_chain": {
+            "type": "array",
+            "maxItems": 6,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "assessment": {"type": "string"},
+                    "evidence_refs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["assessment", "evidence_refs"],
+            },
+        },
+        "related_activity": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "alert_id": {"type": "string"},
+                    "assessment": {"type": "string"},
+                    "evidence_refs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["alert_id", "assessment", "evidence_refs"],
+            },
+        },
+        "risk_assessment": {
+            "type": "object",
+            "properties": {
+                "risk_level": {
+                    "type": "string",
+                    "enum": ["critical", "high", "medium", "low", "info"],
+                },
+                "attack_status": {
+                    "type": "string",
+                    "enum": [
+                        "confirmed_compromise",
+                        "likely_compromise",
+                        "malicious_activity",
+                        "attempted_attack",
+                        "suspicious",
+                        "benign",
+                        "insufficient_evidence",
+                    ],
+                },
+                "likelihood": {
+                    "type": "string",
+                    "enum": ["high", "medium", "low", "unknown"],
+                },
+                "impact": {
+                    "type": "string",
+                    "enum": ["critical", "high", "medium", "low", "unknown"],
+                },
+                "rationale": {"type": "string"},
+                "aggravating_factors": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "mitigating_factors": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "evidence_refs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+            },
+            "required": [
+                "risk_level",
+                "attack_status",
+                "likelihood",
+                "impact",
+                "rationale",
+                "aggravating_factors",
+                "mitigating_factors",
+                "evidence_refs",
+            ],
+        },
+        "hypothesis_assessment": {
+            "type": "array",
+            "maxItems": 6,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "hypothesis_id": {"type": "string"},
+                    "title": {"type": "string"},
+                    "disposition": {
+                        "type": "string",
+                        "enum": [
+                            "supported",
+                            "partially_supported",
+                            "not_supported",
+                            "unresolved",
+                        ],
+                    },
+                    "confidence": {"type": "number"},
+                    "rationale": {"type": "string"},
+                    "supporting_evidence_refs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "contradicting_evidence_refs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": [
+                    "hypothesis_id",
+                    "title",
+                    "disposition",
+                    "confidence",
+                    "rationale",
+                    "supporting_evidence_refs",
+                    "contradicting_evidence_refs",
+                ],
+            },
+        },
+        "scope_assessment": {
+            "type": "object",
+            "properties": {
+                "blast_radius_assessment": {"type": "string"},
+                "evidence_refs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+            },
+            "required": ["blast_radius_assessment", "evidence_refs"],
+        },
+        "impact": {"type": "string", "maxLength": 1_200},
+        "response_plan": {
+            "type": "array",
+            "maxItems": 6,
+            "items": _REPORT_RESPONSE_STEP_SCHEMA,
         },
         "final_assessment": {"type": "string", "maxLength": 1_200},
     },
@@ -214,51 +380,24 @@ REPORT_SCHEMA = {
         "risk_assessment",
         "hypothesis_assessment",
         "scope_assessment",
+        "impact",
         "response_plan",
         "final_assessment",
     ],
 }
 REPORT_RETRY_SCHEMA = {
-    "x-controller-output-token-budget": 4_096,
+    "x-controller-output-token-budget": 8_192,
+    "x-controller-native-structured-output": True,
     "type": "object",
     "properties": {
         "title": {"type": "string", "maxLength": 160},
         "executive_summary": {"type": "string", "maxLength": 600},
-        "conclusion": {"type": "object"},
+        "conclusion": _REPORT_CONCLUSION_SCHEMA,
         "impact": {"type": "string", "maxLength": 600},
         "response_plan": {
             "type": "array",
             "maxItems": 4,
-            "items": {
-                "type": "object",
-                "properties": {
-                    "step_id": {"type": "string", "maxLength": 80},
-                    "stage": {"type": "string", "maxLength": 80},
-                    "mode": {
-                        "type": "string",
-                        "enum": ["observe", "approve_required"],
-                    },
-                    "action": {"type": "string", "maxLength": 500},
-                    "rationale": {"type": "string", "maxLength": 500},
-                    "success_criteria": {"type": "string", "maxLength": 500},
-                    "rollback": {"type": "string", "maxLength": 500},
-                    "evidence_refs": {
-                        "type": "array",
-                        "maxItems": 12,
-                        "items": {"type": "string"},
-                    },
-                },
-                "required": [
-                    "step_id",
-                    "stage",
-                    "mode",
-                    "action",
-                    "rationale",
-                    "success_criteria",
-                    "rollback",
-                    "evidence_refs",
-                ],
-            },
+            "items": _REPORT_RESPONSE_STEP_SCHEMA,
         },
         "final_assessment": {"type": "string", "maxLength": 600},
     },
@@ -4352,12 +4491,18 @@ class ResponseInvestigationAgent:
         candidate: dict[str, Any] = {}
         usage = dict(current.get("usage") or {})
         if not llm.is_deterministic:
-            prior_contract_rejections = sum(
-                1
+            prior_rejection_steps = [
+                step
                 for step in current.get("steps") or []
                 if step.get("phase") == "synthesis_rejected"
                 and (step.get("detail") or {}).get("code")
                 == "model_response_contract"
+            ]
+            prior_contract_rejections = len(prior_rejection_steps)
+            last_contract_reason = (
+                str((prior_rejection_steps[-1].get("detail") or {}).get("reason") or "")
+                if prior_rejection_steps
+                else ""
             )
             first_attempt = prior_contract_rejections + 1
             if first_attempt > 3:
@@ -4462,10 +4607,15 @@ class ResponseInvestigationAgent:
                 if attempt == 1:
                     structured_prompt = prompt
                 else:
+                    previous_failure = (
+                        "The previous response reached the provider output-token boundary. "
+                        if last_contract_reason == "output_truncated"
+                        else "The previous response did not satisfy the JSON contract. "
+                    )
                     structured_prompt = (
                         "Return a compact JSON rescue patch for a defensive-security "
                         "investigation. This is not a complete report. The previous full "
-                        "narrative exceeded the provider response boundary. Use only the "
+                        f"report was rejected. {previous_failure}Use only the "
                         "six fields in the compact schema below and do not add findings, "
                         "attack-chain events, related activity, hypotheses, forensic "
                         "workstreams, evidence gaps or controller metadata. Treat every "
@@ -4503,7 +4653,10 @@ class ResponseInvestigationAgent:
                         )
                         return
                     break
-                except LLMResponseContractError:
+                except LLMResponseContractError as exc:
+                    last_contract_reason = str(
+                        getattr(exc, "reason_code", "invalid_structured_output")
+                    )
                     retry = attempt < 3
                     rejection_step = self._append_step(
                         session_id,
@@ -4522,6 +4675,7 @@ class ResponseInvestigationAgent:
                             "code": "model_response_contract",
                             "retry": retry,
                             "attempt": attempt,
+                            "reason": last_contract_reason,
                             "schema_mode": (
                                 "full" if attempt == 1 else "compact_retry"
                             ),
@@ -4551,6 +4705,7 @@ class ResponseInvestigationAgent:
                             "response_agent_model_paused",
                             error_type="LLMResponseContractError",
                             rejection_code="model_response_contract",
+                            contract_reason=last_contract_reason,
                         )
                     return
                 except Exception as exc:

@@ -890,6 +890,54 @@ class ModelTransportBoundaryTest(unittest.TestCase):
         self.assertEqual(result["classification"], "suspicious")
         self.assertEqual(result["model"], "claude-sonnet-4-6")
 
+    def test_anthropic_structured_request_uses_native_json_schema(self):
+        response = _Response(
+            json.dumps(
+                {
+                    "type": "message",
+                    "stop_reason": "end_turn",
+                    "content": [
+                        {"type": "thinking", "thinking": "not forwarded"},
+                        {"type": "text", "text": '{"title":"report"}'},
+                    ],
+                }
+            ).encode()
+        )
+        llm = GatewayLLM(
+            LLMConfig(
+                provider="gateway",
+                endpoint="https://messages.example/v1/messages",
+                api_key="secret-value",
+                model="claude-opus-4-8",
+                allowed_hosts=["messages.example"],
+            )
+        )
+        schema = {
+            "x-controller-output-token-budget": 8_192,
+            "x-controller-native-structured-output": True,
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "maxLength": 160},
+            },
+            "required": ["title"],
+        }
+        resolution = [(None, None, None, None, ("8.8.8.8", 443))]
+        with patch("defensive_ai_gateway.llm.socket.getaddrinfo", return_value=resolution):
+            with patch(
+                "defensive_ai_gateway.llm._open_no_redirect", return_value=response
+            ) as urlopen:
+                result = llm.generate_structured("report prompt", {}, schema)
+
+        payload = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
+        native_schema = payload["output_config"]["format"]["schema"]
+        self.assertEqual(payload["max_tokens"], 8_192)
+        self.assertEqual(payload["output_config"]["format"]["type"], "json_schema")
+        self.assertEqual(native_schema["additionalProperties"], False)
+        self.assertNotIn("x-controller-output-token-budget", native_schema)
+        self.assertNotIn("x-controller-native-structured-output", native_schema)
+        self.assertNotIn("maxLength", native_schema["properties"]["title"])
+        self.assertEqual(result, {"title": "report"})
+
     def test_openai_responses_request_and_response_are_adapted(self):
         result_json = {
             "classification": "suspicious",
