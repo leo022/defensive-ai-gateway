@@ -14,7 +14,7 @@ from .models import new_id, now_ms
 
 
 REPORT_SCHEMA_VERSION = "response-investigation-report-v7"
-AGENT_VERSION = "response-investigation-agent-v11"
+AGENT_VERSION = "response-investigation-agent-v12"
 TOOL_VERSION = "7"
 FORENSIC_INVENTORY_MAX_ALERTS = 200
 ACTIVE_STATUSES = {
@@ -152,8 +152,12 @@ _REPORT_CONCLUSION_SCHEMA = {
             ],
         },
         "confidence": {"type": "number"},
-        "statement": {"type": "string"},
-        "basis": {"type": "array", "items": {"type": "string"}},
+        "statement": {"type": "string", "maxLength": 450},
+        "basis": {
+            "type": "array",
+            "maxItems": 4,
+            "items": {"type": "string", "maxLength": 300},
+        },
     },
     "required": ["classification", "confidence", "statement", "basis"],
 }
@@ -166,10 +170,10 @@ _REPORT_RESPONSE_STEP_SCHEMA = {
             "type": "string",
             "enum": ["observe", "approve_required"],
         },
-        "action": {"type": "string", "maxLength": 500},
-        "rationale": {"type": "string", "maxLength": 500},
-        "success_criteria": {"type": "string", "maxLength": 500},
-        "rollback": {"type": "string", "maxLength": 500},
+        "action": {"type": "string", "maxLength": 320},
+        "rationale": {"type": "string", "maxLength": 240},
+        "success_criteria": {"type": "string", "maxLength": 240},
+        "rollback": {"type": "string", "maxLength": 240},
         "evidence_refs": {
             "type": "array",
             "maxItems": 12,
@@ -192,17 +196,17 @@ REPORT_SCHEMA = {
     "x-controller-native-structured-output": True,
     "type": "object",
     "properties": {
-        "title": {"type": "string", "maxLength": 200},
-        "executive_summary": {"type": "string", "maxLength": 1_200},
+        "title": {"type": "string", "maxLength": 160},
+        "executive_summary": {"type": "string", "maxLength": 450},
         "conclusion": _REPORT_CONCLUSION_SCHEMA,
         "findings": {
             "type": "array",
-            "maxItems": 6,
+            "maxItems": 4,
             "items": {
                 "type": "object",
                 "properties": {
-                    "claim_id": {"type": "string"},
-                    "title": {"type": "string"},
+                    "claim_id": {"type": "string", "maxLength": 80},
+                    "title": {"type": "string", "maxLength": 160},
                     "severity": {
                         "type": "string",
                         "enum": ["critical", "high", "medium", "low", "info"],
@@ -211,11 +215,12 @@ REPORT_SCHEMA = {
                         "type": "string",
                         "enum": ["confirmed", "inferred", "unverified"],
                     },
-                    "statement": {"type": "string"},
-                    "significance": {"type": "string"},
+                    "statement": {"type": "string", "maxLength": 450},
+                    "significance": {"type": "string", "maxLength": 300},
                     "evidence_refs": {
                         "type": "array",
-                        "items": {"type": "string"},
+                        "maxItems": 12,
+                        "items": {"type": "string", "maxLength": 200},
                     },
                 },
                 "required": [
@@ -235,10 +240,11 @@ REPORT_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "assessment": {"type": "string"},
+                    "assessment": {"type": "string", "maxLength": 300},
                     "evidence_refs": {
                         "type": "array",
-                        "items": {"type": "string"},
+                        "maxItems": 12,
+                        "items": {"type": "string", "maxLength": 200},
                     },
                 },
                 "required": ["assessment", "evidence_refs"],
@@ -246,15 +252,16 @@ REPORT_SCHEMA = {
         },
         "related_activity": {
             "type": "array",
-            "maxItems": 8,
+            "maxItems": 6,
             "items": {
                 "type": "object",
                 "properties": {
-                    "alert_id": {"type": "string"},
-                    "assessment": {"type": "string"},
+                    "alert_id": {"type": "string", "maxLength": 128},
+                    "assessment": {"type": "string", "maxLength": 300},
                     "evidence_refs": {
                         "type": "array",
-                        "items": {"type": "string"},
+                        "maxItems": 12,
+                        "items": {"type": "string", "maxLength": 200},
                     },
                 },
                 "required": ["alert_id", "assessment", "evidence_refs"],
@@ -287,18 +294,21 @@ REPORT_SCHEMA = {
                     "type": "string",
                     "enum": ["critical", "high", "medium", "low", "unknown"],
                 },
-                "rationale": {"type": "string"},
+                "rationale": {"type": "string", "maxLength": 450},
                 "aggravating_factors": {
                     "type": "array",
-                    "items": {"type": "string"},
+                    "maxItems": 4,
+                    "items": {"type": "string", "maxLength": 240},
                 },
                 "mitigating_factors": {
                     "type": "array",
-                    "items": {"type": "string"},
+                    "maxItems": 4,
+                    "items": {"type": "string", "maxLength": 240},
                 },
                 "evidence_refs": {
                     "type": "array",
-                    "items": {"type": "string"},
+                    "maxItems": 12,
+                    "items": {"type": "string", "maxLength": 200},
                 },
             },
             "required": [
@@ -314,12 +324,12 @@ REPORT_SCHEMA = {
         },
         "hypothesis_assessment": {
             "type": "array",
-            "maxItems": 6,
+            "maxItems": 4,
             "items": {
                 "type": "object",
                 "properties": {
-                    "hypothesis_id": {"type": "string"},
-                    "title": {"type": "string"},
+                    "hypothesis_id": {"type": "string", "maxLength": 80},
+                    "title": {"type": "string", "maxLength": 160},
                     "disposition": {
                         "type": "string",
                         "enum": [
@@ -330,14 +340,16 @@ REPORT_SCHEMA = {
                         ],
                     },
                     "confidence": {"type": "number"},
-                    "rationale": {"type": "string"},
+                    "rationale": {"type": "string", "maxLength": 400},
                     "supporting_evidence_refs": {
                         "type": "array",
-                        "items": {"type": "string"},
+                        "maxItems": 12,
+                        "items": {"type": "string", "maxLength": 200},
                     },
                     "contradicting_evidence_refs": {
                         "type": "array",
-                        "items": {"type": "string"},
+                        "maxItems": 12,
+                        "items": {"type": "string", "maxLength": 200},
                     },
                 },
                 "required": [
@@ -354,21 +366,22 @@ REPORT_SCHEMA = {
         "scope_assessment": {
             "type": "object",
             "properties": {
-                "blast_radius_assessment": {"type": "string"},
+                "blast_radius_assessment": {"type": "string", "maxLength": 500},
                 "evidence_refs": {
                     "type": "array",
-                    "items": {"type": "string"},
+                    "maxItems": 12,
+                    "items": {"type": "string", "maxLength": 200},
                 },
             },
             "required": ["blast_radius_assessment", "evidence_refs"],
         },
-        "impact": {"type": "string", "maxLength": 1_200},
+        "impact": {"type": "string", "maxLength": 450},
         "response_plan": {
             "type": "array",
             "maxItems": 6,
             "items": _REPORT_RESPONSE_STEP_SCHEMA,
         },
-        "final_assessment": {"type": "string", "maxLength": 1_200},
+        "final_assessment": {"type": "string", "maxLength": 450},
     },
     "required": [
         "title",
@@ -391,15 +404,15 @@ REPORT_RETRY_SCHEMA = {
     "type": "object",
     "properties": {
         "title": {"type": "string", "maxLength": 160},
-        "executive_summary": {"type": "string", "maxLength": 600},
+        "executive_summary": {"type": "string", "maxLength": 450},
         "conclusion": _REPORT_CONCLUSION_SCHEMA,
-        "impact": {"type": "string", "maxLength": 600},
+        "impact": {"type": "string", "maxLength": 450},
         "response_plan": {
             "type": "array",
             "maxItems": 4,
             "items": _REPORT_RESPONSE_STEP_SCHEMA,
         },
-        "final_assessment": {"type": "string", "maxLength": 600},
+        "final_assessment": {"type": "string", "maxLength": 450},
     },
     "required": [
         "title",
@@ -4569,8 +4582,12 @@ class ResponseInvestigationAgent:
                 "such as none, N/A or 无 for rationale, success criteria or rollback. "
                 "Risk aggravating_factors and mitigating_factors must be JSON arrays of "
                 "complete sentences, never a string or an array of individual characters. "
-                "Keep the JSON concise: use at most 6 findings, 6 attack-chain events, "
-                "8 related events, 6 hypotheses and 6 response steps. Do not repeat "
+                "Keep the final report decision-focused and non-redundant. State each "
+                "fact once in its most relevant section. Limit the executive summary "
+                "to three sentences and the final assessment to two sentences. Use at "
+                "most 4 findings, 6 attack-chain events, 6 related events, 4 hypotheses "
+                "and 6 response steps. Reuse response_playbook step_id values; do not "
+                "omit a controller step merely to shorten the response. Do not repeat "
                 "controller-owned forensic workstreams, evidence gaps, cross-source "
                 "inventory or prior-analysis context; the controller attaches those "
                 "complete locked sections after synthesis. "
@@ -5947,10 +5964,10 @@ class ResponseInvestigationAgent:
         normalized = copy.deepcopy(base)
         if isinstance(candidate, dict) and candidate:
             for key, limit in (
-                ("title", 500),
-                ("executive_summary", 4_000),
-                ("impact", 3_000),
-                ("final_assessment", 4_000),
+                ("title", 160),
+                ("executive_summary", 450),
+                ("impact", 450),
+                ("final_assessment", 450),
             ):
                 value = _model_narrative_text(candidate.get(key), limit)
                 if value:
@@ -5977,15 +5994,15 @@ class ResponseInvestigationAgent:
                     ),
                 )
                 statement = _model_narrative_text(
-                    conclusion.get("statement"), 4_000
+                    conclusion.get("statement"), 450
                 )
                 if statement:
                     normalized["conclusion"]["statement"] = statement
                 basis = [
-                    _model_narrative_text(item, 1_500)
+                    _model_narrative_text(item, 300)
                     for item in conclusion.get("basis") or []
-                    if _model_narrative_text(item, 1_500)
-                ][:20]
+                    if _model_narrative_text(item, 300)
+                ][:4]
                 if basis:
                     normalized["conclusion"]["basis"] = basis
 
@@ -6062,8 +6079,10 @@ class ResponseInvestigationAgent:
                     )
                 ),
             )
-            if response_plan:
-                normalized["response_plan"] = response_plan
+            normalized["response_plan"] = self._merge_response_plan_with_base(
+                response_plan,
+                base.get("response_plan") or [],
+            )
             normalized["forensic_workstreams"] = self._merge_forensic_workstreams(
                 candidate.get("forensic_workstreams"),
                 base["forensic_workstreams"],
@@ -6105,6 +6124,7 @@ class ResponseInvestigationAgent:
                 (session.get("model_metadata") or {}).get("report_language")
             ),
         )
+        self._compact_final_report(normalized)
         return normalized
 
     @staticmethod
@@ -6745,6 +6765,282 @@ class ResponseInvestigationAgent:
             item["evidence_refs"] = list(dict.fromkeys(refs))[:64]
         return response_plan
 
+    @staticmethod
+    def _merge_response_plan_with_base(
+        candidate: list[dict[str, Any]],
+        base: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Apply model prose without allowing it to erase governed steps or citations."""
+        if not base:
+            return copy.deepcopy(candidate[:6])
+
+        candidates = {
+            str(item.get("step_id") or ""): item
+            for item in candidate
+            if isinstance(item, dict) and item.get("step_id")
+        }
+        merged_plan: list[dict[str, Any]] = []
+        for base_item in base:
+            if not isinstance(base_item, dict):
+                continue
+            step_id = str(base_item.get("step_id") or "")
+            model_item = candidates.get(step_id)
+            merged = copy.deepcopy(base_item)
+            if model_item:
+                for key in (
+                    "stage",
+                    "mode",
+                    "action",
+                    "rationale",
+                    "success_criteria",
+                    "rollback",
+                ):
+                    if model_item.get(key) not in (None, ""):
+                        merged[key] = copy.deepcopy(model_item[key])
+            merged["evidence_refs"] = list(
+                dict.fromkeys(
+                    [
+                        *[
+                            str(ref)
+                            for ref in base_item.get("evidence_refs") or []
+                            if str(ref).strip()
+                        ],
+                        *[
+                            str(ref)
+                            for ref in (model_item or {}).get("evidence_refs") or []
+                            if str(ref).strip()
+                        ],
+                    ]
+                )
+            )[:64]
+            merged_plan.append(merged)
+        return merged_plan
+
+    @staticmethod
+    def _compact_final_forensic_workstreams(
+        workstreams: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        compacted: list[dict[str, Any]] = []
+        for item in workstreams:
+            if not isinstance(item, dict):
+                continue
+            rendered: dict[str, Any] = {}
+            for key, limit in (
+                ("workstream_id", 128),
+                ("title", 180),
+                ("domain", 64),
+                ("status", 32),
+                ("coverage_summary", 240),
+                ("priority", 32),
+            ):
+                if key in item:
+                    rendered[key] = _text(item.get(key), limit)
+
+            if "evidence_sources" in item:
+                rendered["evidence_sources"] = [
+                    {
+                        key: source.get(key)
+                        for key in (
+                            "alert_id",
+                            "product",
+                            "event_type",
+                            "relation",
+                            "syslog_message_integrity",
+                            "evidence_ref",
+                        )
+                        if key in source
+                    }
+                    for source in item.get("evidence_sources") or []
+                    if isinstance(source, dict)
+                ][:2]
+            if "collection_steps" in item:
+                rendered["collection_steps"] = [
+                    _text(step, 280)
+                    for step in item.get("collection_steps") or []
+                    if _text(step, 280)
+                ][:1]
+            if "evidence_refs" in item:
+                rendered["evidence_refs"] = list(
+                    dict.fromkeys(
+                        str(ref)
+                        for ref in item.get("evidence_refs") or []
+                        if str(ref).strip()
+                    )
+                )[:8]
+
+            if "investigation_result" in item:
+                result = item.get("investigation_result") or {}
+                compact_result: dict[str, Any] = {}
+                if "conclusion_state" in result:
+                    compact_result["conclusion_state"] = _text(
+                        result.get("conclusion_state"), 64
+                    )
+                if "assessment" in result:
+                    compact_result["assessment"] = _text(
+                        result.get("assessment"), 350
+                    )
+                for key, count, limit in (
+                    ("observations", 2, 300),
+                    ("alternative_explanations", 1, 250),
+                    ("next_pivots", 1, 250),
+                ):
+                    if key in result:
+                        compact_result[key] = [
+                            _text(value, limit)
+                            for value in result.get(key) or []
+                            if _text(value, limit)
+                        ][:count]
+                rendered["investigation_result"] = compact_result
+            compacted.append(rendered)
+        return compacted[: len(FORENSIC_WORKSTREAMS)]
+
+    @classmethod
+    def _compact_final_report(cls, report: dict[str, Any]) -> None:
+        report["title"] = _text(report.get("title"), 160)
+        for key in ("executive_summary", "impact", "final_assessment"):
+            report[key] = _text(report.get(key), 450)
+
+        conclusion = report.get("conclusion") or {}
+        conclusion["statement"] = _text(conclusion.get("statement"), 450)
+        conclusion["basis"] = list(
+            dict.fromkeys(
+                _text(item, 300)
+                for item in conclusion.get("basis") or []
+                if _text(item, 300)
+            )
+        )[:4]
+
+        risk = report.get("risk_assessment") or {}
+        risk["rationale"] = _text(risk.get("rationale"), 450)
+        for key in ("aggravating_factors", "mitigating_factors"):
+            risk[key] = [
+                _text(item, 240)
+                for item in risk.get(key) or []
+                if _text(item, 240)
+            ][:4]
+
+        compact_findings: list[dict[str, Any]] = []
+        seen_findings: set[str] = set()
+        for item in report.get("findings") or []:
+            if not isinstance(item, dict):
+                continue
+            rendered = copy.deepcopy(item)
+            rendered["claim_id"] = _text(rendered.get("claim_id"), 80)
+            rendered["title"] = _text(rendered.get("title"), 160)
+            rendered["statement"] = _text(rendered.get("statement"), 450)
+            rendered["significance"] = _text(rendered.get("significance"), 300)
+            rendered["evidence_refs"] = list(
+                dict.fromkeys(
+                    str(ref)
+                    for ref in rendered.get("evidence_refs") or []
+                    if str(ref).strip()
+                )
+            )[:12]
+            identity = rendered["statement"].casefold()
+            if not identity or identity in seen_findings:
+                continue
+            seen_findings.add(identity)
+            compact_findings.append(rendered)
+        report["findings"] = compact_findings[:4]
+
+        compact_chain: list[dict[str, Any]] = []
+        seen_chain: set[tuple[str, str]] = set()
+        for item in report.get("attack_chain") or []:
+            if not isinstance(item, dict):
+                continue
+            rendered = copy.deepcopy(item)
+            rendered["statement"] = _text(rendered.get("statement"), 450)
+            rendered["assessment"] = _text(rendered.get("assessment"), 300)
+            rendered["evidence_refs"] = list(
+                dict.fromkeys(
+                    str(ref)
+                    for ref in rendered.get("evidence_refs") or []
+                    if str(ref).strip()
+                )
+            )[:12]
+            identity = (
+                str(rendered.get("timestamp") or ""),
+                rendered["statement"].casefold(),
+            )
+            if identity in seen_chain:
+                continue
+            seen_chain.add(identity)
+            compact_chain.append(rendered)
+        report["attack_chain"] = compact_chain[:6]
+
+        compact_related: list[dict[str, Any]] = []
+        seen_related: set[str] = set()
+        for item in report.get("related_activity") or []:
+            if not isinstance(item, dict):
+                continue
+            rendered = copy.deepcopy(item)
+            for key, limit in (
+                ("activity", 400),
+                ("relationship", 300),
+                ("assessment", 300),
+            ):
+                if key in rendered:
+                    rendered[key] = _text(rendered.get(key), limit)
+            rendered["evidence_refs"] = list(
+                dict.fromkeys(
+                    str(ref)
+                    for ref in rendered.get("evidence_refs") or []
+                    if str(ref).strip()
+                )
+            )[:12]
+            identity = str(rendered.get("alert_id") or "").casefold()
+            if identity and identity in seen_related:
+                continue
+            if identity:
+                seen_related.add(identity)
+            compact_related.append(rendered)
+        report["related_activity"] = compact_related[:6]
+
+        hypotheses = []
+        for item in report.get("hypothesis_assessment") or []:
+            if not isinstance(item, dict):
+                continue
+            rendered = copy.deepcopy(item)
+            rendered["hypothesis_id"] = _text(
+                rendered.get("hypothesis_id"), 80
+            )
+            rendered["title"] = _text(rendered.get("title"), 160)
+            rendered["rationale"] = _text(rendered.get("rationale"), 400)
+            for key in (
+                "supporting_evidence_refs",
+                "contradicting_evidence_refs",
+            ):
+                rendered[key] = list(
+                    dict.fromkeys(
+                        str(ref)
+                        for ref in rendered.get(key) or []
+                        if str(ref).strip()
+                    )
+                )[:12]
+            rendered["missing_evidence"] = [
+                _text(value, 350)
+                for value in rendered.get("missing_evidence") or []
+                if _text(value, 350)
+            ][:4]
+            hypotheses.append(rendered)
+        report["hypothesis_assessment"] = hypotheses[:6]
+
+        report["forensic_workstreams"] = cls._compact_final_forensic_workstreams(
+            report.get("forensic_workstreams") or []
+        )
+        for item in report.get("investigation_log") or []:
+            if not isinstance(item, dict):
+                continue
+            refs = list(
+                dict.fromkeys(
+                    str(ref)
+                    for ref in item.get("evidence_refs") or []
+                    if str(ref).strip()
+                )
+            )
+            item["evidence_ref_count"] = len(refs)
+            item.pop("evidence_refs", None)
+
     def _normalize_response_plan(
         self,
         value: Any,
@@ -6757,7 +7053,7 @@ class ResponseInvestigationAgent:
         for index, item in enumerate(value[:20], start=1):
             if not isinstance(item, dict):
                 continue
-            action = _model_narrative_text(item.get("action"), 1_500)
+            action = _model_narrative_text(item.get("action"), 320)
             if not action:
                 continue
             mode = str(item.get("mode") or "")
@@ -6769,7 +7065,7 @@ class ResponseInvestigationAgent:
                     if self.policy.requires_approval(action)
                     else "observe"
                 )
-            rationale = _model_narrative_text(item.get("rationale"), 1_000)
+            rationale = _model_narrative_text(item.get("rationale"), 240)
             if self._plan_detail_is_placeholder(rationale):
                 rationale = _pick(
                 language,
@@ -6785,7 +7081,7 @@ class ResponseInvestigationAgent:
                 ),
             )
             success_criteria = _model_narrative_text(
-                item.get("success_criteria"), 1_000
+                item.get("success_criteria"), 240
             )
             if self._plan_detail_is_placeholder(success_criteria):
                 success_criteria = _pick(
@@ -6801,7 +7097,7 @@ class ResponseInvestigationAgent:
                     else "A verifiable result is bound to the current Case and no unapproved production change occurred."
                 ),
             )
-            rollback = _model_narrative_text(item.get("rollback"), 1_000)
+            rollback = _model_narrative_text(item.get("rollback"), 240)
             if self._plan_detail_is_placeholder(rollback):
                 rollback = _pick(
                 language,

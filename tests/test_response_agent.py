@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import tempfile
@@ -598,6 +599,38 @@ class ResponseAgentTest(unittest.TestCase):
             )
         )
         self.assertTrue(report["content"]["final_assessment"])
+        self.assertLessEqual(len(report["content"]["executive_summary"]), 450)
+        self.assertLessEqual(len(report["content"]["final_assessment"]), 450)
+        self.assertTrue(
+            all(
+                len(item.get("evidence_sources") or []) <= 2
+                and len(item.get("collection_steps") or []) <= 1
+                and len(item.get("evidence_refs") or []) <= 8
+                and len(
+                    item.get("investigation_result", {}).get("observations") or []
+                )
+                <= 2
+                and len(
+                    item.get("investigation_result", {}).get(
+                        "alternative_explanations"
+                    )
+                    or []
+                )
+                <= 1
+                and len(
+                    item.get("investigation_result", {}).get("next_pivots") or []
+                )
+                <= 1
+                for item in report["content"]["forensic_workstreams"]
+            )
+        )
+        self.assertTrue(
+            all(
+                "evidence_refs" not in item
+                and item.get("evidence_ref_count", 0) >= 0
+                for item in report["content"]["investigation_log"]
+            )
+        )
         self.assertTrue(
             all(
                 item["mode"] in {"observe", "approve_required"}
@@ -2334,6 +2367,64 @@ class ResponseAgentTest(unittest.TestCase):
             validation["checks"]["response_plan_operational"]
         )
 
+    def test_report_compiler_preserves_controller_plan_refs_and_omitted_steps(self):
+        self.state.response_agent.stop()
+        case_id = self._case("response-agent-plan-reference-inheritance")
+        source = self.state.repo.get_case_response_source(case_id)
+        artifact = self.state.case_response.generate(
+            case_id, actor="analyst"
+        )["artifact"]
+        started = self.state.response_agent.create(
+            case_id,
+            artifact=artifact,
+            goal="Preserve the governed response plan",
+            actor="analyst",
+        )
+        session = self.state.repo.get_response_agent_session(
+            started["session_id"]
+        )
+        base = self.state.response_agent._base_report(
+            session,
+            source,
+            artifact,
+        )
+        self.assertGreaterEqual(len(base["response_plan"]), 3)
+        target = copy.deepcopy(base["response_plan"][2])
+        target["evidence_refs"] = []
+        model_only_step = copy.deepcopy(target)
+        model_only_step["step_id"] = "model-only-step"
+
+        normalized = self.state.response_agent._normalize_report(
+            {"response_plan": [target, model_only_step]},
+            base,
+            session,
+        )
+        validation, _refs = self.state.response_agent._validate_report(
+            normalized,
+            session,
+            source,
+            artifact,
+        )
+
+        self.assertEqual(
+            [item["step_id"] for item in normalized["response_plan"]],
+            [item["step_id"] for item in base["response_plan"]],
+        )
+        for expected, actual in zip(
+            base["response_plan"], normalized["response_plan"]
+        ):
+            self.assertTrue(
+                set(expected["evidence_refs"]).issubset(actual["evidence_refs"]),
+                expected["step_id"],
+            )
+        self.assertFalse(
+            any(
+                error.startswith("response_plan_")
+                for error in validation["errors"]
+            ),
+            validation["errors"],
+        )
+
     def test_risk_factor_normalization_preserves_complete_sentences(self):
         normalized = self.state.response_agent._normalize_risk_assessment(
             {
@@ -3425,8 +3516,12 @@ class ResponseAgentTest(unittest.TestCase):
         self.assertEqual(normalized["impact"], "Unknown")
         self.assertEqual(normalized["response_plan"], [])
         self.assertEqual(
-            normalized["forensic_workstreams"],
-            base["forensic_workstreams"],
+            [item["workstream_id"] for item in normalized["forensic_workstreams"]],
+            [item["workstream_id"] for item in base["forensic_workstreams"]],
+        )
+        self.assertNotIn(
+            "analysis_metrics",
+            normalized["forensic_workstreams"][0],
         )
 
     def test_prior_llm_uncertainties_are_not_controller_evidence_gaps(self):
@@ -4406,13 +4501,21 @@ class ResponseAgentHTTPRoleTest(unittest.TestCase):
 
 
 class StructuredLLMContractTest(unittest.TestCase):
-    def test_report_schema_requests_bounded_large_output_budget(self):
+    def test_report_schema_requests_bounded_concise_output(self):
         self.assertEqual(
             REPORT_SCHEMA["x-controller-output-token-budget"],
             12_288,
         )
         self.assertTrue(REPORT_SCHEMA["x-controller-native-structured-output"])
-        self.assertEqual(REPORT_SCHEMA["properties"]["findings"]["maxItems"], 6)
+        self.assertEqual(REPORT_SCHEMA["properties"]["findings"]["maxItems"], 4)
+        self.assertEqual(
+            REPORT_SCHEMA["properties"]["executive_summary"]["maxLength"],
+            450,
+        )
+        self.assertEqual(
+            REPORT_SCHEMA["properties"]["hypothesis_assessment"]["maxItems"],
+            4,
+        )
         for controller_owned in (
             "cross_source_correlation",
             "forensic_workstreams",
